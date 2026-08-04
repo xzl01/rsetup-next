@@ -1,3 +1,16 @@
+rsetup (0.4.28) noble; urgency=medium
+
+  [ ZHANG Yuntian ]
+  * Add 'resolute' and 'resolute-test' to pkg.conf.template
+
+  [ xzl ]
+  * Add CQU APT mirrors
+
+  [ Feng Zhang ]
+  * fix(sddm): auto-detect Plasma session for autologin
+
+ -- "Radxa Computer Co., Ltd" <dev@radxa.com>  Tue, 04 Aug 2026 03:14:17 +0000
+
 rsetup (0.4.27) noble; urgency=medium
 
   [ ZHANG Yuntian ]
