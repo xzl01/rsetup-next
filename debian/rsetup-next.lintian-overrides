@@ -2,4 +2,5 @@
 rsetup-next: initial-upload-closes-no-bugs
 
 # The executable is intentionally static for Debian 12 runtime compatibility.
+rsetup-next: statically-linked-binary [usr/bin/rsetup-next]
 rsetup-next: shared-library-lacks-prerequisites [usr/bin/rsetup-next]
