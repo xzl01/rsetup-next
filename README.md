@@ -160,7 +160,8 @@ properly vendored crates as described in `debian/README.source`.
 
 Packages are built on Debian 13/Trixie with Rust 1.85 or newer, then installed
 and smoke-tested on Debian 12/Bookworm. Bookworm is the runtime compatibility
-baseline; its Rust 1.63 toolchain is not used for source builds.
+baseline; its Rust 1.63 toolchain is not used for source builds. CI validates
+both amd64 and arm64 packages.
 
 ## Hardware validation boundary
 
