@@ -1,125 +1,35 @@
-Source: rsetup
-Maintainer: "Radxa Computer Co., Ltd" <dev@radxa.com>
+Source: rsetup-next
 Section: admin
-Priority: standard
-Standards-Version: 4.6.0
-Build-Depends: debhelper (>=12~),
-               devscripts,
-               lintian,
-               dh-exec,
-               pandoc,
-               shellcheck,
+Maintainer: xzl <xiangzelong@radxa.com>
+Build-Depends:
+ cargo (>= 1.85),
+ debhelper-compat (= 13),
+ nodejs,
+ rustc (>= 1.85),
+Standards-Version: 4.7.4.1
+Rules-Requires-Root: no
+Homepage: https://github.com/xzl01/rsetup-next
+Vcs-Browser: https://github.com/xzl01/rsetup-next
+Vcs-Git: https://github.com/xzl01/rsetup-next.git
 
-Package: rsetup
-Architecture: all
-Section: admin
-Priority: standard
-Depends: device-tree-compiler,
-         gdisk,
-         jq,
-         librtui (>= 0.2.0),
-         parted,
-         pkexec | policykit-1 (<< 122-1),
-         python3,
-         python3-yaml,
-         systemd,
-         u-boot-menu,
-         ${misc:Depends},
-Recommends: gstreamer1.0-tools,
-Suggests: aicrf-test,
-          gpiod,
-          sudo,
-          x-terminal-emulator,
-Description: Radxa system setup utility
- Radxa system setup utility (rsetup) provides an user friendly menu to
- perform many essential system configuration tasks. It also provides
- an on-boot configuration service to allow customization.
-
-Package: rsetup-config-thermal-governor-step-wise
-Architecture: all
-Section: admin
-Priority: standard
-Depends: rsetup (= ${binary:Version}),
-         ${misc:Depends},
-Description: Radxa system config - Set thermal_governor to step_wise
- This package sets thermal_governor to step_wise on boot.
-
-Package: rsetup-config-first-boot
-Architecture: all
-Section: admin
-Priority: standard
-Depends: rsetup (= ${binary:Version}),
-         btrfs-progs,
-         ${misc:Depends},
-Description: Radxa system config - First boot configuration
- This package contains the default first boot script.
-
-Package: rsetup-config-aic8800-ttyas1
-Architecture: all
-Section: admin
-Priority: standard
-Depends: rsetup (= ${binary:Version}),
-         ${misc:Depends},
-Description: Radxa system config - Attach AIC8800 Bluetooth on /dev/ttyAS1
- This package attaches AIC8800 Bluetooth on /dev/ttyAS1 on boot.
-
-Package: rsetup-config-aic8800-ttys1
-Architecture: all
-Section: admin
-Priority: standard
-Depends: rsetup (= ${binary:Version}),
-         ${misc:Depends},
-Provides: rsetup-config-hciattach-ttys1 (= 0.4.0)
-Conflicts: rsetup-config-hciattach-ttys1 (<< 0.4.0)
-Replaces: rsetup-config-hciattach-ttys1 (<< 0.4.0)
-Description: Radxa system config - Attach AIC8800 Bluetooth on /dev/ttyS1
- This package attaches AIC8800 Bluetooth on /dev/ttyS1 on boot.
-
-Package: rsetup-config-rgb0-rainbow
-Architecture: all
-Section: admin
-Priority: standard
-Depends: rsetup (= ${binary:Version}),
-         ${misc:Depends},
-Description: Radxa system config - Set rgb0 LED's pattern to rainbow
- This package set rgb0 LED's pattern to rainbow on boot.
-
-Package: rsetup-config-wan-led-eth0
-Architecture: all
-Section: admin
-Priority: standard
-Depends: rsetup (= ${binary:Version}),
-         ${misc:Depends},
-Provides: rsetup-config-wan-led-netdev
-Description: Radxa system config - Set wan-led LED's netdev to eth0
- This package set wan-led LED's netdev to eth0 on boot.
-
-Package: rsetup-config-wan-led-enp1s0
-Architecture: all
-Section: admin
-Priority: standard
-Depends: rsetup (= ${binary:Version}),
-         ${misc:Depends},
-Provides: rsetup-config-wan-led-netdev
-Description: Radxa system config - Set wan-led LED's netdev to enp1s0
- This package set wan-led LED's netdev to enp1s0 on boot.
-
-Package: rsetup-config-lan-led-eth0
-Architecture: all
-Section: admin
-Priority: standard
-Depends: rsetup (= ${binary:Version}),
-         ${misc:Depends},
-Provides: rsetup-config-lan-led-netdev
-Description: Radxa system config - Set lan-led LED's netdev to eth0
- This package set lan-led LED's netdev to eth0 on boot.
-
-Package: rsetup-config-lan-led-enp1s0
-Architecture: all
-Section: admin
-Priority: standard
-Depends: rsetup (= ${binary:Version}),
-         ${misc:Depends},
-Provides: rsetup-config-lan-led-netdev
-Description: Radxa system config - Set lan-led LED's netdev to enp1s0
- This package set lan-led LED's netdev to enp1s0 on boot.
+Package: rsetup-next
+Architecture: any
+Depends:
+ apt,
+ btrfs-progs,
+ e2fsprogs,
+ iproute2,
+ systemd,
+ util-linux,
+ ${misc:Depends},
+ ${shlibs:Depends},
+Suggests:
+ network-manager,
+ openssh-server,
+Description: local control center for Linux single-board computers
+ rsetup-next provides one typed control plane for observing and managing a
+ Linux single-board computer. It includes a scriptable command-line interface,
+ an interactive terminal interface, and a loopback Web control center.
+ .
+ Mutating operations are dry-run by default and require explicit live execution
+ and confirmation.

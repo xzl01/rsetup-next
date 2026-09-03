@@ -1,10 +1,36 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
-Upstream-Name: rsetup
-Source: https://github.com/radxa-pkg/rsetup
+Upstream-Name: rsetup-next
+Source: https://github.com/xzl01/rsetup-next
 
 Files: *
-Copyright: © 2025 Radxa Computer Co., Ltd
+Copyright: 2025-2026 Radxa Computer Co., Ltd
+           2026 xzl
 License: GPL-3+
+
+Files: ui/fonts/BarlowCondensed-*.ttf
+Copyright: 2017 The Barlow Project Authors
+License: OFL-1.1
+ The complete license text is installed as
+ /usr/share/doc/rsetup-next/OFL-Barlow.txt.gz.
+
+Files: ui/fonts/open-sans-*.woff2
+Copyright: Open Sans project contributors
+License: Apache-2.0
+ On Debian systems, the complete text of the Apache License 2.0 can be found in
+ /usr/share/common-licenses/Apache-2.0.
+
+Files: ui/fonts/source-code-pro.woff2
+Copyright: 2010, 2012 Adobe Systems Incorporated
+License: OFL-1.1
+ The complete license text is installed as
+ /usr/share/doc/rsetup-next/SOURCE-CODE-PRO-LICENSE.txt.gz.
+
+Files: ui/assets/vendor-cix.png
+       ui/assets/vendor-partners.webp
+Copyright: respective trademark owners
+License: not-established
+ These marks are included for nominative device-vendor identification.
+ Redistribution permission has not been established; see debian/README.source.
 
 License: GPL-3+
  This program is free software; you can redistribute it and/or modify
@@ -14,13 +40,8 @@ License: GPL-3+
  .
  This program is distributed in the hope that it will be useful, but
  WITHOUT ANY WARRANTY; without even the implied warranty of
- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
  General Public License for more details.
  .
- You should have received a copy of the GNU General Public License
- along with this program; if not, write to the Free Software
- Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
- 02110-1301, USA.
- .
  On Debian systems, the complete text of the GNU General Public License
- can be found in /usr/share/common-licenses/GPL-3.
+ version 3 can be found in /usr/share/common-licenses/GPL-3.

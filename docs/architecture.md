@@ -91,8 +91,8 @@ alpha API.
 
 The Rust control plane never invokes the legacy `rsetup` command. Fixed catalog
 actions run through built-in implementations that call only the required Linux
-system tools. The original Bash tree may be consulted as migration reference,
-but it is not a runtime dependency or fallback executor.
+system tools. Git history preserves upstream behavior for comparison; no legacy
+runtime tree or fallback executor is shipped.
 
 Do not migrate a hardware operation merely by translating its syntax. Preserve
 its compatibility checks, recovery warning, target validation, and board test

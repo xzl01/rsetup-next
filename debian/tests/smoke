@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+rsetup-next --demo status --json | grep -q '"identity"'
+rsetup-next --demo actions --json | grep -q '"system.update"'

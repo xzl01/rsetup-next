@@ -59,9 +59,8 @@ scripts.
 - English and Simplified Chinese are first-class presentation languages across
   CLI, TUI, browser GUI, and Tauri. Machine-readable JSON and HTTP payloads stay
   locale-neutral and preserve stable identifiers.
-- Existing rsetup Bash functionality is migration input only. The new control
-  plane must not invoke or require the legacy command at runtime; incompatible
-  internal changes are allowed.
+- The new control plane must not invoke or require the legacy command at
+  runtime; incompatible internal changes are allowed.
 - Read-only inspection must work without elevated privileges where Linux
   exposes the data.
 - Mutating and recovery-sensitive actions must show impact, prerequisites, and
@@ -86,10 +85,9 @@ be stated with explicit labels, impact copy, and confirmation gates.
 
 ## Evidence on Hand
 
-The upstream repository contains production Bash modules for system updates,
-bootloader and boot-media operations, overlays, networking, GPIO/LED controls,
-users, localization, services, and common tasks. It also contains the existing
-`librtui` terminal interface and Debian packaging.
+The upstream project history remains available for behavior comparison. The
+working tree contains only the new Rust control plane, shared interface assets,
+and its packaging.
 
 No approved user research, fleet requirements, production telemetry, or visual
 identity assets beyond the existing rsetup/Radxa association are present.

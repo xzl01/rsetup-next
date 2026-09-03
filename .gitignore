@@ -1,31 +1,26 @@
-# Devenv
-/.devenv*
-/devenv.local.nix
+# Rust and desktop build output
+/target
+/apps/desktop/node_modules
+/apps/desktop/src-tauri/target
+/apps/desktop/src-tauri/gen/schemas
 
-# direnv
-/.direnv
-
-# pre-commit
-/.pre-commit-config.yaml
-
-# Local VS Code configuration
-/.vscode*
-
-# Kernel build artifacts
+# Debian build output and package-local Cargo cache
+/debian/.debhelper
+/debian/cargo-home
+/debian/rsetup-next
+/debian/tmp
+/debian/debhelper-build-stamp
+/debian/files
+/debian/*.debhelper.log
+/debian/*.substvars
 /*.deb
 /*.buildinfo
 /*.changes
 /.pc
 
-# Output folder
-/out
-/target
-/apps/desktop/node_modules
-/apps/desktop/src-tauri/target
-/apps/desktop/src-tauri/gen/schemas
+# Editors, local environment, and review artifacts
+/.vscode*
 /.impeccable/review
-
-# Local environment files
 .env
 .env.*
 !.env.example

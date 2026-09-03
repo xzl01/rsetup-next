@@ -1,3 +1,0 @@
-# handle GDM auto login
-interest-noawait /etc/gdm3/daemon.conf
-interest-noawait /etc/gdm3/custom.conf

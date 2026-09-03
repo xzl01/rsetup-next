@@ -1,0 +1,75 @@
+.TH RSETUP-NEXT 1 "2026-09-03" "rsetup-next 0.5.0-alpha.1" "User Commands"
+.SH NAME
+rsetup-next \- local control center for Linux single-board computers
+.SH SYNOPSIS
+.B rsetup-next
+.RI [ OPTIONS ]
+.I COMMAND
+.RI [ COMMAND-OPTIONS ]
+.SH DESCRIPTION
+.B rsetup-next
+provides device inspection, guided system operations, APT source management,
+an interactive terminal interface, and a loopback Web control center.
+Mutating operations are dry-run by default.
+.SH COMMANDS
+.TP
+.B status
+Show the current device snapshot.
+.TP
+.B actions
+List guided operations.
+.TP
+.B run ACTION
+Preview or execute a catalog action.
+.TP
+.B sources COMMAND
+Inspect, plan, or apply APT source changes.
+.TP
+.B doctor
+Check the current runtime and execution policy.
+.TP
+.B tui
+Start the interactive terminal interface.
+.TP
+.B serve
+Start the Web control center on the loopback interface.
+.SH OPTIONS
+.TP
+.B \-\-demo
+Use synthetic SBC data.
+.TP
+.B \-\-live-execution
+Allow live mutation on Linux. Confirmation and root checks still apply.
+.TP
+.BI \-\-lang " LANGUAGE"
+Select automatic, English, or Simplified Chinese presentation.
+.SH EXAMPLES
+.nf
+rsetup-next status --json
+rsetup-next --demo tui
+rsetup-next sources plan cqu
+sudo rsetup-next --live-execution sources apply cqu \
+  --plan-token TOKEN --confirm
+.fi
+.SH FILES
+.TP
+.I /etc/apt/sources.list
+Traditional APT source configuration.
+.TP
+.I /etc/apt/sources.list.d/
+Traditional and Deb822 APT source configuration fragments.
+.SH ENVIRONMENT
+.TP
+.B RSETUP_EXECUTION
+Set to
+.B live
+to opt into live execution.
+.TP
+.B RSETUP_LANG
+Select the presentation language.
+.TP
+.B RSETUP_MODE
+Select automatic, live, or demo probing.
+.SH SEE ALSO
+.BR apt-get (8),
+.BR systemctl (1)

@@ -1,1 +1,0 @@
-config/01-hciattach-ttys1.conf /usr/lib/rsetup/conf.d/on_boot

@@ -1,0 +1,29 @@
+rsetup-next and Cargo dependencies
+==================================
+
+The binary package is built with Debian 13 (Trixie) and Rust 1.85 or newer. CI
+then installs and runs the resulting package in Debian 12 (Bookworm), which is
+the runtime compatibility baseline.
+
+The package build itself is network-isolated. For local and CI builds, run:
+
+    make deb-prepare
+    dpkg-buildpackage --build=binary --no-sign
+
+The first command resolves Cargo.lock and fills debian/cargo-home. That ignored
+cache is intentionally not part of the source package.
+
+An upload to the Debian archive must instead use crates already packaged by
+Debian or a policy-compliant vendored source. The local cache workflow validates
+the binary package but does not by itself make the source archive-ready.
+
+Debian 12's archive Rust 1.63 toolchain cannot compile this Rust 2024 workspace.
+Bookworm is therefore a tested runtime target, not the source-build environment.
+
+Vendor marks
+============
+
+The Web interface embeds SoC vendor marks supplied from the Vamrs partner page
+and a CIX reference image. Their redistribution terms have not been identified.
+Do not upload this source to Debian main until those rights are documented or
+the files are replaced with freely redistributable assets.

@@ -23,3 +23,51 @@ jobs:
         run: cargo test --workspace
       - name: Test browser localization
         run: node --test ui/i18n.test.mjs
+
+  debian-package:
+    runs-on: ubuntu-latest
+    container: debian:trixie-slim
+    steps:
+      - name: Install packaging tools
+        run: >-
+          apt-get update &&
+          apt-get install -y --no-install-recommends
+          ca-certificates cargo debhelper devscripts dpkg-dev git lintian
+          nodejs rustc
+      - uses: actions/checkout@v7
+      - name: Prepare offline Cargo cache
+        run: CARGO_HOME="$GITHUB_WORKSPACE/debian/cargo-home" cargo fetch --locked
+      - name: Build Debian package
+        run: dpkg-buildpackage --build=binary --no-sign
+      - name: Inspect Debian package
+        run: |
+          dpkg-deb --info ../rsetup-next_*.deb
+          dpkg-deb --contents ../rsetup-next_*.deb
+          lintian --fail-on error ../rsetup-next_*.changes
+      - name: Export Debian package
+        run: |
+          mkdir -p artifacts
+          cp ../rsetup-next_*.deb artifacts/
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rsetup-next-debian
+          path: artifacts/*.deb
+          retention-days: 7
+
+  debian-12-runtime:
+    needs: debian-package
+    runs-on: ubuntu-latest
+    container: debian:bookworm-slim
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: rsetup-next-debian
+          path: artifacts
+      - name: Install on Debian 12
+        run: |
+          apt-get update
+          apt-get install -y ./artifacts/rsetup-next_*.deb
+      - name: Smoke test on Debian 12
+        run: |
+          rsetup-next --demo status --json | grep -q '"identity"'
+          rsetup-next --demo actions --json | grep -q '"system.update"'

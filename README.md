@@ -138,11 +138,29 @@ crates/rsetup-core/       typed telemetry, capability, action and audit models
 crates/rsetup-app/        clap CLI, ratatui TUI, axum API and embedded Web assets
 ui/                       browser/Tauri control center and presentation locale catalog
 apps/desktop/src-tauri/   optional desktop shell
-src/usr/lib/rsetup/       upstream reference tree; not linked or invoked by rsetup-next
 ```
 
 See [the architecture notes](docs/architecture.md) for provider boundaries,
 API routes, action execution, and the planned remote-node seam.
+
+## Debian package
+
+The package installs the `rsetup-next` CLI/TUI/Web binary. It does not install
+the removed Bash implementation or run the browser process as root.
+
+```bash
+make deb-prepare
+make deb
+```
+
+`deb-prepare` downloads locked Rust dependencies into an ignored, package-local
+Cargo cache. The following `dpkg-buildpackage` step runs Cargo in offline mode.
+For Debian archive submission, replace this cache with Debian-packaged or
+properly vendored crates as described in `debian/README.source`.
+
+Packages are built on Debian 13/Trixie with Rust 1.85 or newer, then installed
+and smoke-tested on Debian 12/Bookworm. Bookworm is the runtime compatibility
+baseline; its Rust 1.63 toolchain is not used for source builds.
 
 ## Hardware validation boundary
 
