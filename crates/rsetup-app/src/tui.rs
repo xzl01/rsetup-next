@@ -142,6 +142,8 @@ impl App {
 
     fn refresh(&mut self) -> Result<()> {
         self.snapshot = self.controller.snapshot()?;
+        self.actions = self.controller.actions();
+        self.selected = self.selected.min(self.actions.len().saturating_sub(1));
         self.source_status = self
             .controller
             .source_status()
@@ -156,6 +158,14 @@ impl App {
         let Some(action) = self.actions.get(self.selected) else {
             return;
         };
+        if !action.available {
+            self.notice = Some(action.unavailable_reason.as_deref().map_or_else(
+                || self.locale.text("not_available").into(),
+                |reason| self.locale.action_unavailable_reason(reason),
+            ));
+            self.confirm_pending = false;
+            return;
+        }
         if action.id == "system.change-sources" {
             self.source_picker = true;
             self.notice = None;
@@ -405,10 +415,14 @@ fn render_actions(frame: &mut Frame, app: &mut App, area: Rect) {
         .actions
         .iter()
         .map(|action| {
-            let color = match action.risk {
-                RiskLevel::Safe => SIGNAL,
-                RiskLevel::Guarded => AMBER,
-                RiskLevel::High | RiskLevel::Critical => CORAL,
+            let color = if action.available {
+                match action.risk {
+                    RiskLevel::Safe => SIGNAL,
+                    RiskLevel::Guarded => AMBER,
+                    RiskLevel::High | RiskLevel::Critical => CORAL,
+                }
+            } else {
+                MUTED
             };
             ListItem::new(Line::from(vec![
                 Span::styled(
@@ -451,15 +465,28 @@ fn render_actions(frame: &mut Frame, app: &mut App, area: Rect) {
                 .unwrap_or_default()
         )
     } else if let Some(action) = app.actions.get(app.selected) {
-        format!(
-            "{}\n{}\n{} {} · ~{}s",
-            action.id,
-            app.locale
-                .action_description(&action.id, &action.description),
-            action.steps.len(),
-            app.locale.text("steps_short"),
-            action.estimated_seconds
-        )
+        if action.available {
+            format!(
+                "{}\n{}\n{} {} · ~{}s",
+                action.id,
+                app.locale
+                    .action_description(&action.id, &action.description),
+                action.steps.len(),
+                app.locale.text("steps_short"),
+                action.estimated_seconds
+            )
+        } else {
+            format!(
+                "{}\n{}\n{}: {}",
+                action.id,
+                app.locale
+                    .action_description(&action.id, &action.description),
+                app.locale.text("unavailable"),
+                app.locale.action_unavailable_reason(
+                    action.unavailable_reason.as_deref().unwrap_or("--")
+                )
+            )
+        }
     } else {
         app.locale.text("no_operation").into()
     };

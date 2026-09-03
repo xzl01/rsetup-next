@@ -6,12 +6,16 @@ use crate::{
 use chrono::Utc;
 use std::{
     collections::VecDeque,
-    env,
+    env, fs,
+    path::Path,
     process::Command,
     sync::{Arc, RwLock},
 };
 use thiserror::Error;
 use uuid::Uuid;
+
+const PRIVILEGED_HELPER: &str = "/usr/libexec/rsetup-next-helper";
+const PKEXEC: &str = "/usr/bin/pkexec";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionPolicy {
@@ -40,6 +44,8 @@ pub enum ActionError {
     ConfirmationRequired(String),
     #[error("{0} requires root privileges")]
     RootRequired(String),
+    #[error("administrator authorization failed for {0}: {1}")]
+    Authorization(String, String),
     #[error("{0} requires guided input")]
     InputRequired(String),
     #[error("unable to start action: {0}")]
@@ -50,7 +56,7 @@ pub enum ActionError {
 pub struct Controller {
     mode: ProbeMode,
     policy: ExecutionPolicy,
-    actions: Arc<Vec<ActionSpec>>,
+    synthetic: bool,
     runs: Arc<RwLock<VecDeque<ActionRun>>>,
     activity: Arc<RwLock<VecDeque<ActivityEvent>>>,
     sources: Arc<SourceManager>,
@@ -80,7 +86,7 @@ impl Controller {
         Self {
             mode,
             policy,
-            actions: Arc::new(action_catalog()),
+            synthetic,
             runs: Arc::new(RwLock::new(VecDeque::new())),
             activity: Arc::new(RwLock::new(activity)),
             sources: Arc::new(SourceManager::new(synthetic)),
@@ -101,7 +107,7 @@ impl Controller {
     }
 
     pub fn actions(&self) -> Vec<ActionSpec> {
-        self.actions.as_ref().clone()
+        action_catalog(self.synthetic)
     }
 
     pub fn activity(&self) -> Vec<ActivityEvent> {
@@ -175,7 +181,9 @@ impl Controller {
             }
         } else {
             if effective_uid() != Some(0) {
-                return Err(SourceError::RootRequired);
+                let result = run_privileged_source_apply(provider_id, plan_token)?;
+                self.record_run(result.run.clone());
+                return Ok(result);
             }
             let outcome = self.sources.apply_live(provider_id, plan_token)?;
             SourceApplyResult {
@@ -197,10 +205,9 @@ impl Controller {
 
     pub fn execute(&self, action_id: &str, confirmed: bool) -> Result<ActionRun, ActionError> {
         let action = self
-            .actions
-            .iter()
+            .actions()
+            .into_iter()
             .find(|candidate| candidate.id == action_id)
-            .cloned()
             .ok_or_else(|| ActionError::Unknown(action_id.into()))?;
         if !action.available {
             return Err(ActionError::Unavailable(action.title));
@@ -215,7 +222,9 @@ impl Controller {
             && action.requires_root
             && effective_uid() != Some(0)
         {
-            return Err(ActionError::RootRequired(action.title));
+            let run = run_privileged_action(&action.id, &action.title)?;
+            self.record_run(run.clone());
+            return Ok(run);
         }
 
         let started_at = Utc::now();
@@ -288,8 +297,8 @@ impl Default for Controller {
     }
 }
 
-fn action_catalog() -> Vec<ActionSpec> {
-    vec![
+fn action_catalog(synthetic: bool) -> Vec<ActionSpec> {
+    let mut actions = vec![
         action(
             "system.inspect",
             "Run system inspection",
@@ -337,19 +346,77 @@ fn action_catalog() -> Vec<ActionSpec> {
             None,
         ),
         action(
+            "service.ssh-install",
+            "Install remote shell",
+            "Install the OpenSSH server package without changing its current enablement state.",
+            "Connect",
+            RiskLevel::Guarded,
+            true,
+            90,
+            &[
+                "Install the OpenSSH server package",
+                "Refresh the detected SSH service state",
+            ],
+            None,
+        ),
+        action(
             "service.ssh-enable",
             "Enable remote shell",
-            "Enable and start the system SSH service.",
+            "Enable and start SSH. Confirm that remote-login accounts use strong credentials first.",
             "Connect",
             RiskLevel::Guarded,
             true,
             8,
             &[
-                "Check SSH service",
+                "Check SSH service and account security",
                 "Enable service at boot",
                 "Start the service",
             ],
             Some(&["systemctl", "enable", "--now", "ssh.service"]),
+        ),
+        action(
+            "service.ssh-disable",
+            "Disable remote shell",
+            "Stop SSH and prevent it from starting automatically.",
+            "Connect",
+            RiskLevel::High,
+            true,
+            8,
+            &[
+                "Stop the SSH service",
+                "Disable automatic startup",
+                "Verify the service state",
+            ],
+            Some(&["systemctl", "disable", "--now", "ssh.service"]),
+        ),
+        action(
+            "service.ssh-regenerate-host-keys",
+            "Regenerate SSH host keys",
+            "Replace this device's SSH server identity and restart the service.",
+            "Connect",
+            RiskLevel::High,
+            true,
+            30,
+            &[
+                "Remove existing SSH host key files",
+                "Generate a new host key set",
+                "Refresh the detected SSH service state",
+            ],
+            None,
+        ),
+        action(
+            "service.ssh-remove",
+            "Remove remote shell",
+            "Remove the OpenSSH server package from this device.",
+            "Connect",
+            RiskLevel::High,
+            true,
+            90,
+            &[
+                "Remove the OpenSSH server package",
+                "Refresh the detected SSH service state",
+            ],
+            None,
         ),
         action(
             "network.restart",
@@ -367,6 +434,64 @@ fn action_catalog() -> Vec<ActionSpec> {
             Some(&["systemctl", "restart", "NetworkManager.service"]),
         ),
         action(
+            "service.docker-install",
+            "Install container runtime",
+            "Install the distribution Docker package without enabling the service.",
+            "Services",
+            RiskLevel::Guarded,
+            true,
+            180,
+            &[
+                "Install the Docker package",
+                "Refresh the detected Docker service state",
+            ],
+            None,
+        ),
+        action(
+            "service.docker-enable",
+            "Enable container runtime",
+            "Enable and start the Docker service.",
+            "Services",
+            RiskLevel::Guarded,
+            true,
+            15,
+            &[
+                "Enable the Docker service at boot",
+                "Start the Docker service",
+                "Verify the service state",
+            ],
+            Some(&["systemctl", "enable", "--now", "docker.service"]),
+        ),
+        action(
+            "service.docker-disable",
+            "Disable container runtime",
+            "Stop Docker and prevent it from starting automatically.",
+            "Services",
+            RiskLevel::High,
+            true,
+            20,
+            &[
+                "Stop running containers through the Docker service",
+                "Disable automatic startup",
+                "Verify the service state",
+            ],
+            Some(&["systemctl", "disable", "--now", "docker.service"]),
+        ),
+        action(
+            "service.docker-remove",
+            "Remove container runtime",
+            "Remove the distribution Docker package while retaining container data.",
+            "Services",
+            RiskLevel::High,
+            true,
+            120,
+            &[
+                "Remove the Docker package",
+                "Keep existing images and container data under /var/lib/docker",
+            ],
+            None,
+        ),
+        action(
             "storage.expand-root",
             "Expand root filesystem",
             "Grow the supported root filesystem to occupy available storage.",
@@ -379,6 +504,21 @@ fn action_catalog() -> Vec<ActionSpec> {
                 "Validate ext4 or btrfs",
                 "Expand filesystem",
                 "Verify resulting capacity",
+            ],
+            None,
+        ),
+        action(
+            "power.enable-sleep",
+            "Enable sleep and hibernate",
+            "Restore systemd sleep and hibernate targets.",
+            "Power",
+            RiskLevel::Guarded,
+            true,
+            5,
+            &[
+                "Unmask sleep targets",
+                "Reload systemd",
+                "Verify target state",
             ],
             None,
         ),
@@ -412,7 +552,11 @@ fn action_catalog() -> Vec<ActionSpec> {
             ],
             Some(&["systemctl", "reboot"]),
         ),
-    ]
+    ];
+    if !synthetic {
+        apply_live_availability(&mut actions);
+    }
+    actions
 }
 
 #[expect(
@@ -445,9 +589,244 @@ fn action(
     }
 }
 
+fn apply_live_availability(actions: &mut [ActionSpec]) {
+    for action in actions {
+        let unavailable = match action.id.as_str() {
+            "system.update" => missing_commands(&["apt-get", "apt-mark"]),
+            "system.change-sources" => missing_commands(&["apt-get"]),
+            "service.ssh-install" => {
+                if package_installed("openssh-server") {
+                    Some("OpenSSH server is already installed.".into())
+                } else {
+                    missing_commands(&["apt-get"])
+                }
+            }
+            "service.ssh-enable" => service_enable_unavailable(
+                "openssh-server",
+                "ssh.service",
+                "SSH is already enabled and running.",
+            ),
+            "service.ssh-disable" => service_disable_unavailable(
+                "openssh-server",
+                "ssh.service",
+                "SSH is already disabled and stopped.",
+            ),
+            "service.ssh-regenerate-host-keys" => {
+                package_action_unavailable("openssh-server", "ssh.service")
+                    .or_else(|| missing_commands(&["dpkg-reconfigure"]))
+            }
+            "service.ssh-remove" => package_only_unavailable("openssh-server")
+                .or_else(|| missing_commands(&["apt-get"])),
+            "network.restart" => service_action_unavailable("NetworkManager.service"),
+            "service.docker-install" => {
+                if package_installed("docker.io") {
+                    Some("Docker is already installed.".into())
+                } else {
+                    missing_commands(&["apt-get"])
+                }
+            }
+            "service.docker-enable" => service_enable_unavailable(
+                "docker.io",
+                "docker.service",
+                "Docker is already enabled and running.",
+            ),
+            "service.docker-disable" => service_disable_unavailable(
+                "docker.io",
+                "docker.service",
+                "Docker is already disabled and stopped.",
+            ),
+            "service.docker-remove" => {
+                package_only_unavailable("docker.io").or_else(|| missing_commands(&["apt-get"]))
+            }
+            "storage.expand-root" => missing_commands(&["findmnt", "blkid"]).or_else(|| {
+                if command_exists("resize2fs") || command_exists("btrfs") {
+                    None
+                } else {
+                    Some("Neither resize2fs nor btrfs is installed.".into())
+                }
+            }),
+            "power.enable-sleep" => missing_commands(&["systemctl"]).or_else(|| {
+                (!sleep_targets().iter().any(|unit| unit_is_masked(unit)))
+                    .then(|| "Sleep and hibernate targets are already enabled.".into())
+            }),
+            "power.disable-sleep" => missing_commands(&["systemctl"]).or_else(|| {
+                sleep_targets()
+                    .iter()
+                    .all(|unit| unit_is_masked(unit))
+                    .then(|| "Sleep and hibernate targets are already disabled.".into())
+            }),
+            "system.reboot" => missing_commands(&["systemctl"]),
+            _ => None,
+        };
+        if let Some(reason) = unavailable {
+            action.available = false;
+            action.unavailable_reason = Some(reason);
+        }
+    }
+}
+
+fn package_action_unavailable(package: &str, unit: &str) -> Option<String> {
+    if let Some(reason) = package_only_unavailable(package) {
+        return Some(reason);
+    }
+    service_action_unavailable(unit)
+}
+
+fn service_enable_unavailable(package: &str, unit: &str, current: &str) -> Option<String> {
+    package_action_unavailable(package, unit)
+        .or_else(|| (unit_is_enabled(unit) && service_is_active(unit)).then(|| current.into()))
+}
+
+fn service_disable_unavailable(package: &str, unit: &str, current: &str) -> Option<String> {
+    package_action_unavailable(package, unit)
+        .or_else(|| (!unit_is_enabled(unit) && !service_is_active(unit)).then(|| current.into()))
+}
+
+fn package_only_unavailable(package: &str) -> Option<String> {
+    (!package_installed(package)).then(|| format!("Package {package} is not installed."))
+}
+
+fn service_action_unavailable(unit: &str) -> Option<String> {
+    missing_commands(&["systemctl"]).or_else(|| {
+        if systemd_unit_exists(unit) {
+            None
+        } else {
+            Some(format!("Systemd unit {unit} is not installed."))
+        }
+    })
+}
+
+fn missing_commands(programs: &[&str]) -> Option<String> {
+    let missing = programs
+        .iter()
+        .copied()
+        .filter(|program| !command_exists(program))
+        .collect::<Vec<_>>();
+    (!missing.is_empty()).then(|| format!("Missing required command(s): {}.", missing.join(", ")))
+}
+
+fn command_exists(program: &str) -> bool {
+    env::var_os("PATH").is_some_and(|paths| {
+        env::split_paths(&paths).any(|directory| directory.join(program).is_file())
+    })
+}
+
+fn package_installed(package: &str) -> bool {
+    Command::new("dpkg-query")
+        .args(["-W", "-f=${db:Status-Abbrev}", package])
+        .output()
+        .is_ok_and(|output| {
+            output.status.success() && String::from_utf8_lossy(&output.stdout).starts_with("ii ")
+        })
+}
+
+fn systemd_unit_exists(unit: &str) -> bool {
+    Command::new("systemctl")
+        .args(["list-unit-files", unit, "--no-legend"])
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line.split_whitespace().next() == Some(unit))
+        })
+}
+
+fn unit_is_enabled(unit: &str) -> bool {
+    Command::new("systemctl")
+        .args(["is-enabled", "--quiet", unit])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn service_is_active(unit: &str) -> bool {
+    Command::new("systemctl")
+        .args(["is-active", "--quiet", unit])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn unit_is_masked(unit: &str) -> bool {
+    Command::new("systemctl")
+        .args(["is-enabled", unit])
+        .output()
+        .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "masked")
+}
+
+fn sleep_targets() -> [&'static str; 5] {
+    [
+        "sleep.target",
+        "suspend.target",
+        "hibernate.target",
+        "hybrid-sleep.target",
+        "suspend-then-hibernate.target",
+    ]
+}
+
 fn effective_uid() -> Option<u32> {
     let output = Command::new("id").arg("-u").output().ok()?;
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+fn run_privileged_action(action_id: &str, title: &str) -> Result<ActionRun, ActionError> {
+    privileged_helper_ready().map_err(|_| ActionError::RootRequired(title.into()))?;
+    let output = Command::new(PKEXEC)
+        .args([PRIVILEGED_HELPER, "action", action_id, "--confirmed"])
+        .output()
+        .map_err(|error| ActionError::Authorization(title.into(), error.to_string()))?;
+    if !output.status.success() {
+        return Err(ActionError::Authorization(
+            title.into(),
+            helper_error(&output.stderr, output.status),
+        ));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| ActionError::Launch(format!("invalid helper response: {error}")))
+}
+
+fn run_privileged_source_apply(
+    provider_id: &str,
+    plan_token: &str,
+) -> Result<SourceApplyResult, SourceError> {
+    privileged_helper_ready().map_err(|_| SourceError::RootRequired)?;
+    let output = Command::new(PKEXEC)
+        .args([
+            PRIVILEGED_HELPER,
+            "sources-apply",
+            provider_id,
+            plan_token,
+            "--confirmed",
+        ])
+        .output()
+        .map_err(|error| SourceError::Authorization(error.to_string()))?;
+    if !output.status.success() {
+        return Err(SourceError::Authorization(helper_error(
+            &output.stderr,
+            output.status,
+        )));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| SourceError::Io(format!("invalid helper response: {error}")))
+}
+
+fn privileged_helper_ready() -> Result<(), ()> {
+    if cfg!(target_os = "linux")
+        && Path::new(PKEXEC).is_file()
+        && Path::new(PRIVILEGED_HELPER).is_file()
+    {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+fn helper_error(stderr: &[u8], status: std::process::ExitStatus) -> String {
+    let detail = String::from_utf8_lossy(stderr).trim().to_owned();
+    if detail.is_empty() {
+        format!("privileged helper exited with {status}")
+    } else {
+        detail
+    }
 }
 
 #[derive(Debug)]
@@ -485,7 +864,47 @@ fn execute_builtin_action(action_id: &str) -> Result<BuiltinActionResult, Action
             ),
             CommandStep::new("Report held packages", "apt-mark", &["showhold"]),
         ]),
+        "service.ssh-install" => {
+            execute_package_action("Install OpenSSH server", "install", "openssh-server")
+        }
+        "service.ssh-regenerate-host-keys" => execute_ssh_host_key_regeneration(),
+        "service.ssh-remove" => {
+            execute_package_action("Remove OpenSSH server", "remove", "openssh-server")
+        }
+        "service.docker-install" => {
+            execute_package_action("Install Docker", "install", "docker.io")
+        }
+        "service.docker-remove" => execute_package_action("Remove Docker", "remove", "docker.io"),
         "storage.expand-root" => execute_root_expansion(),
+        "power.enable-sleep" => execute_command_steps(vec![
+            CommandStep::new(
+                "Unmask sleep targets",
+                "systemctl",
+                &[
+                    "unmask",
+                    "sleep.target",
+                    "suspend.target",
+                    "hibernate.target",
+                    "hybrid-sleep.target",
+                    "suspend-then-hibernate.target",
+                ],
+            ),
+            CommandStep::new("Reload systemd", "systemctl", &["daemon-reload"]),
+            CommandStep::new(
+                "Verify target state",
+                "systemctl",
+                &[
+                    "show",
+                    "--property=LoadState",
+                    "--property=UnitFileState",
+                    "sleep.target",
+                    "suspend.target",
+                    "hibernate.target",
+                    "hybrid-sleep.target",
+                    "suspend-then-hibernate.target",
+                ],
+            ),
+        ]),
         "power.disable-sleep" => execute_command_steps(vec![
             CommandStep::new(
                 "Mask sleep targets",
@@ -519,6 +938,57 @@ fn execute_builtin_action(action_id: &str) -> Result<BuiltinActionResult, Action
             "no built-in executor is registered for {action_id}"
         ))),
     }
+}
+
+fn execute_package_action(
+    label: &'static str,
+    operation: &'static str,
+    package: &'static str,
+) -> Result<BuiltinActionResult, ActionError> {
+    execute_command_steps(vec![CommandStep::new(
+        label,
+        "apt-get",
+        &["--assume-yes", operation, package],
+    )])
+}
+
+fn execute_ssh_host_key_regeneration() -> Result<BuiltinActionResult, ActionError> {
+    let mut transcript = String::from("== Remove existing SSH host keys ==\n");
+    let entries = fs::read_dir("/etc/ssh")
+        .map_err(|error| ActionError::Launch(format!("unable to read /etc/ssh: {error}")))?;
+    let mut removed = 0usize;
+    for entry in entries {
+        let entry = entry.map_err(|error| ActionError::Launch(error.to_string()))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("ssh_host_") {
+            fs::remove_file(entry.path()).map_err(|error| {
+                ActionError::Launch(format!(
+                    "unable to remove {}: {error}",
+                    entry.path().display()
+                ))
+            })?;
+            transcript.push_str(&format!("removed /etc/ssh/{name}\n"));
+            removed += 1;
+        }
+    }
+    if removed == 0 {
+        transcript.push_str("no existing host key files were found\n");
+    }
+    let regenerate = CommandStep::new(
+        "Generate SSH host keys",
+        "dpkg-reconfigure",
+        &["-f", "noninteractive", "openssh-server"],
+    );
+    let output = run_step(&regenerate, &mut transcript)?;
+    if !output.status.success() {
+        return Ok(failed_step(&regenerate, &output, transcript));
+    }
+    Ok((
+        ActionStatus::Succeeded,
+        "SSH host keys were regenerated successfully.".into(),
+        bounded_text(&transcript),
+    ))
 }
 
 fn execute_root_expansion() -> Result<BuiltinActionResult, ActionError> {
@@ -758,7 +1228,7 @@ mod tests {
 
     #[test]
     fn catalog_has_no_legacy_rsetup_executor() {
-        for action in action_catalog() {
+        for action in action_catalog(true) {
             assert!(!action.description.to_ascii_lowercase().contains("legacy"));
             assert_ne!(
                 action
@@ -769,5 +1239,33 @@ mod tests {
                 Some("rsetup")
             );
         }
+    }
+
+    #[test]
+    fn demo_catalog_contains_migrated_service_lifecycle_actions() {
+        let actions = action_catalog(true);
+        let identifiers = actions
+            .iter()
+            .map(|action| action.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        for expected in [
+            "service.ssh-install",
+            "service.ssh-enable",
+            "service.ssh-disable",
+            "service.ssh-regenerate-host-keys",
+            "service.ssh-remove",
+            "service.docker-install",
+            "service.docker-enable",
+            "service.docker-disable",
+            "service.docker-remove",
+            "power.enable-sleep",
+            "power.disable-sleep",
+        ] {
+            assert!(
+                identifiers.contains(expected),
+                "missing migrated action {expected}"
+            );
+        }
+        assert!(actions.iter().all(|action| action.available));
     }
 }

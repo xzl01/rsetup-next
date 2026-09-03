@@ -22,8 +22,10 @@ require the legacy `rsetup` command at runtime.
 The core currently probes board identity, operating system, memory, load,
 temperature, uptime, storage, network interfaces, selected services, and
 hardware capability signals. Its guided operation catalog covers inspection,
-system update, SSH enablement, network recovery, root-filesystem expansion,
-sleep policy, and reboot.
+system update, the complete OpenSSH and Docker service lifecycles, network
+recovery, root-filesystem expansion, reversible sleep policy, and reboot.
+Operations that do not apply to the current system remain visible with a reason
+instead of failing only after execution starts.
 
 APT source management is implemented as a guided workflow across the CLI, TUI,
 Web, and Tauri surfaces. It detects both traditional `.list` files and Deb822
@@ -79,8 +81,8 @@ rsetup-next --demo sources apply cqu --plan-token PLAN_TOKEN_FROM_PREVIEW --conf
 rsetup-next doctor
 ```
 
-On a Linux board, inspect and preview as an ordinary user. Live application is
-an explicitly elevated step:
+On a Linux board, inspect and preview as an ordinary user. A direct CLI session
+can still elevate explicitly:
 
 ```bash
 rsetup-next sources plan cqu
@@ -92,9 +94,12 @@ application to the provider and complete source-file contents that were
 reviewed; if any APT source changes before execution, the command refuses the
 stale plan and requires a new preview.
 
-The browser and desktop processes should remain unprivileged. Until the planned
-Polkit-authorized helper is packaged, an unprivileged live GUI reports the
-stable `root_required` error instead of attempting to elevate the whole UI.
+The browser and desktop processes remain unprivileged. The Debian package ships
+`/usr/libexec/rsetup-next-helper` and a Polkit policy for live GUI operations.
+That helper accepts only fixed catalog action IDs or an exact, previously
+reviewed source plan; it has no arbitrary command mode. If authorization is
+cancelled, the interfaces report `authorization_failed` without changing the
+system.
 
 ## English and Chinese
 
@@ -145,8 +150,9 @@ API routes, action execution, and the planned remote-node seam.
 
 ## Debian package
 
-The package installs the `rsetup-next` CLI/TUI/Web binary. It does not install
-the removed Bash implementation or run the browser process as root.
+The package installs the `rsetup-next` CLI/TUI/Web binary, its narrow privileged
+helper, and the matching Polkit policy. It does not install the removed Bash
+implementation or run the browser process as root.
 
 ```bash
 make deb-prepare

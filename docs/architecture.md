@@ -12,7 +12,8 @@ CLI ─────┐
 TUI ─────┼── Controller ── Probe provider ── /proc, /sys, systemd
 HTTP GUI ┤       │
 Tauri ───┘       ├──────── Fixed action catalog ── built-in Rust executors
-                 └──────── APT source manager ──── validated mirror catalog
+                 ├──────── APT source manager ──── validated mirror catalog
+                 └──────── Polkit helper ───────── root-only fixed protocol
 ```
 
 The current `Controller` is in-process. Its serializable models and stable
@@ -53,9 +54,18 @@ Execution has two independent gates:
 1. `ExecutionPolicy::DryRun` is the default and produces a synthetic result.
 2. Guarded or more severe actions require explicit confirmation.
 
-Live execution additionally rejects root-required operations when the server or
-CLI does not have root privileges. A production daemon should replace
-process-wide root with a small privileged helper and explicit policy rules.
+For a root-required live operation, an already-root CLI executes directly.
+Otherwise the controller asks Polkit to start `/usr/libexec/rsetup-next-helper`.
+The browser, HTTP server, TUI, and desktop shell remain unprivileged. The helper
+accepts only `action ACTION_ID --confirmed` or
+`sources-apply PROVIDER_ID PLAN_TOKEN --confirmed`, then returns the typed JSON
+result. It does not accept executable paths, command arguments, or shell text.
+Cancellation and failed authorization are returned as a stable
+`authorization_failed` error.
+
+The live action catalog is rebuilt when requested and checks package, systemd
+unit, and command prerequisites. Unsupported operations remain discoverable but
+are marked unavailable with a reason in each surface.
 
 The `system.change-sources` workflow is parameterized and therefore cannot be
 executed through the generic action endpoint. Its dedicated controller methods

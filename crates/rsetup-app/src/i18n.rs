@@ -212,9 +212,18 @@ impl Locale {
             "system.inspect" => "运行系统检查",
             "system.update" => "更新操作系统",
             "system.change-sources" => "切换软件源",
+            "service.ssh-install" => "安装远程终端",
             "service.ssh-enable" => "启用远程终端",
+            "service.ssh-disable" => "停用远程终端",
+            "service.ssh-regenerate-host-keys" => "重新生成 SSH 主机密钥",
+            "service.ssh-remove" => "移除远程终端",
             "network.restart" => "重启网络管理器",
+            "service.docker-install" => "安装容器运行时",
+            "service.docker-enable" => "启用容器运行时",
+            "service.docker-disable" => "停用容器运行时",
+            "service.docker-remove" => "移除容器运行时",
             "storage.expand-root" => "扩展根文件系统",
+            "power.enable-sleep" => "启用睡眠与休眠",
             "power.disable-sleep" => "禁用睡眠与休眠",
             "system.reboot" => "重启设备",
             _ => fallback,
@@ -232,9 +241,18 @@ impl Locale {
             "system.change-sources" => {
                 "选择可信的 Debian、Ubuntu 与 Radxa 镜像；执行前预览并备份，刷新失败时自动回滚。"
             }
-            "service.ssh-enable" => "启用并启动系统 SSH 服务。",
+            "service.ssh-install" => "安装 OpenSSH 服务端软件包，不改变当前启用状态。",
+            "service.ssh-enable" => "启用并启动 SSH；请先确认远程登录账户使用安全凭据。",
+            "service.ssh-disable" => "停止 SSH 服务并禁止其自动启动。",
+            "service.ssh-regenerate-host-keys" => "替换本机 SSH 服务身份并生成一组新密钥。",
+            "service.ssh-remove" => "从本机移除 OpenSSH 服务端软件包。",
             "network.restart" => "重启 NetworkManager 并重新检查本机网络接口。",
+            "service.docker-install" => "安装发行版提供的 Docker 软件包，不自动启用服务。",
+            "service.docker-enable" => "启用并启动 Docker 服务。",
+            "service.docker-disable" => "停止 Docker 服务并禁止其自动启动。",
+            "service.docker-remove" => "移除 Docker 软件包，保留现有容器数据。",
             "storage.expand-root" => "将支持的根文件系统扩展至可用存储空间。",
+            "power.enable-sleep" => "恢复 systemd 睡眠与休眠目标。",
             "power.disable-sleep" => "屏蔽系统睡眠与休眠目标，让 SBC 持续在线。",
             "system.reboot" => "停止服务并立即重启本机开发板。",
             _ => fallback,
@@ -263,19 +281,72 @@ impl Locale {
                 "备份并原子替换受影响文件",
                 "刷新软件包元数据，失败时恢复原文件",
             ],
-            "service.ssh-enable" => &["检查 SSH 服务", "设置开机启用", "启动 SSH 服务"],
+            "service.ssh-install" => &["安装 OpenSSH 服务端软件包", "刷新检测到的 SSH 服务状态"],
+            "service.ssh-enable" => &["检查 SSH 服务与账户安全", "设置开机启用", "启动 SSH 服务"],
+            "service.ssh-disable" => &["停止 SSH 服务", "禁止自动启动", "检查服务状态"],
+            "service.ssh-regenerate-host-keys" => &[
+                "删除现有 SSH 主机密钥文件",
+                "生成一组新的主机密钥",
+                "刷新检测到的 SSH 服务状态",
+            ],
+            "service.ssh-remove" => &["移除 OpenSSH 服务端软件包", "刷新检测到的 SSH 服务状态"],
             "network.restart" => &["记录活动接口", "重启 NetworkManager", "等待网络接口恢复"],
+            "service.docker-install" => &["安装 Docker 软件包", "刷新检测到的 Docker 服务状态"],
+            "service.docker-enable" => {
+                &["设置 Docker 开机启用", "启动 Docker 服务", "检查服务状态"]
+            }
+            "service.docker-disable" => &["停止 Docker 服务及容器", "禁止自动启动", "检查服务状态"],
+            "service.docker-remove" => &["移除 Docker 软件包", "保留 /var/lib/docker 中的现有数据"],
             "storage.expand-root" => &[
                 "确定根块设备",
                 "验证 ext4 或 btrfs",
                 "扩展文件系统",
                 "检查扩展后容量",
             ],
+            "power.enable-sleep" => &["取消屏蔽睡眠目标", "重新加载 systemd", "检查目标状态"],
             "power.disable-sleep" => &["屏蔽睡眠目标", "重新加载 systemd", "检查目标状态"],
             "system.reboot" => &["写回待处理数据", "停止服务", "请求系统重启"],
             _ => return fallback.to_vec(),
         };
         steps.iter().map(|value| (*value).into()).collect()
+    }
+
+    pub fn action_unavailable_reason(self, reason: &str) -> String {
+        if !self.is_zh() {
+            return reason.into();
+        }
+        match reason {
+            "OpenSSH server is already installed." => "OpenSSH 服务端已安装。".into(),
+            "Docker is already installed." => "Docker 已安装。".into(),
+            "SSH is already enabled and running." => "SSH 已启用并正在运行。".into(),
+            "SSH is already disabled and stopped." => "SSH 已停用并停止运行。".into(),
+            "Docker is already enabled and running." => "Docker 已启用并正在运行。".into(),
+            "Docker is already disabled and stopped." => "Docker 已停用并停止运行。".into(),
+            "Sleep and hibernate targets are already enabled." => "睡眠与休眠目标已启用。".into(),
+            "Sleep and hibernate targets are already disabled." => "睡眠与休眠目标已停用。".into(),
+            "Neither resize2fs nor btrfs is installed." => "未安装 resize2fs 或 btrfs。".into(),
+            _ => {
+                if let Some(package) = reason
+                    .strip_prefix("Package ")
+                    .and_then(|value| value.strip_suffix(" is not installed."))
+                {
+                    return format!("未安装软件包 {package}。");
+                }
+                if let Some(unit) = reason
+                    .strip_prefix("Systemd unit ")
+                    .and_then(|value| value.strip_suffix(" is not installed."))
+                {
+                    return format!("未安装 systemd 单元 {unit}。");
+                }
+                if let Some(commands) = reason
+                    .strip_prefix("Missing required command(s): ")
+                    .and_then(|value| value.strip_suffix('.'))
+                {
+                    return format!("缺少必要命令：{commands}。");
+                }
+                reason.into()
+            }
+        }
     }
 
     pub fn service_label(self, id: &str, fallback: &str) -> String {
@@ -340,6 +411,10 @@ impl Locale {
             ActionError::RootRequired(title) => {
                 format!("操作“{}”需要管理员权限", self.known_action_title(title))
             }
+            ActionError::Authorization(title, detail) => format!(
+                "操作“{}”的管理员授权失败：{detail}",
+                self.known_action_title(title)
+            ),
             ActionError::InputRequired(title) => {
                 format!("操作“{}”需要先选择镜像", self.known_action_title(title))
             }
@@ -358,6 +433,7 @@ impl Locale {
             SourceError::PlanRequired => "请先预览软件源变更，再使用返回的计划令牌应用".into(),
             SourceError::StalePlan => "软件源文件已在预览后变化，请重新预览".into(),
             SourceError::RootRequired => "切换软件源需要管理员权限".into(),
+            SourceError::Authorization(detail) => format!("管理员授权失败：{detail}"),
             SourceError::Io(detail) => format!("无法管理 APT 软件源：{detail}"),
         }
     }
@@ -391,9 +467,18 @@ impl Locale {
             "Run system inspection" => "system.inspect",
             "Update operating system" => "system.update",
             "Change package mirrors" => "system.change-sources",
+            "Install remote shell" => "service.ssh-install",
             "Enable remote shell" => "service.ssh-enable",
+            "Disable remote shell" => "service.ssh-disable",
+            "Regenerate SSH host keys" => "service.ssh-regenerate-host-keys",
+            "Remove remote shell" => "service.ssh-remove",
             "Restart network manager" => "network.restart",
+            "Install container runtime" => "service.docker-install",
+            "Enable container runtime" => "service.docker-enable",
+            "Disable container runtime" => "service.docker-disable",
+            "Remove container runtime" => "service.docker-remove",
             "Expand root filesystem" => "storage.expand-root",
+            "Enable sleep and hibernate" => "power.enable-sleep",
             "Disable sleep and hibernate" => "power.disable-sleep",
             "Reboot device" => "system.reboot",
             _ => return fallback.into(),
@@ -411,6 +496,14 @@ mod tests {
         assert_eq!(
             Locale::ZhCn.action_title("system.reboot", "Reboot device"),
             "重启设备"
+        );
+    }
+
+    #[test]
+    fn chinese_action_availability_preserves_package_name() {
+        assert_eq!(
+            Locale::ZhCn.action_unavailable_reason("Package openssh-server is not installed."),
+            "未安装软件包 openssh-server。"
         );
     }
 

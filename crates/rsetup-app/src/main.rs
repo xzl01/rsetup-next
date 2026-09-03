@@ -355,8 +355,19 @@ fn print_actions(controller: &Controller, locale: Locale, json: bool) -> Result<
         return Ok(());
     }
     for action in actions {
+        let unavailable = if action.available {
+            String::new()
+        } else {
+            format!(
+                " [{}: {}]",
+                locale.text("unavailable"),
+                locale.action_unavailable_reason(
+                    action.unavailable_reason.as_deref().unwrap_or("--")
+                )
+            )
+        };
         println!(
-            "{:<24} {:<9} {}{}",
+            "{:<36} {:<9} {}{}{}",
             action.id,
             locale.risk(action.risk),
             locale.action_title(&action.id, &action.title),
@@ -364,7 +375,8 @@ fn print_actions(controller: &Controller, locale: Locale, json: bool) -> Result<
                 format!(" [{}]", locale.text("root"))
             } else {
                 String::new()
-            }
+            },
+            unavailable,
         );
     }
     Ok(())

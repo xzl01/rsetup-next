@@ -187,6 +187,11 @@ async fn run_action(
                 ActionError::RootRequired(_) => {
                     ApiError::new(StatusCode::FORBIDDEN, "root_required", error.to_string())
                 }
+                ActionError::Authorization(_, _) => ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    "authorization_failed",
+                    error.to_string(),
+                ),
                 ActionError::InputRequired(_) => ApiError::new(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "input_required",
@@ -278,6 +283,11 @@ impl ApiError {
             SourceError::RootRequired => {
                 Self::new(StatusCode::FORBIDDEN, "root_required", error.to_string())
             }
+            SourceError::Authorization(_) => Self::new(
+                StatusCode::FORBIDDEN,
+                "authorization_failed",
+                error.to_string(),
+            ),
             SourceError::Io(_) => Self::internal(error),
         }
     }

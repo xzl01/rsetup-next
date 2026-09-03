@@ -11,9 +11,18 @@ const routes = [
 ];
 
 const workflowGroups = [
-  { id: "system", actions: ["system.inspect", "system.update", "power.disable-sleep", "system.reboot"] },
-  { id: "network", actions: ["service.ssh-enable", "network.restart"] },
+  { id: "system", actions: ["system.inspect", "system.update", "power.enable-sleep", "power.disable-sleep", "system.reboot"] },
+  { id: "network", actions: ["service.ssh-install", "service.ssh-enable", "service.ssh-disable", "service.ssh-regenerate-host-keys", "service.ssh-remove", "network.restart"] },
+  { id: "services", actions: ["service.docker-install", "service.docker-enable", "service.docker-disable", "service.docker-remove"] },
   { id: "storage", actions: ["storage.expand-root"] },
+];
+
+const quickActionIds = [
+  "system.inspect",
+  "system.update",
+  "system.change-sources",
+  "service.ssh-enable",
+  "network.restart",
 ];
 
 const socVendors = [
@@ -652,7 +661,9 @@ function renderSnapshot() {
 
 function renderActions() {
   const actions = state.actions;
-  const quick = actions.filter((action) => action.id !== "system.reboot").slice(0, 5);
+  const quick = quickActionIds
+    .map((actionId) => actions.find((action) => action.id === actionId))
+    .filter(Boolean);
   $("[data-operation-list]").innerHTML = quick.length ? quick.map(operationButton).join("") : emptyRow(t("operations.empty"));
   const detailed = actions.filter((action) => action.id !== "system.change-sources");
   const knownActionIds = new Set(workflowGroups.flatMap((group) => group.actions));
@@ -676,18 +687,22 @@ function renderActions() {
 
 function workflowButton(raw) {
   const action = i18n.action(raw);
-  return `<button class="workflow-row" type="button" data-action-id="${escapeHtml(action.id)}">
+  const unavailable = !action.available;
+  const meta = unavailable ? t("operations.unavailable") : `~${action.estimatedSeconds}s`;
+  return `<button class="workflow-row${unavailable ? " is-unavailable" : ""}" type="button" data-action-id="${escapeHtml(action.id)}"${unavailable ? " disabled" : ""}${action.unavailableReason ? ` title="${escapeHtml(action.unavailableReason)}"` : ""}>
     <span class="risk-plate" data-risk="${escapeHtml(action.risk)}">${escapeHtml(riskLabel(action.risk))}</span>
-    <span class="workflow-copy"><strong>${escapeHtml(action.title)}</strong></span>
-    <span class="workflow-meta">~${action.estimatedSeconds}s</span>${icon("run")}
+    <span class="workflow-copy"><strong>${escapeHtml(action.title)}</strong>${unavailable ? `<span>${escapeHtml(action.unavailableReason || t("operations.unavailable"))}</span>` : ""}</span>
+    <span class="workflow-meta">${escapeHtml(meta)}</span>${icon("run")}
   </button>`;
 }
 
 function operationButton(raw) {
   const action = i18n.action(raw);
-  return `<button class="operation-row" type="button" data-action-id="${escapeHtml(action.id)}">
+  const unavailable = !action.available;
+  const meta = unavailable ? action.unavailableReason || t("operations.unavailable") : `${action.category} · ${t("steps", { count: action.steps.length })} · ~${action.estimatedSeconds}s`;
+  return `<button class="operation-row${unavailable ? " is-unavailable" : ""}" type="button" data-action-id="${escapeHtml(action.id)}"${unavailable ? " disabled" : ""}${action.unavailableReason ? ` title="${escapeHtml(action.unavailableReason)}"` : ""}>
     <span class="risk-plate" data-risk="${escapeHtml(action.risk)}">${escapeHtml(riskLabel(action.risk))}</span>
-    <span class="operation-copy"><strong>${escapeHtml(action.title)}</strong><span>${escapeHtml(action.category)} · ${escapeHtml(t("steps", { count: action.steps.length }))} · ~${action.estimatedSeconds}s</span></span>${icon("run")}
+    <span class="operation-copy"><strong>${escapeHtml(action.title)}</strong><span>${escapeHtml(meta)}</span></span>${icon("run")}
   </button>`;
 }
 
@@ -731,7 +746,9 @@ function renderActionDetails({ reset = false } = {}) {
   if (!raw) return;
   const action = i18n.action(raw);
   setText("[data-task-title]", action.title);
-  setText("[data-task-description]", action.description);
+  setText("[data-task-description]", action.available
+    ? action.description
+    : `${action.description} ${t("operations.unavailableReason", { reason: action.unavailableReason || t("operations.unavailable") })}`);
   setText("[data-task-time]", `${action.estimatedSeconds}s`);
   setText("[data-task-root]", action.requiresRoot ? t("drawer.root") : t("drawer.user"));
   const risk = $("[data-task-risk]");
@@ -739,10 +756,10 @@ function renderActionDetails({ reset = false } = {}) {
   risk.textContent = riskLabel(action.risk);
   $("[data-task-steps]").innerHTML = action.steps.map((step) => `<li>${escapeHtml(step)}</li>`).join("");
   const guarded = action.risk !== "safe";
-  $("[data-confirm-line]").hidden = !guarded;
+  $("[data-confirm-line]").hidden = !guarded || !action.available;
   if (reset) {
     $("[data-task-confirm]").checked = false;
-    $("[data-task-execute]").disabled = guarded;
+    $("[data-task-execute]").disabled = !action.available || guarded;
     const result = $("[data-task-result]");
     result.hidden = true;
     result.classList.remove("is-error");
@@ -752,6 +769,10 @@ function renderActionDetails({ reset = false } = {}) {
 function openAction(actionId) {
   const action = state.actions.find((candidate) => candidate.id === actionId);
   if (!action) return;
+  if (!action.available) {
+    toast(i18n.action(action).title, i18n.action(action).unavailableReason || t("operations.unavailable"), true);
+    return;
+  }
   if (action.id === "system.change-sources") {
     navigate("workflows");
     const manager = $("#source-manager");
@@ -781,7 +802,7 @@ function closeAction() {
 
 async function executeSelectedAction() {
   const action = state.selectedAction;
-  if (!action) return;
+  if (!action || !action.available) return;
   const button = $("[data-task-execute]");
   const result = $("[data-task-result]");
   const confirm = action.risk === "safe" || $("[data-task-confirm]").checked;
@@ -806,7 +827,7 @@ async function executeSelectedAction() {
     toast(t("toast.failed"), detail, true);
   } finally {
     $("span", button).textContent = t("drawer.run");
-    button.disabled = action.risk !== "safe" && !$("[data-task-confirm]").checked;
+    button.disabled = !action.available || (action.risk !== "safe" && !$("[data-task-confirm]").checked);
   }
 }
 
@@ -832,7 +853,7 @@ function renderCommandResults() {
     .map((route) => `<button class="command-result" type="button" data-command-route="${route.id}">${icon(route.icon)}<span><strong>${escapeHtml(route.label)}</strong><span>${escapeHtml(route.detail)}</span></span><em>${t("command.section")}</em></button>`);
   const actionItems = state.actions.map(i18n.action)
     .filter((action) => `${action.title} ${action.description} ${action.category}`.toLocaleLowerCase(i18n.getLocale()).includes(query))
-    .map((action) => `<button class="command-result" type="button" data-command-action="${escapeHtml(action.id)}">${icon("run")}<span><strong>${escapeHtml(action.title)}</strong><span>${escapeHtml(action.description)}</span></span><em>${escapeHtml(riskLabel(action.risk))}</em></button>`);
+    .map((action) => `<button class="command-result${action.available ? "" : " is-unavailable"}" type="button" data-command-action="${escapeHtml(action.id)}"${action.available ? "" : " disabled"}>${icon("run")}<span><strong>${escapeHtml(action.title)}</strong><span>${escapeHtml(action.available ? action.description : action.unavailableReason || t("operations.unavailable"))}</span></span><em>${escapeHtml(action.available ? riskLabel(action.risk) : t("operations.unavailable"))}</em></button>`);
   host.innerHTML = [...routeItems, ...actionItems].join("") || emptyRow(t("command.empty"));
   $$('[data-command-route]', host).forEach((button) => button.addEventListener("click", () => navigate(button.dataset.commandRoute)));
   $$('[data-command-action]', host).forEach((button) => button.addEventListener("click", () => { dismissDialog($("[data-command-dialog]")); openAction(button.dataset.commandAction); }));
@@ -864,7 +885,9 @@ function bindEvents() {
   $("[data-theme-toggle]").addEventListener("click", () => setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark"));
   $("[data-task-close]").addEventListener("click", closeAction);
   $("[data-task-drawer]").addEventListener("cancel", (event) => { event.preventDefault(); closeAction(); });
-  $("[data-task-confirm]").addEventListener("change", (event) => { $("[data-task-execute]").disabled = !event.currentTarget.checked; });
+  $("[data-task-confirm]").addEventListener("change", (event) => {
+    $("[data-task-execute]").disabled = !state.selectedAction?.available || !event.currentTarget.checked;
+  });
   $("[data-task-execute]").addEventListener("click", executeSelectedAction);
   $("[data-source-provider]").addEventListener("change", () => { clearSourcePlan(); renderProviderDetail(); });
   $("[data-source-preview]").addEventListener("click", previewSources);

@@ -19,10 +19,12 @@ Depends:
  btrfs-progs,
  e2fsprogs,
  iproute2,
+ pkexec,
  systemd,
  ${misc:Depends},
  ${shlibs:Depends},
 Suggests:
+ docker.io,
  network-manager,
  openssh-server,
 Description: local control center for Linux single-board computers

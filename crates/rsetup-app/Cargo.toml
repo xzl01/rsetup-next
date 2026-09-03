@@ -5,10 +5,15 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+default-run = "rsetup-next"
 
 [[bin]]
 name = "rsetup-next"
 path = "src/main.rs"
+
+[[bin]]
+name = "rsetup-next-helper"
+path = "src/helper.rs"
 
 [dependencies]
 anyhow.workspace = true

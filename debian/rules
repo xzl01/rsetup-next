@@ -10,7 +10,8 @@ export CARGO_PROFILE_RELEASE_DEBUG := 1
 	dh $@ --buildsystem=none
 
 override_dh_auto_build:
-	cargo rustc -p rsetup-next --release --locked --offline -- -C target-feature=+crt-static
+	cargo rustc -p rsetup-next --release --bin rsetup-next --locked --offline -- -C target-feature=+crt-static
+	cargo rustc -p rsetup-next --release --bin rsetup-next-helper --locked --offline -- -C target-feature=+crt-static
 
 override_dh_auto_test:
 ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
@@ -20,6 +21,8 @@ endif
 
 override_dh_auto_install:
 	install -Dm755 target/release/rsetup-next debian/rsetup-next/usr/bin/rsetup-next
+	install -Dm755 target/release/rsetup-next-helper debian/rsetup-next/usr/libexec/rsetup-next-helper
+	install -Dm644 data/com.radxa.rsetup-next.policy debian/rsetup-next/usr/share/polkit-1/actions/com.radxa.rsetup-next.policy
 
 override_dh_auto_clean:
 	cargo clean

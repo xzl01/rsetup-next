@@ -11,6 +11,8 @@ rsetup-next \- local control center for Linux single-board computers
 provides device inspection, guided system operations, APT source management,
 an interactive terminal interface, and a loopback Web control center.
 Mutating operations are dry-run by default.
+Root-required live operations from an unprivileged interface use a fixed-action
+Polkit helper; the application itself remains unprivileged.
 .SH COMMANDS
 .TP
 .B status
@@ -58,6 +60,12 @@ Traditional APT source configuration.
 .TP
 .I /etc/apt/sources.list.d/
 Traditional and Deb822 APT source configuration fragments.
+.TP
+.I /usr/libexec/rsetup-next-helper
+Polkit-authorized helper for fixed catalog operations.
+.TP
+.I /usr/share/polkit-1/actions/com.radxa.rsetup-next.policy
+Authorization policy for the privileged helper.
 .SH ENVIRONMENT
 .TP
 .B RSETUP_EXECUTION

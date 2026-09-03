@@ -27,6 +27,7 @@ impl From<ActionError> for CommandError {
             ActionError::ConfirmationRequired(_) => "confirmation_required",
             ActionError::Unavailable(_) => "action_unavailable",
             ActionError::RootRequired(_) => "root_required",
+            ActionError::Authorization(_, _) => "authorization_failed",
             ActionError::InputRequired(_) => "input_required",
             ActionError::Launch(_) => "internal_error",
         };
@@ -46,6 +47,7 @@ impl From<SourceError> for CommandError {
             SourceError::PlanRequired => "plan_required",
             SourceError::StalePlan => "stale_plan",
             SourceError::RootRequired => "root_required",
+            SourceError::Authorization(_) => "authorization_failed",
             SourceError::Io(_) => "internal_error",
         };
         Self {

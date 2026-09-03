@@ -67,6 +67,8 @@
       "operations.openAll": "Open all",
       "operations.loading": "Loading action catalog",
       "operations.empty": "No guided operation is available.",
+      "operations.unavailable": "Unavailable",
+      "operations.unavailableReason": "Unavailable: {reason}",
       "capabilities.title": "Available capabilities",
       "capabilities.signals": "{count} signals",
       "capabilities.online": "{available}/{total} online",
@@ -130,6 +132,7 @@
       "workflows.title": "System operations",
       "workflows.group.system": "System & power",
       "workflows.group.network": "Network access",
+      "workflows.group.services": "Services & containers",
       "workflows.group.storage": "Storage",
       "workflows.group.other": "Other",
       "workflows.group.count": "Operations · {count}",
@@ -213,6 +216,7 @@
       "api.plan_required": "Preview this mirror change before applying it.",
       "api.stale_plan": "Source files changed after preview. Build and review a fresh plan.",
       "api.root_required": "This operation requires root privileges.",
+      "api.authorization_failed": "Administrator authorization was not completed.",
       "api.internal_error": "The local control plane encountered an error.",
       "api.transport_failure": "Unable to reach the local control plane.",
       "api.http_failure": "The local control plane returned HTTP {status}.",
@@ -284,6 +288,8 @@
       "operations.openAll": "查看全部",
       "operations.loading": "正在加载操作目录",
       "operations.empty": "当前没有可用的引导式操作。",
+      "operations.unavailable": "当前不可用",
+      "operations.unavailableReason": "当前不可用：{reason}",
       "capabilities.title": "可用硬件能力",
       "capabilities.signals": "{count} 项能力",
       "capabilities.online": "{available}/{total} 可用",
@@ -347,6 +353,7 @@
       "workflows.title": "系统管理",
       "workflows.group.system": "系统与电源",
       "workflows.group.network": "网络访问",
+      "workflows.group.services": "服务与容器",
       "workflows.group.storage": "存储",
       "workflows.group.other": "其他",
       "workflows.group.count": "操作 · {count}",
@@ -430,6 +437,7 @@
       "api.plan_required": "请先预览这次镜像变更，再进行应用。",
       "api.stale_plan": "软件源文件已在预览后变化，请重新生成并检查计划。",
       "api.root_required": "此操作需要管理员权限。",
+      "api.authorization_failed": "未完成管理员授权。",
       "api.internal_error": "本机控制中心发生错误。",
       "api.transport_failure": "无法连接本机控制中心。",
       "api.http_failure": "本机控制中心返回 HTTP {status}。",
@@ -440,9 +448,18 @@
     "system.inspect": ["运行系统检查", "重新读取开发板身份、健康状态、服务与已检测硬件。", "观察", ["读取操作系统与设备树身份", "检查存储、网络、温度与服务", "重新计算提醒"]],
     "system.update": ["更新操作系统", "刷新软件包索引并升级已安装的软件包。", "维护", ["刷新软件包元数据", "升级已安装的软件包", "列出被保留的软件包"]],
     "system.change-sources": ["切换软件源", "选择可信的 Debian、Ubuntu 与 Radxa 镜像；执行前预览并备份，刷新失败时自动回滚。", "维护", ["检测受管 APT 软件源条目", "只预览已识别的 Debian、Ubuntu 与 Radxa 地址变更", "备份并原子替换受影响文件", "刷新软件包元数据，失败时恢复原文件"]],
-    "service.ssh-enable": ["启用远程终端", "启用并启动系统 SSH 服务。", "连接", ["检查 SSH 服务", "设置开机启用", "启动 SSH 服务"]],
+    "service.ssh-install": ["安装远程终端", "安装 OpenSSH 服务端软件包，不改变当前启用状态。", "连接", ["安装 OpenSSH 服务端软件包", "刷新检测到的 SSH 服务状态"]],
+    "service.ssh-enable": ["启用远程终端", "启用并启动 SSH；请先确认远程登录账户使用安全凭据。", "连接", ["检查 SSH 服务与账户安全", "设置开机启用", "启动 SSH 服务"]],
+    "service.ssh-disable": ["停用远程终端", "停止 SSH 服务并禁止其自动启动。", "连接", ["停止 SSH 服务", "禁止自动启动", "检查服务状态"]],
+    "service.ssh-regenerate-host-keys": ["重新生成 SSH 主机密钥", "替换本机 SSH 服务身份并生成一组新密钥。", "连接", ["移除现有 SSH 主机密钥", "生成一组新主机密钥", "刷新检测到的 SSH 服务状态"]],
+    "service.ssh-remove": ["移除远程终端", "从本机移除 OpenSSH 服务端软件包。", "连接", ["移除 OpenSSH 服务端软件包", "刷新检测到的 SSH 服务状态"]],
     "network.restart": ["重启网络管理器", "重启 NetworkManager 并重新检查本机网络接口。", "连接", ["记录活动接口", "重启 NetworkManager", "等待网络接口恢复"]],
+    "service.docker-install": ["安装容器运行时", "安装发行版提供的 Docker 软件包，不自动启用服务。", "服务", ["安装 Docker 软件包", "刷新检测到的 Docker 服务状态"]],
+    "service.docker-enable": ["启用容器运行时", "启用并启动 Docker 服务。", "服务", ["设置 Docker 开机启用", "启动 Docker 服务", "检查服务状态"]],
+    "service.docker-disable": ["停用容器运行时", "停止 Docker 服务并禁止其自动启动。", "服务", ["停止 Docker 服务及容器", "禁止自动启动", "检查服务状态"]],
+    "service.docker-remove": ["移除容器运行时", "移除 Docker 软件包，保留现有容器数据。", "服务", ["移除 Docker 软件包", "保留 /var/lib/docker 中的现有数据"]],
     "storage.expand-root": ["扩展根文件系统", "将支持的根文件系统扩展至可用存储空间。", "存储", ["确定根块设备", "验证 ext4 或 btrfs", "扩展文件系统", "检查扩展后容量"]],
+    "power.enable-sleep": ["启用睡眠与休眠", "恢复 systemd 睡眠与休眠目标。", "电源", ["取消屏蔽睡眠目标", "重新加载 systemd", "检查目标状态"]],
     "power.disable-sleep": ["禁用睡眠与休眠", "屏蔽系统睡眠与休眠目标，让 SBC 持续在线。", "电源", ["屏蔽睡眠目标", "重新加载 systemd", "检查目标状态"]],
     "system.reboot": ["重启设备", "停止服务并立即重启本机开发板。", "电源", ["写回待处理数据", "停止服务", "请求系统重启"]],
   };
@@ -487,10 +504,31 @@
     return locale;
   }
 
+  function translatedUnavailableReason(reason) {
+    if (locale !== "zh-CN" || !reason) return reason;
+    if (reason === "OpenSSH server is already installed.") return "OpenSSH 服务端已安装。";
+    if (reason === "Docker is already installed.") return "Docker 已安装。";
+    if (reason === "SSH is already enabled and running.") return "SSH 已启用并正在运行。";
+    if (reason === "SSH is already disabled and stopped.") return "SSH 已停用并停止运行。";
+    if (reason === "Docker is already enabled and running.") return "Docker 已启用并正在运行。";
+    if (reason === "Docker is already disabled and stopped.") return "Docker 已停用并停止运行。";
+    if (reason === "Sleep and hibernate targets are already enabled.") return "睡眠与休眠目标已启用。";
+    if (reason === "Sleep and hibernate targets are already disabled.") return "睡眠与休眠目标已停用。";
+    if (reason === "Neither resize2fs nor btrfs is installed.") return "未安装 resize2fs 或 btrfs。";
+    const packageMatch = reason.match(/^Package (.+) is not installed\.$/);
+    if (packageMatch) return `未安装软件包 ${packageMatch[1]}。`;
+    const unitMatch = reason.match(/^Systemd unit (.+) is not installed\.$/);
+    if (unitMatch) return `未安装 systemd 单元 ${unitMatch[1]}。`;
+    const commandMatch = reason.match(/^Missing required command\(s\): (.+)\.$/);
+    if (commandMatch) return `缺少必要命令：${commandMatch[1]}。`;
+    return reason;
+  }
+
   function action(value) {
-    if (locale !== "zh-CN" || !actionCopy[value.id]) return { ...value, steps: [...value.steps] };
+    const base = { ...value, steps: [...(value.steps || [])], unavailableReason: translatedUnavailableReason(value.unavailableReason) };
+    if (locale !== "zh-CN" || !actionCopy[value.id]) return base;
     const [title, description, category, steps] = actionCopy[value.id];
-    return { ...value, title, description, category, steps: [...steps] };
+    return { ...base, title, description, category, steps: [...steps] };
   }
 
   function capability(value) {
@@ -540,8 +578,13 @@
         const english = {
           "system.inspect": "Run system inspection", "system.update": "Update operating system",
           "system.change-sources": "Change package mirrors",
-          "service.ssh-enable": "Enable remote shell", "network.restart": "Restart network manager",
-          "storage.expand-root": "Expand root filesystem", "power.disable-sleep": "Disable sleep and hibernate",
+          "service.ssh-install": "Install remote shell", "service.ssh-enable": "Enable remote shell",
+          "service.ssh-disable": "Disable remote shell", "service.ssh-regenerate-host-keys": "Regenerate SSH host keys",
+          "service.ssh-remove": "Remove remote shell", "network.restart": "Restart network manager",
+          "service.docker-install": "Install container runtime", "service.docker-enable": "Enable container runtime",
+          "service.docker-disable": "Disable container runtime", "service.docker-remove": "Remove container runtime",
+          "storage.expand-root": "Expand root filesystem", "power.enable-sleep": "Enable sleep and hibernate",
+          "power.disable-sleep": "Disable sleep and hibernate",
           "system.reboot": "Reboot device",
         }[id];
         return [english, copy[0]];

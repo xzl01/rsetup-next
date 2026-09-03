@@ -61,6 +61,10 @@ jobs:
             echo "rsetup-next unexpectedly has dynamic library dependencies"
             exit 1
           fi
+          if readelf -d target/release/rsetup-next-helper | grep -q '(NEEDED)'; then
+            echo "rsetup-next-helper unexpectedly has dynamic library dependencies"
+            exit 1
+          fi
           lintian --fail-on error ../rsetup-next_*.changes
       - name: Export Debian package
         run: |
@@ -96,3 +100,6 @@ jobs:
         run: |
           rsetup-next --demo status --json | grep -q '"identity"'
           rsetup-next --demo actions --json | grep -q '"system.update"'
+          test -x /usr/libexec/rsetup-next-helper
+          test -f /usr/share/polkit-1/actions/com.radxa.rsetup-next.policy
+          /usr/libexec/rsetup-next-helper action system.inspect --confirmed | grep -q '"actionId":"system.inspect"'

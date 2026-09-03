@@ -33,6 +33,22 @@ test("auto-detects Chinese and localizes known actions by stable id", () => {
   assert.equal(i18n.getLocale(), "zh-CN");
   assert.equal(attributes.lang, "zh-CN");
   assert.equal(i18n.action({ id: "system.reboot", title: "Reboot device", description: "", category: "Power", steps: [] }).title, "重启设备");
+  assert.equal(i18n.action({ id: "service.docker-enable", title: "Enable container runtime", description: "", category: "Services", steps: [] }).title, "启用容器运行时");
+});
+
+test("keeps action availability and localizes its reason", () => {
+  const { i18n } = loadI18n("zh-CN");
+  const action = i18n.action({
+    id: "service.ssh-enable",
+    title: "Enable remote shell",
+    description: "",
+    category: "Connect",
+    steps: [],
+    available: false,
+    unavailableReason: "Package openssh-server is not installed.",
+  });
+  assert.equal(action.available, false);
+  assert.equal(action.unavailableReason, "未安装软件包 openssh-server。");
 });
 
 test("switches language, persists the choice, and keeps unknown provider copy", () => {
@@ -47,6 +63,7 @@ test("switches language, persists the choice, and keeps unknown provider copy", 
 test("localizes API error codes without changing the API payload", () => {
   const { i18n } = loadI18n("zh_CN");
   assert.equal(i18n.apiError("root_required", "fallback"), "此操作需要管理员权限。");
+  assert.equal(i18n.apiError("authorization_failed", "fallback"), "未完成管理员授权。");
   assert.equal(i18n.apiError("vendor_error", "provider detail"), "provider detail");
   assert.equal(i18n.t("api.transport_failure"), "无法连接本机控制中心。");
   assert.equal(i18n.t("api.http_failure", { status: 503 }), "本机控制中心返回 HTTP 503。");
