@@ -32,8 +32,8 @@ jobs:
         run: >-
           apt-get update &&
           apt-get install -y --no-install-recommends
-          ca-certificates cargo debhelper devscripts dpkg-dev git lintian
-          nodejs rustc
+          build-essential ca-certificates cargo debhelper devscripts dpkg-dev
+          git lintian nodejs rustc
       - uses: actions/checkout@v7
       - name: Prepare offline Cargo cache
         run: CARGO_HOME="$GITHUB_WORKSPACE/debian/cargo-home" cargo fetch --locked
