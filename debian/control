@@ -20,7 +20,6 @@ Depends:
  e2fsprogs,
  iproute2,
  systemd,
- util-linux,
  ${misc:Depends},
  ${shlibs:Depends},
 Suggests:

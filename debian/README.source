@@ -19,6 +19,8 @@ the binary package but does not by itself make the source archive-ready.
 
 Debian 12's archive Rust 1.63 toolchain cannot compile this Rust 2024 workspace.
 Bookworm is therefore a tested runtime target, not the source-build environment.
+The final executable uses static C runtime linkage so it does not inherit
+Trixie's newer glibc requirement.
 
 Vendor marks
 ============

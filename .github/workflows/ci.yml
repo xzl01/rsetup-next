@@ -43,6 +43,10 @@ jobs:
         run: |
           dpkg-deb --info ../rsetup-next_*.deb
           dpkg-deb --contents ../rsetup-next_*.deb
+          if readelf -d target/release/rsetup-next | grep -q '(NEEDED)'; then
+            echo "rsetup-next unexpectedly has dynamic library dependencies"
+            exit 1
+          fi
           lintian --fail-on error ../rsetup-next_*.changes
       - name: Export Debian package
         run: |

@@ -4,12 +4,13 @@ export CARGO_HOME := $(CURDIR)/debian/cargo-home
 export CARGO_TARGET_DIR := $(CURDIR)/target
 export CARGO_NET_OFFLINE := true
 export CARGO_TERM_COLOR := never
+export CARGO_PROFILE_RELEASE_DEBUG := 1
 
 %:
 	dh $@ --buildsystem=none
 
 override_dh_auto_build:
-	cargo build --workspace --release --locked --offline
+	cargo rustc -p rsetup-next --release --locked --offline -- -C target-feature=+crt-static
 
 override_dh_auto_test:
 ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))

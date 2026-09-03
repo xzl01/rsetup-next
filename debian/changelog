@@ -3,5 +3,6 @@ rsetup-next (0.5.0~alpha1-1) bookworm; urgency=medium
   * Initial package for the Rust control center.
   * Replace the legacy Bash package split with one CLI, TUI, and Web binary.
   * Build Cargo dependencies offline from a package-local cache.
+  * Link the executable statically for Debian 12 runtime compatibility.
 
  -- xzl <xiangzelong@radxa.com>  Thu, 03 Sep 2026 16:00:00 +0800
