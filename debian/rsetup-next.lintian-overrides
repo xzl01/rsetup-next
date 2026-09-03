@@ -1,0 +1,5 @@
+# This third-party package is not submitted through Debian's ITP process.
+rsetup-next: initial-upload-closes-no-bugs
+
+# The executable is intentionally static for Debian 12 runtime compatibility.
+rsetup-next: shared-library-lacks-prerequisites [usr/bin/rsetup-next]
