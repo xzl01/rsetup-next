@@ -24,9 +24,13 @@ Depends:
  ${misc:Depends},
  ${shlibs:Depends},
 Suggests:
+ device-tree-compiler,
  docker.io,
+ ffmpeg,
+ gpiod,
  network-manager,
  openssh-server,
+ v4l-utils,
 Description: local control center for Linux single-board computers
  rsetup-next provides one typed control plane for observing and managing a
  Linux single-board computer. It includes a scriptable command-line interface,

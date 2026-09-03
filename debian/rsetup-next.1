@@ -27,6 +27,10 @@ Preview or execute a catalog action.
 .B sources COMMAND
 Inspect, plan, or apply APT source changes.
 .TP
+.B hardware COMMAND
+Inspect overlays, the 40-pin GPIO map, cameras, and thermal policy. Overlay and
+thermal mutations require confirmation.
+.TP
 .B doctor
 Check the current runtime and execution policy.
 .TP
@@ -50,6 +54,10 @@ Select automatic, English, or Simplified Chinese presentation.
 rsetup-next status --json
 rsetup-next --demo tui
 rsetup-next sources plan cqu
+rsetup-next hardware overlays status
+rsetup-next hardware gpio --json
+rsetup-next hardware video capture video0 --output camera.jpg
+rsetup-next hardware thermal set step_wise --confirm
 sudo rsetup-next --live-execution sources apply cqu \
   --plan-token TOKEN --confirm
 .fi
@@ -66,6 +74,12 @@ Polkit-authorized helper for fixed catalog operations.
 .TP
 .I /usr/share/polkit-1/actions/com.radxa.rsetup-next.policy
 Authorization policy for the privileged helper.
+.TP
+.I /etc/rsetup-next/thermal-policy
+Validated thermal policy restored at boot.
+.TP
+.I /usr/lib/systemd/system/rsetup-next-thermal-policy.service
+Oneshot thermal-policy restore unit.
 .SH ENVIRONMENT
 .TP
 .B RSETUP_EXECUTION

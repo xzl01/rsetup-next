@@ -188,9 +188,17 @@ English and Simplified Chinese are equal presentation locales. Locale changes re
 - Low-saturation indigo for actions, selection, focus, and the resolved board state.
 - Deep rounding, circular icon wells, generous spacing, and diffused tinted shadows.
 - A board-first overview with a generous guided-operations companion surface.
+- Focused hardware drawers for overlay selection, GPIO header mapping, camera
+  test frames, and fan/thermal policy without turning the hardware route into a
+  dense configuration table.
 - Hover lift, pillow-like press feedback, and a broad halo for keyboard focus.
 - Risk and provider truth communicated through words and structure as well as color.
 - Equal English and Simplified Chinese presentation with locale-neutral control-plane semantics.
+
+Hardware cards are launch surfaces, not miniature settings panels. Their tool
+drawers preserve the same cloud surface and field depth while giving pin maps,
+camera frames, policy choices, and exact change plans enough width. Read-only
+signals remain visually distinct from confirmed root mutations.
 
 ## Colors
 

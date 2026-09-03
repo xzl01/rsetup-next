@@ -102,4 +102,5 @@ jobs:
           rsetup-next --demo actions --json | grep -q '"system.update"'
           test -x /usr/libexec/rsetup-next-helper
           test -f /usr/share/polkit-1/actions/com.radxa.rsetup-next.policy
+          test -f /usr/lib/systemd/system/rsetup-next-thermal-policy.service
           /usr/libexec/rsetup-next-helper action system.inspect --confirmed | grep -q '"actionId":"system.inspect"'

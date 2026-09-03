@@ -1,6 +1,10 @@
 use crate::{
     ActionRun, ActionSpec, ActionStatus, ActivityEvent, ProbeMode, RiskLevel, SourceApplyResult,
     SourceError, SourcePlan, SourceStatus, collect_snapshot,
+    hardware::{
+        GpioStatus, HardwareError, HardwareManager, OverlayApplyResult, OverlayPlan, OverlayStatus,
+        ThermalStatus, VideoFrame, VideoStatus,
+    },
     sources::{SourceManager, source_run},
 };
 use chrono::Utc;
@@ -60,6 +64,7 @@ pub struct Controller {
     runs: Arc<RwLock<VecDeque<ActionRun>>>,
     activity: Arc<RwLock<VecDeque<ActivityEvent>>>,
     sources: Arc<SourceManager>,
+    hardware: Arc<HardwareManager>,
 }
 
 impl Controller {
@@ -90,6 +95,7 @@ impl Controller {
             runs: Arc::new(RwLock::new(VecDeque::new())),
             activity: Arc::new(RwLock::new(activity)),
             sources: Arc::new(SourceManager::new(synthetic)),
+            hardware: Arc::new(HardwareManager::new(synthetic)),
         }
     }
 
@@ -136,6 +142,126 @@ impl Controller {
 
     pub fn source_status(&self) -> Result<SourceStatus, SourceError> {
         self.sources.status()
+    }
+
+    pub fn overlay_status(&self) -> Result<OverlayStatus, HardwareError> {
+        self.hardware.overlay_status()
+    }
+
+    pub fn plan_overlay_change(
+        &self,
+        selected_ids: &[String],
+    ) -> Result<OverlayPlan, HardwareError> {
+        self.hardware.plan_overlays(selected_ids)
+    }
+
+    pub fn apply_overlay_change(
+        &self,
+        selected_ids: &[String],
+        plan_token: &str,
+        confirmed: bool,
+    ) -> Result<OverlayApplyResult, HardwareError> {
+        if !confirmed {
+            return Err(HardwareError::ConfirmationRequired);
+        }
+        if plan_token.trim().is_empty() {
+            return Err(HardwareError::PlanRequired);
+        }
+        let result = if self.policy == ExecutionPolicy::DryRun {
+            let plan = self.plan_overlay_change(selected_ids)?;
+            if plan.plan_token != plan_token {
+                return Err(HardwareError::StalePlan);
+            }
+            OverlayApplyResult {
+                run: hardware_dry_run(
+                    "hardware.overlays",
+                    "Switch device-tree overlays",
+                    &plan
+                        .changes
+                        .iter()
+                        .map(|change| {
+                            format!(
+                                "{}: {}",
+                                change.id,
+                                if change.after_enabled {
+                                    "enable"
+                                } else {
+                                    "disable"
+                                }
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                reboot_required: plan.reboot_required,
+                plan,
+            }
+        } else if effective_uid() != Some(0) {
+            let result = run_privileged_overlay_apply(selected_ids, plan_token)?;
+            self.record_run(result.run.clone());
+            return Ok(result);
+        } else {
+            self.hardware
+                .apply_overlays_live(selected_ids, plan_token)?
+        };
+        self.record_run(result.run.clone());
+        Ok(result)
+    }
+
+    pub fn gpio_status(&self) -> Result<GpioStatus, HardwareError> {
+        self.hardware.gpio_status()
+    }
+
+    pub fn video_status(&self) -> Result<VideoStatus, HardwareError> {
+        self.hardware.video_status()
+    }
+
+    pub fn capture_video_frame(&self, device_id: &str) -> Result<VideoFrame, HardwareError> {
+        self.hardware.capture_video_frame(device_id)
+    }
+
+    pub fn thermal_status(&self) -> Result<ThermalStatus, HardwareError> {
+        self.hardware.thermal_status()
+    }
+
+    pub fn apply_thermal_policy(
+        &self,
+        policy: &str,
+        confirmed: bool,
+    ) -> Result<ActionRun, HardwareError> {
+        if !confirmed {
+            return Err(HardwareError::ConfirmationRequired);
+        }
+        let run = if self.policy == ExecutionPolicy::DryRun {
+            let status = self.thermal_status()?;
+            if !status.available_policies.iter().any(|item| item == policy) {
+                return Err(HardwareError::InvalidInput(format!(
+                    "policy {policy} is not available"
+                )));
+            }
+            hardware_dry_run(
+                "hardware.thermal-policy",
+                "Set fan and thermal policy",
+                &[
+                    format!("set every supported thermal zone to {policy}"),
+                    format!("persist {policy} for boot"),
+                ],
+            )
+        } else if effective_uid() != Some(0) {
+            let run = run_privileged_thermal_apply(policy)?;
+            self.record_run(run.clone());
+            return Ok(run);
+        } else {
+            self.hardware.apply_thermal_policy_live(policy)?
+        };
+        self.record_run(run.clone());
+        Ok(run)
+    }
+
+    pub fn restore_thermal_policy(&self) -> Result<ActionRun, HardwareError> {
+        if self.policy != ExecutionPolicy::Live || effective_uid() != Some(0) {
+            return Err(HardwareError::RootRequired);
+        }
+        self.hardware.restore_thermal_policy_live()
     }
 
     pub fn plan_source_change(&self, provider_id: &str) -> Result<SourcePlan, SourceError> {
@@ -807,6 +933,62 @@ fn run_privileged_source_apply(
     }
     serde_json::from_slice(&output.stdout)
         .map_err(|error| SourceError::Io(format!("invalid helper response: {error}")))
+}
+
+fn run_privileged_overlay_apply(
+    selected_ids: &[String],
+    plan_token: &str,
+) -> Result<OverlayApplyResult, HardwareError> {
+    privileged_helper_ready().map_err(|_| HardwareError::RootRequired)?;
+    let selected = selected_ids.join(",");
+    let output = Command::new(PKEXEC)
+        .args([
+            PRIVILEGED_HELPER,
+            "overlays-apply",
+            &selected,
+            plan_token,
+            "--confirmed",
+        ])
+        .output()
+        .map_err(|error| HardwareError::Authorization(error.to_string()))?;
+    if !output.status.success() {
+        return Err(HardwareError::Authorization(helper_error(
+            &output.stderr,
+            output.status,
+        )));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| HardwareError::Io(format!("invalid helper response: {error}")))
+}
+
+fn run_privileged_thermal_apply(policy: &str) -> Result<ActionRun, HardwareError> {
+    privileged_helper_ready().map_err(|_| HardwareError::RootRequired)?;
+    let output = Command::new(PKEXEC)
+        .args([PRIVILEGED_HELPER, "thermal-apply", policy, "--confirmed"])
+        .output()
+        .map_err(|error| HardwareError::Authorization(error.to_string()))?;
+    if !output.status.success() {
+        return Err(HardwareError::Authorization(helper_error(
+            &output.stderr,
+            output.status,
+        )));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| HardwareError::Io(format!("invalid helper response: {error}")))
+}
+
+fn hardware_dry_run(action_id: &str, title: &str, steps: &[String]) -> ActionRun {
+    ActionRun {
+        id: Uuid::new_v4().to_string(),
+        action_id: action_id.into(),
+        action_title: title.into(),
+        status: ActionStatus::Planned,
+        synthetic: true,
+        summary: "Dry run completed; no hardware configuration was changed.".into(),
+        output: Some(format!("planned steps:\n- {}", steps.join("\n- "))),
+        started_at: Utc::now(),
+        finished_at: Some(Utc::now()),
+    }
 }
 
 fn privileged_helper_ready() -> Result<(), ()> {

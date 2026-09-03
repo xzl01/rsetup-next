@@ -8,7 +8,7 @@ use i18n::{Locale, LocaleArg};
 use rsetup_core::{
     Controller, ExecutionPolicy, ProbeMode, SourceApplyResult, SourcePlan, SourceStatus,
 };
-use std::{io::IsTerminal, net::SocketAddr};
+use std::{fs, io::IsTerminal, net::SocketAddr, path::PathBuf};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -65,6 +65,11 @@ enum Commands {
         #[command(subcommand)]
         command: SourceCommands,
     },
+    /// Inspect and manage board hardware / 查看和管理开发板硬件
+    Hardware {
+        #[command(subcommand)]
+        command: HardwareCommands,
+    },
     /// Open the interactive terminal control center / 打开交互式终端控制中心
     Tui,
     /// Serve the browser control center and JSON API / 启动浏览器控制中心与 JSON API
@@ -98,6 +103,82 @@ enum SourceCommands {
         /// Token returned by `sources plan` / `sources plan` 返回的计划令牌
         #[arg(long, value_name = "TOKEN")]
         plan_token: String,
+        #[arg(long)]
+        confirm: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum HardwareCommands {
+    /// Manage device-tree overlays / 管理设备树叠加层
+    Overlays {
+        #[command(subcommand)]
+        command: OverlayCommands,
+    },
+    /// Show the 40-pin GPIO map / 显示 40 针 GPIO 映射
+    Gpio {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect cameras or capture a test frame / 查看摄像头或抓取测试帧
+    Video {
+        #[command(subcommand)]
+        command: VideoCommands,
+    },
+    /// Inspect or set fan and thermal policy / 查看或设置风扇与温控策略
+    Thermal {
+        #[command(subcommand)]
+        command: ThermalCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum OverlayCommands {
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    Plan {
+        #[arg(long = "enable")]
+        selected_ids: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    Apply {
+        #[arg(long = "enable")]
+        selected_ids: Vec<String>,
+        #[arg(long, value_name = "TOKEN")]
+        plan_token: String,
+        #[arg(long)]
+        confirm: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum VideoCommands {
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    Capture {
+        device: String,
+        #[arg(long, value_name = "FILE")]
+        output: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ThermalCommands {
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    Set {
+        policy: String,
         #[arg(long)]
         confirm: bool,
         #[arg(long)]
@@ -191,6 +272,59 @@ async fn main() -> Result<()> {
                     .map_err(|error| anyhow!(locale.source_error(&error)))?;
                 print_source_apply(&result, locale, json)?;
             }
+        },
+        Commands::Hardware { command } => match command {
+            HardwareCommands::Overlays { command } => match command {
+                OverlayCommands::Status { json } => {
+                    let status = controller.overlay_status()?;
+                    print_json_or_debug(&status, json)?;
+                }
+                OverlayCommands::Plan { selected_ids, json } => {
+                    let plan = controller.plan_overlay_change(&selected_ids)?;
+                    print_json_or_debug(&plan, json)?;
+                }
+                OverlayCommands::Apply {
+                    selected_ids,
+                    plan_token,
+                    confirm,
+                    json,
+                } => {
+                    let result =
+                        controller.apply_overlay_change(&selected_ids, &plan_token, confirm)?;
+                    print_json_or_debug(&result, json)?;
+                }
+            },
+            HardwareCommands::Gpio { json } => {
+                let status = controller.gpio_status()?;
+                print_json_or_debug(&status, json)?;
+            }
+            HardwareCommands::Video { command } => match command {
+                VideoCommands::Status { json } => {
+                    let status = controller.video_status()?;
+                    print_json_or_debug(&status, json)?;
+                }
+                VideoCommands::Capture { device, output } => {
+                    let frame = controller.capture_video_frame(&device)?;
+                    let bytes = decode_base64(&frame.base64)
+                        .ok_or_else(|| anyhow!("invalid frame returned by provider"))?;
+                    fs::write(&output, bytes)?;
+                    println!("{}", output.display());
+                }
+            },
+            HardwareCommands::Thermal { command } => match command {
+                ThermalCommands::Status { json } => {
+                    let status = controller.thermal_status()?;
+                    print_json_or_debug(&status, json)?;
+                }
+                ThermalCommands::Set {
+                    policy,
+                    confirm,
+                    json,
+                } => {
+                    let run = controller.apply_thermal_policy(&policy, confirm)?;
+                    print_json_or_debug(&run, json)?;
+                }
+            },
         },
         Commands::Tui => tui::run(controller, locale)?,
         Commands::Serve { listen } => server::serve(controller, listen).await?,
@@ -455,4 +589,56 @@ fn percent(value: u64, total: u64) -> f32 {
     } else {
         value as f32 / total as f32 * 100.0
     }
+}
+
+fn print_json_or_debug<T>(value: &T, json: bool) -> Result<()>
+where
+    T: serde::Serialize + std::fmt::Debug,
+{
+    if json {
+        println!("{}", serde_json::to_string_pretty(value)?);
+    } else {
+        println!("{value:#?}");
+    }
+    Ok(())
+}
+
+fn decode_base64(value: &str) -> Option<Vec<u8>> {
+    fn decode(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    if value.len() % 4 != 0 {
+        return None;
+    }
+    let mut output = Vec::with_capacity(value.len() / 4 * 3);
+    for chunk in value.as_bytes().chunks_exact(4) {
+        let a = u32::from(decode(chunk[0])?);
+        let b = u32::from(decode(chunk[1])?);
+        let c = if chunk[2] == b'=' {
+            0
+        } else {
+            u32::from(decode(chunk[2])?)
+        };
+        let d = if chunk[3] == b'=' {
+            0
+        } else {
+            u32::from(decode(chunk[3])?)
+        };
+        let bits = (a << 18) | (b << 12) | (c << 6) | d;
+        output.push((bits >> 16) as u8);
+        if chunk[2] != b'=' {
+            output.push((bits >> 8) as u8);
+        }
+        if chunk[3] != b'=' {
+            output.push(bits as u8);
+        }
+    }
+    Some(output)
 }

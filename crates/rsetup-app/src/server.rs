@@ -7,8 +7,9 @@ use axum::{
     routing::{get, post},
 };
 use rsetup_core::{
-    ActionRun, ActionSpec, ActivityEvent, Controller, DeviceSnapshot, SourceApplyResult,
-    SourcePlan, SourceStatus,
+    ActionRun, ActionSpec, ActivityEvent, Controller, DeviceSnapshot, GpioStatus,
+    OverlayApplyResult, OverlayPlan, OverlayStatus, SourceApplyResult, SourcePlan, SourceStatus,
+    ThermalStatus, VideoFrame, VideoStatus,
 };
 use serde::Deserialize;
 use std::{net::SocketAddr, sync::Arc};
@@ -41,6 +42,31 @@ struct SourceRequest {
     provider_id: String,
     #[serde(default)]
     plan_token: Option<String>,
+    #[serde(default)]
+    confirm: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OverlayRequest {
+    #[serde(default)]
+    selected_ids: Vec<String>,
+    #[serde(default)]
+    plan_token: Option<String>,
+    #[serde(default)]
+    confirm: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VideoCaptureRequest {
+    device_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThermalPolicyRequest {
+    policy: String,
     #[serde(default)]
     confirm: bool,
 }
@@ -81,6 +107,14 @@ pub fn router(controller: Controller) -> Router {
         .route("/api/v1/sources", get(source_status))
         .route("/api/v1/sources/plan", post(plan_sources))
         .route("/api/v1/sources/apply", post(apply_sources))
+        .route("/api/v1/hardware/overlays", get(overlay_status))
+        .route("/api/v1/hardware/overlays/plan", post(plan_overlays))
+        .route("/api/v1/hardware/overlays/apply", post(apply_overlays))
+        .route("/api/v1/hardware/gpio", get(gpio_status))
+        .route("/api/v1/hardware/video", get(video_status))
+        .route("/api/v1/hardware/video/capture", post(capture_video))
+        .route("/api/v1/hardware/thermal", get(thermal_status))
+        .route("/api/v1/hardware/thermal/apply", post(apply_thermal_policy))
         .route("/api/v1/activity", get(activity))
         .layer(TraceLayer::new_for_http())
         .with_state(Arc::new(controller))
@@ -235,6 +269,86 @@ async fn apply_sources(
         .map_err(ApiError::from_source)
 }
 
+async fn overlay_status(
+    State(controller): State<Arc<Controller>>,
+) -> Result<Json<OverlayStatus>, ApiError> {
+    controller
+        .overlay_status()
+        .map(Json)
+        .map_err(ApiError::from_hardware)
+}
+
+async fn plan_overlays(
+    State(controller): State<Arc<Controller>>,
+    Json(request): Json<OverlayRequest>,
+) -> Result<Json<OverlayPlan>, ApiError> {
+    controller
+        .plan_overlay_change(&request.selected_ids)
+        .map(Json)
+        .map_err(ApiError::from_hardware)
+}
+
+async fn apply_overlays(
+    State(controller): State<Arc<Controller>>,
+    Json(request): Json<OverlayRequest>,
+) -> Result<Json<OverlayApplyResult>, ApiError> {
+    controller
+        .apply_overlay_change(
+            &request.selected_ids,
+            request.plan_token.as_deref().unwrap_or_default(),
+            request.confirm,
+        )
+        .map(Json)
+        .map_err(ApiError::from_hardware)
+}
+
+async fn gpio_status(
+    State(controller): State<Arc<Controller>>,
+) -> Result<Json<GpioStatus>, ApiError> {
+    controller
+        .gpio_status()
+        .map(Json)
+        .map_err(ApiError::from_hardware)
+}
+
+async fn video_status(
+    State(controller): State<Arc<Controller>>,
+) -> Result<Json<VideoStatus>, ApiError> {
+    controller
+        .video_status()
+        .map(Json)
+        .map_err(ApiError::from_hardware)
+}
+
+async fn capture_video(
+    State(controller): State<Arc<Controller>>,
+    Json(request): Json<VideoCaptureRequest>,
+) -> Result<Json<VideoFrame>, ApiError> {
+    controller
+        .capture_video_frame(&request.device_id)
+        .map(Json)
+        .map_err(ApiError::from_hardware)
+}
+
+async fn thermal_status(
+    State(controller): State<Arc<Controller>>,
+) -> Result<Json<ThermalStatus>, ApiError> {
+    controller
+        .thermal_status()
+        .map(Json)
+        .map_err(ApiError::from_hardware)
+}
+
+async fn apply_thermal_policy(
+    State(controller): State<Arc<Controller>>,
+    Json(request): Json<ThermalPolicyRequest>,
+) -> Result<Json<ActionRun>, ApiError> {
+    controller
+        .apply_thermal_policy(&request.policy, request.confirm)
+        .map(Json)
+        .map_err(ApiError::from_hardware)
+}
+
 struct ApiError {
     status: StatusCode,
     code: &'static str,
@@ -289,6 +403,45 @@ impl ApiError {
                 error.to_string(),
             ),
             SourceError::Io(_) => Self::internal(error),
+        }
+    }
+
+    fn from_hardware(error: rsetup_core::HardwareError) -> Self {
+        use rsetup_core::HardwareError;
+        match error {
+            HardwareError::Unsupported(_) => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "hardware_unsupported",
+                error.to_string(),
+            ),
+            HardwareError::InvalidInput(_) => Self::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_hardware_selection",
+                error.to_string(),
+            ),
+            HardwareError::Conflict(_) => {
+                Self::new(StatusCode::CONFLICT, "hardware_conflict", error.to_string())
+            }
+            HardwareError::ConfirmationRequired => Self::new(
+                StatusCode::CONFLICT,
+                "confirmation_required",
+                error.to_string(),
+            ),
+            HardwareError::PlanRequired => {
+                Self::new(StatusCode::CONFLICT, "plan_required", error.to_string())
+            }
+            HardwareError::StalePlan => {
+                Self::new(StatusCode::CONFLICT, "stale_plan", error.to_string())
+            }
+            HardwareError::RootRequired => {
+                Self::new(StatusCode::FORBIDDEN, "root_required", error.to_string())
+            }
+            HardwareError::Authorization(_) => Self::new(
+                StatusCode::FORBIDDEN,
+                "authorization_failed",
+                error.to_string(),
+            ),
+            HardwareError::Io(_) => Self::internal(error),
         }
     }
 }

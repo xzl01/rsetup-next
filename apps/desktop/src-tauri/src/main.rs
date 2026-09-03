@@ -1,6 +1,7 @@
 use rsetup_core::{
     ActionError, ActionRun, ActionSpec, ActivityEvent, Controller, DeviceSnapshot,
-    SourceApplyResult, SourceError, SourcePlan, SourceStatus,
+    GpioStatus, HardwareError, OverlayApplyResult, OverlayPlan, OverlayStatus, SourceApplyResult,
+    SourceError, SourcePlan, SourceStatus, ThermalStatus, VideoFrame, VideoStatus,
 };
 use serde::Serialize;
 
@@ -49,6 +50,26 @@ impl From<SourceError> for CommandError {
             SourceError::RootRequired => "root_required",
             SourceError::Authorization(_) => "authorization_failed",
             SourceError::Io(_) => "internal_error",
+        };
+        Self {
+            code,
+            message: error.to_string(),
+        }
+    }
+}
+
+impl From<HardwareError> for CommandError {
+    fn from(error: HardwareError) -> Self {
+        let code = match &error {
+            HardwareError::Unsupported(_) => "hardware_unsupported",
+            HardwareError::InvalidInput(_) => "invalid_hardware_selection",
+            HardwareError::Conflict(_) => "hardware_conflict",
+            HardwareError::ConfirmationRequired => "confirmation_required",
+            HardwareError::PlanRequired => "plan_required",
+            HardwareError::StalePlan => "stale_plan",
+            HardwareError::RootRequired => "root_required",
+            HardwareError::Authorization(_) => "authorization_failed",
+            HardwareError::Io(_) => "internal_error",
         };
         Self {
             code,
@@ -112,6 +133,69 @@ fn apply_sources(
         .map_err(CommandError::from)
 }
 
+#[tauri::command]
+fn overlay_status(controller: tauri::State<'_, Controller>) -> Result<OverlayStatus, CommandError> {
+    controller.overlay_status().map_err(CommandError::from)
+}
+
+#[tauri::command]
+fn plan_overlays(
+    controller: tauri::State<'_, Controller>,
+    selected_ids: Vec<String>,
+) -> Result<OverlayPlan, CommandError> {
+    controller
+        .plan_overlay_change(&selected_ids)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+fn apply_overlays(
+    controller: tauri::State<'_, Controller>,
+    selected_ids: Vec<String>,
+    plan_token: String,
+    confirm: bool,
+) -> Result<OverlayApplyResult, CommandError> {
+    controller
+        .apply_overlay_change(&selected_ids, &plan_token, confirm)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+fn gpio_status(controller: tauri::State<'_, Controller>) -> Result<GpioStatus, CommandError> {
+    controller.gpio_status().map_err(CommandError::from)
+}
+
+#[tauri::command]
+fn video_status(controller: tauri::State<'_, Controller>) -> Result<VideoStatus, CommandError> {
+    controller.video_status().map_err(CommandError::from)
+}
+
+#[tauri::command]
+fn capture_video_frame(
+    controller: tauri::State<'_, Controller>,
+    device_id: String,
+) -> Result<VideoFrame, CommandError> {
+    controller
+        .capture_video_frame(&device_id)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+fn thermal_status(controller: tauri::State<'_, Controller>) -> Result<ThermalStatus, CommandError> {
+    controller.thermal_status().map_err(CommandError::from)
+}
+
+#[tauri::command]
+fn apply_thermal_policy(
+    controller: tauri::State<'_, Controller>,
+    policy: String,
+    confirm: bool,
+) -> Result<ActionRun, CommandError> {
+    controller
+        .apply_thermal_policy(&policy, confirm)
+        .map_err(CommandError::from)
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(Controller::from_environment())
@@ -122,7 +206,15 @@ fn main() {
             run_action,
             source_status,
             plan_sources,
-            apply_sources
+            apply_sources,
+            overlay_status,
+            plan_overlays,
+            apply_overlays,
+            gpio_status,
+            video_status,
+            capture_video_frame,
+            thermal_status,
+            apply_thermal_policy
         ])
         .run(tauri::generate_context!())
         .expect("failed to run rsetup desktop");

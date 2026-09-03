@@ -266,6 +266,19 @@
       </button>
     </dialog>
 
+    <dialog class="hardware-drawer" data-hardware-drawer aria-labelledby="hardware-tool-title">
+      <div class="hardware-drawer-head">
+        <div>
+          <h2 id="hardware-tool-title" data-hardware-tool-title data-i18n="hardware.tool">Hardware tool</h2>
+          <p data-hardware-tool-description data-i18n="hardware.loading">Reading hardware state…</p>
+        </div>
+        <button class="icon-button" type="button" data-hardware-close aria-label="Close hardware tool" data-i18n-aria="hardware.close"><svg aria-hidden="true"><use href="#icon-close"></use></svg></button>
+      </div>
+      <div class="hardware-tool-body" data-hardware-body>
+        <div class="hardware-tool-loading"><span></span><span data-i18n="hardware.loading">Reading hardware state…</span></div>
+      </div>
+    </dialog>
+
     <dialog class="command-dialog" data-command-dialog>
       <form method="dialog" class="command-shell">
         <label class="command-search">

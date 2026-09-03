@@ -13,6 +13,7 @@ TUI ─────┼── Controller ── Probe provider ── /proc, /sys
 HTTP GUI ┤       │
 Tauri ───┘       ├──────── Fixed action catalog ── built-in Rust executors
                  ├──────── APT source manager ──── validated mirror catalog
+                 ├──────── Hardware manager ────── overlays, GPIO, V4L2, thermal
                  └──────── Polkit helper ───────── root-only fixed protocol
 ```
 
@@ -57,11 +58,11 @@ Execution has two independent gates:
 For a root-required live operation, an already-root CLI executes directly.
 Otherwise the controller asks Polkit to start `/usr/libexec/rsetup-next-helper`.
 The browser, HTTP server, TUI, and desktop shell remain unprivileged. The helper
-accepts only `action ACTION_ID --confirmed` or
-`sources-apply PROVIDER_ID PLAN_TOKEN --confirmed`, then returns the typed JSON
-result. It does not accept executable paths, command arguments, or shell text.
-Cancellation and failed authorization are returned as a stable
-`authorization_failed` error.
+accepts only fixed protocol verbs: a catalog action, an exact source plan, an
+exact overlay plan, a validated thermal policy, or boot-time thermal policy
+restoration. It returns a typed JSON result and does not accept executable
+paths, arbitrary file paths, command arguments, or shell text. Cancellation and
+failed authorization are returned as a stable `authorization_failed` error.
 
 The live action catalog is rebuilt when requested and checks package, systemd
 unit, and command prerequisites. Unsupported operations remain discoverable but
@@ -78,6 +79,20 @@ are never rewritten. Every plan includes a deterministic token over the selected
 provider, source revision, and complete transformed documents. Apply rebuilds
 the plan from disk and rejects missing or stale tokens before writing.
 
+## Native hardware manager
+
+`rsetup-core::hardware` owns hardware-specific observation and mutation.
+Overlay IDs must be basenames ending in `.dtbo`; video IDs must match an
+enumerated `videoN`; thermal policies must be present in the kernel's common
+policy set. These identifiers are validated again inside the root helper.
+
+Overlay planning fingerprints the complete enabled state and selected IDs.
+Applying a stale token is rejected. File renames are rolled back if any rename
+or `u-boot-update` fails. GPIO inspection is intentionally read-only. Camera
+capture is time-bounded and size-bounded. Thermal policy writes preserve the
+upstream `pwm-fan` incompatibility guard and store only one validated policy
+under `/etc/rsetup-next`; a packaged oneshot unit restores it at boot.
+
 ## HTTP API
 
 The loopback server exposes:
@@ -91,6 +106,14 @@ The loopback server exposes:
 | `GET` | `/api/v1/sources` | detected APT source state and trusted mirror catalog |
 | `POST` | `/api/v1/sources/plan` | preview managed source changes for one provider ID |
 | `POST` | `/api/v1/sources/apply` | confirm and apply an exact plan token; stale plans are rejected |
+| `GET` | `/api/v1/hardware/overlays` | list managed overlay state |
+| `POST` | `/api/v1/hardware/overlays/plan` | validate and preview an overlay selection |
+| `POST` | `/api/v1/hardware/overlays/apply` | apply an exact overlay plan |
+| `GET` | `/api/v1/hardware/gpio` | read the 40-pin GPIO map |
+| `GET` | `/api/v1/hardware/video` | list Video4Linux capture devices |
+| `POST` | `/api/v1/hardware/video/capture` | capture one bounded test frame |
+| `GET` | `/api/v1/hardware/thermal` | inspect thermal zones and cooling devices |
+| `POST` | `/api/v1/hardware/thermal/apply` | apply and persist a validated policy |
 | `GET` | `/api/v1/activity` | current in-memory event history |
 
 Remote binding, authentication, persistent audit storage, multi-user policy,

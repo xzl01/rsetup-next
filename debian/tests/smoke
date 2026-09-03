@@ -5,3 +5,8 @@ rsetup-next --demo status --json | grep -q '"identity"'
 rsetup-next --demo actions --json | grep -q '"system.update"'
 test -x /usr/libexec/rsetup-next-helper
 test -f /usr/share/polkit-1/actions/com.radxa.rsetup-next.policy
+test -f /usr/lib/systemd/system/rsetup-next-thermal-policy.service
+rsetup-next --demo hardware overlays status --json | grep -q '"overlays"'
+rsetup-next --demo hardware gpio --json | grep -q '"physicalPin"'
+rsetup-next --demo hardware video status --json | grep -q '"captureAvailable"'
+rsetup-next --demo hardware thermal status --json | grep -q '"availablePolicies"'

@@ -14,7 +14,7 @@ require the legacy `rsetup` command at runtime.
 
 | Surface | Entry | Purpose |
 | --- | --- | --- |
-| CLI | `rsetup-next status`, `actions`, `run`, `sources`, `doctor` | automation and recovery-friendly output, including JSON |
+| CLI | `rsetup-next status`, `actions`, `run`, `sources`, `hardware`, `doctor` | automation and recovery-friendly output, including JSON |
 | TUI | `rsetup-next tui` | keyboard-operated local mission control |
 | Web GUI | `rsetup-next serve` | responsive browser control center and JSON API |
 | Desktop GUI | `apps/desktop` | Tauri shell using the same static UI and `rsetup-core` |
@@ -34,6 +34,22 @@ endpoints, leaves third-party repositories untouched, and previews every
 affected line before confirmation. Live application creates timestamped
 backups, writes atomically, runs `apt-get update`, and automatically restores
 the previous files if the refresh fails.
+
+The native hardware manager now covers four migrated workflows:
+
+- Device-tree overlays are listed from the managed U-Boot directory, checked
+  for declared resource conflicts and package requirements, previewed with an
+  exact revision-bound token, and renamed transactionally before
+  `u-boot-update`. Changes apply after reboot.
+- The 40-pin GPIO header is a read-only map. It resolves `PIN_n` line names
+  with libgpiod tools when available and never changes line direction or level.
+- Video4Linux devices can capture a bounded single-frame webcam test through
+  `ffmpeg`; device IDs are enumerated and validated rather than accepted as
+  arbitrary paths.
+- Thermal zones and cooling devices are inspected directly from sysfs. The
+  original thermal-governor choice is preserved, including the
+  `pwm-fan`/`power_allocator` incompatibility check, and the selected policy
+  is restored at boot by a native systemd unit.
 
 ## Safety model
 
@@ -78,6 +94,13 @@ rsetup-next --demo run system.update --confirm
 rsetup-next --demo sources status
 rsetup-next --demo sources plan cqu
 rsetup-next --demo sources apply cqu --plan-token PLAN_TOKEN_FROM_PREVIEW --confirm
+rsetup-next --demo hardware overlays status --json
+rsetup-next --demo hardware overlays plan --enable rk3588-uart2-m0.dtbo
+rsetup-next --demo hardware gpio --json
+rsetup-next --demo hardware video status
+rsetup-next --demo hardware video capture video0 --output camera.svg
+rsetup-next --demo hardware thermal status
+rsetup-next --demo hardware thermal set step_wise --confirm
 rsetup-next doctor
 ```
 
@@ -96,10 +119,10 @@ stale plan and requires a new preview.
 
 The browser and desktop processes remain unprivileged. The Debian package ships
 `/usr/libexec/rsetup-next-helper` and a Polkit policy for live GUI operations.
-That helper accepts only fixed catalog action IDs or an exact, previously
-reviewed source plan; it has no arbitrary command mode. If authorization is
-cancelled, the interfaces report `authorization_failed` without changing the
-system.
+That helper accepts only fixed catalog action IDs, an exact previously reviewed
+source or overlay plan, a validated thermal policy, or the boot-time thermal
+restore verb. It has no arbitrary command mode. If authorization is cancelled,
+the interfaces report `authorization_failed` without changing the system.
 
 ## English and Chinese
 
@@ -151,8 +174,10 @@ API routes, action execution, and the planned remote-node seam.
 ## Debian package
 
 The package installs the `rsetup-next` CLI/TUI/Web binary, its narrow privileged
-helper, and the matching Polkit policy. It does not install the removed Bash
-implementation or run the browser process as root.
+helper, the matching Polkit policy, and the thermal-policy restore unit. It
+does not install the removed Bash implementation or run the browser process as
+root. Optional `device-tree-compiler`, `gpiod`, `v4l-utils`, and `ffmpeg`
+packages enrich the corresponding hardware tools.
 
 ```bash
 make deb-prepare
@@ -177,9 +202,11 @@ relicensed under this project's GPL-3+ license.
 
 The Rust workspace, demo provider, CLI, HTTP API, and browser GUI can be tested
 on the development host. Live Linux probing still needs validation on supported
-Radxa boards. Bootloader, SPI/eMMC, GPIO, overlay, thermal, networking, and
-power-changing actions must be tested individually on recoverable hardware
-before they are presented as production-ready.
+Radxa boards. The overlay transaction, libgpiod mapping, real camera capture,
+sysfs policy writes and boot-time thermal restore are implemented but have not
+yet been exercised on physical hardware. Bootloader, SPI/eMMC, GPIO, overlay,
+thermal, networking, and power-changing actions must be tested individually on
+recoverable hardware before they are presented as production-ready.
 
 ## License
 

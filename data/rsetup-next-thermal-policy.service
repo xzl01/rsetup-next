@@ -1,0 +1,11 @@
+[Unit]
+Description=Restore rsetup-next fan and thermal policy
+After=sysinit.target
+ConditionPathExists=/etc/rsetup-next/thermal-policy
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/rsetup-next-helper thermal-restore
+
+[Install]
+WantedBy=multi-user.target

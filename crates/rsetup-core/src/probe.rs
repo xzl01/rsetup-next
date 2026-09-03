@@ -188,7 +188,7 @@ fn demo_snapshot() -> DeviceSnapshot {
             ServiceSummary { id: "docker.service".into(), label: "Container runtime".into(), state: ServiceState::Inactive, detail: "Installed · stopped".into() },
         ],
         capabilities: vec![
-            capability("device-tree", "Device-tree overlays", true, "14 overlays available"),
+            capability("device-tree", "Device-tree overlays", true, "6 overlays available"),
             capability("gpio", "GPIO", true, "5 gpiochips · 160 lines"),
             capability("video", "Video capture", true, "2 Video4Linux devices"),
             capability("thermal", "Thermal controls", true, "3 zones · step_wise"),

@@ -9,6 +9,12 @@ enum HelperRequest {
         provider_id: String,
         plan_token: String,
     },
+    OverlaysApply {
+        selected_ids: Vec<String>,
+        plan_token: String,
+    },
+    ThermalApply(String),
+    ThermalRestore,
 }
 
 fn main() -> Result<()> {
@@ -30,6 +36,20 @@ fn main() -> Result<()> {
             &plan_token,
             true,
         )?)?,
+        HelperRequest::OverlaysApply {
+            selected_ids,
+            plan_token,
+        } => serde_json::to_value(controller.apply_overlay_change(
+            &selected_ids,
+            &plan_token,
+            true,
+        )?)?,
+        HelperRequest::ThermalApply(policy) => {
+            serde_json::to_value(controller.apply_thermal_policy(&policy, true)?)?
+        }
+        HelperRequest::ThermalRestore => {
+            serde_json::to_value(controller.restore_thermal_policy()?)?
+        }
     };
 
     println!("{}", serde_json::to_string(&response)?);
@@ -51,7 +71,26 @@ fn parse_request(arguments: &[String]) -> Result<HelperRequest> {
                 plan_token: plan_token.clone(),
             })
         }
-        _ => bail!("invalid helper request; expected a fixed action or an exact source plan"),
+        [command, selected, plan_token, confirmation]
+            if command == "overlays-apply" && confirmation == "--confirmed" =>
+        {
+            let selected_ids = selected
+                .split(',')
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+                .collect();
+            Ok(HelperRequest::OverlaysApply {
+                selected_ids,
+                plan_token: plan_token.clone(),
+            })
+        }
+        [command, policy, confirmation]
+            if command == "thermal-apply" && confirmation == "--confirmed" =>
+        {
+            Ok(HelperRequest::ThermalApply(policy.clone()))
+        }
+        [command] if command == "thermal-restore" => Ok(HelperRequest::ThermalRestore),
+        _ => bail!("invalid helper request; expected a fixed native operation"),
     }
 }
 
@@ -88,6 +127,28 @@ mod tests {
             ])
             .unwrap(),
             HelperRequest::Action("system.inspect".into())
+        );
+        assert_eq!(
+            parse_request(&[
+                "overlays-apply".into(),
+                "uart.dtbo,spi.dtbo".into(),
+                "plan-token".into(),
+                "--confirmed".into(),
+            ])
+            .unwrap(),
+            HelperRequest::OverlaysApply {
+                selected_ids: vec!["uart.dtbo".into(), "spi.dtbo".into()],
+                plan_token: "plan-token".into(),
+            }
+        );
+        assert!(
+            parse_request(&[
+                "thermal-apply".into(),
+                "step_wise".into(),
+                "--confirmed".into(),
+                "extra".into(),
+            ])
+            .is_err()
         );
     }
 }

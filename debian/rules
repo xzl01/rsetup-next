@@ -23,6 +23,7 @@ override_dh_auto_install:
 	install -Dm755 target/release/rsetup-next debian/rsetup-next/usr/bin/rsetup-next
 	install -Dm755 target/release/rsetup-next-helper debian/rsetup-next/usr/libexec/rsetup-next-helper
 	install -Dm644 data/com.radxa.rsetup-next.policy debian/rsetup-next/usr/share/polkit-1/actions/com.radxa.rsetup-next.policy
+	install -Dm644 data/rsetup-next-thermal-policy.service debian/rsetup-next/usr/lib/systemd/system/rsetup-next-thermal-policy.service
 
 override_dh_auto_clean:
 	cargo clean
