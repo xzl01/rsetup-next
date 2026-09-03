@@ -12,6 +12,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Reject legacy runtime files
+        run: |
+          test ! -e src/usr/bin/rsetup
+          test ! -e src/usr/lib/rsetup
+          test ! -e src/usr/lib/librtui
+          test ! -e src/usr/share/librtui
+          test ! -e externals/librtui
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy,rustfmt
