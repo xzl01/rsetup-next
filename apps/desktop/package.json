@@ -1,0 +1,13 @@
+{
+  "name": "rsetup-desktop",
+  "private": true,
+  "version": "0.5.0-alpha.1",
+  "type": "module",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.0"
+  }
+}

@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en" data-theme="light" data-locale="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="description" content="rsetup SBC control center" />
+    <title>rsetup · SBC Control Center</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <!--
+      THESIS: Make serious SBC control feel calm and approachable without softening operational truth; reject the hostile black instrumentation wall.
+      OWN-WORLD: Pale slate canvas, warm white cloud surfaces, low-saturation indigo actions, softly tinted depth, large rounded forms, and circular icon wells.
+      STORY: Recognize the board, understand its health, choose a guided action, review explicit risk, and see the auditable outcome with low cognitive pressure.
+      FIRST VIEWPORT: A floating top bar and soft navigation dock frame a generous board-health stage; guided operations sit at right, with capabilities and recent activity flowing below.
+      FORM: User-pinned Soft UI, assigned grounded direction 5, seed a27c8826.
+      FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, DESIGN.md, and every shipping raster carrying its provenance
+    -->
+    <a class="skip-link" href="#workspace" data-i18n="skip">Skip to control center</a>
+    <div class="scan-pass" aria-hidden="true"></div>
+
+    <header class="command-rail">
+      <button class="brand-lockup" type="button" data-route="overview" aria-label="Open overview" data-i18n-aria="brand.open">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span class="brand-name">rsetup</span>
+        <span class="brand-channel" data-i18n="brand.channel">LOCAL CONTROL</span>
+      </button>
+
+      <div class="device-breadcrumb" aria-live="polite">
+        <span class="signal-dot" data-signal></span>
+        <span data-product data-i18n="board.detecting">Detecting board</span>
+        <span class="slash">/</span>
+        <span data-hostname>local</span>
+      </div>
+
+      <div class="rail-actions">
+        <span class="clock" data-clock>--:--:--</span>
+        <button class="command-trigger" type="button" data-command-trigger aria-label="Open command palette" data-i18n-aria="command.open">
+          <svg aria-hidden="true"><use href="#icon-search"></use></svg>
+          <span data-i18n="command.label">Command</span>
+          <kbd>⌘ K</kbd>
+        </button>
+        <details class="debug-menu" data-debug-menu hidden>
+          <summary class="icon-button debug-trigger" aria-label="Open device simulator" data-i18n-aria="debug.open"><svg aria-hidden="true"><use href="#icon-debug"></use></svg></summary>
+          <section class="debug-panel" aria-labelledby="debug-title">
+            <div class="debug-panel-head"><div><strong id="debug-title" data-i18n="debug.title">Device simulator</strong><span data-i18n="debug.synthetic">Synthetic data only</span></div><span class="debug-badge">DEV</span></div>
+            <label class="debug-field"><span data-i18n="debug.device">Current device</span><select data-debug-profile></select></label>
+            <div class="debug-custom" data-debug-custom hidden>
+              <label class="debug-field debug-field-wide"><span data-i18n="debug.product">Product name</span><input type="text" data-debug-product autocomplete="off" /></label>
+              <label class="debug-field"><span data-i18n="debug.vendor">SoC vendor</span><input type="text" data-debug-vendor autocomplete="off" /></label>
+              <label class="debug-field"><span data-i18n="debug.soc">SoC model</span><input type="text" data-debug-soc autocomplete="off" /></label>
+              <label class="debug-field"><span data-i18n="debug.architecture">Architecture</span><input type="text" data-debug-architecture autocomplete="off" /></label>
+              <label class="debug-field"><span data-i18n="debug.hostname">Hostname</span><input type="text" data-debug-hostname autocomplete="off" /></label>
+              <button class="secondary-button debug-apply" type="button" data-debug-apply><span data-i18n="debug.apply">Apply custom device</span></button>
+            </div>
+            <button class="text-button debug-reset" type="button" data-debug-reset data-i18n="debug.reset">Use provider device</button>
+          </section>
+        </details>
+        <button class="language-button" type="button" data-language-toggle aria-label="切换为中文" data-i18n-aria="language.toggle">
+          <span data-language-label>中文</span>
+        </button>
+        <button class="icon-button" type="button" data-theme-toggle aria-label="Toggle color theme" data-i18n-aria="theme.toggle">
+          <svg aria-hidden="true"><use href="#icon-sun"></use></svg>
+        </button>
+      </div>
+    </header>
+
+    <nav class="route-rail" aria-label="Control center sections" data-i18n-aria="nav.label">
+      <button class="route-button is-active" type="button" data-route="overview" aria-current="page">
+        <svg aria-hidden="true"><use href="#icon-overview"></use></svg><span data-i18n="route.overview">Overview</span>
+      </button>
+      <button class="route-button" type="button" data-route="system">
+        <svg aria-hidden="true"><use href="#icon-system"></use></svg><span data-i18n="route.system">System</span>
+      </button>
+      <button class="route-button" type="button" data-route="network">
+        <svg aria-hidden="true"><use href="#icon-network"></use></svg><span data-i18n="route.network">Network</span>
+      </button>
+      <button class="route-button" type="button" data-route="hardware">
+        <svg aria-hidden="true"><use href="#icon-chip"></use></svg><span data-i18n="route.hardware">Hardware</span>
+      </button>
+      <button class="route-button" type="button" data-route="workflows">
+        <svg aria-hidden="true"><use href="#icon-run"></use></svg><span data-i18n="route.workflows">Workflows</span>
+      </button>
+      <button class="route-button" type="button" data-route="activity">
+        <svg aria-hidden="true"><use href="#icon-pulse"></use></svg><span data-i18n="route.activity">Activity</span>
+      </button>
+    </nav>
+
+    <main id="workspace" class="workspace" tabindex="-1">
+      <section class="view is-active" data-view="overview" aria-labelledby="overview-title">
+        <div class="view-heading">
+          <div>
+            <h1 id="overview-title" data-i18n="overview.title">Your board at a glance</h1>
+          </div>
+          <div class="mode-stamp" data-mode-stamp>
+            <span data-i18n="provider">Provider</span>
+            <strong data-i18n="connecting">Connecting</strong>
+          </div>
+        </div>
+
+        <div class="mission-grid">
+          <section class="device-plot instrument-frame" aria-labelledby="device-plot-title">
+            <div class="frame-label">
+              <h2 id="device-plot-title" data-i18n="health.title">Board health</h2>
+              <span data-collected data-i18n="health.awaiting">awaiting first signal</span>
+            </div>
+
+            <div class="plot-field">
+              <div class="plot-axis plot-axis-x" aria-hidden="true"></div>
+              <div class="plot-axis plot-axis-y" aria-hidden="true"></div>
+              <div class="core-node">
+                <span class="node-index" data-i18n="local.device">Local device</span>
+                <div class="soc-emblem" data-soc-emblem data-logo="generic" role="img" aria-label="Abstract single-board computer diagram" data-i18n-aria="board.diagram">
+                  <span class="soc-partner-logo" aria-hidden="true"></span>
+                  <span class="soc-generic-mark" aria-hidden="true"><svg><use href="#icon-chip"></use></svg><span data-soc-vendor data-i18n="soc.detecting">Detecting vendor</span></span>
+                </div>
+                <strong data-core-state data-i18n="syncing">SYNCING</strong>
+                <span data-core-detail data-i18n="provider.reading">Reading local provider</span>
+              </div>
+
+              <div class="telemetry-node node-cpu" data-tone="signal">
+                <span data-i18n="metric.cpu">CPU LOAD</span><strong data-cpu>--</strong>
+                <div class="meter"><i data-cpu-meter></i></div>
+              </div>
+              <div class="telemetry-node node-memory" data-tone="cyan">
+                <span data-i18n="metric.memory">MEMORY</span><strong data-memory>--</strong>
+                <div class="meter"><i data-memory-meter></i></div>
+              </div>
+              <div class="telemetry-node node-thermal" data-tone="amber">
+                <span data-i18n="metric.thermal">THERMAL</span><strong data-temperature>--</strong>
+                <small data-thermal-detail data-i18n="metric.sensorPending">sensor pending</small>
+              </div>
+              <div class="telemetry-node node-storage" data-tone="bone">
+                <span data-i18n="metric.storage">ROOT MEDIA</span><strong data-storage>--</strong>
+                <small data-storage-detail data-i18n="metric.mountPending">mount pending</small>
+              </div>
+            </div>
+
+            <div class="plot-footer">
+              <span><b data-uptime>--</b> <i data-i18n="metric.uptime">uptime</i></span>
+              <span><b data-kernel>--</b> <i data-i18n="metric.kernel">kernel</i></span>
+              <span><b data-arch>--</b> <i data-i18n="metric.architecture">architecture</i></span>
+            </div>
+          </section>
+
+          <aside class="operations-bay instrument-frame" aria-labelledby="operations-title">
+            <div class="frame-label">
+              <h2 id="operations-title" data-i18n="operations.title">Guided operations</h2>
+              <button class="text-button" type="button" data-route="workflows" data-i18n="operations.openAll">Open all</button>
+            </div>
+            <div class="operation-list" data-operation-list aria-live="polite">
+              <div class="loading-row"><span></span><i data-i18n="operations.loading">Loading action catalog</i></div>
+            </div>
+          </aside>
+
+          <section class="signal-bay instrument-frame" aria-labelledby="signals-title">
+            <div class="frame-label">
+              <h2 id="signals-title" data-i18n="capabilities.title">Available capabilities</h2>
+              <span data-capability-count>0 signals</span>
+            </div>
+            <div class="capability-strip" data-capabilities></div>
+          </section>
+
+          <section class="ledger-bay instrument-frame" aria-labelledby="ledger-title">
+            <div class="frame-label">
+              <h2 id="ledger-title" data-i18n="activity.recent">Recent activity</h2>
+              <button class="text-button" type="button" data-route="activity" data-i18n="activity.full">Full history</button>
+            </div>
+            <ol class="event-ledger" data-event-ledger>
+              <li class="loading-row"><span></span><i data-i18n="activity.waiting">Waiting for control-plane activity</i></li>
+            </ol>
+          </section>
+        </div>
+      </section>
+
+      <section class="view" data-view="system" aria-labelledby="system-title">
+        <div class="view-heading">
+          <h1 id="system-title" data-i18n="system.title">System overview</h1>
+          <button class="primary-button" type="button" data-refresh><svg aria-hidden="true"><use href="#icon-refresh"></use></svg><span data-i18n="refresh.probe">Refresh probe</span></button>
+        </div>
+        <div class="detail-grid">
+          <section class="detail-span-2 instrument-frame"><div class="frame-label"><h2 data-i18n="services.title">Service signals</h2></div><div class="data-table" data-services></div></section>
+          <section class="instrument-frame"><div class="frame-label"><h2 data-i18n="storage.title">Storage map</h2></div><div class="data-table" data-storage-list></div></section>
+          <section class="instrument-frame"><div class="frame-label"><h2 data-i18n="identity.title">System identity</h2></div><dl class="identity-list" data-identity></dl></section>
+        </div>
+      </section>
+
+      <section class="view" data-view="network" aria-labelledby="network-title">
+        <div class="view-heading"><h1 id="network-title" data-i18n="network.title">Network connections</h1></div>
+        <div class="network-map instrument-frame" data-network-map></div>
+      </section>
+
+      <section class="view" data-view="hardware" aria-labelledby="hardware-title">
+        <div class="view-heading"><h1 id="hardware-title" data-i18n="hardware.title">Hardware capabilities</h1></div>
+        <div class="hardware-matrix" data-hardware-matrix></div>
+      </section>
+
+      <section class="view" data-view="workflows" aria-labelledby="workflows-title">
+        <div class="view-heading"><h1 id="workflows-title" data-i18n="workflows.title">System operations</h1><div class="legend"><span data-risk="safe" data-i18n="risk.safe">Safe</span><span data-risk="guarded" data-i18n="risk.guarded">Guarded</span><span data-risk="high" data-i18n="risk.high">High</span><span data-risk="critical" data-i18n="risk.critical">Critical</span></div></div>
+        <div class="operations-stack">
+          <section id="source-manager" class="source-manager instrument-frame" aria-labelledby="source-manager-title" tabindex="-1">
+            <div class="frame-label">
+              <div class="source-heading"><span class="source-icon" aria-hidden="true"><svg><use href="#icon-sources"></use></svg></span><h2 id="source-manager-title" data-i18n="sources.title">Package mirrors</h2></div>
+              <div class="source-badges"><span class="risk-plate" data-risk="guarded" data-i18n="risk.guarded">Guarded</span><span class="privilege-plate" data-i18n="sources.root">Administrator authorization</span></div>
+            </div>
+            <div class="source-body">
+              <dl class="source-status" data-source-status aria-live="polite">
+                <div><dt data-i18n="sources.distribution">Distribution</dt><dd>—</dd></div>
+                <div><dt data-i18n="sources.systemCurrent">System source</dt><dd>—</dd></div>
+                <div><dt data-i18n="sources.radxaCurrent">Radxa source</dt><dd>—</dd></div>
+                <div><dt data-i18n="sources.managedFiles">Managed files</dt><dd>—</dd></div>
+              </dl>
+              <div class="source-workflow">
+                <label class="field-label" for="source-provider"><span data-i18n="sources.choose">Choose a trusted mirror</span>
+                  <select id="source-provider" data-source-provider disabled><option data-i18n="sources.loading">Detecting mirrors…</option></select>
+                </label>
+                <div class="provider-detail" data-source-provider-detail></div>
+                <button class="secondary-button" type="button" data-source-preview disabled><svg aria-hidden="true"><use href="#icon-search"></use></svg><span data-i18n="sources.preview">Preview changes</span></button>
+              </div>
+            </div>
+            <div class="source-plan" data-source-plan hidden aria-live="polite">
+              <div class="source-plan-head"><strong data-source-plan-title>—</strong><span data-source-plan-count>—</span></div>
+              <div class="source-diff-list" data-source-diff-list></div>
+              <div class="source-warnings" data-source-warnings></div>
+              <label class="confirm-line source-confirm">
+                <input type="checkbox" data-source-confirm />
+                <span data-i18n="sources.confirm">Reviewed. Back up, switch, and refresh package indexes.</span>
+              </label>
+              <div class="drawer-result source-result" data-source-result hidden></div>
+              <button class="execute-button source-apply" type="button" data-source-apply disabled><span data-i18n="sources.apply">Apply mirror</span><svg aria-hidden="true"><use href="#icon-run"></use></svg></button>
+            </div>
+          </section>
+          <div class="workflow-groups" data-workflow-table></div>
+        </div>
+      </section>
+
+      <section class="view" data-view="activity" aria-labelledby="activity-title">
+        <div class="view-heading"><h1 id="activity-title" data-i18n="activity.title">Activity record</h1></div>
+        <ol class="activity-timeline instrument-frame" data-activity-timeline></ol>
+      </section>
+    </main>
+
+    <footer class="status-rail" role="status" aria-live="polite">
+      <span class="status-identity"><i data-footer-signal></i><b data-footer-status data-i18n="status.starting">Control plane starting</b></span>
+      <span data-footer-detail data-i18n="status.connecting">Connecting to the local provider</span>
+      <button class="text-button" type="button" data-refresh data-i18n="refresh.now">Refresh now</button>
+    </footer>
+
+    <dialog class="task-drawer" data-task-drawer aria-labelledby="task-title">
+      <div class="drawer-head">
+        <div><span class="risk-plate" data-task-risk>SAFE</span><h2 id="task-title" data-task-title data-i18n="drawer.operation">Operation</h2></div>
+        <button class="icon-button" type="button" data-task-close aria-label="Close operation" data-i18n-aria="drawer.close"><svg aria-hidden="true"><use href="#icon-close"></use></svg></button>
+      </div>
+      <p class="drawer-description" data-task-description></p>
+      <div class="task-facts"><span><b data-task-time>--</b> <i data-i18n="drawer.estimated">estimated</i></span><span><b data-task-root>--</b> <i data-i18n="drawer.privilege">privilege</i></span></div>
+      <h3 data-i18n="drawer.procedure">Procedure</h3>
+      <ol class="procedure-list" data-task-steps></ol>
+      <label class="confirm-line" data-confirm-line>
+        <input type="checkbox" data-task-confirm />
+        <span data-i18n="drawer.confirm">I understand this operation can change the local board.</span>
+      </label>
+      <div class="drawer-result" data-task-result hidden></div>
+      <button class="execute-button" type="button" data-task-execute>
+        <span data-i18n="drawer.run">Run procedure</span><svg aria-hidden="true"><use href="#icon-run"></use></svg>
+      </button>
+    </dialog>
+
+    <dialog class="command-dialog" data-command-dialog>
+      <form method="dialog" class="command-shell">
+        <label class="command-search">
+          <svg aria-hidden="true"><use href="#icon-search"></use></svg>
+          <span class="sr-only" data-i18n="command.search">Search commands</span>
+          <input type="search" autocomplete="off" placeholder="Go to a section or run a procedure…" data-command-input data-i18n-placeholder="command.placeholder" />
+          <kbd>ESC</kbd>
+        </label>
+        <div class="command-results" data-command-results></div>
+      </form>
+    </dialog>
+
+    <div class="toast-stack" data-toasts aria-live="polite"></div>
+
+    <svg class="icon-sprite" aria-hidden="true">
+      <symbol id="icon-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"></circle><path d="m16 16 4 4"></path></symbol>
+      <symbol id="icon-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.5"></circle><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9 7 7M17 17l2.1 2.1M19.1 4.9 17 7M7 17l-2.1 2.1"></path></symbol>
+      <symbol id="icon-overview" viewBox="0 0 24 24"><path d="M4 4h6v6H4zM14 4h6v10h-6zM4 14h6v6H4zM14 18h6v2h-6z"></path></symbol>
+      <symbol id="icon-system" viewBox="0 0 24 24"><path d="M5 5h14v14H5zM8 9h8M8 12h5M8 15h7"></path></symbol>
+      <symbol id="icon-network" viewBox="0 0 24 24"><circle cx="12" cy="5" r="2.5"></circle><circle cx="5" cy="18" r="2.5"></circle><circle cx="19" cy="18" r="2.5"></circle><path d="M12 7.5v4M7 17l5-5 5 5"></path></symbol>
+      <symbol id="icon-chip" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10"></rect><path d="M9 2v5M15 2v5M9 17v5M15 17v5M2 9h5M17 9h5M2 15h5M17 15h5"></path></symbol>
+      <symbol id="icon-run" viewBox="0 0 24 24"><path d="M6 4h12v16H6zM9 8h6M9 12h4M9 16h6"></path><path d="m15 11 3 2-3 2"></path></symbol>
+      <symbol id="icon-pulse" viewBox="0 0 24 24"><path d="M3 12h4l2-6 4 12 2-6h6"></path></symbol>
+      <symbol id="icon-refresh" viewBox="0 0 24 24"><path d="M19 8a8 8 0 1 0 1 7M19 3v5h-5"></path></symbol>
+      <symbol id="icon-sources" viewBox="0 0 24 24"><path d="M4 6h11M4 12h16M4 18h11"></path><path d="m15 3 3 3-3 3M15 15l3 3-3 3"></path></symbol>
+      <symbol id="icon-debug" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10M14 4v6M6 14v6"></path><circle cx="14" cy="7" r="2"></circle><circle cx="8" cy="17" r="2"></circle></symbol>
+      <symbol id="icon-device-tree" viewBox="0 0 24 24"><circle cx="6" cy="5" r="2"></circle><circle cx="18" cy="8" r="2"></circle><circle cx="6" cy="19" r="2"></circle><path d="M8 5h3a3 3 0 0 1 3 3v8a3 3 0 0 1-3 3H8M14 8h2"></path></symbol>
+      <symbol id="icon-gpio" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="2"></rect><path d="M9 3v4M15 3v4M9 17v4M15 17v4M3 9h4M17 9h4M3 15h4M17 15h4M10 10h4v4h-4z"></path></symbol>
+      <symbol id="icon-video" viewBox="0 0 24 24"><rect x="3" y="6" width="14" height="12" rx="3"></rect><path d="m17 10 4-2v8l-4-2zM7 10h4M7 14h2"></path></symbol>
+      <symbol id="icon-thermal" viewBox="0 0 24 24"><path d="M10 14.5V5a3 3 0 0 1 6 0v9.5a5 5 0 1 1-6 0Z"></path><path d="M13 7v9M5 7h2M4 11h3"></path></symbol>
+      <symbol id="icon-spi-flash" viewBox="0 0 24 24"><rect x="6" y="5" width="12" height="14" rx="2"></rect><path d="M9 2v3M15 2v3M9 19v3M15 19v3M3 8h3M18 8h3M3 12h3M18 12h3M3 16h3M18 16h3M9 9h6M9 13h6"></path></symbol>
+      <symbol id="icon-close" viewBox="0 0 24 24"><path d="m5 5 14 14M19 5 5 19"></path></symbol>
+    </svg>
+
+    <script src="/i18n.js" defer></script>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

@@ -1,0 +1,220 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-09-03T05:05:39Z",
+  "title": "Design System: rsetup Soft Control Center",
+  "extensions": {
+    "colorMeta": {
+      "ground": { "role": "neutral", "displayName": "Pale Slate Ground", "canonical": "#f4f6fa", "tonalRamp": ["#202432", "#343a4e", "#596579", "#8791a3", "#b8c0d2", "#dce2ed", "#eef1f7", "#f4f6fa"] },
+      "surface": { "role": "neutral", "displayName": "Warm Cloud", "canonical": "#ffffff", "tonalRamp": ["#202432", "#343a4e", "#596579", "#8791a3", "#b8c0d2", "#dce2ed", "#f4f6fa", "#ffffff"] },
+      "field": { "role": "neutral", "displayName": "Soft Field", "canonical": "#eef1f7", "tonalRamp": ["#202432", "#343a4e", "#596579", "#8791a3", "#b8c0d2", "#dce2ed", "#eef1f7", "#f8f9fc"] },
+      "field-strong": { "role": "neutral", "displayName": "Pressed Field", "canonical": "#e5e9f3", "tonalRamp": ["#202432", "#343a4e", "#596579", "#8791a3", "#b8c0d2", "#dce2ed", "#e5e9f3", "#f4f6fa"] },
+      "line": { "role": "neutral", "displayName": "Soft Line", "canonical": "#dce2ed", "tonalRamp": ["#202432", "#343a4e", "#596579", "#8791a3", "#b8c0d2", "#dce2ed", "#eef1f7", "#f8f9fc"] },
+      "line-dim": { "role": "neutral", "displayName": "Quiet Line", "canonical": "#e9edf4", "tonalRamp": ["#202432", "#343a4e", "#596579", "#8791a3", "#b8c0d2", "#dce2ed", "#e9edf4", "#f8f9fc"] },
+      "ink": { "role": "neutral", "displayName": "Slate Ink", "canonical": "#293246", "tonalRamp": ["#202432", "#293246", "#454c62", "#596579", "#8791a3", "#b8c0d2", "#dce2ed", "#f4f5fb"] },
+      "ink-muted": { "role": "neutral", "displayName": "Muted Slate Ink", "canonical": "#596579", "tonalRamp": ["#202432", "#293246", "#454c62", "#596579", "#8791a3", "#b8c0d2", "#dce2ed", "#f4f5fb"] },
+      "indigo": { "role": "primary", "displayName": "Grounded Indigo", "canonical": "#5962a5", "tonalRamp": ["#272b3b", "#393f5a", "#4f5797", "#5962a5", "#7b84c4", "#aeb5ea", "#d9dcf5", "#eceefa"] },
+      "indigo-hover": { "role": "primary", "displayName": "Grounded Indigo Hover", "canonical": "#4f5797", "tonalRamp": ["#272b3b", "#393f5a", "#4f5797", "#5962a5", "#7b84c4", "#aeb5ea", "#d9dcf5", "#eceefa"] },
+      "on-indigo": { "role": "neutral", "displayName": "Cloud on Indigo", "canonical": "#ffffff", "tonalRamp": ["#272b3b", "#596579", "#8791a3", "#b8c0d2", "#dce2ed", "#eef1f7", "#f4f6fa", "#ffffff"] },
+      "indigo-soft": { "role": "primary", "displayName": "Indigo Mist", "canonical": "#eceefa", "tonalRamp": ["#272b3b", "#393f5a", "#4f5797", "#5962a5", "#7b84c4", "#aeb5ea", "#d9dcf5", "#eceefa"] },
+      "cyan": { "role": "secondary", "displayName": "Measured Cyan", "canonical": "#4e8199", "tonalRamp": ["#1c2d36", "#304654", "#3f6577", "#4e8199", "#6ca2b8", "#8ec3d7", "#bee0eb", "#e6f1f4"] },
+      "cyan-soft": { "role": "secondary", "displayName": "Measured Cyan Mist", "canonical": "#e6f1f4", "tonalRamp": ["#1c2d36", "#304654", "#3f6577", "#4e8199", "#6ca2b8", "#8ec3d7", "#bee0eb", "#e6f1f4"] },
+      "emerald": { "role": "secondary", "displayName": "Confirmed Emerald", "canonical": "#32715d", "tonalRamp": ["#18352d", "#304b45", "#285b4c", "#32715d", "#59947f", "#83c0aa", "#b8dfd2", "#e5f2ed"] },
+      "emerald-soft": { "role": "secondary", "displayName": "Confirmed Emerald Mist", "canonical": "#e5f2ed", "tonalRamp": ["#18352d", "#304b45", "#285b4c", "#32715d", "#59947f", "#83c0aa", "#b8dfd2", "#e5f2ed"] },
+      "amber": { "role": "secondary", "displayName": "Guard Amber", "canonical": "#87561f", "tonalRamp": ["#372714", "#4d4034", "#67451f", "#87561f", "#b28046", "#ddb078", "#efd1aa", "#f8eddf"] },
+      "amber-soft": { "role": "secondary", "displayName": "Guard Amber Mist", "canonical": "#f8eddf", "tonalRamp": ["#372714", "#4d4034", "#67451f", "#87561f", "#b28046", "#ddb078", "#efd1aa", "#f8eddf"] },
+      "coral": { "role": "tertiary", "displayName": "Critical Coral", "canonical": "#a83f50", "tonalRamp": ["#3b252d", "#533b45", "#7a3341", "#a83f50", "#c86b79", "#e89aa5", "#f3c5cc", "#fae9ec"] },
+      "coral-soft": { "role": "tertiary", "displayName": "Critical Coral Mist", "canonical": "#fae9ec", "tonalRamp": ["#3b252d", "#533b45", "#7a3341", "#a83f50", "#c86b79", "#e89aa5", "#f3c5cc", "#fae9ec"] },
+      "dark-ground": { "role": "neutral", "displayName": "Dark Slate Ground", "canonical": "#202432", "tonalRamp": ["#202432", "#293246", "#343a4e", "#596579", "#8791a3", "#b8c0d2", "#dce2ed", "#f4f5fb"] },
+      "dark-surface": { "role": "neutral", "displayName": "Dark Cloud", "canonical": "#2a2f41", "tonalRamp": ["#202432", "#2a2f41", "#454c62", "#596579", "#8791a3", "#b8c0d2", "#dce2ed", "#f4f5fb"] },
+      "dark-field": { "role": "neutral", "displayName": "Dark Soft Field", "canonical": "#343a4e", "tonalRamp": ["#202432", "#293246", "#343a4e", "#596579", "#8791a3", "#b8c0d2", "#dce2ed", "#f4f5fb"] },
+      "dark-field-strong": { "role": "neutral", "displayName": "Dark Pressed Field", "canonical": "#3c435a", "tonalRamp": ["#202432", "#293246", "#3c435a", "#596579", "#8791a3", "#b8c0d2", "#dce2ed", "#f4f5fb"] },
+      "dark-line": { "role": "neutral", "displayName": "Dark Soft Line", "canonical": "#454c62", "tonalRamp": ["#202432", "#293246", "#454c62", "#596579", "#8791a3", "#b8c0d2", "#dce2ed", "#f4f5fb"] },
+      "dark-line-dim": { "role": "neutral", "displayName": "Dark Quiet Line", "canonical": "#383e52", "tonalRamp": ["#202432", "#293246", "#383e52", "#596579", "#8791a3", "#b8c0d2", "#dce2ed", "#f4f5fb"] },
+      "dark-ink": { "role": "neutral", "displayName": "Dark Theme Ink", "canonical": "#f4f5fb", "tonalRamp": ["#202432", "#293246", "#454c62", "#596579", "#8791a3", "#b8c0d2", "#dce2ed", "#f4f5fb"] },
+      "dark-ink-muted": { "role": "neutral", "displayName": "Dark Theme Muted Ink", "canonical": "#b8c0d2", "tonalRamp": ["#202432", "#293246", "#454c62", "#596579", "#8791a3", "#b8c0d2", "#dce2ed", "#f4f5fb"] },
+      "dark-indigo": { "role": "primary", "displayName": "Dark Theme Indigo", "canonical": "#aeb5ea", "tonalRamp": ["#272b3b", "#393f5a", "#4f5797", "#5962a5", "#7b84c4", "#aeb5ea", "#d9dcf5", "#eceefa"] },
+      "dark-indigo-hover": { "role": "primary", "displayName": "Dark Theme Indigo Hover", "canonical": "#bec4f2", "tonalRamp": ["#272b3b", "#393f5a", "#4f5797", "#5962a5", "#7b84c4", "#aeb5ea", "#bec4f2", "#eceefa"] },
+      "dark-on-indigo": { "role": "neutral", "displayName": "Dark Theme Ink on Indigo", "canonical": "#272b3b", "tonalRamp": ["#202432", "#272b3b", "#454c62", "#596579", "#8791a3", "#b8c0d2", "#dce2ed", "#f4f5fb"] },
+      "dark-indigo-soft": { "role": "primary", "displayName": "Dark Theme Indigo Mist", "canonical": "#393f5a", "tonalRamp": ["#272b3b", "#393f5a", "#4f5797", "#5962a5", "#7b84c4", "#aeb5ea", "#d9dcf5", "#eceefa"] },
+      "dark-cyan": { "role": "secondary", "displayName": "Dark Theme Measured Cyan", "canonical": "#8ec3d7", "tonalRamp": ["#1c2d36", "#304654", "#3f6577", "#4e8199", "#6ca2b8", "#8ec3d7", "#bee0eb", "#e6f1f4"] },
+      "dark-cyan-soft": { "role": "secondary", "displayName": "Dark Theme Cyan Mist", "canonical": "#304654", "tonalRamp": ["#1c2d36", "#304654", "#3f6577", "#4e8199", "#6ca2b8", "#8ec3d7", "#bee0eb", "#e6f1f4"] },
+      "dark-emerald": { "role": "secondary", "displayName": "Dark Theme Confirmed Emerald", "canonical": "#83c0aa", "tonalRamp": ["#18352d", "#304b45", "#285b4c", "#32715d", "#59947f", "#83c0aa", "#b8dfd2", "#e5f2ed"] },
+      "dark-emerald-soft": { "role": "secondary", "displayName": "Dark Theme Emerald Mist", "canonical": "#304b45", "tonalRamp": ["#18352d", "#304b45", "#285b4c", "#32715d", "#59947f", "#83c0aa", "#b8dfd2", "#e5f2ed"] },
+      "dark-amber": { "role": "secondary", "displayName": "Dark Theme Guard Amber", "canonical": "#ddb078", "tonalRamp": ["#372714", "#4d4034", "#67451f", "#87561f", "#b28046", "#ddb078", "#efd1aa", "#f8eddf"] },
+      "dark-amber-soft": { "role": "secondary", "displayName": "Dark Theme Amber Mist", "canonical": "#4d4034", "tonalRamp": ["#372714", "#4d4034", "#67451f", "#87561f", "#b28046", "#ddb078", "#efd1aa", "#f8eddf"] },
+      "dark-coral": { "role": "tertiary", "displayName": "Dark Theme Critical Coral", "canonical": "#e89aa5", "tonalRamp": ["#3b252d", "#533b45", "#7a3341", "#a83f50", "#c86b79", "#e89aa5", "#f3c5cc", "#fae9ec"] },
+      "dark-coral-soft": { "role": "tertiary", "displayName": "Dark Theme Coral Mist", "canonical": "#533b45", "tonalRamp": ["#3b252d", "#533b45", "#7a3341", "#a83f50", "#c86b79", "#e89aa5", "#f3c5cc", "#fae9ec"] }
+    },
+    "typographyMeta": {
+      "display": { "displayName": "View Display", "purpose": "One dominant title for the active operating view." },
+      "headline": { "displayName": "Drawer Headline", "purpose": "Operation drawers and rare local emphasis." },
+      "title": { "displayName": "Cloud Title", "purpose": "Panel headings and subsystem names." },
+      "body": { "displayName": "Operational Body", "purpose": "Actions, explanations, procedures, and supporting context; Chinese presentation uses 1.62 line-height." },
+      "label": { "displayName": "Machine Label", "purpose": "Telemetry, risk, timestamps, shortcuts, and provider-derived values." },
+      "utility": { "displayName": "Utility Control", "purpose": "Compact top-rail language control labels." }
+    },
+    "shadows": [
+      { "name": "soft-float", "value": "0 12px 32px rgba(77, 89, 130, 0.10)", "purpose": "Status surfaces and light utility elevation." },
+      { "name": "cloud-lift", "value": "0 20px 48px rgba(77, 89, 130, 0.12)", "purpose": "Top chrome, navigation dock, and primary cloud panels." },
+      { "name": "hover-lift", "value": "0 24px 54px rgba(89, 98, 165, 0.18)", "purpose": "Interactive rows and cloud surfaces while hovered." },
+      { "name": "control-lift", "value": "0 8px 20px rgba(89, 98, 165, 0.13)", "purpose": "Compact icon wells and controls." },
+      { "name": "overlay-lift", "value": "0 28px 80px rgba(48, 57, 91, 0.24)", "purpose": "Drawers, command dialog, and toasts." },
+      { "name": "provider-resolve-peak", "value": "0 24px 56px rgba(89, 98, 165, 0.26)", "purpose": "Finite peak of the fresh-provider resolve halo." },
+      { "name": "focus-halo", "value": "0 0 0 5px rgba(89, 98, 165, 0.48)", "purpose": "Visible keyboard focus in the light theme." },
+      { "name": "dark-cloud-lift", "value": "0 20px 48px rgba(10, 14, 28, 0.25)", "purpose": "Theme-adjusted cloud elevation on dark surfaces." },
+      { "name": "dark-overlay-lift", "value": "0 28px 80px rgba(8, 11, 24, 0.42)", "purpose": "Theme-adjusted overlay elevation on dark surfaces." }
+    ],
+    "motion": [
+      { "name": "ease-soft", "value": "cubic-bezier(0.22, 1, 0.36, 1)", "purpose": "Finite provider resolution and drawer entry." },
+      { "name": "control-response", "value": "200ms ease-in-out", "purpose": "Compact hover lift, active press, color, and shadow changes." },
+      { "name": "surface-response", "value": "300ms ease-in-out", "purpose": "Cloud surface and operation-row lift." },
+      { "name": "provider-resolve", "value": "820ms var(--ease-soft)", "purpose": "One finite scale-and-halo confirmation after fresh provider state resolves." },
+      { "name": "drawer-entry", "value": "300ms var(--ease-soft)", "purpose": "Right-edge guided-operation drawer entry and exit." },
+      { "name": "meter-resolve", "value": "480ms var(--ease-soft)", "purpose": "Measured telemetry bar interpolation." },
+      { "name": "toast-arrival", "value": "300ms var(--ease-soft)", "purpose": "Short outcome-notification entry." },
+      { "name": "reduced-motion", "value": "1ms", "purpose": "Effectively instantaneous animation and transition duration when reduced motion is requested." }
+    ],
+    "breakpoints": [
+      { "name": "compact-desktop", "value": "1080px" },
+      { "name": "single-column-overview", "value": "860px" },
+      { "name": "bottom-navigation", "value": "780px" },
+      { "name": "narrow-mobile", "value": "560px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Action",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The grounded-indigo action for refreshing state or explicitly executing a procedure.",
+      "html": "<button class=\"ds-btn-primary\" type=\"button\"><svg aria-hidden=\"true\" viewBox=\"0 0 24 24\"><path d=\"M19 8a8 8 0 1 0 1 7M19 3v5h-5\"/></svg>Refresh probe</button>",
+      "css": ".ds-btn-primary{min-height:44px;display:inline-flex;align-items:center;justify-content:center;gap:10px;padding:11px 22px;border:0;border-radius:16px;background:var(--signal,#5962a5);color:var(--signal-ink,#fff);font:700 14px/1.55 'Rsetup Sans',sans-serif;box-shadow:0 12px 24px rgba(89,98,165,.25);cursor:pointer;transition:transform 200ms ease-in-out,box-shadow 200ms ease-in-out,background 200ms ease-in-out}.ds-btn-primary svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.ds-btn-primary:hover{transform:translateY(-2px);background:var(--signal-hover,#4f5797);box-shadow:0 18px 34px rgba(89,98,165,.30)}.ds-btn-primary:focus-visible{outline:0;box-shadow:0 0 0 5px var(--focus,rgba(89,98,165,.48))}.ds-btn-primary:active{transform:scale(.96);box-shadow:inset 0 5px 14px rgba(31,39,84,.24)}"
+    },
+    {
+      "name": "Theme Icon Button",
+      "kind": "button",
+      "refersTo": "button-icon",
+      "description": "A 44px tactile icon control held in a soft-indigo well.",
+      "html": "<button class=\"ds-icon-btn\" type=\"button\" aria-label=\"Toggle color theme\"><svg aria-hidden=\"true\" viewBox=\"0 0 24 24\"><circle cx=\"12\" cy=\"12\" r=\"3.5\"/><path d=\"M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9 7 7M17 17l2.1 2.1M19.1 4.9 17 7M7 17l-2.1 2.1\"/></svg></button>",
+      "css": ".ds-icon-btn{width:44px;height:44px;display:grid;place-items:center;border:0;border-radius:15px;background:var(--signal-soft,#eceefa);color:var(--signal,#5962a5);cursor:pointer;transition:transform 200ms ease-in-out,box-shadow 200ms ease-in-out,background 200ms ease-in-out}.ds-icon-btn svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.ds-icon-btn:hover{transform:translateY(-2px);background:var(--ground-2,#fff);box-shadow:var(--shadow-control,0 8px 20px rgba(89,98,165,.13))}.ds-icon-btn:focus-visible{outline:0;box-shadow:0 0 0 5px var(--focus,rgba(89,98,165,.48))}.ds-icon-btn:active{transform:scale(.95);box-shadow:inset 0 3px 9px rgba(77,89,130,.12)}"
+    },
+    {
+      "name": "Language Control",
+      "kind": "button",
+      "refersTo": "language-control",
+      "description": "The 44px top-rail locale switch whose label names the alternate presentation language.",
+      "html": "<button class=\"ds-language\" type=\"button\" aria-label=\"切换为中文\">中文</button>",
+      "css": ".ds-language{min-width:54px;height:44px;padding:0 13px;border:0;border-radius:16px;background:var(--field,#eef1f7);color:var(--bone-muted,#596579);box-shadow:var(--shadow-control,0 8px 20px rgba(89,98,165,.13));font:800 12px/1 'Rsetup Sans','PingFang SC','Microsoft YaHei','Noto Sans CJK SC',sans-serif;letter-spacing:.02em;cursor:pointer;transition:color 200ms ease-in-out,transform 200ms ease-in-out,background 200ms ease-in-out}.ds-language:hover{transform:translateY(-2px);color:var(--signal,#5962a5);background:var(--signal-soft,#eceefa)}.ds-language:focus-visible{outline:0;box-shadow:0 0 0 5px var(--focus,rgba(89,98,165,.48))}.ds-language:active{transform:scale(.96)}"
+    },
+    {
+      "name": "Route Navigation Item",
+      "kind": "nav",
+      "refersTo": "navigation-route",
+      "description": "A rounded route cell with a circular icon well and independent active treatment.",
+      "html": "<button class=\"ds-route is-active\" type=\"button\" aria-current=\"page\"><svg aria-hidden=\"true\" viewBox=\"0 0 24 24\"><path d=\"M4 4h6v6H4zM14 4h6v10h-6zM4 14h6v6H4zM14 18h6v2h-6z\"/></svg><span>Overview</span></button>",
+      "css": ".ds-route{min-height:72px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:7px;padding:7px 4px;border:0;border-radius:20px;background:transparent;color:var(--bone-muted,#596579);font:500 11px/1.3 'Rsetup Mono',monospace;cursor:pointer;transition:transform 200ms ease-in-out,background 200ms ease-in-out,color 200ms ease-in-out,box-shadow 200ms ease-in-out}.ds-route svg{width:34px;height:34px;padding:8px;border-radius:999px;background:var(--field,#eef1f7);fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.ds-route:hover{transform:translateY(-2px);background:var(--field,#eef1f7);color:var(--bone,#293246);box-shadow:0 8px 18px rgba(77,89,130,.08)}.ds-route.is-active{background:var(--signal-soft,#eceefa);color:var(--signal,#5962a5);font-weight:700}.ds-route.is-active svg{background:var(--signal,#5962a5);color:var(--signal-ink,#fff);box-shadow:var(--shadow-control,0 8px 20px rgba(89,98,165,.13))}.ds-route:focus-visible{outline:0;box-shadow:0 0 0 5px var(--focus,rgba(89,98,165,.48))}.ds-route:active{transform:scale(.96);box-shadow:inset 0 3px 9px rgba(77,89,130,.10)}"
+    },
+    {
+      "name": "Risk Chips",
+      "kind": "chip",
+      "refersTo": "chip-risk-safe",
+      "description": "Written safe, guarded, and critical risk labels on soft semantic fills.",
+      "html": "<div class=\"ds-risk-row\"><span class=\"ds-risk ds-safe\">safe</span><span class=\"ds-risk ds-guarded\">guarded</span><span class=\"ds-risk ds-critical\">critical</span></div>",
+      "css": ".ds-risk-row{display:flex;flex-wrap:wrap;gap:8px}.ds-risk{min-width:68px;display:inline-flex;align-items:center;justify-content:center;padding:5px 8px;border-radius:12px;font:700 11px/1.3 'Rsetup Mono',monospace;text-align:center}.ds-safe{background:var(--success-soft,#e5f2ed);color:var(--success,#32715d)}.ds-guarded{background:var(--amber-soft,#f8eddf);color:var(--amber,#87561f)}.ds-critical{background:var(--coral-soft,#fae9ec);color:var(--coral,#a83f50)}"
+    },
+    {
+      "name": "Cloud Surface",
+      "kind": "card",
+      "refersTo": "card-cloud",
+      "description": "The primary warm, deeply rounded container for board state or guided operations.",
+      "html": "<section class=\"ds-cloud\"><header><h3>Board health</h3><span>updated just now</span></header><div class=\"ds-cloud-field\">Local device connected</div></section>",
+      "css": ".ds-cloud{padding:28px;border:0;border-radius:30px;background:var(--ground-2,#fff);color:var(--bone,#293246);font:400 14px/1.55 'Rsetup Sans',sans-serif;box-shadow:var(--shadow-card,0 20px 48px rgba(77,89,130,.12));transition:transform 300ms ease-in-out,box-shadow 300ms ease-in-out}.ds-cloud:hover{transform:translateY(-2px);box-shadow:var(--shadow-hover,0 24px 54px rgba(89,98,165,.18))}.ds-cloud header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px}.ds-cloud h3{margin:0;font-size:18px;font-weight:800;letter-spacing:-.02em}.ds-cloud header span{color:var(--bone-muted,#596579);font-size:12px}.ds-cloud-field{min-height:120px;display:grid;place-items:center;padding:20px;border-radius:24px;background:var(--field,#eef1f7);color:var(--signal,#5962a5);font-weight:700}"
+    },
+    {
+      "name": "Command Search Field",
+      "kind": "input",
+      "refersTo": "input-command",
+      "description": "A generous soft field whose halo belongs to the complete search control.",
+      "html": "<label class=\"ds-command-search\"><svg aria-hidden=\"true\" viewBox=\"0 0 24 24\"><circle cx=\"11\" cy=\"11\" r=\"6.5\"/><path d=\"m16 16 4 4\"/></svg><span class=\"ds-sr\">Search commands</span><input type=\"search\" placeholder=\"Go to a section or run a procedure…\"/><kbd>ESC</kbd></label>",
+      "css": ".ds-command-search{min-height:70px;display:flex;align-items:center;gap:13px;padding:0 16px;border-radius:20px;background:var(--field,#eef1f7);color:var(--bone,#293246)}.ds-command-search svg{width:20px;height:20px;color:var(--signal,#5962a5);fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.ds-command-search input{flex:1;min-width:0;padding:13px 0;border:0;outline:0;background:transparent;color:var(--bone,#293246);font:400 16px/1.55 'Rsetup Sans',sans-serif;caret-color:var(--signal,#5962a5)}.ds-command-search input::placeholder{color:var(--bone-muted,#596579)}.ds-command-search:focus-within{box-shadow:0 0 0 5px var(--focus,rgba(89,98,165,.48))}.ds-command-search kbd{padding:4px 8px;border-radius:9px;background:var(--ground-2,#fff);color:var(--bone-muted,#596579);font:500 11px/1.3 'Rsetup Mono',monospace}.ds-sr{position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap}"
+    },
+    {
+      "name": "Guided Operation Row",
+      "kind": "custom",
+      "refersTo": "card-cloud",
+      "description": "A full-width tactile procedure entry combining risk, purpose, timing, and invocation.",
+      "html": "<button class=\"ds-operation\" type=\"button\"><span class=\"ds-operation-risk\">guarded</span><span class=\"ds-operation-copy\"><strong>Enable remote shell</strong><span>Connect · 3 steps · ~8s</span></span><span class=\"ds-operation-icon\" aria-hidden=\"true\"><svg viewBox=\"0 0 24 24\"><path d=\"M6 4h12v16H6zM9 8h6M9 12h4M9 16h6\"/></svg></span></button>",
+      "css": ".ds-operation{width:100%;min-height:68px;display:grid;grid-template-columns:76px minmax(0,1fr) 34px;align-items:center;gap:12px;padding:11px 12px;border:0;border-radius:20px;background:var(--field,#eef1f7);color:var(--bone,#293246);text-align:left;cursor:pointer;transition:transform 300ms ease-in-out,box-shadow 300ms ease-in-out,background 300ms ease-in-out}.ds-operation-risk{min-width:68px;display:inline-flex;align-items:center;justify-content:center;padding:5px 8px;border-radius:12px;background:var(--amber-soft,#f8eddf);color:var(--amber,#87561f);font:700 11px/1.3 'Rsetup Mono',monospace}.ds-operation-copy strong,.ds-operation-copy span{display:block}.ds-operation-copy strong{font:700 13px/1.4 'Rsetup Sans',sans-serif}.ds-operation-copy span{margin-top:2px;color:var(--bone-muted,#596579);font-size:11px}.ds-operation-icon{width:34px;height:34px;display:grid;place-items:center;border-radius:999px;background:var(--ground-2,#fff);color:var(--signal,#5962a5)}.ds-operation-icon svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.ds-operation:hover{transform:translateY(-2px);background:var(--ground-2,#fff);box-shadow:var(--shadow-hover,0 24px 54px rgba(89,98,165,.18))}.ds-operation:focus-visible{outline:0;box-shadow:0 0 0 5px var(--focus,rgba(89,98,165,.48))}.ds-operation:active{transform:scale(.98);box-shadow:inset 0 4px 12px rgba(77,89,130,.10)}"
+    },
+    {
+      "name": "Package Mirror Change Plan",
+      "kind": "custom",
+      "refersTo": "guarded-change-plan",
+      "description": "The trusted-provider workflow, compact source status, per-file diff, privilege boundary, and exact-plan acknowledgement for package mirror changes.",
+      "html": "<section class=\"ds-mirror\"><header class=\"ds-mirror-head\"><div><h3>Package mirrors</h3><p>Switch recognized system and Radxa sources with a reviewable plan.</p></div><div class=\"ds-mirror-badges\"><span class=\"ds-mirror-guard\">Guarded</span><span class=\"ds-mirror-root\">Administrator authorization</span></div></header><div class=\"ds-mirror-body\"><dl class=\"ds-mirror-status\"><div><dt>Distribution</dt><dd>Debian 12 · arm64</dd></div><div><dt>System source</dt><dd>Official</dd></div><div><dt>Radxa source</dt><dd>Official</dd></div><div><dt>Managed files</dt><dd>2</dd></div></dl><div class=\"ds-mirror-workflow\"><label>Choose a trusted mirror<select><option>CQU Mirrors · Chongqing, CN</option></select></label><p>System supported · Radxa supported</p><button class=\"ds-mirror-preview\" type=\"button\">Preview changes</button></div></div><div class=\"ds-mirror-plan\"><header><strong>CQU Mirrors</strong><span>3 entries · 2 files</span></header><article><header><strong>/etc/apt/sources.list.d/debian.sources</strong><span>2 replacements</span></header><pre><i class=\"ds-mirror-remove\">- URIs: https://deb.debian.org/debian</i><i class=\"ds-mirror-add\">+ URIs: https://mirrors.cqu.edu.cn/debian</i></pre></article><label class=\"ds-mirror-confirm\"><input type=\"checkbox\"/><span>I reviewed this exact file plan and authorize the privileged change.</span></label><button class=\"ds-mirror-apply\" type=\"button\" disabled>Apply mirror</button></div></section>",
+      "css": ".ds-mirror{padding:24px;border-radius:30px;background:var(--ground-2,#fff);color:var(--bone,#293246);font:400 14px/1.55 'Rsetup Sans',sans-serif;box-shadow:var(--shadow-card,0 20px 48px rgba(77,89,130,.12))}.ds-mirror-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px}.ds-mirror h3{margin:0;font-size:18px;font-weight:800;letter-spacing:-.02em}.ds-mirror-head p{max-width:58ch;margin:5px 0 0;color:var(--bone-muted,#596579);font-size:13px}.ds-mirror-badges{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:8px}.ds-mirror-guard,.ds-mirror-root{display:inline-flex;align-items:center;min-height:26px;padding:5px 9px;border-radius:12px;font:500 11px/1.3 'Rsetup Mono',monospace}.ds-mirror-guard{background:var(--amber-soft,#f8eddf);color:var(--amber,#87561f);font-weight:700}.ds-mirror-root{background:var(--field,#eef1f7);color:var(--bone-muted,#596579)}.ds-mirror-body{display:grid;grid-template-columns:minmax(0,.92fr) minmax(260px,1.08fr);gap:18px;margin-top:20px}.ds-mirror-status{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:0}.ds-mirror-status div,.ds-mirror-workflow{padding:13px 14px;border-radius:18px;background:var(--field,#eef1f7)}.ds-mirror-status dt{color:var(--bone-muted,#596579);font-size:11px}.ds-mirror-status dd{margin:5px 0 0;overflow:hidden;font:500 11px/1.3 'Rsetup Mono',monospace;text-overflow:ellipsis;white-space:nowrap}.ds-mirror-workflow{border-radius:22px}.ds-mirror-workflow label{display:block;color:var(--bone-muted,#596579);font-size:12px;font-weight:700}.ds-mirror-workflow select{width:100%;min-height:48px;margin-top:8px;padding:0 14px;border:0;border-radius:15px;background:var(--ground-2,#fff);color:var(--bone,#293246);box-shadow:inset 0 0 0 1px var(--line-dim,#e9edf4),var(--shadow-soft,0 12px 32px rgba(77,89,130,.10))}.ds-mirror-workflow select:focus-visible,.ds-mirror-preview:focus-visible,.ds-mirror-confirm:focus-within{outline:0;box-shadow:0 0 0 5px var(--focus,rgba(89,98,165,.48))}.ds-mirror-workflow p{margin:12px 2px;color:var(--bone-muted,#596579);font-size:12px}.ds-mirror-preview{min-height:44px;padding:10px 16px;border:0;border-radius:15px;background:var(--signal-soft,#eceefa);color:var(--signal,#5962a5);font-weight:700;cursor:pointer;box-shadow:var(--shadow-control,0 8px 20px rgba(89,98,165,.13));transition:transform 200ms ease-in-out,box-shadow 200ms ease-in-out}.ds-mirror-preview:hover{transform:translateY(-2px);box-shadow:var(--shadow-hover,0 24px 54px rgba(89,98,165,.18))}.ds-mirror-plan{margin-top:18px;padding:20px;border-radius:24px;background:var(--field,#eef1f7)}.ds-mirror-plan>header,.ds-mirror-plan article>header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.ds-mirror-plan>header>strong{font-size:17px}.ds-mirror-plan header span{color:var(--bone-muted,#596579);font:500 11px/1.3 'Rsetup Mono',monospace}.ds-mirror-plan article{overflow:hidden;margin-top:16px;border-radius:18px;background:var(--ground-2,#fff)}.ds-mirror-plan article>header{padding:12px 14px;border-bottom:1px solid var(--line-dim,#e9edf4)}.ds-mirror-plan article>header strong{overflow-wrap:anywhere;font:500 11px/1.3 'Rsetup Mono',monospace}.ds-mirror-plan pre{margin:0;padding:13px 14px;white-space:pre-wrap;font:500 11px/1.6 'Rsetup Mono',monospace}.ds-mirror-plan pre i{display:block;font-style:normal;overflow-wrap:anywhere}.ds-mirror-remove{color:var(--coral,#a83f50)}.ds-mirror-add{color:var(--success,#32715d)}.ds-mirror-confirm{min-height:52px;display:flex;align-items:flex-start;gap:12px;margin-top:16px;padding:16px;border-radius:18px;background:var(--ground-2,#fff);cursor:pointer}.ds-mirror-confirm input{width:19px;height:19px;flex:0 0 auto;margin:1px 0 0;accent-color:var(--signal,#5962a5)}.ds-mirror-apply{min-height:52px;margin-top:14px;padding:11px 22px;border:0;border-radius:18px;background:var(--field-strong,#e5e9f3);color:var(--bone-muted,#596579);font-weight:700;cursor:not-allowed}.ds-mirror-apply:not(:disabled){background:var(--signal,#5962a5);color:var(--signal-ink,#fff);cursor:pointer}.ds-mirror-apply:not(:disabled):hover{transform:translateY(-2px)}@media(max-width:560px){.ds-mirror-head{display:block}.ds-mirror-badges{justify-content:flex-start;margin-top:14px}.ds-mirror-body{display:flex;flex-direction:column}.ds-mirror-workflow{order:1}.ds-mirror-status{order:2}.ds-mirror-plan{padding:16px}.ds-mirror-plan>header{display:block}.ds-mirror-plan>header span{display:block;margin-top:8px}}"
+    },
+    {
+      "name": "Guarded Confirmation",
+      "kind": "custom",
+      "refersTo": "chip-risk-guarded",
+      "description": "The explicit acknowledgement boundary before any non-safe procedure becomes executable.",
+      "html": "<label class=\"ds-confirm\"><input type=\"checkbox\"/><span>I understand this operation can change the local board.</span></label>",
+      "css": ".ds-confirm{min-height:52px;display:flex;align-items:flex-start;gap:12px;padding:16px;border-radius:18px;background:var(--amber-soft,#f8eddf);color:var(--amber,#87561f);font:400 14px/1.55 'Rsetup Sans',sans-serif;cursor:pointer}.ds-confirm input{width:19px;height:19px;flex:0 0 auto;margin:1px 0 0;accent-color:var(--signal,#5962a5)}.ds-confirm:hover{box-shadow:0 8px 20px rgba(135,86,31,.10)}.ds-confirm:focus-within{box-shadow:0 0 0 5px var(--focus,rgba(89,98,165,.48))}.ds-confirm:active{box-shadow:inset 0 3px 9px rgba(135,86,31,.12)}"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Calm Control Cloud",
+    "overview": "rsetup turns a serious local SBC control plane into a calm, tactile workspace. A pale slate ground supports warm white cloud surfaces, low-saturation indigo actions, softly colored feedback, and generous breathing room. The result should feel approachable and touchable while remaining explicit about provider truth, synthetic data, privilege, risk, and execution state.\n\nThe system uses rounded geometry and diffused depth to create an orderly operating environment rather than an austere instrument wall. The board-health stage remains the visual anchor; guided procedures, capability state, and recent activity sit in clearly separated surfaces that reduce cognitive pressure. Circular icon wells provide a recurring visual signature without turning the interface playful.\n\nThe light theme is the primary expression. The optional dark theme remaps the same semantic roles to deep blue-slate surfaces and lifted pastel signals; it does not change hierarchy, interaction, or risk meaning.\n\nEnglish and Simplified Chinese are equal presentation locales. Locale changes replace static, provider-derived, action, result, and accessibility copy as one presentation update while leaving the control plane and its machine contracts unchanged.",
+    "keyCharacteristics": [
+      "Pale slate canvas and warm white cloud surfaces.",
+      "Low-saturation indigo for actions, selection, focus, and the resolved board state.",
+      "Deep rounding, circular icon wells, generous spacing, and diffused tinted shadows.",
+      "A board-first overview with a generous guided-operations companion surface.",
+      "Hover lift, pillow-like press feedback, and a broad halo for keyboard focus.",
+      "Risk and provider truth communicated through words and structure as well as color.",
+      "Equal English and Simplified Chinese presentation with locale-neutral control-plane semantics."
+    ],
+    "rules": [
+      { "name": "The Semantic Color Rule", "body": "Safe, guarded, critical, demo, running, success, and error states always include readable language or a structural cue; hue only reinforces the meaning.", "section": "colors" },
+      { "name": "The Quiet Indigo Rule", "body": "Indigo identifies action, selection, focus, or provider resolution. It is not a general-purpose decorative wash.", "section": "colors" },
+      { "name": "The Theme Role Rule", "body": "The optional dark theme changes values, never semantic roles or risk meaning. Components consume the shared semantic variables.", "section": "colors" },
+      { "name": "The Human First Rule", "body": "Use the sans face for actions and explanations; reserve mono for values or compact labels that genuinely come from the control plane.", "section": "typography" },
+      { "name": "The One Display Moment Rule", "body": "Each view gets one large title. Repeating display scale inside panels collapses the hierarchy.", "section": "typography" },
+      { "name": "The CJK Coverage Rule", "body": "Chinese presentation inherits the Rsetup Sans-first CJK fallback stack and 1.62 body line-height; missing glyph boxes and Latin-density line spacing are release defects.", "section": "typography" },
+      { "name": "The Board-First Rule", "body": "Responsive reflow may move supporting information, but board identity and health remain the first and strongest content block.", "section": "layout" },
+      { "name": "The Floating-Rail Accounting Rule", "body": "Workspace, drawer, status, and toast insets must account for the top bar and current navigation dock so content and feedback never hide behind fixed chrome.", "section": "layout" },
+      { "name": "The Touch Floor Rule", "body": "Every interactive target is at least 44px in one dimension, with enough spacing to avoid accidental adjacent activation.", "section": "layout" },
+      { "name": "The Soft Depth Rule", "body": "Use tinted diffusion and tonal layering. Hard frames and high-contrast drop shadows do not belong in the default Soft UI.", "section": "elevation" },
+      { "name": "The Finite Halo Rule", "body": "The provider halo runs once after the initial resolution or a user-requested refresh, then returns to the normal cloud shadow. It never pulses at rest or repeats during quiet polling.", "section": "elevation" },
+      { "name": "The Cloud Silhouette Rule", "body": "New primary surfaces should read as calm, generous volumes with large radii and internal space, not cramped boxes.", "section": "shapes" },
+      { "name": "The Circular Well Rule", "body": "Use circular wells for compact line icons and state signals; keep their color semantic and their size subordinate to text.", "section": "shapes" },
+      { "name": "The Procedure-not-Button Rule", "body": "Mutating work must expose impact, prerequisites, risk, confirmation, running state, and result; never reduce a recovery-sensitive operation to an isolated action.", "section": "components" },
+      { "name": "The Reviewed Plan Rule", "body": "A privileged change may execute only the exact per-file plan the user reviewed; stale state invalidates confirmation instead of silently rebuilding or substituting a plan.", "section": "components" },
+      { "name": "The Purposeful Motion Rule", "body": "Use 200–300ms transitions for lift, press, and spatial entry, and the soft ease for finite resolution. Reduced-motion preference collapses animations and transitions to 1ms.", "section": "components" },
+      { "name": "The Presentation-only Locale Rule", "body": "Locale may change every human-facing string and its reflow, but never the operation selected, its risk, its confirmation boundary, or any stable machine identifier or value.", "section": "components" }
+    ],
+    "dos": [
+      "Do keep board identity and current state legible before presenting operations.",
+      "Do use pale slate, warm cloud surfaces, grounded indigo, large radii, and softly tinted depth as the default visual grammar.",
+      "Do preserve visible focus, the skip link, native dialog behavior, focus return, reduced-motion handling, and 44px touch targets.",
+      "Do pair every risk, provider, synthetic, running, success, and error state with readable language and structural treatment.",
+      "Do keep synthetic telemetry visibly labelled and mutating synthetic actions explicitly dry-run.",
+      "Do preserve the same semantic roles when offering the optional dark theme.",
+      "Do switch static, dynamic, and accessibility copy together, including document language and title, and search the localized route and action catalog.",
+      "Do verify both locales against the four committed i18n evidence screenshots, including the 390px mobile viewport.",
+      "Do show trusted-provider scope, affected paths, exact before/after lines, privilege, and confirmation before applying a package-mirror plan.",
+      "Do keep the actionable mirror workflow before the passive status summary at 560px and below."
+    ],
+    "donts": [
+      "Don't reintroduce hostile industrial-console styling, neon accents, etched frames, or dense instrument decoration.",
+      "Don't remove generous spacing or deep rounding to fit more controls above the fold.",
+      "Don't use permanent glow, pulsing ambience, or repeated provider resolution during background polling.",
+      "Don't make dangerous operations feel safe through friendly styling; retain explicit risk, impact, privilege, acknowledgement, and result copy.",
+      "Don't encode safe, guarded, critical, demo, or error states through color alone.",
+      "Don't hide primary board state, touch target size, or risk information to simplify narrow layouts.",
+      "Don't translate or remap API IDs, action IDs, risk meaning, confirmation gates, or machine-readable values.",
+      "Don't preserve acknowledgement when the package-source revision changes, or apply a plan other than the one shown in the current diff."
+    ]
+  }
+}
