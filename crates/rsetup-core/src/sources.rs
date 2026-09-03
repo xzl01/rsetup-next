@@ -581,18 +581,19 @@ fn transform_document(
         let mut updated = (*line).to_string();
         let mut edits = Vec::new();
         for (start, end, uri) in uri_tokens(line) {
-            if let Some((kind, _, suffix)) = classify_uri(uri, distribution_id)
-                && let Some(target) = target_uri(
+            if let Some((kind, _, suffix)) = classify_uri(uri, distribution_id) {
+                if let Some(target) = target_uri(
                     provider,
                     kind,
                     distribution_id,
                     architecture,
                     security.get(index).copied().unwrap_or(false),
                     &suffix,
-                )
-                && target != uri.trim_end_matches('/')
-            {
-                edits.push((start, end, target));
+                ) {
+                    if target != uri.trim_end_matches('/') {
+                        edits.push((start, end, target));
+                    }
+                }
             }
         }
         for (start, end, target) in edits.iter().rev() {
@@ -696,11 +697,13 @@ fn security_hints(lines: &[&str], format: &str) -> Vec<bool> {
 fn classify_uri(uri: &str, distribution_id: &str) -> Option<(SourceKind, &'static str, String)> {
     let normalized = uri.trim_end_matches('/');
     for provider in PROVIDERS {
-        if let Some(base) = provider.radxa_base
-            && base != "distribution-default"
-            && let Some(suffix) = strip_uri_base(normalized, base)
-        {
-            return Some((SourceKind::Radxa, provider.id, suffix));
+        if let Some(base) = provider.radxa_base {
+            if base == "distribution-default" {
+                continue;
+            }
+            if let Some(suffix) = strip_uri_base(normalized, base) {
+                return Some((SourceKind::Radxa, provider.id, suffix));
+            }
         }
     }
 

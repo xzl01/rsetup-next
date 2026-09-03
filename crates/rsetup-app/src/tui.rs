@@ -49,23 +49,23 @@ fn run_loop(
     let mut state = App::new(controller, locale)?;
     loop {
         terminal.draw(|frame| render(frame, &mut state))?;
-        if event::poll(Duration::from_millis(250))?
-            && let Event::Key(key) = event::read()?
-        {
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            match key.code {
-                KeyCode::Char('q') => break,
-                KeyCode::Esc if state.source_picker => state.close_source_picker(),
-                KeyCode::Esc => break,
-                KeyCode::Char('j') | KeyCode::Down => state.next(),
-                KeyCode::Char('k') | KeyCode::Up => state.previous(),
-                KeyCode::Char('r') => state.refresh()?,
-                KeyCode::Enter => state.request_run(),
-                KeyCode::Char('y') if state.confirm_pending => state.execute_selected()?,
-                KeyCode::Char('n') if state.confirm_pending => state.confirm_pending = false,
-                _ => {}
+        if event::poll(Duration::from_millis(250))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Char('q') => break,
+                    KeyCode::Esc if state.source_picker => state.close_source_picker(),
+                    KeyCode::Esc => break,
+                    KeyCode::Char('j') | KeyCode::Down => state.next(),
+                    KeyCode::Char('k') | KeyCode::Up => state.previous(),
+                    KeyCode::Char('r') => state.refresh()?,
+                    KeyCode::Enter => state.request_run(),
+                    KeyCode::Char('y') if state.confirm_pending => state.execute_selected()?,
+                    KeyCode::Char('n') if state.confirm_pending => state.confirm_pending = false,
+                    _ => {}
+                }
             }
         }
     }
