@@ -1,4 +1,4 @@
-# This third-party package is not submitted through Debian's ITP process.
+# Packages are published and maintained only by the rsetup-next repository.
 rsetup-next: initial-upload-closes-no-bugs
 
 # The executable is intentionally static for Debian 12 runtime compatibility.

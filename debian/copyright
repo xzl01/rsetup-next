@@ -28,9 +28,11 @@ License: OFL-1.1
 Files: ui/assets/vendor-cix.png
        ui/assets/vendor-partners.webp
 Copyright: respective trademark owners
-License: not-established
- These marks are included for nominative device-vendor identification.
- Redistribution permission has not been established; see debian/README.source.
+License: vendor-marks-reserved
+ These marks remain the property of their respective owners and are included
+ only for device-vendor identification. The rsetup-next project does not claim
+ ownership of or relicense them. They are not covered by the GPL-3+ license
+ applied to the rest of this project.
 
 License: GPL-3+
  This program is free software; you can redistribute it and/or modify

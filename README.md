@@ -155,13 +155,17 @@ make deb
 
 `deb-prepare` downloads locked Rust dependencies into an ignored, package-local
 Cargo cache. The following `dpkg-buildpackage` step runs Cargo in offline mode.
-For Debian archive submission, replace this cache with Debian-packaged or
-properly vendored crates as described in `debian/README.source`.
+The generated packages are maintained and distributed only through this
+repository; they are not intended for submission to the Debian archive.
 
 Packages are built on Debian 13/Trixie with Rust 1.85 or newer, then installed
 and smoke-tested on Debian 12/Bookworm. Bookworm is the runtime compatibility
 baseline; its Rust 1.63 toolchain is not used for source builds. CI validates
 both amd64 and arm64 packages.
+
+SoC vendor marks under `ui/assets` remain the property of their respective
+owners. They are used only for device-vendor identification and are not
+relicensed under this project's GPL-3+ license.
 
 ## Hardware validation boundary
 
