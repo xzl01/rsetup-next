@@ -85,6 +85,12 @@
       <button class="route-button" type="button" data-route="activity">
         <svg aria-hidden="true"><use href="#icon-pulse"></use></svg><span data-i18n="route.activity">Activity</span>
       </button>
+      <button class="route-button" type="button" data-route="help">
+        <svg aria-hidden="true"><use href="#icon-help"></use></svg><span data-i18n="route.help">FAQ</span>
+      </button>
+      <button class="contact-launcher" type="button" data-contact-open aria-label="Contact Radxa" data-i18n-aria="contact.open">
+        <svg aria-hidden="true"><use href="#icon-community"></use></svg><span data-i18n="contact.short">Contact</span>
+      </button>
     </nav>
 
     <main id="workspace" class="workspace" tabindex="-1">
@@ -239,6 +245,32 @@
         <div class="view-heading"><h1 id="activity-title" data-i18n="activity.title">Activity record</h1></div>
         <ol class="activity-timeline instrument-frame" data-activity-timeline></ol>
       </section>
+
+      <section class="view" data-view="help" aria-labelledby="help-title">
+        <div class="view-heading help-heading">
+          <div>
+            <h1 id="help-title" data-i18n="help.title">Help & support</h1>
+            <p data-i18n="help.lede">Board-aware answers and official resources.</p>
+          </div>
+          <div class="help-heading-actions">
+            <span class="help-board-badge" data-help-board>—</span>
+            <button class="secondary-button help-contact-button" type="button" data-contact-open>
+              <svg aria-hidden="true"><use href="#icon-community"></use></svg><span data-i18n="contact.short">Contact</span>
+            </button>
+          </div>
+        </div>
+        <div class="help-layout">
+          <section class="help-library instrument-frame" aria-labelledby="help-library-title">
+            <header class="help-library-head">
+              <span class="help-icon" aria-hidden="true"><svg><use href="#icon-help"></use></svg></span>
+              <div><h2 id="help-library-title" data-help-library-title>Board help</h2><p data-help-library-description></p></div>
+            </header>
+            <div class="help-link-list" data-help-links></div>
+            <div class="faq-heading"><h2 data-i18n="help.faq.title">Frequently asked questions</h2><span data-i18n="help.faq.scope">For this board</span></div>
+            <div class="faq-list" data-help-faq></div>
+          </section>
+        </div>
+      </section>
     </main>
 
     <footer class="status-rail" role="status" aria-live="polite">
@@ -291,6 +323,38 @@
       </form>
     </dialog>
 
+    <dialog class="contact-dialog" data-contact-dialog aria-labelledby="contact-dialog-title" aria-describedby="contact-dialog-description">
+      <header class="contact-dialog-head">
+        <span class="contact-dialog-icon" aria-hidden="true"><svg><use href="#icon-community"></use></svg></span>
+        <div>
+          <h2 id="contact-dialog-title" data-i18n="contact.title">Talk to the community</h2>
+          <p id="contact-dialog-description" data-i18n="contact.description">Scan an official QR code or choose another Radxa community channel.</p>
+        </div>
+        <button class="icon-button" type="button" data-contact-close aria-label="Close contact options" data-i18n-aria="contact.close"><svg aria-hidden="true"><use href="#icon-close"></use></svg></button>
+      </header>
+      <div class="contact-dialog-body">
+        <div class="contact-qr-grid">
+          <figure class="contact-qr-card" data-channel="qq">
+            <a class="contact-qr-frame" href="https://radxa.com/community" target="_blank" rel="noopener noreferrer">
+              <img src="/assets/community-qq.webp" alt="Official Radxa QQ group QR code" data-i18n-alt="contact.qqQr" width="400" height="400" />
+            </a>
+            <figcaption><strong data-i18n="contact.channel.qq.name">QQ</strong><span data-i18n="contact.scan">Scan to join</span></figcaption>
+          </figure>
+          <figure class="contact-qr-card" data-channel="wechat">
+            <a class="contact-qr-frame" href="https://radxa.com/community" target="_blank" rel="noopener noreferrer">
+              <img src="/assets/community-wechat.png" alt="Official Radxa WeChat group QR code" data-i18n-alt="contact.wechatQr" width="256" height="256" />
+            </a>
+            <figcaption><strong data-i18n="contact.channel.wechat.name">WeChat</strong><span data-i18n="contact.scan">Scan to join</span></figcaption>
+          </figure>
+        </div>
+        <section class="contact-channel-section" aria-labelledby="contact-channel-title">
+          <h3 id="contact-channel-title" data-i18n="contact.otherChannels">Other official channels</h3>
+          <div class="contact-link-list" data-contact-links></div>
+        </section>
+        <a class="community-home-link" href="https://radxa.com/community" target="_blank" rel="noopener noreferrer"><span data-i18n="contact.communityPage">Open all community channels</span><svg aria-hidden="true"><use href="#icon-external"></use></svg></a>
+      </div>
+    </dialog>
+
     <div class="toast-stack" data-toasts aria-live="polite"></div>
 
     <svg class="icon-sprite" aria-hidden="true">
@@ -302,6 +366,11 @@
       <symbol id="icon-chip" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10"></rect><path d="M9 2v5M15 2v5M9 17v5M15 17v5M2 9h5M17 9h5M2 15h5M17 15h5"></path></symbol>
       <symbol id="icon-run" viewBox="0 0 24 24"><path d="M6 4h12v16H6zM9 8h6M9 12h4M9 16h6"></path><path d="m15 11 3 2-3 2"></path></symbol>
       <symbol id="icon-pulse" viewBox="0 0 24 24"><path d="M3 12h4l2-6 4 12 2-6h6"></path></symbol>
+      <symbol id="icon-help" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"></circle><path d="M9.7 9a2.5 2.5 0 1 1 3.4 2.35c-.75.32-1.1.75-1.1 1.65v.5M12 17h.01"></path></symbol>
+      <symbol id="icon-community" viewBox="0 0 24 24"><path d="M4 6h16v10H9l-5 4z"></path><path d="M8 10h8M8 13h5"></path></symbol>
+      <symbol id="icon-docs" viewBox="0 0 24 24"><path d="M5 3h10l4 4v14H5zM14 3v5h5M8 12h8M8 16h6"></path></symbol>
+      <symbol id="icon-external" viewBox="0 0 24 24"><path d="M14 5h5v5M12 12l7-7M19 14v5H5V5h5"></path></symbol>
+      <symbol id="icon-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"></path></symbol>
       <symbol id="icon-refresh" viewBox="0 0 24 24"><path d="M19 8a8 8 0 1 0 1 7M19 3v5h-5"></path></symbol>
       <symbol id="icon-sources" viewBox="0 0 24 24"><path d="M4 6h11M4 12h16M4 18h11"></path><path d="m15 3 3 3-3 3M15 15l3 3-3 3"></path></symbol>
       <symbol id="icon-debug" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10M14 4v6M6 14v6"></path><circle cx="14" cy="7" r="2"></circle><circle cx="8" cy="17" r="2"></circle></symbol>

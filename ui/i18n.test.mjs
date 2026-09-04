@@ -53,8 +53,12 @@ test("keeps action availability and localizes its reason", () => {
 
 test("switches language, persists the choice, and keeps unknown provider copy", () => {
   const { i18n, storage } = loadI18n();
+  assert.equal(i18n.t("route.help"), "FAQ");
+  assert.equal(i18n.t("help.libraryTitle", { board: "ROCK 5B" }), "ROCK 5B help");
   i18n.setLocale("zh");
   assert.equal(storage.get("rsetup-locale-v1"), "zh-CN");
+  assert.equal(i18n.t("help.libraryTitle", { board: "ROCK 5B" }), "ROCK 5B 帮助");
+  assert.equal(i18n.t("contact.wechatQr"), "Radxa 官方微信群二维码");
   assert.equal(i18n.action({ id: "vendor.action", title: "Vendor action", description: "Vendor detail", category: "Vendor", steps: ["One"] }).title, "Vendor action");
   i18n.setLocale("en");
   assert.equal(i18n.t("overview.title"), "Your board at a glance");

@@ -357,6 +357,7 @@ svg {
 .secondary-button,
 .text-button,
 .route-button,
+.contact-launcher,
 .operation-row,
 .workflow-row,
 .command-result { border: 0; cursor: pointer; }
@@ -563,6 +564,43 @@ svg {
 .route-button:active {
   transform: scale(0.96);
   box-shadow: inset 0 3px 9px rgba(77, 89, 130, 0.10);
+}
+
+.contact-launcher {
+  min-height: 62px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  margin-top: auto;
+  padding: 7px 4px;
+  border-radius: 20px;
+  background: var(--success-soft);
+  color: var(--success);
+  font-size: 11px;
+  font-weight: 700;
+  transition: transform 200ms ease-in-out, background 200ms ease-in-out, box-shadow 200ms ease-in-out;
+}
+
+.contact-launcher svg {
+  width: 32px;
+  height: 32px;
+  padding: 7px;
+  border-radius: 999px;
+  background: var(--ground-2);
+  color: currentColor;
+}
+
+.contact-launcher:hover {
+  transform: translateY(-2px);
+  background: color-mix(in srgb, var(--success-soft) 72%, var(--ground-2));
+  box-shadow: 0 10px 22px rgba(50, 113, 93, 0.15);
+}
+
+.contact-launcher:active {
+  transform: scale(0.96);
+  box-shadow: inset 0 3px 9px rgba(50, 113, 93, 0.12);
 }
 
 .workspace {
@@ -1580,6 +1618,250 @@ body.is-resolving .core-node { animation: core-resolve 820ms var(--ease-soft) bo
 .activity-timeline .event-row:last-child { border-bottom: 0; }
 .activity-timeline .event-row strong { margin: 0; }
 
+.help-heading { align-items: end; }
+.help-heading p {
+  max-width: 66ch;
+  margin: 10px 0 0;
+  color: var(--bone-muted);
+}
+
+.help-board-badge {
+  max-width: min(420px, 42vw);
+  overflow: hidden;
+  padding: 10px 14px;
+  border-radius: 16px;
+  background: var(--field);
+  color: var(--bone-muted);
+  font-family: "Rsetup Mono", monospace;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.help-layout {
+  display: block;
+}
+
+.help-library { padding: 28px; }
+.help-heading-actions { display: flex; align-items: center; gap: 10px; }
+.help-contact-button { display: none; }
+.help-library-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+}
+
+.help-icon,
+.contact-dialog-icon {
+  width: 48px;
+  height: 48px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border-radius: 16px;
+  background: var(--signal-soft);
+  color: var(--signal);
+}
+
+.help-icon svg,
+.contact-dialog-icon svg { width: 23px; height: 23px; }
+.help-library-head h2,
+.faq-heading h2 { font-size: 18px; font-weight: 800; letter-spacing: -0.02em; }
+.help-library-head p { max-width: 68ch; margin: 7px 0 0; color: var(--bone-muted); }
+
+.help-link-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 24px;
+}
+
+.help-resource-link,
+.contact-link,
+.community-home-link {
+  color: inherit;
+  text-decoration: none;
+}
+
+.help-resource-link {
+  min-height: 74px;
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr) 20px;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 18px;
+  background: var(--field);
+  transition: transform 200ms ease-in-out, background 200ms ease-in-out, box-shadow 200ms ease-in-out;
+}
+
+.help-resource-link:hover {
+  transform: translateY(-2px);
+  background: var(--ground-2);
+  box-shadow: var(--shadow-soft);
+}
+
+.help-resource-link > svg:first-child {
+  width: 36px;
+  height: 36px;
+  padding: 9px;
+  border-radius: 13px;
+  background: var(--ground-2);
+  color: var(--signal);
+}
+
+.help-resource-link > svg:last-child,
+.community-home-link svg { width: 18px; height: 18px; color: var(--bone-muted); }
+.help-resource-link strong,
+.help-resource-link span { display: block; }
+.help-resource-link strong { font-size: 12px; }
+.help-resource-link span { margin-top: 3px; color: var(--bone-muted); font-size: 11px; }
+
+.faq-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 32px 2px 12px;
+}
+.faq-heading span { color: var(--bone-muted); font-size: 11px; }
+.faq-list { display: grid; gap: 8px; }
+.faq-item {
+  overflow: hidden;
+  border-radius: 18px;
+  background: var(--field);
+}
+.faq-item summary {
+  min-height: 64px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 30px;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 16px;
+  color: var(--bone);
+  cursor: pointer;
+  font-weight: 700;
+  list-style: none;
+}
+.faq-item summary::-webkit-details-marker { display: none; }
+.faq-item summary svg {
+  width: 30px;
+  height: 30px;
+  padding: 7px;
+  border-radius: 999px;
+  background: var(--ground-2);
+  color: var(--signal);
+  transition: transform 200ms var(--ease-soft);
+}
+.faq-item[open] summary svg { transform: rotate(45deg); }
+.faq-answer {
+  max-width: 72ch;
+  padding: 0 58px 18px 16px;
+  color: var(--bone-muted);
+  line-height: 1.65;
+}
+
+.contact-dialog {
+  width: min(760px, calc(100vw - 28px));
+  max-height: min(820px, calc(100vh - 40px));
+  padding: 0;
+  overflow: auto;
+  border: 0;
+  border-radius: 30px;
+  background: var(--ground-2);
+  color: var(--bone);
+  box-shadow: var(--shadow-overlay);
+}
+.contact-dialog[open] { animation: contact-rise 240ms var(--ease-soft); }
+.contact-dialog::backdrop { background: rgba(41, 50, 70, 0.30); }
+.contact-dialog-head {
+  display: grid;
+  grid-template-columns: 48px minmax(0, 1fr) 44px;
+  align-items: start;
+  gap: 16px;
+  padding: 28px 28px 20px;
+}
+.contact-dialog-icon { background: var(--success-soft); color: var(--success); }
+.contact-dialog-head h2 { margin: 1px 0 0; font-size: 28px; font-weight: 800; line-height: 1.15; letter-spacing: -0.03em; }
+.contact-dialog-head p { max-width: 58ch; margin: 7px 0 0; color: var(--bone-muted); }
+.contact-dialog-body { padding: 0 28px 28px; }
+.contact-qr-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.contact-qr-card {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 148px minmax(0, 1fr);
+  align-items: center;
+  gap: 18px;
+  margin: 0;
+  padding: 16px;
+  border-radius: 22px;
+  background: var(--field);
+}
+.contact-qr-frame {
+  display: block;
+  aspect-ratio: 1;
+  padding: 8px;
+  border-radius: 18px;
+  overflow: hidden;
+  background: #ffffff;
+  box-shadow: 0 8px 20px rgba(41, 50, 70, 0.10);
+}
+.contact-qr-frame img { width: 100%; height: 100%; display: block; object-fit: contain; }
+.contact-qr-card figcaption strong,
+.contact-qr-card figcaption span { display: block; }
+.contact-qr-card figcaption strong { font-size: 18px; font-weight: 800; }
+.contact-qr-card figcaption span { margin-top: 5px; color: var(--bone-muted); font-size: 12px; }
+.contact-channel-section { margin-top: 24px; }
+.contact-channel-section h3 { margin: 0 0 10px; font-size: 14px; font-weight: 800; }
+.contact-link-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.contact-link {
+  min-height: 56px;
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr) 18px;
+  align-items: center;
+  gap: 11px;
+  padding: 9px 11px;
+  border-radius: 16px;
+  background: var(--field);
+  transition: transform 200ms ease-in-out, background 200ms ease-in-out;
+}
+.contact-link:hover { transform: translateY(-2px); background: var(--ground-2); }
+.contact-mark {
+  width: 38px;
+  height: 38px;
+  display: grid;
+  place-items: center;
+  border-radius: 13px;
+  background: var(--ground-2);
+  color: var(--signal);
+  font-family: "Rsetup Mono", monospace;
+  font-size: 11px;
+  font-weight: 700;
+}
+.contact-link[data-channel="forum"] .contact-mark { background: var(--success-soft); color: var(--success); }
+.contact-link[data-channel="discord"] .contact-mark { background: var(--signal-soft); color: var(--signal); }
+.contact-link-copy strong,
+.contact-link-copy span { display: block; }
+.contact-link-copy strong { font-size: 12px; }
+.contact-link-copy span { margin-top: 3px; color: var(--bone-muted); font-size: 11px; }
+.contact-link > svg { width: 17px; height: 17px; color: var(--bone-muted); }
+.community-home-link {
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 18px;
+  padding: 0 4px;
+  color: var(--signal);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+@keyframes contact-rise {
+  from { transform: translateY(12px); opacity: 0; }
+}
+
 .status-rail {
   position: fixed;
   z-index: 26;
@@ -1823,6 +2105,13 @@ body.is-resolving .core-node { animation: core-resolve 820ms var(--ease-soft) bo
   .clock { display: none; }
 }
 
+@media (max-height: 780px) and (min-width: 781px) {
+  .route-button { min-height: 54px; gap: 3px; padding: 4px; }
+  .route-button svg { width: 30px; height: 30px; padding: 7px; }
+  .contact-launcher { min-height: 50px; }
+  .contact-launcher svg { width: 28px; height: 28px; }
+}
+
 @media (max-width: 860px) {
   .device-breadcrumb .slash,
   .device-breadcrumb [data-hostname] { display: none; }
@@ -1857,13 +2146,14 @@ body.is-resolving .core-node { animation: core-resolve 820ms var(--ease-soft) bo
     width: auto;
     height: 64px;
     display: grid;
-    grid-template-columns: repeat(6, minmax(0, 1fr));
+    grid-template-columns: repeat(7, minmax(0, 1fr));
     gap: 4px;
     padding: 6px;
     border-radius: 23px;
   }
   .route-button { min-height: 52px; gap: 2px; padding: 4px 1px; border-radius: 17px; font-size: 11px; }
   .route-button svg { width: 29px; height: 29px; padding: 7px; }
+  .contact-launcher { display: none; }
   .workspace { inset: 94px 0 118px 0; padding: 8px 14px 36px; }
   .view-heading { min-height: auto; margin: 4px 3px 22px; }
   .view-heading h1 { font-size: clamp(30px, 8vw, 40px); }
@@ -1883,6 +2173,7 @@ body.is-resolving .core-node { animation: core-resolve 820ms var(--ease-soft) bo
   .workflow-meta { display: none; }
   .activity-timeline .event-row { grid-template-columns: 84px minmax(0, 1fr); }
   .activity-timeline .event-row span { grid-column: 2; }
+  .help-contact-button { display: inline-flex; }
   .status-rail { right: 14px; bottom: 80px; left: 14px; }
   .status-rail > span:nth-child(2) { display: none; }
   .toast-stack { right: 16px; bottom: 136px; }
@@ -1896,6 +2187,7 @@ body.is-resolving .core-node { animation: core-resolve 820ms var(--ease-soft) bo
   .device-breadcrumb { display: none; }
   .brand-lockup { width: 142px; }
   .view-heading { display: block; }
+  .help-board-badge { display: inline-flex; max-width: 100%; margin-top: 16px; }
   .view-heading .primary-button { width: 100%; margin-top: 18px; }
   .frame-label { padding: 22px 20px 8px; }
   .plot-field { min-height: 430px; margin: 10px 20px 0; }
@@ -1947,6 +2239,23 @@ body.is-resolving .core-node { animation: core-resolve 820ms var(--ease-soft) bo
   .workflow-row { min-height: 86px; grid-template-columns: 70px minmax(0, 1fr) 34px; gap: 10px; padding: 11px 9px; }
   .activity-timeline .event-row { display: block; }
   .activity-timeline .event-row strong { margin: 5px 0 3px; }
+  .help-heading-actions { align-items: stretch; flex-direction: column; margin-top: 16px; }
+  .help-board-badge { margin-top: 0; }
+  .help-contact-button { width: 100%; justify-content: center; margin: 0; }
+  .help-library { padding: 20px; }
+  .help-library-head { align-items: center; }
+  .help-link-list { grid-template-columns: 1fr; }
+  .faq-heading { align-items: flex-start; }
+  .faq-heading span { margin-top: 4px; }
+  .faq-answer { padding-right: 16px; }
+  .contact-dialog { width: calc(100vw - 20px); max-height: calc(100vh - 20px); }
+  .contact-dialog-head { grid-template-columns: 42px minmax(0, 1fr) 42px; gap: 12px; padding: 22px 20px 16px; }
+  .contact-dialog-icon { width: 42px; height: 42px; border-radius: 14px; }
+  .contact-dialog-head h2 { font-size: 24px; }
+  .contact-dialog-body { padding: 0 20px 22px; }
+  .contact-qr-grid { grid-template-columns: 1fr; }
+  .contact-qr-card { grid-template-columns: 118px minmax(0, 1fr); padding: 14px; }
+  .contact-link-list { grid-template-columns: 1fr; }
   .status-rail { grid-template-columns: minmax(0, 1fr) auto; }
   .status-identity { overflow: hidden; }
   .status-identity b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

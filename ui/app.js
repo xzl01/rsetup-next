@@ -8,6 +8,7 @@ const routes = [
   { id: "hardware", icon: "chip" },
   { id: "workflows", icon: "run" },
   { id: "activity", icon: "pulse" },
+  { id: "help", icon: "help" },
 ];
 
 const workflowGroups = [
@@ -68,6 +69,62 @@ const defaultDebugCustom = {
   architecture: "aarch64",
 };
 
+const helpProfiles = [
+  {
+    id: "rock-5b",
+    name: "ROCK 5B",
+    patterns: ["rock 5b", "rock5b"],
+    resources: [
+      { kind: "guide", path: "/rock5/rock5b" },
+      { kind: "faq", path: "/rock5/rock5b/faq" },
+      { kind: "download", path: "/rock5/rock5b/download" },
+    ],
+  },
+  {
+    id: "orion-o6",
+    name: "Orion O6",
+    patterns: ["orion o6", "orion-o6"],
+    resources: [
+      { kind: "guide", path: "/orion/o6" },
+      { kind: "faq", path: "/orion/faq" },
+      { kind: "download", path: "/orion/download" },
+    ],
+  },
+  {
+    id: "dragon-q6a",
+    name: "Dragon Q6A",
+    patterns: ["dragon q6a", "q6a"],
+    resources: [
+      { kind: "guide", path: "/dragon/q6a/getting-started" },
+      { kind: "download", path: "/dragon/q6a/download" },
+    ],
+  },
+  {
+    id: "zero-2-pro",
+    name: "ZERO 2 Pro",
+    patterns: ["zero 2 pro", "zero2pro", "zero 2pro"],
+    resources: [
+      { kind: "guide", path: "/zero/zero2pro" },
+      { kind: "download", path: "/zero/zero2pro/download" },
+    ],
+  },
+];
+
+const genericHelpResources = [
+  { kind: "docs", path: "/welcome" },
+  { kind: "forum", url: "https://forum.radxa.com/" },
+  { kind: "github", url: "https://github.com/radxa" },
+];
+
+const helpFaqs = ["docs", "hardware", "privilege", "support"];
+
+const contactChannels = [
+  { id: "forum", mark: "FR", url: "https://forum.radxa.com/" },
+  { id: "github", mark: "GH", url: "https://github.com/radxa" },
+  { id: "discord", mark: "DC", url: "https://discord.com/invite/mn73YNWdHY" },
+  { id: "telegram", mark: "TG", url: "https://t.me/rockpi4" },
+];
+
 const state = {
   providerSnapshot: null,
   snapshot: null,
@@ -83,6 +140,7 @@ const state = {
   videoFrame: null,
   thermalPolicy: null,
   lastInvoker: null,
+  contactInvoker: null,
   route: "overview",
   refreshing: false,
   debugProfile: "provider",
@@ -296,6 +354,16 @@ function capabilityVisual(id) {
   return capabilityVisuals[id] || { icon: "chip", tone: "signal" };
 }
 
+function helpProfile(identity) {
+  const haystack = `${identity?.product || ""} ${identity?.hostname || ""}`.toLocaleLowerCase("en");
+  return helpProfiles.find((profile) => profile.patterns.some((pattern) => haystack.includes(pattern))) || null;
+}
+
+function localizedDocsUrl(path) {
+  const languagePath = i18n.getLocale() === "zh-CN" ? "" : "/en";
+  return `https://docs.radxa.com${languagePath}${path}`;
+}
+
 function debugProfileById(id) {
   return debugDeviceProfiles.find((profile) => profile.id === id);
 }
@@ -373,6 +441,7 @@ function activateDebugProfile(profileId) {
   saveDebugState();
   state.snapshot = applyDebugDevice(state.providerSnapshot);
   renderSnapshot();
+  renderHelp();
   renderDebugControls();
   resolveSignals();
   if (state.debugProfile !== "custom") {
@@ -392,6 +461,7 @@ function applyCustomDebugDevice() {
   saveDebugState();
   state.snapshot = applyDebugDevice(state.providerSnapshot);
   renderSnapshot();
+  renderHelp();
   renderDebugControls();
   resolveSignals();
   toast(t("debug.title"), t("debug.changed", { device: state.debugCustom.product }));
@@ -402,6 +472,7 @@ function applyStaticTranslations() {
   $("meta[name='description']")?.setAttribute("content", t("document.description"));
   $$('[data-i18n]').forEach((element) => { element.textContent = t(element.dataset.i18n); });
   $$('[data-i18n-aria]').forEach((element) => { element.setAttribute("aria-label", t(element.dataset.i18nAria)); });
+  $$('[data-i18n-alt]').forEach((element) => { element.setAttribute("alt", t(element.dataset.i18nAlt)); });
   $$('[data-i18n-placeholder]').forEach((element) => { element.setAttribute("placeholder", t(element.dataset.i18nPlaceholder)); });
   setText("[data-language-label]", t("language.short"));
 }
@@ -463,6 +534,7 @@ function renderAll() {
   renderActions();
   renderActivity();
   renderSources();
+  renderHelp();
   renderCommandResults();
   renderDebugControls();
 }
@@ -1106,6 +1178,61 @@ function renderActivity() {
   $("[data-activity-timeline]").innerHTML = activity.length ? activity.map(eventRow).join("") : emptyListItem(t("activity.empty"));
 }
 
+function helpResourceUrl(resource) {
+  return resource.url || localizedDocsUrl(resource.path);
+}
+
+function renderHelpResource(resource) {
+  return `<a class="help-resource-link" href="${escapeHtml(helpResourceUrl(resource))}" target="_blank" rel="noopener noreferrer">
+    ${icon("docs")}<span><strong>${escapeHtml(t(`help.resource.${resource.kind}.title`))}</strong><span>${escapeHtml(t(`help.resource.${resource.kind}.description`))}</span></span>${icon("external")}
+  </a>`;
+}
+
+function renderContactLink(channel) {
+  return `<a class="contact-link" data-channel="${escapeHtml(channel.id)}" href="${escapeHtml(channel.url)}" target="_blank" rel="noopener noreferrer">
+    <span class="contact-mark" aria-hidden="true">${escapeHtml(channel.mark)}</span><span class="contact-link-copy"><strong>${escapeHtml(t(`contact.channel.${channel.id}.name`))}</strong><span>${escapeHtml(t(`contact.channel.${channel.id}.detail`))}</span></span>${icon("external")}
+  </a>`;
+}
+
+function renderContactLinks() {
+  const host = $("[data-contact-links]");
+  if (host) host.innerHTML = contactChannels.map(renderContactLink).join("");
+}
+
+function renderHelp() {
+  const identity = state.snapshot?.identity;
+  const profile = helpProfile(identity);
+  const board = profile?.name || identity?.product || t("board.detecting");
+  const soc = identity?.soc || t("provider.unknown");
+  const resources = profile?.resources || genericHelpResources;
+
+  setText("[data-help-board]", t("help.boardBadge", { board, soc }));
+  setText("[data-help-library-title]", t("help.libraryTitle", { board }));
+  setText("[data-help-library-description]", t(profile ? "help.libraryDescription" : "help.libraryGeneric", { board }));
+  $("[data-help-links]").innerHTML = resources.map(renderHelpResource).join("");
+  $("[data-help-faq]").innerHTML = helpFaqs.map((faq) => `<details class="faq-item">
+    <summary><span>${escapeHtml(t(`help.faq.${faq}.question`, { board }))}</span>${icon("plus")}</summary>
+    <div class="faq-answer">${escapeHtml(t(`help.faq.${faq}.answer`, { board }))}</div>
+  </details>`).join("");
+  renderContactLinks();
+}
+
+function openContact(event) {
+  state.contactInvoker = event?.currentTarget || document.activeElement;
+  renderContactLinks();
+  const dialog = $("[data-contact-dialog]");
+  if (!dialog.open) openDialog(dialog);
+  requestAnimationFrame(() => $("[data-contact-close]").focus());
+}
+
+function closeContact() {
+  const dialog = $("[data-contact-dialog]");
+  if (dialog.open) dismissDialog(dialog);
+  const invoker = state.contactInvoker;
+  state.contactInvoker = null;
+  requestAnimationFrame(() => invoker?.focus?.());
+}
+
 function eventRow(raw) {
   const event = i18n.activity(raw);
   return `<li class="event-row"><time datetime="${escapeHtml(event.at)}">${relativeTime(event.at)}</time><strong>${escapeHtml(event.title)}</strong><span>${escapeHtml(event.detail)}${event.synthetic ? ` · ${t("activity.simulated")}` : ""}</span></li>`;
@@ -1276,6 +1403,9 @@ function bindEvents() {
   });
   $("[data-language-toggle]").addEventListener("click", () => i18n.setLocale(i18n.getLocale() === "zh-CN" ? "en" : "zh-CN"));
   $("[data-theme-toggle]").addEventListener("click", () => setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark"));
+  $$('[data-contact-open]').forEach((button) => button.addEventListener("click", openContact));
+  $("[data-contact-close]").addEventListener("click", closeContact);
+  $("[data-contact-dialog]").addEventListener("cancel", (event) => { event.preventDefault(); closeContact(); });
   $("[data-task-close]").addEventListener("click", closeAction);
   $("[data-task-drawer]").addEventListener("cancel", (event) => { event.preventDefault(); closeAction(); });
   $("[data-task-confirm]").addEventListener("change", (event) => {

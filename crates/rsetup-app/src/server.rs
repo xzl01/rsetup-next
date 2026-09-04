@@ -22,6 +22,8 @@ const I18N_JS: &str = include_str!("../../../ui/i18n.js");
 const APP_JS: &str = include_str!("../../../ui/app.js");
 const VENDOR_PARTNERS: &[u8] = include_bytes!("../../../ui/assets/vendor-partners.webp");
 const VENDOR_CIX: &[u8] = include_bytes!("../../../ui/assets/vendor-cix.png");
+const COMMUNITY_QQ: &[u8] = include_bytes!("../../../ui/assets/community-qq.webp");
+const COMMUNITY_WECHAT: &[u8] = include_bytes!("../../../ui/assets/community-wechat.png");
 const FONT_REGULAR: &[u8] = include_bytes!("../../../ui/fonts/open-sans-regular.woff2");
 const FONT_DISPLAY: &[u8] = include_bytes!("../../../ui/fonts/open-sans-800.woff2");
 const FONT_MONO: &[u8] = include_bytes!("../../../ui/fonts/source-code-pro.woff2");
@@ -89,6 +91,8 @@ pub fn router(controller: Controller) -> Router {
         .route("/app.js", get(script))
         .route("/assets/vendor-partners.webp", get(vendor_partners))
         .route("/assets/vendor-cix.png", get(vendor_cix))
+        .route("/assets/community-qq.webp", get(community_qq))
+        .route("/assets/community-wechat.png", get(community_wechat))
         .route("/fonts/open-sans-regular.woff2", get(font_regular))
         .route("/fonts/open-sans-800.woff2", get(font_display))
         .route("/fonts/source-code-pro.woff2", get(font_mono))
@@ -151,6 +155,14 @@ async fn vendor_partners() -> impl IntoResponse {
 
 async fn vendor_cix() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "image/png")], VENDOR_CIX)
+}
+
+async fn community_qq() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/webp")], COMMUNITY_QQ)
+}
+
+async fn community_wechat() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/png")], COMMUNITY_WECHAT)
 }
 
 async fn font_regular() -> impl IntoResponse {
@@ -468,5 +480,11 @@ mod tests {
     #[test]
     fn router_builds_with_demo_controller() {
         let _router = router(Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun));
+    }
+
+    #[test]
+    fn community_qr_assets_are_embedded() {
+        assert!(COMMUNITY_QQ.starts_with(b"RIFF"));
+        assert!(COMMUNITY_WECHAT.starts_with(b"\x89PNG\r\n\x1a\n"));
     }
 }
