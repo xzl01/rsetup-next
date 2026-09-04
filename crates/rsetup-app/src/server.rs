@@ -1,15 +1,17 @@
 use anyhow::Result;
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{StatusCode, header},
     response::{Html, IntoResponse},
     routing::{get, post},
 };
 use rsetup_core::{
-    ActionRun, ActionSpec, ActivityEvent, Controller, DeviceSnapshot, GpioStatus,
-    OverlayApplyResult, OverlayPlan, OverlayStatus, SourceApplyResult, SourcePlan, SourceStatus,
-    ThermalStatus, VideoFrame, VideoStatus,
+    ActionRun, ActionSpec, ActivityEvent, Controller, DeviceSnapshot, FanCurveApplyResult,
+    FanCurvePlan, FanCurveRequest, FanCurveStatus, GpioStatus, LedStatus, OverlayApplyResult,
+    OverlayPlan, OverlayStatus, RgbLedConfig, SourceApplyResult, SourcePlan, SourceStatus,
+    SpiFlashApplyResult, SpiFlashPlan, SpiFlashRequest, SpiFlashStatus, ThermalStatus, VideoFrame,
+    VideoStatus,
 };
 use serde::Deserialize;
 use std::{net::SocketAddr, sync::Arc};
@@ -61,6 +63,23 @@ struct OverlayRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct GpioQuery {
+    profile: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SpiFlashApiRequest {
+    #[serde(flatten)]
+    request: SpiFlashRequest,
+    #[serde(default)]
+    plan_token: Option<String>,
+    #[serde(default)]
+    confirm: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct VideoCaptureRequest {
     device_id: String,
 }
@@ -69,6 +88,34 @@ struct VideoCaptureRequest {
 #[serde(rename_all = "camelCase")]
 struct ThermalPolicyRequest {
     policy: String,
+    #[serde(default)]
+    confirm: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FanCurveApiRequest {
+    #[serde(flatten)]
+    request: FanCurveRequest,
+    #[serde(default)]
+    plan_token: Option<String>,
+    #[serde(default)]
+    confirm: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LedTriggerRequest {
+    led_id: String,
+    trigger: String,
+    #[serde(default)]
+    confirm: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RgbLedRequest {
+    config: RgbLedConfig,
     #[serde(default)]
     confirm: bool,
 }
@@ -115,10 +162,25 @@ pub fn router(controller: Controller) -> Router {
         .route("/api/v1/hardware/overlays/plan", post(plan_overlays))
         .route("/api/v1/hardware/overlays/apply", post(apply_overlays))
         .route("/api/v1/hardware/gpio", get(gpio_status))
+        .route("/api/v1/hardware/spi-flash", get(spi_flash_status))
+        .route("/api/v1/hardware/spi-flash/plan", post(plan_spi_flash))
+        .route("/api/v1/hardware/spi-flash/apply", post(apply_spi_flash))
+        .route("/api/v1/hardware/leds", get(led_status))
+        .route("/api/v1/hardware/leds/trigger", post(apply_led_trigger))
+        .route("/api/v1/hardware/leds/rgb", post(apply_rgb_led))
         .route("/api/v1/hardware/video", get(video_status))
         .route("/api/v1/hardware/video/capture", post(capture_video))
         .route("/api/v1/hardware/thermal", get(thermal_status))
         .route("/api/v1/hardware/thermal/apply", post(apply_thermal_policy))
+        .route("/api/v1/hardware/thermal/fan-curve", get(fan_curve_status))
+        .route(
+            "/api/v1/hardware/thermal/fan-curve/plan",
+            post(plan_fan_curve),
+        )
+        .route(
+            "/api/v1/hardware/thermal/fan-curve/apply",
+            post(apply_fan_curve),
+        )
         .route("/api/v1/activity", get(activity))
         .layer(TraceLayer::new_for_http())
         .with_state(Arc::new(controller))
@@ -316,9 +378,72 @@ async fn apply_overlays(
 
 async fn gpio_status(
     State(controller): State<Arc<Controller>>,
+    Query(query): Query<GpioQuery>,
 ) -> Result<Json<GpioStatus>, ApiError> {
     controller
-        .gpio_status()
+        .gpio_status_for_profile(query.profile.as_deref())
+        .map(Json)
+        .map_err(ApiError::from_hardware)
+}
+
+async fn spi_flash_status(
+    State(controller): State<Arc<Controller>>,
+) -> Result<Json<SpiFlashStatus>, ApiError> {
+    controller
+        .spi_flash_status()
+        .map(Json)
+        .map_err(ApiError::from_hardware)
+}
+
+async fn plan_spi_flash(
+    State(controller): State<Arc<Controller>>,
+    Json(request): Json<SpiFlashApiRequest>,
+) -> Result<Json<SpiFlashPlan>, ApiError> {
+    controller
+        .plan_spi_flash(&request.request)
+        .map(Json)
+        .map_err(ApiError::from_hardware)
+}
+
+async fn apply_spi_flash(
+    State(controller): State<Arc<Controller>>,
+    Json(request): Json<SpiFlashApiRequest>,
+) -> Result<Json<SpiFlashApplyResult>, ApiError> {
+    controller
+        .apply_spi_flash(
+            &request.request,
+            request.plan_token.as_deref().unwrap_or_default(),
+            request.confirm,
+        )
+        .map(Json)
+        .map_err(ApiError::from_hardware)
+}
+
+async fn led_status(
+    State(controller): State<Arc<Controller>>,
+) -> Result<Json<LedStatus>, ApiError> {
+    controller
+        .led_status()
+        .map(Json)
+        .map_err(ApiError::from_hardware)
+}
+
+async fn apply_led_trigger(
+    State(controller): State<Arc<Controller>>,
+    Json(request): Json<LedTriggerRequest>,
+) -> Result<Json<ActionRun>, ApiError> {
+    controller
+        .apply_led_trigger(&request.led_id, &request.trigger, request.confirm)
+        .map(Json)
+        .map_err(ApiError::from_hardware)
+}
+
+async fn apply_rgb_led(
+    State(controller): State<Arc<Controller>>,
+    Json(request): Json<RgbLedRequest>,
+) -> Result<Json<ActionRun>, ApiError> {
+    controller
+        .apply_rgb_led(&request.config, request.confirm)
         .map(Json)
         .map_err(ApiError::from_hardware)
 }
@@ -357,6 +482,39 @@ async fn apply_thermal_policy(
 ) -> Result<Json<ActionRun>, ApiError> {
     controller
         .apply_thermal_policy(&request.policy, request.confirm)
+        .map(Json)
+        .map_err(ApiError::from_hardware)
+}
+
+async fn fan_curve_status(
+    State(controller): State<Arc<Controller>>,
+) -> Result<Json<FanCurveStatus>, ApiError> {
+    controller
+        .fan_curve_status()
+        .map(Json)
+        .map_err(ApiError::from_hardware)
+}
+
+async fn plan_fan_curve(
+    State(controller): State<Arc<Controller>>,
+    Json(request): Json<FanCurveApiRequest>,
+) -> Result<Json<FanCurvePlan>, ApiError> {
+    controller
+        .plan_fan_curve(&request.request)
+        .map(Json)
+        .map_err(ApiError::from_hardware)
+}
+
+async fn apply_fan_curve(
+    State(controller): State<Arc<Controller>>,
+    Json(request): Json<FanCurveApiRequest>,
+) -> Result<Json<FanCurveApplyResult>, ApiError> {
+    controller
+        .apply_fan_curve(
+            &request.request,
+            request.plan_token.as_deref().unwrap_or_default(),
+            request.confirm,
+        )
         .map(Json)
         .map_err(ApiError::from_hardware)
 }

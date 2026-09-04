@@ -6,9 +6,10 @@ use anyhow::{Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use i18n::{Locale, LocaleArg};
 use rsetup_core::{
-    Controller, ExecutionPolicy, ProbeMode, SourceApplyResult, SourcePlan, SourceStatus,
+    Controller, ExecutionPolicy, FanCurveConfig, FanCurvePoint, FanCurveRequest, ProbeMode,
+    RgbLedConfig, SourceApplyResult, SourcePlan, SourceStatus, SpiFlashRequest,
 };
-use std::{fs, io::IsTerminal, net::SocketAddr, path::PathBuf};
+use std::{fs, io::IsTerminal, net::SocketAddr, path::PathBuf, time::Duration};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -122,6 +123,16 @@ enum HardwareCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Manage SPI boot flash / 管理 SPI 启动闪存
+    SpiFlash {
+        #[command(subcommand)]
+        command: SpiFlashCommands,
+    },
+    /// Inspect or control Linux LED class devices / 查看或控制 Linux LED 设备
+    Leds {
+        #[command(subcommand)]
+        command: LedCommands,
+    },
     /// Inspect cameras or capture a test frame / 查看摄像头或抓取测试帧
     Video {
         #[command(subcommand)]
@@ -159,6 +170,39 @@ enum OverlayCommands {
 }
 
 #[derive(Debug, Subcommand)]
+enum SpiFlashCommands {
+    /// Show detected SPI NOR targets and installed boot images / 显示 SPI NOR 与已安装引导镜像
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Preview an install or erase operation / 预览写入或擦除操作
+    Plan {
+        #[arg(value_parser = ["install", "erase"])]
+        operation: String,
+        target: String,
+        #[arg(long)]
+        image: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply a previously previewed operation / 执行已预览的操作
+    Apply {
+        #[arg(value_parser = ["install", "erase"])]
+        operation: String,
+        target: String,
+        #[arg(long)]
+        image: Option<String>,
+        #[arg(long, value_name = "TOKEN")]
+        plan_token: String,
+        #[arg(long)]
+        confirm: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum VideoCommands {
     Status {
         #[arg(long)]
@@ -179,6 +223,109 @@ enum ThermalCommands {
     },
     Set {
         policy: String,
+        #[arg(long)]
+        confirm: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Configure a temperature-driven pwm-fan curve / 配置温度驱动的风扇曲线
+    FanCurve {
+        #[command(subcommand)]
+        command: FanCurveCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum FanCurveCommands {
+    /// Show detected curve targets and saved configuration / 显示曲线目标与已保存配置
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Preview enabling or updating a curve / 预览启用或更新曲线
+    Plan {
+        #[arg(long)]
+        zone: String,
+        #[arg(long)]
+        device: String,
+        #[arg(long = "point", value_parser = parse_fan_curve_point, required = true)]
+        points: Vec<FanCurvePoint>,
+        #[arg(long, default_value_t = 2_000)]
+        poll_ms: u32,
+        #[arg(long, default_value_t = 2.0)]
+        hysteresis_c: f32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply an exact previously previewed curve / 应用已预览的曲线
+    Apply {
+        #[arg(long)]
+        zone: String,
+        #[arg(long)]
+        device: String,
+        #[arg(long = "point", value_parser = parse_fan_curve_point, required = true)]
+        points: Vec<FanCurvePoint>,
+        #[arg(long, default_value_t = 2_000)]
+        poll_ms: u32,
+        #[arg(long, default_value_t = 2.0)]
+        hysteresis_c: f32,
+        #[arg(long)]
+        plan_token: String,
+        #[arg(long)]
+        confirm: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Preview restoring the previous thermal governor / 预览恢复原温控策略
+    PlanDisable {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Disable the curve using an exact preview token / 使用预览令牌停用曲线
+    Disable {
+        #[arg(long)]
+        plan_token: String,
+        #[arg(long)]
+        confirm: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run the boot-persistent fan controller.
+    #[command(hide = true)]
+    Daemon,
+    /// Force the configured pwm-fan to maximum cooling before service exit.
+    #[command(hide = true)]
+    FailSafe,
+}
+
+#[derive(Debug, Subcommand)]
+enum LedCommands {
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    Trigger {
+        led: String,
+        trigger: String,
+        #[arg(long)]
+        confirm: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    Rgb {
+        group: String,
+        #[arg(long, default_value = "solid")]
+        mode: String,
+        #[arg(long, default_value_t = 255)]
+        red: u8,
+        #[arg(long, default_value_t = 255)]
+        green: u8,
+        #[arg(long, default_value_t = 255)]
+        blue: u8,
+        #[arg(long, default_value_t = 100)]
+        brightness: u8,
+        #[arg(long, default_value_t = 5_000)]
+        cycle_ms: u32,
         #[arg(long)]
         confirm: bool,
         #[arg(long)]
@@ -298,6 +445,80 @@ async fn main() -> Result<()> {
                 let status = controller.gpio_status()?;
                 print_json_or_debug(&status, json)?;
             }
+            HardwareCommands::SpiFlash { command } => match command {
+                SpiFlashCommands::Status { json } => {
+                    let status = controller.spi_flash_status()?;
+                    print_json_or_debug(&status, json)?;
+                }
+                SpiFlashCommands::Plan {
+                    operation,
+                    target,
+                    image,
+                    json,
+                } => {
+                    let request = SpiFlashRequest {
+                        operation,
+                        target_id: target,
+                        image_id: image,
+                    };
+                    let plan = controller.plan_spi_flash(&request)?;
+                    print_json_or_debug(&plan, json)?;
+                }
+                SpiFlashCommands::Apply {
+                    operation,
+                    target,
+                    image,
+                    plan_token,
+                    confirm,
+                    json,
+                } => {
+                    let request = SpiFlashRequest {
+                        operation,
+                        target_id: target,
+                        image_id: image,
+                    };
+                    let result = controller.apply_spi_flash(&request, &plan_token, confirm)?;
+                    print_json_or_debug(&result, json)?;
+                }
+            },
+            HardwareCommands::Leds { command } => match command {
+                LedCommands::Status { json } => {
+                    let status = controller.led_status()?;
+                    print_json_or_debug(&status, json)?;
+                }
+                LedCommands::Trigger {
+                    led,
+                    trigger,
+                    confirm,
+                    json,
+                } => {
+                    let run = controller.apply_led_trigger(&led, &trigger, confirm)?;
+                    print_json_or_debug(&run, json)?;
+                }
+                LedCommands::Rgb {
+                    group,
+                    mode,
+                    red,
+                    green,
+                    blue,
+                    brightness,
+                    cycle_ms,
+                    confirm,
+                    json,
+                } => {
+                    let config = RgbLedConfig {
+                        group_id: group,
+                        mode,
+                        red,
+                        green,
+                        blue,
+                        brightness,
+                        cycle_ms,
+                    };
+                    let run = controller.apply_rgb_led(&config, confirm)?;
+                    print_json_or_debug(&run, json)?;
+                }
+            },
             HardwareCommands::Video { command } => match command {
                 VideoCommands::Status { json } => {
                     let status = controller.video_status()?;
@@ -324,6 +545,68 @@ async fn main() -> Result<()> {
                     let run = controller.apply_thermal_policy(&policy, confirm)?;
                     print_json_or_debug(&run, json)?;
                 }
+                ThermalCommands::FanCurve { command } => match command {
+                    FanCurveCommands::Status { json } => {
+                        let status = controller.fan_curve_status()?;
+                        print_json_or_debug(&status, json)?;
+                    }
+                    FanCurveCommands::Plan {
+                        zone,
+                        device,
+                        points,
+                        poll_ms,
+                        hysteresis_c,
+                        json,
+                    } => {
+                        let request =
+                            fan_curve_request(zone, device, points, poll_ms, hysteresis_c);
+                        let plan = controller.plan_fan_curve(&request)?;
+                        print_json_or_debug(&plan, json)?;
+                    }
+                    FanCurveCommands::Apply {
+                        zone,
+                        device,
+                        points,
+                        poll_ms,
+                        hysteresis_c,
+                        plan_token,
+                        confirm,
+                        json,
+                    } => {
+                        let request =
+                            fan_curve_request(zone, device, points, poll_ms, hysteresis_c);
+                        let result = controller.apply_fan_curve(&request, &plan_token, confirm)?;
+                        print_json_or_debug(&result, json)?;
+                    }
+                    FanCurveCommands::PlanDisable { json } => {
+                        let request = FanCurveRequest {
+                            enabled: false,
+                            config: None,
+                        };
+                        let plan = controller.plan_fan_curve(&request)?;
+                        print_json_or_debug(&plan, json)?;
+                    }
+                    FanCurveCommands::Disable {
+                        plan_token,
+                        confirm,
+                        json,
+                    } => {
+                        let request = FanCurveRequest {
+                            enabled: false,
+                            config: None,
+                        };
+                        let result = controller.apply_fan_curve(&request, &plan_token, confirm)?;
+                        print_json_or_debug(&result, json)?;
+                    }
+                    FanCurveCommands::Daemon => run_fan_curve_daemon(&controller).await?,
+                    FanCurveCommands::FailSafe => {
+                        let tick = controller.fan_curve_shutdown_failsafe()?;
+                        tracing::warn!(
+                            cooling_state = tick.cooling_state,
+                            "fan curve service exit forced maximum cooling"
+                        );
+                    }
+                },
             },
         },
         Commands::Tui => tui::run(controller, locale)?,
@@ -331,6 +614,100 @@ async fn main() -> Result<()> {
         Commands::Doctor { json } => print_doctor(&controller, locale, json)?,
     }
     Ok(())
+}
+
+fn parse_fan_curve_point(value: &str) -> std::result::Result<FanCurvePoint, String> {
+    let (temperature, speed) = value
+        .split_once(':')
+        .ok_or_else(|| "expected TEMP:SPEED, for example 55:45".to_owned())?;
+    let temperature_c = temperature
+        .parse::<f32>()
+        .map_err(|_| "fan curve temperature must be a number".to_owned())?;
+    let speed_percent = speed
+        .parse::<u8>()
+        .map_err(|_| "fan curve speed must be an integer from 0 to 100".to_owned())?;
+    Ok(FanCurvePoint {
+        temperature_c,
+        speed_percent,
+    })
+}
+
+fn fan_curve_request(
+    zone_id: String,
+    cooling_device_id: String,
+    points: Vec<FanCurvePoint>,
+    poll_interval_ms: u32,
+    hysteresis_c: f32,
+) -> FanCurveRequest {
+    FanCurveRequest {
+        enabled: true,
+        config: Some(FanCurveConfig {
+            zone_id,
+            cooling_device_id,
+            poll_interval_ms,
+            hysteresis_c,
+            points,
+        }),
+    }
+}
+
+async fn run_fan_curve_daemon(controller: &Controller) -> Result<()> {
+    let interrupt = tokio::signal::ctrl_c();
+    tokio::pin!(interrupt);
+    #[cfg(unix)]
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    loop {
+        let tick = match controller.fan_curve_tick() {
+            Ok(tick) => tick,
+            Err(error) => {
+                force_fan_curve_failsafe(controller, "fatal controller error");
+                return Err(error.into());
+            }
+        };
+        if tick.failsafe {
+            tracing::warn!(
+                cooling_state = tick.cooling_state,
+                "fan curve sensor fail-safe forced maximum cooling"
+            );
+        } else {
+            tracing::debug!(
+                temperature_c = tick.temperature_c,
+                speed_percent = tick.speed_percent,
+                cooling_state = tick.cooling_state,
+                "fan curve step applied"
+            );
+        }
+        #[cfg(unix)]
+        tokio::select! {
+            result = &mut interrupt => {
+                result?;
+                break;
+            }
+            _ = terminate.recv() => break,
+            () = tokio::time::sleep(Duration::from_millis(u64::from(tick.poll_interval_ms))) => {}
+        }
+        #[cfg(not(unix))]
+        tokio::select! {
+            result = &mut interrupt => {
+                result?;
+                break;
+            }
+            () = tokio::time::sleep(Duration::from_millis(u64::from(tick.poll_interval_ms))) => {}
+        }
+    }
+    force_fan_curve_failsafe(controller, "service shutdown");
+    Ok(())
+}
+
+fn force_fan_curve_failsafe(controller: &Controller, reason: &str) {
+    match controller.fan_curve_shutdown_failsafe() {
+        Ok(tick) => tracing::warn!(
+            cooling_state = tick.cooling_state,
+            reason,
+            "fan curve fail-safe forced maximum cooling"
+        ),
+        Err(error) => tracing::error!(%error, reason, "unable to force maximum cooling"),
+    }
 }
 
 fn print_source_status(status: &SourceStatus, locale: Locale, json: bool) -> Result<()> {

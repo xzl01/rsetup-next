@@ -1,11 +1,18 @@
 use crate::{
     ActionRun, ActionSpec, ActionStatus, ActivityEvent, ProbeMode, RiskLevel, SourceApplyResult,
     SourceError, SourcePlan, SourceStatus, collect_snapshot,
+    fan_curve::{
+        FanCurveApplyResult, FanCurveManager, FanCurvePlan, FanCurveRequest, FanCurveStatus,
+        FanCurveTick,
+    },
     hardware::{
-        GpioStatus, HardwareError, HardwareManager, OverlayApplyResult, OverlayPlan, OverlayStatus,
-        ThermalStatus, VideoFrame, VideoStatus,
+        GpioStatus, HardwareError, HardwareManager, LedStatus, OverlayApplyResult, OverlayPlan,
+        OverlayStatus, RgbLedConfig, ThermalStatus, VideoFrame, VideoStatus,
     },
     sources::{SourceManager, source_run},
+    spi_flash::{
+        SpiFlashApplyResult, SpiFlashManager, SpiFlashPlan, SpiFlashRequest, SpiFlashStatus,
+    },
 };
 use chrono::Utc;
 use std::{
@@ -65,6 +72,8 @@ pub struct Controller {
     activity: Arc<RwLock<VecDeque<ActivityEvent>>>,
     sources: Arc<SourceManager>,
     hardware: Arc<HardwareManager>,
+    spi_flash: Arc<SpiFlashManager>,
+    fan_curve: Arc<FanCurveManager>,
 }
 
 impl Controller {
@@ -96,6 +105,8 @@ impl Controller {
             activity: Arc::new(RwLock::new(activity)),
             sources: Arc::new(SourceManager::new(synthetic)),
             hardware: Arc::new(HardwareManager::new(synthetic)),
+            spi_flash: Arc::new(SpiFlashManager::new(synthetic)),
+            fan_curve: Arc::new(FanCurveManager::new(synthetic)),
         }
     }
 
@@ -211,6 +222,157 @@ impl Controller {
         self.hardware.gpio_status()
     }
 
+    pub fn gpio_status_for_profile(
+        &self,
+        profile_id: Option<&str>,
+    ) -> Result<GpioStatus, HardwareError> {
+        self.hardware.gpio_status_for_profile(profile_id)
+    }
+
+    pub fn led_status(&self) -> Result<LedStatus, HardwareError> {
+        self.hardware.led_status()
+    }
+
+    pub fn spi_flash_status(&self) -> Result<SpiFlashStatus, HardwareError> {
+        self.spi_flash.status()
+    }
+
+    pub fn plan_spi_flash(&self, request: &SpiFlashRequest) -> Result<SpiFlashPlan, HardwareError> {
+        self.spi_flash.plan(request)
+    }
+
+    pub fn apply_spi_flash(
+        &self,
+        request: &SpiFlashRequest,
+        plan_token: &str,
+        confirmed: bool,
+    ) -> Result<SpiFlashApplyResult, HardwareError> {
+        if !confirmed {
+            return Err(HardwareError::ConfirmationRequired);
+        }
+        if plan_token.trim().is_empty() {
+            return Err(HardwareError::PlanRequired);
+        }
+        let result = if self.policy == ExecutionPolicy::DryRun {
+            let plan = self.plan_spi_flash(request)?;
+            if plan.plan_token != plan_token {
+                return Err(HardwareError::StalePlan);
+            }
+            let mut steps = vec![format!("back up {} before changing it", plan.target.path)];
+            if let Some(image) = &plan.image {
+                steps.push(format!(
+                    "assemble {} using the {} layout",
+                    image.title, image.layout
+                ));
+                steps.push(format!("write the image to {}", plan.target.path));
+            } else {
+                steps.push(format!("erase every block on {}", plan.target.path));
+            }
+            steps.push("read back and verify the SPI flash contents".into());
+            SpiFlashApplyResult {
+                run: hardware_dry_run(
+                    &format!("hardware.spi-flash.{}", request.operation),
+                    if request.operation == "install" {
+                        "Install SPI boot image"
+                    } else {
+                        "Erase SPI boot flash"
+                    },
+                    &steps,
+                ),
+                plan,
+                backup_path: None,
+            }
+        } else if effective_uid() != Some(0) {
+            let result = run_privileged_spi_flash_apply(request, plan_token)?;
+            self.record_run(result.run.clone());
+            return Ok(result);
+        } else {
+            self.spi_flash.apply_live(request, plan_token)?
+        };
+        self.record_run(result.run.clone());
+        Ok(result)
+    }
+
+    pub fn apply_led_trigger(
+        &self,
+        led_id: &str,
+        trigger: &str,
+        confirmed: bool,
+    ) -> Result<ActionRun, HardwareError> {
+        if !confirmed {
+            return Err(HardwareError::ConfirmationRequired);
+        }
+        let status = self.led_status()?;
+        let led = status
+            .leds
+            .iter()
+            .find(|led| led.id == led_id)
+            .ok_or_else(|| HardwareError::InvalidInput(format!("unknown LED {led_id}")))?;
+        if !led.available_triggers.iter().any(|item| item == trigger) {
+            return Err(HardwareError::InvalidInput(format!(
+                "trigger {trigger} is not available for {led_id}"
+            )));
+        }
+        let run = if self.policy == ExecutionPolicy::DryRun {
+            hardware_dry_run(
+                "hardware.led-trigger",
+                "Set LED trigger",
+                &[
+                    format!("set {led_id} trigger to {trigger}"),
+                    "persist the LED trigger for boot".into(),
+                ],
+            )
+        } else if effective_uid() != Some(0) {
+            let run = run_privileged_led_trigger(led_id, trigger)?;
+            self.record_run(run.clone());
+            return Ok(run);
+        } else {
+            self.hardware.apply_led_trigger_live(led_id, trigger)?
+        };
+        self.record_run(run.clone());
+        Ok(run)
+    }
+
+    pub fn apply_rgb_led(
+        &self,
+        config: &RgbLedConfig,
+        confirmed: bool,
+    ) -> Result<ActionRun, HardwareError> {
+        if !confirmed {
+            return Err(HardwareError::ConfirmationRequired);
+        }
+        self.hardware.validate_rgb_led_config(config)?;
+        let run = if self.policy == ExecutionPolicy::DryRun {
+            hardware_dry_run(
+                "hardware.rgb-led",
+                "Set RGB LED pattern",
+                &[
+                    format!("set {} to {} mode", config.group_id, config.mode),
+                    format!(
+                        "use color #{:02x}{:02x}{:02x}, {}% brightness, {}ms cycle",
+                        config.red, config.green, config.blue, config.brightness, config.cycle_ms
+                    ),
+                    "persist the RGB LED pattern for boot".into(),
+                ],
+            )
+        } else if effective_uid() != Some(0) {
+            let run = run_privileged_rgb_led(config)?;
+            self.record_run(run.clone());
+            return Ok(run);
+        } else {
+            self.hardware.apply_rgb_led_live(config)?
+        };
+        self.record_run(run.clone());
+        Ok(run)
+    }
+
+    pub fn restore_led_state(&self) -> Result<ActionRun, HardwareError> {
+        if self.policy != ExecutionPolicy::Live || effective_uid() != Some(0) {
+            return Err(HardwareError::RootRequired);
+        }
+        self.hardware.restore_led_state_live()
+    }
+
     pub fn video_status(&self) -> Result<VideoStatus, HardwareError> {
         self.hardware.video_status()
     }
@@ -230,6 +392,11 @@ impl Controller {
     ) -> Result<ActionRun, HardwareError> {
         if !confirmed {
             return Err(HardwareError::ConfirmationRequired);
+        }
+        if self.fan_curve_status()?.config.is_some() {
+            return Err(HardwareError::Conflict(
+                "disable the active fan curve before changing the thermal governor".into(),
+            ));
         }
         let run = if self.policy == ExecutionPolicy::DryRun {
             let status = self.thermal_status()?;
@@ -262,6 +429,89 @@ impl Controller {
             return Err(HardwareError::RootRequired);
         }
         self.hardware.restore_thermal_policy_live()
+    }
+
+    pub fn fan_curve_status(&self) -> Result<FanCurveStatus, HardwareError> {
+        self.fan_curve.status()
+    }
+
+    pub fn plan_fan_curve(&self, request: &FanCurveRequest) -> Result<FanCurvePlan, HardwareError> {
+        self.fan_curve.plan(request)
+    }
+
+    pub fn apply_fan_curve(
+        &self,
+        request: &FanCurveRequest,
+        plan_token: &str,
+        confirmed: bool,
+    ) -> Result<FanCurveApplyResult, HardwareError> {
+        if !confirmed {
+            return Err(HardwareError::ConfirmationRequired);
+        }
+        if plan_token.trim().is_empty() {
+            return Err(HardwareError::PlanRequired);
+        }
+        let result = if self.policy == ExecutionPolicy::DryRun {
+            let plan = self.plan_fan_curve(request)?;
+            if plan.plan_token != plan_token {
+                return Err(HardwareError::StalePlan);
+            }
+            let steps = if request.enabled {
+                let config = request.config.as_ref().expect("validated fan curve");
+                vec![
+                    format!("set {} to the user_space governor", config.zone_id),
+                    format!(
+                        "control {} with {} curve points",
+                        config.cooling_device_id,
+                        config.points.len()
+                    ),
+                    "persist the curve and start its fail-safe control service".into(),
+                ]
+            } else {
+                vec![
+                    "stop and disable the fan curve service".into(),
+                    "restore the previous thermal governor".into(),
+                ]
+            };
+            FanCurveApplyResult {
+                run: hardware_dry_run(
+                    if request.enabled {
+                        "hardware.fan-curve.apply"
+                    } else {
+                        "hardware.fan-curve.disable"
+                    },
+                    if request.enabled {
+                        "Apply fan curve"
+                    } else {
+                        "Disable fan curve"
+                    },
+                    &steps,
+                ),
+                plan,
+            }
+        } else if effective_uid() != Some(0) {
+            let result = run_privileged_fan_curve_apply(request, plan_token)?;
+            self.record_run(result.run.clone());
+            return Ok(result);
+        } else {
+            self.fan_curve.apply_live(request, plan_token)?
+        };
+        self.record_run(result.run.clone());
+        Ok(result)
+    }
+
+    pub fn fan_curve_tick(&self) -> Result<FanCurveTick, HardwareError> {
+        if self.policy != ExecutionPolicy::Live || effective_uid() != Some(0) {
+            return Err(HardwareError::RootRequired);
+        }
+        self.fan_curve.tick()
+    }
+
+    pub fn fan_curve_shutdown_failsafe(&self) -> Result<FanCurveTick, HardwareError> {
+        if self.policy != ExecutionPolicy::Live || effective_uid() != Some(0) {
+            return Err(HardwareError::RootRequired);
+        }
+        self.fan_curve.shutdown_failsafe()
     }
 
     pub fn plan_source_change(&self, provider_id: &str) -> Result<SourcePlan, SourceError> {
@@ -961,10 +1211,115 @@ fn run_privileged_overlay_apply(
         .map_err(|error| HardwareError::Io(format!("invalid helper response: {error}")))
 }
 
+fn run_privileged_spi_flash_apply(
+    request: &SpiFlashRequest,
+    plan_token: &str,
+) -> Result<SpiFlashApplyResult, HardwareError> {
+    privileged_helper_ready().map_err(|_| HardwareError::RootRequired)?;
+    let image_id = request.image_id.as_deref().unwrap_or("-");
+    let output = Command::new(PKEXEC)
+        .args([
+            PRIVILEGED_HELPER,
+            "spi-flash-apply",
+            &request.operation,
+            &request.target_id,
+            image_id,
+            plan_token,
+            "--confirmed",
+        ])
+        .output()
+        .map_err(|error| HardwareError::Authorization(error.to_string()))?;
+    if !output.status.success() {
+        return Err(HardwareError::Authorization(helper_error(
+            &output.stderr,
+            output.status,
+        )));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| HardwareError::Io(format!("invalid helper response: {error}")))
+}
+
 fn run_privileged_thermal_apply(policy: &str) -> Result<ActionRun, HardwareError> {
     privileged_helper_ready().map_err(|_| HardwareError::RootRequired)?;
     let output = Command::new(PKEXEC)
         .args([PRIVILEGED_HELPER, "thermal-apply", policy, "--confirmed"])
+        .output()
+        .map_err(|error| HardwareError::Authorization(error.to_string()))?;
+    if !output.status.success() {
+        return Err(HardwareError::Authorization(helper_error(
+            &output.stderr,
+            output.status,
+        )));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| HardwareError::Io(format!("invalid helper response: {error}")))
+}
+
+fn run_privileged_fan_curve_apply(
+    request: &FanCurveRequest,
+    plan_token: &str,
+) -> Result<FanCurveApplyResult, HardwareError> {
+    privileged_helper_ready().map_err(|_| HardwareError::RootRequired)?;
+    let request_json = serde_json::to_string(request)
+        .map_err(|error| HardwareError::Io(format!("invalid fan curve request: {error}")))?;
+    let output = Command::new(PKEXEC)
+        .args([
+            PRIVILEGED_HELPER,
+            "fan-curve-apply",
+            &request_json,
+            plan_token,
+            "--confirmed",
+        ])
+        .output()
+        .map_err(|error| HardwareError::Authorization(error.to_string()))?;
+    if !output.status.success() {
+        return Err(HardwareError::Authorization(helper_error(
+            &output.stderr,
+            output.status,
+        )));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| HardwareError::Io(format!("invalid helper response: {error}")))
+}
+
+fn run_privileged_led_trigger(led_id: &str, trigger: &str) -> Result<ActionRun, HardwareError> {
+    privileged_helper_ready().map_err(|_| HardwareError::RootRequired)?;
+    let output = Command::new(PKEXEC)
+        .args([
+            PRIVILEGED_HELPER,
+            "led-trigger",
+            led_id,
+            trigger,
+            "--confirmed",
+        ])
+        .output()
+        .map_err(|error| HardwareError::Authorization(error.to_string()))?;
+    if !output.status.success() {
+        return Err(HardwareError::Authorization(helper_error(
+            &output.stderr,
+            output.status,
+        )));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| HardwareError::Io(format!("invalid helper response: {error}")))
+}
+
+fn run_privileged_rgb_led(config: &RgbLedConfig) -> Result<ActionRun, HardwareError> {
+    privileged_helper_ready().map_err(|_| HardwareError::RootRequired)?;
+    let arguments = [
+        PRIVILEGED_HELPER.to_owned(),
+        "led-rgb".into(),
+        config.group_id.clone(),
+        config.mode.clone(),
+        config.red.to_string(),
+        config.green.to_string(),
+        config.blue.to_string(),
+        config.brightness.to_string(),
+        config.cycle_ms.to_string(),
+        "--confirmed".into(),
+    ];
+    let output = Command::new(PKEXEC)
+        .args(arguments)
         .output()
         .map_err(|error| HardwareError::Authorization(error.to_string()))?;
     if !output.status.success() {
@@ -1349,6 +1704,7 @@ fn source_plan_output(plan: &SourcePlan) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{FanCurveConfig, FanCurvePoint};
 
     #[test]
     fn guarded_action_requires_confirmation() {
@@ -1406,6 +1762,78 @@ mod tests {
             controller.apply_source_change("cqu", "plan-v1-stale", true),
             Err(SourceError::StalePlan)
         ));
+    }
+
+    #[test]
+    fn spi_flash_apply_requires_bound_plan_and_confirmation() {
+        let controller = Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun);
+        let request = SpiFlashRequest {
+            operation: "install".into(),
+            target_id: "mtd0".into(),
+            image_id: Some("rock-5b-rk3588:rockchip-rk35".into()),
+        };
+        let plan = controller.plan_spi_flash(&request).unwrap();
+        assert!(matches!(
+            controller.apply_spi_flash(&request, &plan.plan_token, false),
+            Err(HardwareError::ConfirmationRequired)
+        ));
+        assert!(matches!(
+            controller.apply_spi_flash(&request, "stale", true),
+            Err(HardwareError::StalePlan)
+        ));
+        let result = controller
+            .apply_spi_flash(&request, &plan.plan_token, true)
+            .unwrap();
+        assert_eq!(result.run.status, ActionStatus::Planned);
+        assert!(result.run.synthetic);
+        assert!(result.backup_path.is_none());
+    }
+
+    #[test]
+    fn fan_curve_apply_requires_exact_plan_and_confirmation() {
+        let controller = Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun);
+        let request = FanCurveRequest {
+            enabled: true,
+            config: Some(FanCurveConfig {
+                zone_id: "thermal_zone0".into(),
+                cooling_device_id: "cooling_device0".into(),
+                poll_interval_ms: 2_000,
+                hysteresis_c: 2.0,
+                points: vec![
+                    FanCurvePoint {
+                        temperature_c: 40.0,
+                        speed_percent: 20,
+                    },
+                    FanCurvePoint {
+                        temperature_c: 70.0,
+                        speed_percent: 75,
+                    },
+                    FanCurvePoint {
+                        temperature_c: 82.0,
+                        speed_percent: 100,
+                    },
+                ],
+            }),
+        };
+        let plan = controller.plan_fan_curve(&request).unwrap();
+        assert!(matches!(
+            controller.apply_fan_curve(&request, &plan.plan_token, false),
+            Err(HardwareError::ConfirmationRequired)
+        ));
+
+        let mut changed = request.clone();
+        changed.config.as_mut().unwrap().points[1].speed_percent = 76;
+        assert!(matches!(
+            controller.apply_fan_curve(&changed, &plan.plan_token, true),
+            Err(HardwareError::StalePlan)
+        ));
+
+        let result = controller
+            .apply_fan_curve(&request, &plan.plan_token, true)
+            .unwrap();
+        assert_eq!(result.run.status, ActionStatus::Planned);
+        assert!(result.run.synthetic);
+        assert_eq!(result.plan.resolved_points.len(), 3);
     }
 
     #[test]

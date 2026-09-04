@@ -1,7 +1,9 @@
 use rsetup_core::{
     ActionError, ActionRun, ActionSpec, ActivityEvent, Controller, DeviceSnapshot,
-    GpioStatus, HardwareError, OverlayApplyResult, OverlayPlan, OverlayStatus, SourceApplyResult,
-    SourceError, SourcePlan, SourceStatus, ThermalStatus, VideoFrame, VideoStatus,
+    FanCurveApplyResult, FanCurvePlan, FanCurveRequest, FanCurveStatus, GpioStatus, HardwareError,
+    LedStatus, OverlayApplyResult, OverlayPlan, OverlayStatus, RgbLedConfig, SourceApplyResult,
+    SourceError, SourcePlan, SourceStatus, SpiFlashApplyResult, SpiFlashPlan, SpiFlashRequest,
+    SpiFlashStatus, ThermalStatus, VideoFrame, VideoStatus,
 };
 use serde::Serialize;
 
@@ -161,8 +163,97 @@ fn apply_overlays(
 }
 
 #[tauri::command]
-fn gpio_status(controller: tauri::State<'_, Controller>) -> Result<GpioStatus, CommandError> {
-    controller.gpio_status().map_err(CommandError::from)
+fn gpio_status(
+    controller: tauri::State<'_, Controller>,
+    profile_id: Option<String>,
+) -> Result<GpioStatus, CommandError> {
+    controller
+        .gpio_status_for_profile(profile_id.as_deref())
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+fn spi_flash_status(
+    controller: tauri::State<'_, Controller>,
+) -> Result<SpiFlashStatus, CommandError> {
+    controller.spi_flash_status().map_err(CommandError::from)
+}
+
+#[tauri::command]
+fn plan_spi_flash(
+    controller: tauri::State<'_, Controller>,
+    request: SpiFlashRequest,
+) -> Result<SpiFlashPlan, CommandError> {
+    controller
+        .plan_spi_flash(&request)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+fn apply_spi_flash(
+    controller: tauri::State<'_, Controller>,
+    request: SpiFlashRequest,
+    plan_token: String,
+    confirm: bool,
+) -> Result<SpiFlashApplyResult, CommandError> {
+    controller
+        .apply_spi_flash(&request, &plan_token, confirm)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+fn fan_curve_status(
+    controller: tauri::State<'_, Controller>,
+) -> Result<FanCurveStatus, CommandError> {
+    controller.fan_curve_status().map_err(CommandError::from)
+}
+
+#[tauri::command]
+fn plan_fan_curve(
+    controller: tauri::State<'_, Controller>,
+    request: FanCurveRequest,
+) -> Result<FanCurvePlan, CommandError> {
+    controller.plan_fan_curve(&request).map_err(CommandError::from)
+}
+
+#[tauri::command]
+fn apply_fan_curve(
+    controller: tauri::State<'_, Controller>,
+    request: FanCurveRequest,
+    plan_token: String,
+    confirm: bool,
+) -> Result<FanCurveApplyResult, CommandError> {
+    controller
+        .apply_fan_curve(&request, &plan_token, confirm)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+fn led_status(controller: tauri::State<'_, Controller>) -> Result<LedStatus, CommandError> {
+    controller.led_status().map_err(CommandError::from)
+}
+
+#[tauri::command]
+fn apply_led_trigger(
+    controller: tauri::State<'_, Controller>,
+    led_id: String,
+    trigger: String,
+    confirm: bool,
+) -> Result<ActionRun, CommandError> {
+    controller
+        .apply_led_trigger(&led_id, &trigger, confirm)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+fn apply_rgb_led(
+    controller: tauri::State<'_, Controller>,
+    config: RgbLedConfig,
+    confirm: bool,
+) -> Result<ActionRun, CommandError> {
+    controller
+        .apply_rgb_led(&config, confirm)
+        .map_err(CommandError::from)
 }
 
 #[tauri::command]
@@ -211,6 +302,15 @@ fn main() {
             plan_overlays,
             apply_overlays,
             gpio_status,
+            spi_flash_status,
+            plan_spi_flash,
+            apply_spi_flash,
+            fan_curve_status,
+            plan_fan_curve,
+            apply_fan_curve,
+            led_status,
+            apply_led_trigger,
+            apply_rgb_led,
             video_status,
             capture_video_frame,
             thermal_status,

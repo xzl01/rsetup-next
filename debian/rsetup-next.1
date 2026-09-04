@@ -1,4 +1,4 @@
-.TH RSETUP-NEXT 1 "2026-09-03" "rsetup-next 0.5.0-alpha.1" "User Commands"
+.TH RSETUP-NEXT 1 "2026-09-04" "rsetup-next 0.5.0-alpha.1" "User Commands"
 .SH NAME
 rsetup-next \- local control center for Linux single-board computers
 .SH SYNOPSIS
@@ -28,8 +28,20 @@ Preview or execute a catalog action.
 Inspect, plan, or apply APT source changes.
 .TP
 .B hardware COMMAND
-Inspect overlays, the 40-pin GPIO map, cameras, and thermal policy. Overlay and
-thermal mutations require confirmation.
+Inspect and manage overlays, the 40-pin GPIO map, cameras, thermal policy,
+temperature-driven fan curves, LEDs, and SPI boot flash. Mutations require
+explicit confirmation.
+.PP
+The GPIO map matches the SBC against an embedded catalog of 20 pinout profiles
+and reports at most one current function per physical pin. Running functions
+require evidence from debugfs pinctrl or read-only
+.BR gpioinfo (1)
+metadata. Saved Overlay files under
+.I /boot
+describe the configured next boot, not the current pinmux. Missing evidence is
+reported as unconfirmed; status inspection does not invoke
+.BR gpioget (1)
+or request a GPIO line.
 .TP
 .B doctor
 Check the current runtime and execution policy.
@@ -56,8 +68,20 @@ rsetup-next --demo tui
 rsetup-next sources plan cqu
 rsetup-next hardware overlays status
 rsetup-next hardware gpio --json
+rsetup-next hardware leds status
+rsetup-next hardware spi-flash status
+rsetup-next hardware spi-flash plan install mtd0 \
+  --image rock-5b-rk3588:rockchip-rk35
 rsetup-next hardware video capture video0 --output camera.jpg
 rsetup-next hardware thermal set step_wise --confirm
+rsetup-next hardware thermal fan-curve status --json
+rsetup-next hardware thermal fan-curve plan --zone thermal_zone0 \
+  --device cooling_device0 --point 40:20 --point 55:45 \
+  --point 70:75 --point 82:100 --json
+sudo rsetup-next --live-execution hardware thermal fan-curve apply \
+  --zone thermal_zone0 --device cooling_device0 \
+  --point 40:20 --point 55:45 --point 70:75 --point 82:100 \
+  --plan-token TOKEN --confirm
 sudo rsetup-next --live-execution sources apply cqu \
   --plan-token TOKEN --confirm
 .fi
@@ -80,6 +104,41 @@ Validated thermal policy restored at boot.
 .TP
 .I /usr/lib/systemd/system/rsetup-next-thermal-policy.service
 Oneshot thermal-policy restore unit.
+.TP
+.I /etc/rsetup-next/fan-curve.json
+Root-only curve configuration, including the preserved previous governor.
+.TP
+.I /usr/lib/systemd/system/rsetup-next-fan-curve.service
+Temperature-driven controller. Sensor failure, fatal error, SIGTERM, and
+ExecStop force maximum cooling; deliberate disable restores the prior governor.
+.TP
+.I /run/lock/rsetup-next-fan-curve.lock
+Exclusive lock held across final plan revalidation and curve mutation.
+.TP
+.I /etc/rsetup-next/led-state.json
+Saved LED trigger and RGB pattern state.
+.TP
+.I /usr/lib/systemd/system/rsetup-next-led-state.service
+Oneshot LED-state restore unit.
+.TP
+.I /usr/lib/u-boot/
+Trusted installed bootloader assets used to assemble compatible SPI images.
+.TP
+.I /var/lib/rsetup-next/spi-backups/
+Root-only recovery images captured before SPI flash changes.
+.TP
+.I /sys/kernel/debug/pinctrl/*/pinmux-pins
+Runtime pinmux evidence used when debugfs is available and readable.
+.TP
+.I /usr/share/doc/rsetup-next/PINOUT_PROVENANCE.md
+Source commit, license, and regeneration instructions for the normalized
+20-profile pinout catalog.
+.SH NOTES
+The pinout snapshot is derived from
+.I xzl01/pin-out
+with copyright-owner authorization for distribution under GPL-3.0-or-later.
+Runtime pinctrl and read-only GPIO metadata still require validation across
+real SBCs; absent evidence is intentionally left unconfirmed.
 .SH ENVIRONMENT
 .TP
 .B RSETUP_EXECUTION
@@ -94,4 +153,5 @@ Select the presentation language.
 Select automatic, live, or demo probing.
 .SH SEE ALSO
 .BR apt-get (8),
+.BR gpioinfo (1),
 .BR systemctl (1)

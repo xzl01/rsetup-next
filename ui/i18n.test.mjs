@@ -88,3 +88,67 @@ test("localizes API error codes without changing the API payload", () => {
   assert.equal(i18n.t("api.transport_failure"), "无法连接本机控制中心。");
   assert.equal(i18n.t("api.http_failure", { status: 503 }), "本机控制中心返回 HTTP 503。");
 });
+
+test("localizes LED capability and controls without changing identifiers", () => {
+  const { i18n } = loadI18n("zh-CN");
+  const capability = i18n.capability({
+    id: "led",
+    label: "LED control",
+    detail: "2 status LEDs · 1 RGB group",
+    available: true,
+  });
+  assert.equal(capability.label, "LED 控制");
+  assert.equal(capability.detail, "2 个状态灯 · 1 组 RGB 灯");
+  assert.equal(i18n.t("led.mode.breath"), "呼吸");
+  i18n.setLocale("en");
+  assert.equal(i18n.t("led.applyRgb"), "Apply RGB pattern");
+});
+
+test("localizes SPI flash planning and destructive confirmations", () => {
+  const { i18n } = loadI18n("zh-CN");
+  const capability = i18n.capability({
+    id: "spi-flash",
+    label: "SPI boot flash",
+    detail: "16 MiB MTD device",
+    available: true,
+  });
+  assert.equal(capability.label, "SPI 启动闪存");
+  assert.equal(capability.detail, "16 MiB MTD 设备");
+  assert.match(i18n.t("spiFlash.confirmInstall", { target: "/dev/mtd0", image: "ROCK 5B" }), /SBC 无法启动/);
+  assert.equal(i18n.t("spiFlash.apply.erase"), "备份并擦除闪存");
+  assert.match(i18n.apiError("stale_plan", "fallback"), /系统状态/);
+  i18n.setLocale("en");
+  assert.equal(i18n.t("spiFlash.preview"), "Review SPI operation");
+  assert.match(i18n.apiError("stale_plan", "fallback"), /System state/);
+});
+
+test("localizes fan curve controls and thermal safety copy", () => {
+  const { i18n } = loadI18n("zh-CN");
+  assert.equal(i18n.t("fanCurve.tab"), "风扇曲线");
+  assert.match(i18n.t("fanCurve.pointsHint"), /90 °C/);
+  assert.match(i18n.t("fanCurve.confirmEnable"), /SBC 温控设置/);
+  assert.match(i18n.t("fanCurve.warning.sensor_failure_forces_full_speed"), /满速/);
+  i18n.setLocale("en");
+  assert.equal(i18n.t("fanCurve.preview"), "Review fan curve");
+  assert.match(i18n.t("fanCurve.confirmEnable"), /insufficient cooling/);
+});
+
+test("describes Overlay assignments and Function1 defaults", () => {
+  const { i18n } = loadI18n("zh-CN");
+  const capability = i18n.capability({
+    id: "gpio",
+    label: "GPIO",
+    detail: "Overlay-aware 40-pin map",
+    available: true,
+  });
+  assert.equal(capability.detail, "Overlay 联动的 40Pin 图");
+  assert.match(i18n.t("gpio.currentOnly"), /Overlay 配置/);
+  assert.equal(i18n.t("gpio.source.overlay"), "Overlay 配置");
+  assert.equal(i18n.t("gpio.source.default"), "默认功能");
+  assert.equal(i18n.t("gpio.function1"), "Function1");
+  assert.equal(i18n.t("gpio.source.unassigned"), "未分配");
+  assert.equal(i18n.t("gpio.overlays", { count: 2 }), "2 个已配置 Overlay");
+  i18n.setLocale("en");
+  assert.equal(i18n.t("gpio.unassigned"), "Unassigned");
+  assert.equal(i18n.t("gpio.header.main"), "40-pin expansion header");
+});

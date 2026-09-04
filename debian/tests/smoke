@@ -6,7 +6,15 @@ rsetup-next --demo actions --json | grep -q '"system.update"'
 test -x /usr/libexec/rsetup-next-helper
 test -f /usr/share/polkit-1/actions/com.radxa.rsetup-next.policy
 test -f /usr/lib/systemd/system/rsetup-next-thermal-policy.service
+test -f /usr/lib/systemd/system/rsetup-next-fan-curve.service
+grep -q 'fan-curve fail-safe' /usr/lib/systemd/system/rsetup-next-fan-curve.service
+test -f /usr/lib/systemd/system/rsetup-next-led-state.service
 rsetup-next --demo hardware overlays status --json | grep -q '"overlays"'
 rsetup-next --demo hardware gpio --json | grep -q '"physicalPin"'
+rsetup-next --demo hardware leds status --json | grep -q '"rgbGroups"'
+rsetup-next --demo hardware spi-flash status --json | grep -q '"images"'
+rsetup-next --demo hardware spi-flash plan install mtd0 --image rock-5b-rk3588:rockchip-rk35 --json | grep -q '"planToken"'
 rsetup-next --demo hardware video status --json | grep -q '"captureAvailable"'
 rsetup-next --demo hardware thermal status --json | grep -q '"availablePolicies"'
+rsetup-next --demo hardware thermal fan-curve status --json | grep -q '"points"'
+rsetup-next --demo hardware thermal fan-curve plan --zone thermal_zone0 --device cooling_device0 --point 40:20 --point 55:45 --point 70:75 --point 82:100 --json | grep -q '"planToken"'

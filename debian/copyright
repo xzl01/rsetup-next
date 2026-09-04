@@ -34,6 +34,14 @@ License: vendor-marks-reserved
  ownership of or relicense them. They are not covered by the GPL-3+ license
  applied to the rest of this project.
 
+Files: data/pinouts.json
+Copyright: 2025-2026 xzl01
+License: GPL-3+
+ This normalized pinout snapshot was imported from xzl01/pin-out commit
+ 37411182dc965a857539312bdfef9d0d6ac84a4e and relicensed for inclusion in
+ rsetup-next with the copyright owner's permission. Import provenance and the
+ transformation scope are documented in data/PINOUT_PROVENANCE.md.
+
 License: GPL-3+
  This program is free software; you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by

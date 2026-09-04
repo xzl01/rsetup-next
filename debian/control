@@ -19,6 +19,7 @@ Depends:
  btrfs-progs,
  e2fsprogs,
  iproute2,
+ mtd-utils,
  pkexec,
  systemd,
  ${misc:Depends},

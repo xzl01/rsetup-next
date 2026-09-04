@@ -78,8 +78,10 @@ fn live_snapshot() -> Result<DeviceSnapshot> {
         capability(
             "gpio",
             "GPIO",
-            Path::new("/dev/gpiochip0").exists(),
-            "GPIO character device",
+            Path::new("/proc/device-tree/model").exists()
+                || Path::new("/sys/firmware/devicetree/base/model").exists()
+                || Path::new("/dev/gpiochip0").exists(),
+            "Overlay-aware 40-pin map",
         ),
         capability(
             "video",
@@ -94,10 +96,18 @@ fn live_snapshot() -> Result<DeviceSnapshot> {
             "Kernel thermal subsystem",
         ),
         capability(
+            "led",
+            "LED control",
+            Path::new("/sys/class/leds").exists()
+                || Path::new("/sys/bus/platform/drivers/leds-gpio").exists()
+                || Path::new("/sys/bus/platform/drivers/leds_pwm").exists(),
+            "Linux LED class devices",
+        ),
+        capability(
             "spi-flash",
             "SPI boot flash",
-            Path::new("/dev/mtd0").exists(),
-            "MTD flash device",
+            spi_nor_detected(),
+            "SPI NOR MTD device",
         ),
     ];
     let mut alerts = Vec::new();
@@ -151,6 +161,21 @@ fn live_snapshot() -> Result<DeviceSnapshot> {
     })
 }
 
+fn spi_nor_detected() -> bool {
+    fs::read_dir("/sys/class/mtd").is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            let id = entry.file_name().to_string_lossy().into_owned();
+            id.strip_prefix("mtd").is_some_and(|suffix| {
+                !suffix.is_empty()
+                    && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                    && Path::new("/dev").join(&id).exists()
+                    && read_trimmed(entry.path().join("type"))
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("nor"))
+            })
+        })
+    })
+}
+
 fn demo_snapshot() -> DeviceSnapshot {
     DeviceSnapshot {
         collected_at: Utc::now(),
@@ -189,9 +214,10 @@ fn demo_snapshot() -> DeviceSnapshot {
         ],
         capabilities: vec![
             capability("device-tree", "Device-tree overlays", true, "6 overlays available"),
-            capability("gpio", "GPIO", true, "5 gpiochips · 160 lines"),
+            capability("gpio", "GPIO", true, "Overlay-aware 40-pin map"),
             capability("video", "Video capture", true, "2 Video4Linux devices"),
             capability("thermal", "Thermal controls", true, "3 zones · step_wise"),
+            capability("led", "LED control", true, "2 status LEDs · 1 RGB group"),
             capability("spi-flash", "SPI boot flash", true, "16 MiB MTD device"),
         ],
         alerts: vec![Alert {

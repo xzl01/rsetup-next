@@ -1266,6 +1266,7 @@ body.is-resolving .core-node { animation: core-resolve 820ms var(--ease-soft) bo
 .hardware-cell[data-tone="cyan"] svg { background: var(--cyan-soft); color: var(--cyan); }
 .hardware-cell[data-tone="emerald"] svg { background: var(--success-soft); color: var(--success); }
 .hardware-cell[data-tone="amber"] svg { background: var(--amber-soft); color: var(--amber); }
+.hardware-cell[data-tone="coral"] svg { background: var(--coral-soft); color: var(--coral); }
 
 .hardware-cell.is-offline { opacity: 0.62; }
 .hardware-cell.is-offline svg { background: var(--field); color: var(--bone-muted); }
@@ -1437,26 +1438,117 @@ body.is-resolving .core-node { animation: core-resolve 820ms var(--ease-soft) bo
 .hardware-plan .drawer-result,
 .hardware-tool-body > .drawer-result { margin-right: 0; margin-left: 0; }
 
-.gpio-header {
-  max-width: 560px;
+.spi-operation-tabs {
   display: grid;
-  gap: 5px;
-  margin: 18px auto;
-  padding: 18px;
-  border-radius: 24px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 18px;
+  padding: 5px;
+  border-radius: 18px;
   background: var(--field);
 }
-.gpio-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-.gpio-pin {
+.spi-operation-tabs button {
   min-height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  border: 0;
+  border-radius: 16px;
+  background: transparent;
+  color: var(--bone-muted);
+  cursor: pointer;
+}
+.spi-operation-tabs button svg { width: 19px; height: 19px; }
+.spi-operation-tabs button[aria-selected="true"] { background: var(--ground-2); color: var(--signal); box-shadow: var(--shadow-soft); }
+.spi-operation-tabs button[data-spi-operation="erase"][aria-selected="true"] { color: var(--coral); }
+.spi-operation-tabs button:disabled { cursor: not-allowed; opacity: 0.42; }
+.spi-flash-fields { display: grid; gap: 14px; }
+.spi-device-facts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 16px 0;
+}
+.spi-device-facts span { min-width: 0; padding: 12px 13px; border-radius: 15px; background: var(--field); }
+.spi-device-facts i,
+.spi-device-facts b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.spi-device-facts i { color: var(--bone-muted); font-size: 11px; }
+.spi-device-facts b { margin-top: 5px; color: var(--bone); font-family: "Rsetup Mono", monospace; font-size: 11px; font-weight: 500; }
+.spi-image-layout { margin: 16px 0; padding: 16px; border-radius: 18px; background: var(--field); }
+.spi-image-layout > div { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.spi-image-layout > div strong { color: var(--bone); font-size: 14px; }
+.spi-image-layout > div span { color: var(--bone-muted); font-size: 11px; }
+.spi-image-layout ol { display: grid; gap: 7px; margin: 14px 0 0; padding: 0; list-style: none; }
+.spi-image-layout li { display: flex; justify-content: space-between; gap: 12px; padding-top: 7px; border-top: 1px solid var(--line-dim); color: var(--bone-muted); font-family: "Rsetup Mono", monospace; font-size: 11px; }
+.spi-image-layout li span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.spi-image-layout li b { color: var(--bone); font-weight: 500; white-space: nowrap; }
+.spi-preview { width: 100%; margin-top: 18px; }
+.spi-plan dl { display: grid; gap: 0; margin: 14px 0; }
+.spi-plan dl > div { display: grid; grid-template-columns: minmax(110px, 0.45fr) minmax(0, 1fr); gap: 12px; padding: 10px 12px; border-bottom: 1px solid var(--line-dim); }
+.spi-plan dt { color: var(--bone-muted); font-size: 11px; }
+.spi-plan dd { margin: 0; overflow-wrap: anywhere; color: var(--bone); font-family: "Rsetup Mono", monospace; font-size: 11px; text-align: right; }
+
+.gpio-profile-card {
+  position: relative;
+  overflow: hidden;
+  padding: 20px;
+  border-radius: 24px;
+  background: var(--field);
+  box-shadow: var(--shadow-soft);
+}
+.gpio-profile-card::after {
+  content: "";
+  position: absolute;
+  width: 170px;
+  height: 170px;
+  right: -70px;
+  bottom: -105px;
+  border-radius: 999px;
+  background: var(--signal-soft);
+  pointer-events: none;
+}
+.gpio-profile-title { position: relative; z-index: 1; display: flex; align-items: center; flex-wrap: wrap; gap: 8px 10px; }
+.gpio-profile-title strong { color: var(--bone); font-size: 23px; letter-spacing: -0.025em; }
+.gpio-profile-title span { padding: 5px 8px; border-radius: 10px; background: var(--signal-soft); color: var(--signal); font-size: 10px; font-weight: 800; }
+.gpio-profile-card > p { max-width: 56ch; margin: 7px 0 0; color: var(--bone-muted); font-size: 12px; line-height: 1.55; }
+.gpio-profile-facts { position: relative; z-index: 1; display: flex; flex-wrap: wrap; gap: 7px; margin-top: 16px; }
+.gpio-profile-facts b { padding: 7px 10px; border-radius: 999px; background: var(--ground-2); color: var(--bone-muted); font-family: "Rsetup Mono", monospace; font-size: 10px; font-weight: 500; }
+.gpio-view-note {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 16px 2px 10px;
+  color: var(--bone-muted);
+  font-size: 11px;
+}
+.gpio-view-note::before { width: 7px; height: 7px; border-radius: 999px; background: var(--amber); content: ""; }
+.gpio-connectors { display: grid; gap: 18px; margin-top: 18px; }
+.gpio-connector > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 2px 9px; }
+.gpio-connector > header strong { color: var(--bone); font-size: 13px; }
+.gpio-connector > header span { color: var(--bone-muted); font-family: "Rsetup Mono", monospace; font-size: 10px; }
+.gpio-header { display: grid; gap: 6px; padding: 12px; border-radius: 22px; background: var(--field); }
+.gpio-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+.gpio-pin {
+  min-width: 0;
+  min-height: 58px;
   display: grid;
   grid-template-columns: 28px minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;
-  padding: 7px 10px;
-  border-radius: 13px;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 14px;
   background: var(--ground-2);
+  color: var(--bone);
+  text-align: left;
+  box-shadow: inset 0 0 0 1px transparent;
+  transition: transform 160ms ease-in-out, box-shadow 160ms ease-in-out, background 160ms ease-in-out;
 }
+.gpio-pin:hover { transform: translateY(-1px); box-shadow: var(--shadow-control); }
+.gpio-pin:focus-visible { box-shadow: 0 0 0 4px var(--focus); }
+.gpio-pin.is-selected { background: var(--signal-soft); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--signal) 24%, transparent); }
+.gpio-pin.is-missing { visibility: hidden; }
 .gpio-pin b {
   width: 25px;
   height: 25px;
@@ -1468,18 +1560,35 @@ body.is-resolving .core-node { animation: core-resolve 820ms var(--ease-soft) bo
   font-family: "Rsetup Mono", monospace;
   font-size: 11px;
 }
-.gpio-pin span { overflow: hidden; color: var(--bone); font-family: "Rsetup Mono", monospace; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
-.gpio-pin i { color: var(--bone-muted); font-size: 11px; }
-.gpio-pin[data-value="high"] b { background: var(--success-soft); color: var(--success); }
-.gpio-pin[data-value="low"] b { background: var(--cyan-soft); color: var(--cyan); }
+.gpio-pin span { min-width: 0; overflow: hidden; }
+.gpio-pin span strong,
+.gpio-pin span small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gpio-pin span strong { color: var(--bone); font-family: "Rsetup Mono", monospace; font-size: 11px; font-weight: 600; }
+.gpio-pin span small { margin-top: 2px; color: var(--bone-muted); font-family: "Rsetup Mono", monospace; font-size: 9px; }
+.gpio-pin i { padding: 4px 6px; border-radius: 999px; background: var(--field); color: var(--bone-muted); font-size: 9px; font-style: normal; white-space: nowrap; }
 .gpio-pin[data-kind="ground"] b { background: var(--bone); color: var(--ground); }
 .gpio-pin[data-kind="3v3"] b,
 .gpio-pin[data-kind="5v"] b { background: var(--coral-soft); color: var(--coral); }
-.gpio-pin[data-kind="unmapped"] { opacity: 0.55; }
-.gpio-chip-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-.gpio-chip-list span { padding: 12px; border-radius: 16px; background: var(--field); color: var(--bone-muted); font-size: 11px; }
-.gpio-chip-list b { display: block; margin-bottom: 3px; color: var(--bone); font-family: "Rsetup Mono", monospace; }
-
+.gpio-pin[data-kind="analog"] b { background: var(--amber-soft); color: var(--amber); }
+.gpio-pin[data-source="overlay"] { background: color-mix(in srgb, var(--signal-soft) 52%, var(--ground-2)); }
+.gpio-pin[data-source="overlay"] i { background: var(--signal-soft); color: var(--signal); }
+.gpio-pin[data-source="default"] i { background: var(--success-soft); color: var(--success); }
+.gpio-pin[data-source="conflict"] { background: var(--coral-soft); }
+.gpio-pin[data-source="conflict"] i { color: var(--coral); }
+.gpio-pin[data-source="unassigned"] { opacity: 0.58; }
+.gpio-pin[data-source="unassigned"].is-selected { opacity: 0.8; }
+.gpio-pin-detail { margin-top: 10px; padding: 17px; border-radius: 20px; background: var(--field); }
+.gpio-pin-detail header { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px; }
+.gpio-pin-detail header > span { padding: 6px 9px; border-radius: 999px; background: var(--signal-soft); color: var(--signal); font-family: "Rsetup Mono", monospace; font-size: 10px; }
+.gpio-pin-detail header > strong { min-width: 0; overflow: hidden; color: var(--bone); font-family: "Rsetup Mono", monospace; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.gpio-pin-detail header > i { color: var(--bone-muted); font-size: 10px; font-style: normal; }
+.gpio-pin-detail[data-source="overlay"] header > i { color: var(--signal); }
+.gpio-pin-detail[data-source="default"] header > i { color: var(--success); }
+.gpio-pin-detail[data-source="conflict"] header > i { color: var(--coral); }
+.gpio-pin-detail dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 14px 0 0; }
+.gpio-pin-detail dl > div { min-width: 0; padding: 10px 11px; border-radius: 13px; background: var(--ground-2); }
+.gpio-pin-detail dt { color: var(--bone-muted); font-size: 9px; }
+.gpio-pin-detail dd { margin: 4px 0 0; overflow: hidden; color: var(--bone); font-family: "Rsetup Mono", monospace; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .tool-field { display: grid; gap: 8px; color: var(--bone-muted); font-size: 11px; }
 .tool-field select {
   width: 100%;
@@ -1553,6 +1662,253 @@ body.is-resolving .core-node { animation: core-resolve 820ms var(--ease-soft) bo
 .thermal-zone-list > div > b,
 .cooling-list > div > b { color: var(--bone); font-family: "Rsetup Mono", monospace; font-size: 11px; font-weight: 500; }
 .cooling-list p { color: var(--bone-muted); }
+
+.thermal-tabs { margin-bottom: 16px; }
+.fan-curve-status {
+  min-height: 58px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 4px 2px 12px;
+}
+.fan-curve-status > span {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr);
+  align-items: center;
+  gap: 3px 9px;
+}
+.fan-curve-status > span > i { width: 8px; height: 8px; border-radius: 50%; background: var(--bone-muted); box-shadow: 0 0 0 5px var(--field); }
+.fan-curve-status[data-state="active"] > span > i { background: var(--success); box-shadow: 0 0 0 5px var(--success-soft); }
+.fan-curve-status[data-state="stopped"] > span > i { background: var(--amber); box-shadow: 0 0 0 5px var(--amber-soft); }
+.fan-curve-status b { overflow: hidden; color: var(--bone); font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.fan-curve-status small { grid-column: 2; color: var(--bone-muted); font-family: "Rsetup Mono", monospace; font-size: 11px; }
+.fan-curve-status .text-button { min-height: 44px; padding: 0 12px; color: var(--coral); white-space: nowrap; }
+.fan-curve-chart {
+  position: relative;
+  height: 188px;
+  overflow: hidden;
+  border-radius: 22px;
+  background:
+    radial-gradient(circle at 72% 22%, color-mix(in srgb, var(--cyan) 12%, transparent), transparent 42%),
+    var(--field);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7);
+}
+.fan-curve-plot {
+  position: absolute;
+  inset: 34px 18px 46px 56px;
+}
+.fan-curve-plot svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+  overflow: hidden;
+}
+.fan-curve-grid { fill: none; stroke: color-mix(in srgb, var(--bone-muted) 22%, transparent); stroke-width: 1; stroke-dasharray: 3 4; }
+.fan-curve-axes { fill: none; stroke: color-mix(in srgb, var(--bone-muted) 66%, transparent); stroke-width: 1.5; }
+.fan-curve-line { fill: none; stroke: var(--signal); stroke-width: 4; stroke-linecap: round; stroke-linejoin: round; filter: drop-shadow(0 5px 7px color-mix(in srgb, var(--signal) 20%, transparent)); }
+.fan-curve-temperature { stroke: var(--amber); stroke-width: 2; stroke-dasharray: 4 5; }
+.fan-curve-dot {
+  position: absolute;
+  top: var(--fan-y);
+  left: var(--fan-x);
+  width: 12px;
+  height: 12px;
+  border: 3px solid var(--signal);
+  border-radius: 50%;
+  background: var(--ground-2);
+  transform: translate(-50%, -50%);
+}
+.fan-curve-axis {
+  position: absolute;
+  color: var(--bone-muted);
+  font-family: "Rsetup Mono", monospace;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1;
+}
+.fan-curve-axis-y { left: 12px; }
+.fan-curve-axis-y.is-top { top: 31px; }
+.fan-curve-axis-y.is-middle { top: 50%; transform: translateY(-50%); }
+.fan-curve-axis-y.is-bottom { bottom: 43px; }
+.fan-curve-axis-x { bottom: 27px; }
+.fan-curve-axis-x.is-start { left: 56px; }
+.fan-curve-axis-x.is-middle { left: 50%; transform: translateX(-50%); }
+.fan-curve-axis-x.is-end { right: 18px; }
+.fan-curve-axis-title {
+  position: absolute;
+  color: var(--bone);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+}
+.fan-curve-axis-title.is-y { top: 10px; left: 12px; }
+.fan-curve-axis-title.is-x { bottom: 7px; left: 50%; transform: translateX(-50%); }
+.fan-curve-targets { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 16px; }
+.fan-curve-heading { display: flex; align-items: end; justify-content: space-between; gap: 14px; margin: 22px 0 10px; }
+.fan-curve-heading h3 { margin: 0; font-size: 14px; }
+.fan-curve-heading p { margin: 4px 0 0; color: var(--bone-muted); font-size: 11px; line-height: 1.45; }
+.fan-curve-heading .text-button { min-height: 44px; padding: 0 10px; color: var(--signal); white-space: nowrap; }
+.fan-curve-heading .text-button:disabled { cursor: not-allowed; opacity: 0.4; }
+.fan-curve-points { display: grid; gap: 7px; }
+.fan-curve-point {
+  min-height: 72px;
+  display: grid;
+  grid-template-columns: 28px minmax(90px, 0.72fr) minmax(150px, 1.28fr) 44px;
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+  border-bottom: 1px solid var(--line-dim);
+}
+.fan-curve-point > b { width: 26px; height: 26px; display: grid; place-items: center; border-radius: 50%; background: var(--field); color: var(--signal); font-family: "Rsetup Mono", monospace; font-size: 11px; }
+.fan-curve-point label { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 4px 7px; }
+.fan-curve-point label > span { grid-column: 1 / -1; color: var(--bone-muted); font-size: 11px; }
+.fan-curve-point input[type="number"],
+.fan-curve-settings input,
+.fan-curve-settings select { min-width: 0; min-height: 42px; padding: 0 11px; border: 0; border-radius: 13px; background: var(--field); color: var(--bone); font-family: "Rsetup Mono", monospace; }
+.fan-curve-point input[type="range"] { width: 100%; min-height: 42px; accent-color: var(--signal); }
+.fan-curve-point label > i,
+.fan-curve-point output { color: var(--bone-muted); font-family: "Rsetup Mono", monospace; font-size: 11px; }
+.fan-curve-point > button { width: 44px; height: 44px; display: grid; place-items: center; border: 0; border-radius: 15px; background: transparent; color: var(--bone-muted); cursor: pointer; }
+.fan-curve-point > button:hover:not(:disabled) { background: var(--coral-soft); color: var(--coral); }
+.fan-curve-point > button:disabled { cursor: not-allowed; opacity: 0.28; }
+.fan-curve-point > button svg { width: 18px; height: 18px; }
+.fan-curve-settings { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 16px; }
+.fan-curve-settings label { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 7px; }
+.fan-curve-settings label > span { grid-column: 1 / -1; color: var(--bone-muted); font-size: 11px; }
+.fan-curve-settings label > i { color: var(--bone-muted); font-family: "Rsetup Mono", monospace; font-size: 11px; }
+.fan-curve-preview { width: 100%; margin-top: 18px; }
+.fan-curve-plan .hardware-confirm { margin-top: 16px; }
+.fan-curve-resolved { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 7px; margin: 14px 0; }
+.fan-curve-resolved span { min-width: 0; padding: 11px 9px; border-radius: 15px; background: var(--field); }
+.fan-curve-resolved b,
+.fan-curve-resolved i { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fan-curve-resolved b { font-family: "Rsetup Mono", monospace; font-size: 11px; }
+.fan-curve-resolved i { margin-top: 4px; color: var(--bone-muted); font-size: 11px; }
+.fan-curve-restore { margin: 14px 0; padding: 13px; border-radius: 15px; background: var(--field); }
+
+.led-tabs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 20px;
+  padding: 5px;
+  border-radius: 18px;
+  background: var(--field);
+}
+.led-tabs button {
+  min-height: 48px;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 0 13px;
+  border: 0;
+  border-radius: 16px;
+  background: transparent;
+  color: var(--bone-muted);
+  text-align: left;
+  cursor: pointer;
+}
+.led-tabs button svg { width: 19px; height: 19px; }
+.led-tabs button b { font-family: "Rsetup Mono", monospace; font-size: 11px; font-weight: 500; }
+.led-tabs button[aria-selected="true"] { background: var(--ground-2); color: var(--signal); box-shadow: var(--shadow-soft); }
+.led-tabs button:disabled { cursor: not-allowed; opacity: 0.42; }
+.led-control-panel { display: grid; gap: 16px; }
+.led-status-orbit {
+  width: 112px;
+  height: 112px;
+  display: grid;
+  place-items: center;
+  margin: 2px auto 4px;
+  border-radius: 50%;
+  background: var(--field);
+  box-shadow: inset 0 10px 24px color-mix(in srgb, var(--signal) 8%, transparent);
+}
+.led-status-orbit span {
+  width: 46px;
+  height: 46px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--signal) var(--led-level), var(--field-strong));
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--signal) 34%, transparent);
+}
+.led-control-fields { display: grid; gap: 14px; }
+.led-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.led-facts span { min-width: 0; padding: 12px 13px; border-radius: 15px; background: var(--field); }
+.led-facts i,
+.led-facts b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.led-facts i { color: var(--bone-muted); font-size: 11px; }
+.led-facts b { margin-top: 5px; font-family: "Rsetup Mono", monospace; font-size: 11px; font-weight: 500; }
+.hardware-tool-empty.compact { min-height: 180px; }
+
+.rgb-led-stage {
+  --led-breath-phase: 2500ms;
+  --led-cycle: 5000ms;
+  --led-level: 0.8;
+  position: relative;
+  min-height: 170px;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border-radius: 24px;
+  background: var(--field);
+}
+.rgb-led-stage::before {
+  content: "";
+  position: absolute;
+  width: 220px;
+  height: 220px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--led-color) 18%, transparent);
+  filter: blur(24px);
+  opacity: var(--led-level);
+}
+.rgb-led-glow,
+.rgb-led-core { position: absolute; border-radius: 50%; }
+.rgb-led-glow { --led-base-opacity: var(--led-level); width: 94px; height: 94px; background: var(--led-color); filter: blur(18px); opacity: var(--led-base-opacity); }
+.rgb-led-core { --led-base-opacity: var(--led-level); width: 58px; height: 58px; background: var(--led-color); opacity: var(--led-base-opacity); box-shadow: inset 0 8px 14px color-mix(in srgb, var(--ground-2) 34%, transparent), 0 12px 28px color-mix(in srgb, var(--led-color) 48%, transparent); }
+.rgb-led-stage i { position: absolute; bottom: 14px; color: var(--bone-muted); font-size: 11px; }
+.rgb-led-stage[data-mode="breath"] .rgb-led-core,
+.rgb-led-stage[data-mode="breath"] .rgb-led-glow { animation: led-breathe var(--led-breath-phase) var(--ease-soft) infinite alternate; }
+.rgb-led-stage[data-mode="rainbow"] .rgb-led-core,
+.rgb-led-stage[data-mode="rainbow"] .rgb-led-glow { animation: led-rainbow var(--led-cycle) linear infinite; }
+@keyframes led-breathe { from { transform: scale(0.72); opacity: 0; } to { transform: scale(1.08); opacity: var(--led-base-opacity); } }
+@keyframes led-rainbow { 0% { background: var(--coral); } 33% { background: var(--success); } 66% { background: var(--signal); } 100% { background: var(--coral); } }
+
+.led-mode-field { min-width: 0; margin: 0; padding: 0; border: 0; }
+.led-mode-field legend { margin-bottom: 8px; color: var(--bone-muted); font-size: 11px; }
+.led-mode-field > div { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.led-mode-field label { cursor: pointer; }
+.led-mode-field input { position: absolute; opacity: 0; pointer-events: none; }
+.led-mode-field span { min-height: 44px; display: grid; place-items: center; border-radius: 16px; background: var(--field); color: var(--bone-muted); font-size: 12px; }
+.led-mode-field input:checked + span { background: var(--signal-soft); color: var(--signal); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--signal) 22%, transparent); }
+.led-mode-field label:has(input:focus-visible) span { box-shadow: 0 0 0 4px var(--focus); }
+.led-adjust-grid { display: grid; grid-template-columns: 0.8fr 1.2fr; gap: 10px; }
+.led-color-field,
+.led-range-field,
+.led-cycle-field {
+  min-width: 0;
+  min-height: 76px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: 16px;
+  background: var(--field);
+}
+.led-color-field > span,
+.led-range-field > span,
+.led-cycle-field > span { grid-column: 1 / -1; color: var(--bone-muted); font-size: 11px; }
+.led-color-field input { width: 42px; height: 30px; padding: 0; border: 0; border-radius: 9px; background: transparent; cursor: pointer; }
+.led-color-field input:disabled { cursor: not-allowed; opacity: 0.4; }
+.led-color-field b,
+.led-range-field b,
+.led-cycle-field b { color: var(--bone); font-family: "Rsetup Mono", monospace; font-size: 11px; font-weight: 500; }
+.led-range-field input { width: 100%; accent-color: var(--signal); }
+.led-cycle-field { grid-column: 1 / -1; min-height: 68px; }
+.led-cycle-field input { width: 100%; min-height: 38px; padding: 0 11px; border: 0; border-radius: 12px; background: var(--ground-2); color: var(--bone); font-family: "Rsetup Mono", monospace; }
 
 .legend { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
 .operations-stack { display: grid; gap: 24px; }
@@ -2261,7 +2617,8 @@ body.is-resolving .core-node { animation: core-resolve 820ms var(--ease-soft) bo
   .status-identity b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .task-drawer { width: calc(100vw - 20px); height: calc(100vh - 20px); margin: 10px; }
   .hardware-drawer { width: calc(100vw - 20px); height: calc(100vh - 20px); margin: 10px; }
-  .hardware-drawer-head { padding: 22px 20px 16px; }
+  .hardware-drawer-head { padding: 22px 20px 16px; background: var(--ground-2); backdrop-filter: none; }
+  .hardware-drawer-head > div { min-width: 0; }
   .hardware-tool-body { padding: 0 20px 26px; }
   .overlay-row { grid-template-columns: auto minmax(0, 1fr); }
   .overlay-row > input { grid-column: 1; }
@@ -2271,8 +2628,23 @@ body.is-resolving .core-node { animation: core-resolve 820ms var(--ease-soft) bo
   .gpio-header { padding: 10px; }
   .gpio-pin { grid-template-columns: 24px minmax(0, 1fr); padding: 6px; }
   .gpio-pin i { grid-column: 2; }
-  .gpio-chip-list,
-  .thermal-summary { grid-template-columns: 1fr; }
+  .gpio-pin-detail header { grid-template-columns: auto minmax(0, 1fr); }
+  .gpio-pin-detail header > i { grid-column: 2; }
+  .gpio-pin-detail dl { grid-template-columns: 1fr; }
+  .thermal-summary,
+  .fan-curve-targets,
+  .fan-curve-settings,
+  .led-facts,
+  .led-adjust-grid,
+  .spi-device-facts { grid-template-columns: 1fr; }
+  .spi-image-layout > div { align-items: flex-start; flex-direction: column; }
+  .spi-plan dl > div { grid-template-columns: 1fr; }
+  .spi-plan dd { text-align: left; }
+  .fan-curve-point { grid-template-columns: 28px minmax(0, 1fr) 44px; }
+  .fan-curve-point label:nth-of-type(2) { grid-column: 2; }
+  .fan-curve-point > button { grid-column: 3; grid-row: 1 / 3; }
+  .fan-curve-resolved { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .led-cycle-field { grid-column: auto; }
   .drawer-head { padding: 22px 20px 16px; }
   .drawer-description,
   .task-drawer h3 { padding-right: 20px; padding-left: 20px; }

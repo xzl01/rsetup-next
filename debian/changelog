@@ -7,5 +7,7 @@ rsetup-next (0.5.0~alpha1-1) bookworm; urgency=medium
   * Add a Polkit-authorized fixed-operation helper for unprivileged GUIs.
   * Migrate SSH, Docker, and reversible sleep management operations.
   * Add overlay, read-only GPIO, camera snapshot, and thermal policy tools.
+  * Add native LED and backed-up SPI boot flash management.
+  * Add a validated temperature-driven pwm-fan curve service.
 
  -- xzl <xiangzelong@radxa.com>  Thu, 03 Sep 2026 16:00:00 +0800

@@ -46,19 +46,20 @@ const capabilityVisuals = {
   gpio: { icon: "gpio", tone: "emerald" },
   video: { icon: "video", tone: "cyan" },
   thermal: { icon: "thermal", tone: "amber" },
+  led: { icon: "led", tone: "coral" },
   "spi-flash": { icon: "spi-flash", tone: "signal" },
 };
 
-const hardwareToolIds = new Set(["device-tree", "gpio", "video", "thermal"]);
+const hardwareToolIds = new Set(["device-tree", "gpio", "video", "thermal", "led", "spi-flash"]);
 
 const debugDeviceProfiles = [
-  { id: "rockchip-rk3588", label: "Rockchip · RK3588", product: "Rockchip RK3588 Demo", hostname: "debug-rk3588", socVendor: "Rockchip", soc: "RK3588", architecture: "aarch64" },
-  { id: "allwinner-h618", label: "Allwinner · H618", product: "Allwinner H618 Demo", hostname: "debug-h618", socVendor: "Allwinner", soc: "H618", architecture: "aarch64" },
-  { id: "cix-p1", label: "CIX · P1", product: "CIX P1 Demo", hostname: "debug-cix-p1", socVendor: "CIX", soc: "P1", architecture: "aarch64" },
-  { id: "qualcomm-qcs6490", label: "Qualcomm · QCS6490", product: "Qualcomm QCS6490 Demo", hostname: "debug-qcs6490", socVendor: "Qualcomm", soc: "QCS6490", architecture: "aarch64" },
-  { id: "amlogic-a311d", label: "Amlogic · A311D", product: "Amlogic A311D Demo", hostname: "debug-a311d", socVendor: "Amlogic", soc: "A311D", architecture: "aarch64" },
-  { id: "mediatek-genio700", label: "MediaTek · Genio 700", product: "MediaTek Genio 700 Demo", hostname: "debug-genio700", socVendor: "MediaTek", soc: "Genio 700", architecture: "aarch64" },
-  { id: "starfive-jh7110", label: "StarFive · JH7110", product: "StarFive JH7110 Demo", hostname: "debug-jh7110", socVendor: "StarFive", soc: "JH7110", architecture: "riscv64" },
+  { id: "rockchip-rk3588", label: "ROCK 5B · RK3588", product: "Radxa ROCK 5B Demo", hostname: "debug-rock-5b", socVendor: "Rockchip", soc: "RK3588", architecture: "aarch64", pinoutProfile: "rock5b" },
+  { id: "allwinner-a733", label: "Cubie A7A · A733", product: "Radxa Cubie A7A Demo", hostname: "debug-cubie-a7a", socVendor: "Allwinner", soc: "A733", architecture: "aarch64", pinoutProfile: "cubieA7a" },
+  { id: "cix-p1", label: "Orion O6 · CIX P1", product: "Radxa Orion O6 Demo", hostname: "debug-orion-o6", socVendor: "CIX", soc: "P1", architecture: "aarch64", pinoutProfile: "orionO6" },
+  { id: "qualcomm-qcs6490", label: "Dragon Q6A · QCS6490", product: "Radxa Dragon Q6A Demo", hostname: "debug-dragon-q6a", socVendor: "Qualcomm", soc: "QCS6490", architecture: "aarch64", pinoutProfile: "dragonQ6a" },
+  { id: "amlogic-a311d", label: "ZERO 2 Pro · A311D", product: "Radxa ZERO 2 Pro Demo", hostname: "debug-zero-2-pro", socVendor: "Amlogic", soc: "A311D", architecture: "aarch64", pinoutProfile: "radxaZero2Pro" },
+  { id: "mediatek-genio700", label: "MediaTek · Genio 700", product: "MediaTek Genio 700 Demo", hostname: "debug-genio700", socVendor: "MediaTek", soc: "Genio 700", architecture: "aarch64", pinoutProfile: null },
+  { id: "starfive-jh7110", label: "StarFive · JH7110", product: "StarFive JH7110 Demo", hostname: "debug-jh7110", socVendor: "StarFive", soc: "JH7110", architecture: "riscv64", pinoutProfile: null },
 ];
 
 const defaultDebugCustom = {
@@ -135,10 +136,24 @@ const state = {
   selectedAction: null,
   selectedHardware: null,
   hardwareData: null,
+  hardwareLoadVersion: 0,
+  gpioSelectedPin: null,
   overlayPlan: null,
   overlaySelection: [],
   videoFrame: null,
   thermalPolicy: null,
+  thermalPanel: "policy",
+  fanCurveDraft: null,
+  fanCurvePlan: null,
+  fanCurvePreviewVersion: 0,
+  ledPanel: "status",
+  ledSelection: null,
+  rgbLedConfig: null,
+  spiFlashOperation: "install",
+  spiFlashTarget: null,
+  spiFlashImage: null,
+  spiFlashPlan: null,
+  spiFlashPreviewVersion: 0,
   lastInvoker: null,
   contactInvoker: null,
   route: "overview",
@@ -212,9 +227,32 @@ const transport = {
       body: JSON.stringify({ selectedIds, planToken, confirm }),
     });
   },
-  async gpioStatus() {
-    if (tauriInvoke) return tauriInvoke("gpio_status");
-    return request("/api/v1/hardware/gpio");
+  async gpioStatus(profileId = null) {
+    if (tauriInvoke) return tauriInvoke("gpio_status", { profileId });
+    const query = profileId ? `?profile=${encodeURIComponent(profileId)}` : "";
+    return request(`/api/v1/hardware/gpio${query}`);
+  },
+  async spiFlashStatus() {
+    if (tauriInvoke) return tauriInvoke("spi_flash_status");
+    return request("/api/v1/hardware/spi-flash");
+  },
+  async planSpiFlash(operation, targetId, imageId) {
+    const requestBody = { operation, targetId, imageId };
+    if (tauriInvoke) return tauriInvoke("plan_spi_flash", { request: requestBody });
+    return request("/api/v1/hardware/spi-flash/plan", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(requestBody),
+    });
+  },
+  async applySpiFlash(operation, targetId, imageId, planToken, confirm) {
+    const requestBody = { operation, targetId, imageId };
+    if (tauriInvoke) return tauriInvoke("apply_spi_flash", { request: requestBody, planToken, confirm });
+    return request("/api/v1/hardware/spi-flash/apply", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...requestBody, planToken, confirm }),
+    });
   },
   async videoStatus() {
     if (tauriInvoke) return tauriInvoke("video_status");
@@ -238,6 +276,46 @@ const transport = {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ policy, confirm }),
+    });
+  },
+  async fanCurveStatus() {
+    if (tauriInvoke) return tauriInvoke("fan_curve_status");
+    return request("/api/v1/hardware/thermal/fan-curve");
+  },
+  async planFanCurve(requestBody) {
+    if (tauriInvoke) return tauriInvoke("plan_fan_curve", { request: requestBody });
+    return request("/api/v1/hardware/thermal/fan-curve/plan", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(requestBody),
+    });
+  },
+  async applyFanCurve(requestBody, planToken, confirm) {
+    if (tauriInvoke) return tauriInvoke("apply_fan_curve", { request: requestBody, planToken, confirm });
+    return request("/api/v1/hardware/thermal/fan-curve/apply", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...requestBody, planToken, confirm }),
+    });
+  },
+  async ledStatus() {
+    if (tauriInvoke) return tauriInvoke("led_status");
+    return request("/api/v1/hardware/leds");
+  },
+  async applyLedTrigger(ledId, trigger, confirm) {
+    if (tauriInvoke) return tauriInvoke("apply_led_trigger", { ledId, trigger, confirm });
+    return request("/api/v1/hardware/leds/trigger", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ledId, trigger, confirm }),
+    });
+  },
+  async applyRgbLed(config, confirm) {
+    if (tauriInvoke) return tauriInvoke("apply_rgb_led", { config, confirm });
+    return request("/api/v1/hardware/leds/rgb", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ config, confirm }),
     });
   },
 };
@@ -269,6 +347,17 @@ function displayError(error) {
   if (error?.code) return i18n.apiError(error.code, error.message);
   if (i18n.getLocale() === "zh-CN") return t("api.internal_error");
   return error?.message || String(error);
+}
+
+function hardwareReason(reason) {
+  if (i18n.getLocale() !== "zh-CN") return reason;
+  if (reason === "No SPI NOR MTD device was detected.") return "未检测到 SPI NOR MTD 设备。";
+  if (reason === "Install mtd-utils to write or erase SPI boot flash.") return "请安装 mtd-utils 后再写入或擦除 SPI 启动闪存。";
+  if (reason === "No thermal zone with the user_space governor was detected.") return "未检测到支持 user_space 策略的温区。";
+  if (reason === "No controllable pwm-fan cooling device was detected.") return "未检测到可控制的 pwm-fan 散热设备。";
+  if (reason === "The detected thermal and fan controls are read-only.") return "检测到的温控与风扇接口为只读。";
+  if (reason === "Install the rsetup-next fan curve service before enabling a curve.") return "请先安装 rsetup-next 风扇曲线服务。";
+  return reason;
 }
 
 function setText(selector, value, scope = document) {
@@ -368,6 +457,12 @@ function debugProfileById(id) {
   return debugDeviceProfiles.find((profile) => profile.id === id);
 }
 
+function gpioProfileOverride() {
+  if (!state.snapshot?.synthetic || state.debugProfile === "provider") return null;
+  if (state.debugProfile === "custom") return "none";
+  return debugProfileById(state.debugProfile)?.pinoutProfile || "none";
+}
+
 function loadDebugState() {
   try {
     const storedProfile = localStorage.getItem("rsetup-debug-profile-v1");
@@ -444,6 +539,7 @@ function activateDebugProfile(profileId) {
   renderHelp();
   renderDebugControls();
   resolveSignals();
+  if (state.selectedHardware === "gpio") void openHardwareTool("gpio");
   if (state.debugProfile !== "custom") {
     toast(t("debug.title"), t("debug.changed", { device: state.snapshot.identity.product }));
   }
@@ -464,6 +560,7 @@ function applyCustomDebugDevice() {
   renderHelp();
   renderDebugControls();
   resolveSignals();
+  if (state.selectedHardware === "gpio") void openHardwareTool("gpio");
   toast(t("debug.title"), t("debug.changed", { device: state.debugCustom.product }));
 }
 
@@ -805,6 +902,8 @@ function hardwareToolCopy(id) {
     gpio: "gpio",
     video: "video",
     thermal: "thermal",
+    led: "led",
+    "spi-flash": "spiFlash",
   }[id] || "hardware";
   return { title: t(`${prefix}.title`), description: t(`${prefix}.description`) };
 }
@@ -814,7 +913,7 @@ function overlayDisplayCopy(overlay) {
   if (!state.hardwareData?.synthetic || i18n.getLocale() !== "zh-CN") return overlay;
   const copies = {
     "rk3588-uart2-m0.dtbo": ["UART2 M0", "将 UART2 路由到 40 针排针。", "串口"],
-    "rk3588-i2c3-m0.dtbo": ["I²C3 M0", "在扩展排针上启用 I²C3 总线。", "总线"],
+    "rk3588-i2c3-m1.dtbo": ["I²C3 M1", "在扩展排针上启用 I²C3 总线。", "总线"],
     "rk3588-spi0-m2-cs0-spidev.dtbo": ["SPI0 M2", "通过 spidev 暴露 SPI0 片选 0。", "总线"],
     "rk3588-can1-m0.dtbo": ["CAN1 M0", "在扩展排针上启用 CAN1。", "现场总线"],
     "rk3588-pwm12-m0.dtbo": ["PWM12 M0", "暴露 PWM12，用于风扇或执行器控制。", "PWM"],
@@ -832,11 +931,23 @@ async function openHardwareTool(id) {
     return;
   }
   state.selectedHardware = id;
+  const loadVersion = ++state.hardwareLoadVersion;
   state.hardwareData = null;
+  state.gpioSelectedPin = null;
   state.overlayPlan = null;
   state.overlaySelection = [];
   state.videoFrame = null;
   state.thermalPolicy = null;
+  state.thermalPanel = "policy";
+  state.fanCurveDraft = null;
+  resetFanCurvePlan();
+  state.ledPanel = "status";
+  state.ledSelection = null;
+  state.rgbLedConfig = null;
+  state.spiFlashOperation = "install";
+  state.spiFlashTarget = null;
+  state.spiFlashImage = null;
+  resetSpiFlashPlan();
   state.lastInvoker = document.activeElement;
   const copy = hardwareToolCopy(id);
   setText("[data-hardware-tool-title]", copy.title);
@@ -851,17 +962,29 @@ async function openHardwareTool(id) {
   try {
     const loaders = {
       "device-tree": () => transport.overlayStatus(),
-      gpio: () => transport.gpioStatus(),
+      gpio: () => transport.gpioStatus(gpioProfileOverride()),
       video: () => transport.videoStatus(),
-      thermal: () => transport.thermalStatus(),
+      thermal: async () => {
+        const [thermal, fanCurve] = await Promise.all([transport.thermalStatus(), transport.fanCurveStatus()]);
+        return { ...thermal, fanCurve };
+      },
+      led: () => transport.ledStatus(),
+      "spi-flash": () => transport.spiFlashStatus(),
     };
     const data = await loaders[id]();
-    if (state.selectedHardware !== id) return;
+    if (state.selectedHardware !== id || state.hardwareLoadVersion !== loadVersion) return;
     state.hardwareData = data;
     if (id === "device-tree") state.overlaySelection = data.overlays.filter((item) => item.enabled).map((item) => item.id);
-    if (id === "thermal") state.thermalPolicy = data.currentPolicy || data.recommendedPolicy || data.availablePolicies[0] || null;
+    if (id === "thermal") {
+      state.thermalPolicy = data.currentPolicy || data.recommendedPolicy || data.availablePolicies[0] || null;
+      initializeFanCurveState(data.fanCurve);
+      state.thermalPanel = data.fanCurve?.config ? "curve" : "policy";
+    }
+    if (id === "led") initializeLedState(data);
+    if (id === "spi-flash") initializeSpiFlashState(data);
     renderHardwareTool();
   } catch (error) {
+    if (state.selectedHardware !== id || state.hardwareLoadVersion !== loadVersion) return;
     renderHardwareError(displayError(error));
   }
 }
@@ -875,8 +998,11 @@ function closeHardwareTool() {
     state.lastInvoker = null;
   }, 320);
   state.selectedHardware = null;
+  state.hardwareLoadVersion += 1;
   state.hardwareData = null;
   state.overlayPlan = null;
+  resetSpiFlashPlan();
+  resetFanCurvePlan();
 }
 
 function renderHardwareError(message) {
@@ -892,6 +1018,8 @@ function renderHardwareTool() {
   else if (state.selectedHardware === "gpio") renderGpioTool();
   else if (state.selectedHardware === "video") renderVideoTool();
   else if (state.selectedHardware === "thermal") renderThermalTool();
+  else if (state.selectedHardware === "led") renderLedTool();
+  else if (state.selectedHardware === "spi-flash") renderSpiFlashTool();
 }
 
 function renderOverlayTool() {
@@ -993,39 +1121,255 @@ async function applyOverlays() {
   }
 }
 
-function gpioPinState(pin) {
-  if (pin.kind === "ground") return "GND";
-  if (pin.kind === "3v3") return "3.3V";
-  if (pin.kind === "5v") return "5V";
-  if (pin.kind === "unmapped") return t("gpio.unmapped");
-  if (pin.value === "high") return t("gpio.high");
-  if (pin.value === "low") return t("gpio.low");
-  return t("gpio.unknown");
+function initializeSpiFlashState(data) {
+  state.spiFlashOperation = data.images?.length ? "install" : "erase";
+  state.spiFlashTarget = data.devices?.[0]?.id || null;
+  state.spiFlashImage = data.images?.[0]?.id || null;
+  resetSpiFlashPlan();
 }
 
-function gpioPinCell(pin) {
-  const title = `${t("gpio.pin", { pin: pin.physicalPin })} · ${pin.label} · ${gpioPinState(pin)}`;
-  return `<div class="gpio-pin" data-kind="${escapeHtml(pin.kind)}" data-value="${escapeHtml(pin.value || "unknown")}" title="${escapeHtml(title)}"><b>${pin.physicalPin}</b><span>${escapeHtml(pin.label)}</span><i>${escapeHtml(gpioPinState(pin))}</i></div>`;
+function spiFlashRequest() {
+  return {
+    operation: state.spiFlashOperation,
+    targetId: state.spiFlashTarget,
+    imageId: state.spiFlashOperation === "install" ? state.spiFlashImage : null,
+  };
+}
+
+function sameSpiFlashRequest(left, right) {
+  return left?.operation === right?.operation
+    && left?.targetId === right?.targetId
+    && (left?.imageId || null) === (right?.imageId || null);
+}
+
+function resetSpiFlashPlan() {
+  state.spiFlashPlan = null;
+  state.spiFlashPreviewVersion += 1;
+}
+
+function renderSpiFlashTool() {
+  const data = state.hardwareData;
+  const host = $("[data-hardware-body]");
+  if (!data.supported || !data.devices.length) {
+    host.innerHTML = `<div class="hardware-tool-empty">${escapeHtml(hardwareReason(data.unavailableReason) || t("spiFlash.none"))}</div>`;
+    return;
+  }
+  const target = data.devices.find((device) => device.id === state.spiFlashTarget) || data.devices[0];
+  const image = data.images.find((item) => item.id === state.spiFlashImage) || data.images[0] || null;
+  state.spiFlashTarget = target.id;
+  state.spiFlashImage = image?.id || null;
+  const canPreview = data.mutable && (state.spiFlashOperation === "erase" || Boolean(image));
+  host.innerHTML = `
+    <div class="tool-fact-line"><span>${escapeHtml(t("spiFlash.detected", { devices: data.devices.length, images: data.images.length }))}</span><b>SPI NOR</b></div>
+    <div class="spi-operation-tabs" role="tablist" aria-label="${escapeHtml(t("spiFlash.operation"))}">
+      <button type="button" role="tab" data-spi-operation="install" aria-selected="${state.spiFlashOperation === "install"}" ${data.images.length ? "" : "disabled"}>${icon("spi-flash")}<span>${escapeHtml(t("spiFlash.install"))}</span></button>
+      <button type="button" role="tab" data-spi-operation="erase" aria-selected="${state.spiFlashOperation === "erase"}">${icon("close")}<span>${escapeHtml(t("spiFlash.erase"))}</span></button>
+    </div>
+    <div class="spi-flash-fields">
+      <label class="tool-field"><span>${escapeHtml(t("spiFlash.target"))}</span><select data-spi-target ${data.mutable ? "" : "disabled"}>${data.devices.map((device) => `<option value="${escapeHtml(device.id)}" ${device.id === target.id ? "selected" : ""}>${escapeHtml(device.name)} · ${escapeHtml(device.path)}</option>`).join("")}</select></label>
+      ${state.spiFlashOperation === "install" ? `<label class="tool-field"><span>${escapeHtml(t("spiFlash.image"))}</span><select data-spi-image ${data.mutable && data.images.length ? "" : "disabled"}>${data.images.length ? data.images.map((item) => `<option value="${escapeHtml(item.id)}" ${item.id === image?.id ? "selected" : ""}>${escapeHtml(item.title)} · ${escapeHtml(item.layout)}</option>`).join("") : `<option>${escapeHtml(t("spiFlash.noImages"))}</option>`}</select></label>` : ""}
+    </div>
+    <div class="spi-device-facts">
+      <span><i>${escapeHtml(t("spiFlash.device"))}</i><b>${escapeHtml(target.path)}</b></span>
+      <span><i>${escapeHtml(t("spiFlash.capacity"))}</i><b>${escapeHtml(byteUnit(target.sizeBytes))}</b></span>
+      <span><i>${escapeHtml(t("spiFlash.eraseBlock"))}</i><b>${escapeHtml(byteUnit(target.eraseSizeBytes))}</b></span>
+    </div>
+    ${image && state.spiFlashOperation === "install" ? `<section class="spi-image-layout"><div><strong>${escapeHtml(image.title)}</strong><span>${escapeHtml(t("spiFlash.imageSize", { size: byteUnit(image.sizeBytes) }))}</span></div><ol>${image.components.map((component) => `<li><span>${escapeHtml(component.fileName)}</span><b>${escapeHtml(t("spiFlash.offset", { offset: byteUnit(component.offsetBytes) }))}</b></li>`).join("")}</ol></section>` : ""}
+    ${!data.mutable && data.unavailableReason ? `<div class="tool-warning">${escapeHtml(hardwareReason(data.unavailableReason))}</div>` : ""}
+    ${state.spiFlashOperation === "erase" ? `<div class="tool-warning">${escapeHtml(t("spiFlash.eraseWarning"))}</div>` : ""}
+    <button class="secondary-button spi-preview" type="button" data-spi-preview ${canPreview ? "" : "disabled"}><span>${escapeHtml(t("spiFlash.preview"))}</span>${icon("run")}</button>
+    <div data-spi-plan></div>`;
+  $$('[data-spi-operation]', host).forEach((button) => button.addEventListener("click", () => {
+    state.spiFlashOperation = button.dataset.spiOperation;
+    resetSpiFlashPlan();
+    renderSpiFlashTool();
+  }));
+  $("[data-spi-target]", host)?.addEventListener("change", (event) => {
+    state.spiFlashTarget = event.currentTarget.value;
+    resetSpiFlashPlan();
+    renderSpiFlashTool();
+  });
+  $("[data-spi-image]", host)?.addEventListener("change", (event) => {
+    state.spiFlashImage = event.currentTarget.value;
+    resetSpiFlashPlan();
+    renderSpiFlashTool();
+  });
+  $("[data-spi-preview]", host)?.addEventListener("click", previewSpiFlash);
+  if (state.spiFlashPlan) renderSpiFlashPlan();
+}
+
+async function previewSpiFlash() {
+  const requestBody = spiFlashRequest();
+  if (!requestBody.targetId || (requestBody.operation === "install" && !requestBody.imageId)) return;
+  const previewVersion = state.spiFlashPreviewVersion + 1;
+  state.spiFlashPreviewVersion = previewVersion;
+  const button = $("[data-spi-preview]");
+  button.disabled = true;
+  $("span", button).textContent = t("spiFlash.previewing");
+  try {
+    const plan = await transport.planSpiFlash(requestBody.operation, requestBody.targetId, requestBody.imageId);
+    if (previewVersion !== state.spiFlashPreviewVersion || state.selectedHardware !== "spi-flash") return;
+    if (!sameSpiFlashRequest(spiFlashRequest(), requestBody) || !sameSpiFlashRequest(plan.request, requestBody)) {
+      state.spiFlashPlan = null;
+      renderSpiFlashTool();
+      toast(t("toast.failed"), t("api.stale_plan"), true);
+      return;
+    }
+    state.spiFlashPlan = plan;
+    renderSpiFlashTool();
+  } catch (error) {
+    if (previewVersion !== state.spiFlashPreviewVersion || state.selectedHardware !== "spi-flash") return;
+    renderHardwareError(displayError(error));
+  }
+}
+
+function renderSpiFlashPlan() {
+  const plan = state.spiFlashPlan;
+  const host = $("[data-spi-plan]");
+  if (!host || !plan) return;
+  const operation = plan.request.operation;
+  const imageName = plan.image?.title || "—";
+  const confirmCopy = operation === "install"
+    ? t("spiFlash.confirmInstall", { target: plan.target.path, image: imageName })
+    : t("spiFlash.confirmErase", { target: plan.target.path });
+  host.innerHTML = `<section class="hardware-plan spi-plan">
+    <div class="hardware-plan-head"><strong>${escapeHtml(t(`spiFlash.plan.${operation}`))}</strong><span>${escapeHtml(plan.synthetic ? t("activity.simulated") : t("drawer.root"))}</span></div>
+    <dl><div><dt>${escapeHtml(t("spiFlash.target"))}</dt><dd>${escapeHtml(plan.target.path)}</dd></div>${plan.image ? `<div><dt>${escapeHtml(t("spiFlash.image"))}</dt><dd>${escapeHtml(plan.image.title)}</dd></div>` : ""}<div><dt>${escapeHtml(t("spiFlash.backup"))}</dt><dd>${escapeHtml(t("spiFlash.backupBefore"))}</dd></div><div><dt>${escapeHtml(t("spiFlash.verify"))}</dt><dd>${escapeHtml(t("spiFlash.readback"))}</dd></div></dl>
+    <div class="tool-warning"><span>${escapeHtml(t("spiFlash.powerWarning"))}</span><span>${escapeHtml(t("spiFlash.bootWarning"))}</span></div>
+    <label class="confirm-line hardware-confirm"><input type="checkbox" data-spi-confirm /><span>${escapeHtml(confirmCopy)}</span></label>
+    <button class="execute-button hardware-execute" type="button" data-spi-apply disabled><span>${escapeHtml(t(`spiFlash.apply.${operation}`))}</span>${icon("run")}</button>
+    <div class="drawer-result" data-spi-result hidden></div>
+  </section>`;
+  $("[data-spi-confirm]", host).addEventListener("change", (event) => {
+    $("[data-spi-apply]", host).disabled = !event.currentTarget.checked;
+  });
+  $("[data-spi-apply]", host).addEventListener("click", applySpiFlash);
+}
+
+async function applySpiFlash() {
+  const plan = state.spiFlashPlan;
+  if (!plan) return;
+  if (!sameSpiFlashRequest(spiFlashRequest(), plan.request)) {
+    resetSpiFlashPlan();
+    renderSpiFlashTool();
+    toast(t("toast.failed"), t("api.stale_plan"), true);
+    return;
+  }
+  const button = $("[data-spi-apply]");
+  const result = $("[data-spi-result]");
+  button.disabled = true;
+  $("span", button).textContent = t("spiFlash.applying");
+  result.hidden = false;
+  result.classList.remove("is-error");
+  result.textContent = t("drawer.runState");
+  try {
+    const requestBody = plan.request;
+    const applied = await transport.applySpiFlash(requestBody.operation, requestBody.targetId, requestBody.imageId, plan.planToken, true);
+    const message = applied.run.synthetic ? t("sources.planned") : t(`spiFlash.applied.${requestBody.operation}`);
+    result.textContent = applied.backupPath ? `${message} · ${t("spiFlash.backupPath", { path: applied.backupPath })}` : message;
+    toast(applied.run.synthetic ? t("toast.dryRun") : message, plan.target.path);
+    $("span", button).textContent = t(`spiFlash.apply.${requestBody.operation}`);
+    const confirmation = $("[data-spi-confirm]");
+    if (confirmation) confirmation.checked = false;
+    if (!applied.run.synthetic) {
+      state.hardwareData = await transport.spiFlashStatus();
+      initializeSpiFlashState(state.hardwareData);
+      renderSpiFlashTool();
+    }
+    await refreshAll({ quiet: true });
+  } catch (error) {
+    const detail = displayError(error);
+    const confirmation = $("[data-spi-confirm]");
+    if (confirmation) confirmation.checked = false;
+    if (error?.code === "stale_plan" || error?.code === "plan_required") {
+      resetSpiFlashPlan();
+      renderSpiFlashTool();
+      toast(t("toast.failed"), detail, true);
+      return;
+    }
+    result.classList.add("is-error");
+    result.textContent = detail;
+    $("span", button).textContent = t(`spiFlash.apply.${plan.request.operation}`);
+    button.disabled = true;
+  }
+}
+
+function gpioFunction(pin) {
+  if (pin.currentFunction) return pin.currentFunction;
+  if (pin.functionSource === "conflict") return t("gpio.conflict");
+  return t("gpio.unassigned");
+}
+
+function gpioSource(pin) {
+  return t(`gpio.source.${pin.functionSource || "unassigned"}`);
+}
+
+function gpioPinCell(pin, selected) {
+  if (!pin) return `<span class="gpio-pin is-missing" aria-hidden="true"></span>`;
+  const title = `${t("gpio.pin", { pin: pin.physicalPin })} · ${gpioFunction(pin)} · ${gpioSource(pin)}`;
+  const pad = pin.functionSource === "default" || gpioFunction(pin) === pin.label ? "" : `<small>${escapeHtml(pin.label)}</small>`;
+  return `<button class="gpio-pin ${selected ? "is-selected" : ""}" type="button" data-gpio-pin="${pin.physicalPin}" data-kind="${escapeHtml(pin.kind)}" data-function="${escapeHtml(pin.functionKind || "unassigned")}" data-source="${escapeHtml(pin.functionSource || "unassigned")}" aria-pressed="${selected}" title="${escapeHtml(title)}"><b>${pin.physicalPin}</b><span><strong>${escapeHtml(gpioFunction(pin))}</strong>${pad}</span><i>${escapeHtml(gpioSource(pin))}</i></button>`;
+}
+
+function gpioPinDetail(pin) {
+  const identity = pin.label;
+  const pad = pin.functionSource === "default" ? "" : `<div><dt>${escapeHtml(t("gpio.pad"))}</dt><dd>${escapeHtml(identity)}</dd></div>`;
+  const source = pin.functionSource === "default" ? t("gpio.function1") : pin.sourceDetail || gpioSource(pin);
+  return `<section class="gpio-pin-detail" data-source="${escapeHtml(pin.functionSource || "unassigned")}" aria-live="polite">
+    <header><span>${escapeHtml(t("gpio.pin", { pin: pin.physicalPin }))}</span><strong>${escapeHtml(gpioFunction(pin))}</strong><i>${escapeHtml(gpioSource(pin))}</i></header>
+    <dl>
+      ${pad}
+      <div><dt>${escapeHtml(t("gpio.configuration"))}</dt><dd>${escapeHtml(source)}</dd></div>
+    </dl>
+  </section>`;
+}
+
+function gpioConnectorView(connector, pins, selectedPin, index) {
+  const numbers = connector.pinNumbers || [];
+  const label = connector.id === "main" ? t("gpio.header.main") : t("gpio.header.connector", { index: index + 1 });
+  return `<section class="gpio-connector">
+    <header><strong>${escapeHtml(label)}</strong><span>${escapeHtml(t("gpio.pinCount", { count: numbers.length }))}</span></header>
+    <div class="gpio-header" aria-label="${escapeHtml(label)}">
+      ${Array.from({ length: Math.ceil(numbers.length / 2) }, (_, index) => {
+        const left = pins.get(numbers[index * 2]);
+        const right = pins.get(numbers[index * 2 + 1]);
+        return `<div class="gpio-pair">${gpioPinCell(left, left?.physicalPin === selectedPin)}${gpioPinCell(right, right?.physicalPin === selectedPin)}</div>`;
+      }).join("")}
+    </div>
+  </section>`;
 }
 
 function renderGpioTool() {
   const data = state.hardwareData;
   const host = $("[data-hardware-body]");
-  if (!data.supported) {
+  if (!data.supported && !data.fanCurve?.supported) {
     host.innerHTML = `<div class="hardware-tool-empty">${escapeHtml(data.unavailableReason || t("hardware.unavailable"))}</div>`;
     return;
   }
   const pins = new Map(data.pins.map((pin) => [pin.physicalPin, pin]));
+  const selectedPin = pins.has(state.gpioSelectedPin)
+    ? state.gpioSelectedPin
+    : (data.pins.find((pin) => pin.functionSource === "overlay") || data.pins.find((pin) => pin.functionSource === "conflict") || data.pins[0])?.physicalPin;
+  state.gpioSelectedPin = selectedPin;
+  const selected = pins.get(selectedPin);
+  const connectors = data.connectors?.length ? data.connectors : [{ id: "main", label: "40-Pin GPIO Header", pinNumbers: data.pins.map((pin) => pin.physicalPin) }];
   host.innerHTML = `
-    <div class="tool-fact-line"><span>${escapeHtml(t("gpio.chips", { count: data.chips.length }))}</span><b>40 PIN</b></div>
-    ${data.serialConsoleDetected ? `<div class="tool-warning">${escapeHtml(t("gpio.serialWarning"))}</div>` : ""}
-    <div class="gpio-header" aria-label="${escapeHtml(t("gpio.title"))}">
-      ${Array.from({ length: 20 }, (_, index) => {
-        const odd = index * 2 + 1;
-        return `<div class="gpio-pair">${gpioPinCell(pins.get(odd))}${gpioPinCell(pins.get(odd + 1))}</div>`;
-      }).join("")}
+    <div class="gpio-profile-card">
+      <div class="gpio-profile-title"><strong>${escapeHtml(data.boardName || t("gpio.genericHeader"))}</strong><span>${escapeHtml(t(data.profileId ? "gpio.profileMatched" : "gpio.profileFallback"))}</span></div>
+      <p>${escapeHtml(t(data.profileId ? "gpio.profileDescription" : "gpio.genericDescription"))}</p>
+      <div class="gpio-profile-facts"><b>${escapeHtml(t("gpio.overlays", { count: data.configuredOverlays?.length || 0 }))}</b><b>${escapeHtml(data.layout || "40-pin")}</b></div>
     </div>
-    <div class="gpio-chip-list">${data.chips.map((chip) => `<span><b>${escapeHtml(chip.id)}</b>${escapeHtml(chip.label)} · ${chip.lines ?? "—"}</span>`).join("")}</div>`;
+    ${data.serialConsoleDetected ? `<div class="tool-warning">${escapeHtml(t("gpio.serialWarning"))}</div>` : ""}
+    <div class="gpio-view-note">${escapeHtml(t("gpio.currentOnly"))}</div>
+    ${selected ? gpioPinDetail(selected) : ""}
+    <div class="gpio-connectors">${connectors.map((connector, index) => gpioConnectorView(connector, pins, selectedPin, index)).join("")}</div>`;
+  $$('[data-gpio-pin]', host).forEach((button) => {
+    button.addEventListener("click", () => {
+      state.gpioSelectedPin = Number(button.dataset.gpioPin);
+      renderGpioTool();
+      requestAnimationFrame(() => $(`[data-gpio-pin="${state.gpioSelectedPin}"]`, host)?.focus());
+    });
+  });
 }
 
 function renderVideoTool() {
@@ -1061,6 +1405,116 @@ async function captureVideoFrame() {
   }
 }
 
+function defaultFanCurveConfig(status) {
+  const zone = status?.zones?.find((item) => item.supportsUserSpace) || status?.zones?.[0];
+  const device = status?.coolingDevices?.[0];
+  return {
+    zoneId: zone?.id || "",
+    coolingDeviceId: device?.id || "",
+    pollIntervalMs: 2000,
+    hysteresisC: 2,
+    points: [
+      { temperatureC: 40, speedPercent: 20 },
+      { temperatureC: 55, speedPercent: 45 },
+      { temperatureC: 70, speedPercent: 75 },
+      { temperatureC: 82, speedPercent: 100 },
+    ],
+  };
+}
+
+function initializeFanCurveState(status) {
+  const source = status?.config || defaultFanCurveConfig(status);
+  state.fanCurveDraft = { ...source, points: (source.points || []).map((point) => ({ ...point })) };
+  resetFanCurvePlan();
+}
+
+function resetFanCurvePlan() {
+  state.fanCurvePlan = null;
+  state.fanCurvePreviewVersion += 1;
+}
+
+function fanCurveRequest() {
+  const draft = state.fanCurveDraft;
+  return {
+    enabled: true,
+    config: {
+      zoneId: draft?.zoneId || "",
+      coolingDeviceId: draft?.coolingDeviceId || "",
+      pollIntervalMs: Number(draft?.pollIntervalMs),
+      hysteresisC: Number(draft?.hysteresisC),
+      points: (draft?.points || []).map((point) => ({ temperatureC: Number(point.temperatureC), speedPercent: Number(point.speedPercent) })),
+    },
+  };
+}
+
+function normalizedFanCurveRequest(request) {
+  if (!request?.enabled) return { enabled: false, config: null };
+  return {
+    enabled: true,
+    config: {
+      zoneId: request.config?.zoneId || "",
+      coolingDeviceId: request.config?.coolingDeviceId || "",
+      pollIntervalMs: Number(request.config?.pollIntervalMs),
+      hysteresisC: Number(request.config?.hysteresisC),
+      points: (request.config?.points || []).map((point) => [Number(point.temperatureC), Number(point.speedPercent)]),
+    },
+  };
+}
+
+function sameFanCurveRequest(left, right) {
+  return JSON.stringify(normalizedFanCurveRequest(left)) === JSON.stringify(normalizedFanCurveRequest(right));
+}
+
+function fanCurveValidationKey(request) {
+  if (!request.enabled) return null;
+  const config = request.config;
+  if (!config.zoneId || !config.coolingDeviceId) return "fanCurve.error.target";
+  if (!Number.isFinite(config.hysteresisC) || config.hysteresisC < 0 || config.hysteresisC > 10) return "fanCurve.error.hysteresis";
+  if (!Number.isInteger(config.pollIntervalMs) || config.pollIntervalMs < 500 || config.pollIntervalMs > 10000) return "fanCurve.error.poll";
+  if (config.points.length < 2 || config.points.length > 8) return "fanCurve.error.count";
+  let previousTemperature = -Infinity;
+  let previousSpeed = 0;
+  for (const point of config.points) {
+    if (!Number.isFinite(point.temperatureC) || point.temperatureC < 0 || point.temperatureC > 110 || !Number.isInteger(point.speedPercent) || point.speedPercent < 0 || point.speedPercent > 100) return "fanCurve.error.range";
+    if (point.temperatureC <= previousTemperature || point.speedPercent < previousSpeed) return "fanCurve.error.order";
+    previousTemperature = point.temperatureC;
+    previousSpeed = point.speedPercent;
+  }
+  const last = config.points.at(-1);
+  if (last.speedPercent !== 100 || last.temperatureC > 90) return "fanCurve.error.maximum";
+  return null;
+}
+
+function fanCurveChart(points, currentTemperature) {
+  const clean = (points || []).filter((point) => Number.isFinite(Number(point.temperatureC)) && Number.isFinite(Number(point.speedPercent)));
+  const minimum = Math.min(20, ...clean.map((point) => Number(point.temperatureC)));
+  const maximum = Math.max(90, ...clean.map((point) => Number(point.temperatureC)));
+  const midpoint = minimum + (maximum - minimum) / 2;
+  const x = (temperature) => ((Number(temperature) - minimum) / Math.max(1, maximum - minimum)) * 100;
+  const y = (speed) => 100 - Math.max(0, Math.min(100, Number(speed)));
+  const path = clean.map((point) => `${x(point.temperatureC).toFixed(1)},${y(point.speedPercent).toFixed(1)}`).join(" ");
+  const boundedTemperature = Math.max(minimum, Math.min(maximum, Number(currentTemperature)));
+  const marker = Number.isFinite(Number(currentTemperature))
+    ? `<line class="fan-curve-temperature" vector-effect="non-scaling-stroke" x1="${x(boundedTemperature).toFixed(1)}" x2="${x(boundedTemperature).toFixed(1)}" y1="0" y2="100"></line>`
+    : "";
+  return `<div class="fan-curve-plot">
+    <svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-label="${escapeHtml(t("fanCurve.chart"))}">
+      <path class="fan-curve-grid" vector-effect="non-scaling-stroke" d="M0 0H100M0 50H100M0 100H100"></path>
+      <path class="fan-curve-axes" vector-effect="non-scaling-stroke" d="M0 0V100H100"></path>
+      ${marker}<polyline class="fan-curve-line" vector-effect="non-scaling-stroke" points="${path}"></polyline>
+    </svg>
+    ${clean.map((point) => `<i class="fan-curve-dot" style="--fan-x:${x(point.temperatureC).toFixed(1)}%;--fan-y:${y(point.speedPercent).toFixed(1)}%"></i>`).join("")}
+  </div>
+  <span class="fan-curve-axis fan-curve-axis-y is-top" aria-hidden="true">100%</span>
+  <span class="fan-curve-axis fan-curve-axis-y is-middle" aria-hidden="true">50%</span>
+  <span class="fan-curve-axis fan-curve-axis-y is-bottom" aria-hidden="true">0%</span>
+  <span class="fan-curve-axis fan-curve-axis-x is-start" aria-hidden="true">${formatNumber(minimum, 0)}°</span>
+  <span class="fan-curve-axis fan-curve-axis-x is-middle" aria-hidden="true">${formatNumber(midpoint, 0)}°</span>
+  <span class="fan-curve-axis fan-curve-axis-x is-end" aria-hidden="true">${formatNumber(maximum, 0)}°</span>
+  <span class="fan-curve-axis-title is-y" aria-hidden="true">${escapeHtml(t("fanCurve.speed"))} / %</span>
+  <span class="fan-curve-axis-title is-x" aria-hidden="true">${escapeHtml(t("fanCurve.temperature"))} / °C</span>`;
+}
+
 function renderThermalTool() {
   const data = state.hardwareData;
   const host = $("[data-hardware-body]");
@@ -1069,31 +1523,257 @@ function renderThermalTool() {
     return;
   }
   host.innerHTML = `
+    <div class="thermal-tabs led-tabs" role="tablist" aria-label="${escapeHtml(t("thermal.title"))}">
+      <button type="button" role="tab" data-thermal-panel="policy" aria-selected="${state.thermalPanel === "policy"}">${icon("thermal")}<span>${escapeHtml(t("thermal.policyTab"))}</span></button>
+      <button type="button" role="tab" data-thermal-panel="curve" aria-selected="${state.thermalPanel === "curve"}">${icon("pulse")}<span>${escapeHtml(t("fanCurve.tab"))}</span></button>
+    </div>
+    ${state.thermalPanel === "curve" ? renderFanCurvePanel(data) : renderThermalPolicyPanel(data)}`;
+  $$('[data-thermal-panel]', host).forEach((button) => button.addEventListener("click", () => {
+    state.thermalPanel = button.dataset.thermalPanel;
+    renderThermalTool();
+  }));
+  if (state.thermalPanel === "policy") bindThermalPolicyPanel(host);
+  else bindFanCurvePanel(host);
+}
+
+function renderThermalPolicyPanel(data) {
+  const curveConfigured = Boolean(data.fanCurve?.config);
+  return `
     <div class="thermal-summary">
       <span><i>${escapeHtml(t("thermal.current"))}</i><b>${escapeHtml(data.currentPolicy || "—")}</b></span>
       <span><i>${escapeHtml(t("thermal.saved"))}</i><b>${escapeHtml(data.persistedPolicy || "—")}</b></span>
       <span><i>${escapeHtml(t("thermal.recommended"))}</i><b>${escapeHtml(data.recommendedPolicy || "—")}</b></span>
     </div>
-    ${data.pwmFanDetected ? `<div class="tool-warning">${escapeHtml(t("thermal.pwmWarning"))}</div>` : ""}
+    ${curveConfigured ? `<div class="tool-warning">${escapeHtml(t("fanCurve.policyLocked"))}</div>` : data.pwmFanDetected ? `<div class="tool-warning">${escapeHtml(t("thermal.pwmWarning"))}</div>` : ""}
     <div class="thermal-policies">${data.availablePolicies.map((policy) => {
       const key = ["step_wise", "power_allocator"].includes(policy) ? policy : "other";
-      const blocked = data.pwmFanDetected && policy === "power_allocator";
+      const blocked = curveConfigured || (data.pwmFanDetected && policy === "power_allocator");
       return `<label class="thermal-policy ${blocked ? "is-blocked" : ""}"><input type="radio" name="thermal-policy" value="${escapeHtml(policy)}" ${policy === state.thermalPolicy ? "checked" : ""} ${blocked ? "disabled" : ""} /><span><strong>${escapeHtml(policy)}</strong><i>${escapeHtml(t(`thermal.policyHint.${key}`))}</i></span>${policy === data.recommendedPolicy ? `<b>${escapeHtml(t("thermal.recommended"))}</b>` : ""}</label>`;
     }).join("")}</div>
     <h3 class="tool-section-title">${escapeHtml(t("thermal.zone"))}</h3>
     <div class="thermal-zone-list">${data.zones.map((zone) => `<div><span><strong>${escapeHtml(zone.kind)}</strong><i>${escapeHtml(zone.id)}</i></span><b>${zone.temperatureC == null ? "—" : `${formatNumber(zone.temperatureC, 1)} °C`}</b></div>`).join("")}</div>
     <h3 class="tool-section-title">${escapeHtml(t("thermal.cooling"))}</h3>
     <div class="cooling-list">${data.coolingDevices.length ? data.coolingDevices.map((device) => `<div><span><strong>${escapeHtml(device.kind)}</strong><i>${escapeHtml(device.id)}</i></span><b>${escapeHtml(t("thermal.state", { current: device.currentState ?? "—", max: device.maxState ?? "—" }))}</b></div>`).join("") : `<p>${escapeHtml(t("thermal.noCooling"))}</p>`}</div>
-    <label class="confirm-line hardware-confirm"><input type="checkbox" data-thermal-confirm /><span>${escapeHtml(t("thermal.confirm"))}</span></label>
+    <label class="confirm-line hardware-confirm"><input type="checkbox" data-thermal-confirm ${curveConfigured ? "disabled" : ""} /><span>${escapeHtml(t("thermal.confirm"))}</span></label>
     <button class="execute-button hardware-execute" type="button" data-thermal-apply disabled><span>${escapeHtml(t("thermal.apply"))}</span>${icon("run")}</button>
     <div class="drawer-result" data-thermal-result hidden></div>`;
+}
+
+function bindThermalPolicyPanel(host) {
   $$('input[name="thermal-policy"]', host).forEach((input) => input.addEventListener("change", (event) => {
     state.thermalPolicy = event.currentTarget.value;
   }));
-  $("[data-thermal-confirm]", host).addEventListener("change", (event) => {
+  $("[data-thermal-confirm]", host)?.addEventListener("change", (event) => {
     $("[data-thermal-apply]", host).disabled = !event.currentTarget.checked || !state.thermalPolicy;
   });
-  $("[data-thermal-apply]", host).addEventListener("click", applyThermalPolicy);
+  $("[data-thermal-apply]", host)?.addEventListener("click", applyThermalPolicy);
+}
+
+function fanCurvePointRow(point, index, count, mutable) {
+  return `<div class="fan-curve-point" data-fan-point="${index}">
+    <b>${index + 1}</b>
+    <label><span>${escapeHtml(t("fanCurve.temperature"))}</span><input type="number" min="0" max="120" step="1" value="${escapeHtml(point.temperatureC)}" data-fan-temperature ${mutable ? "" : "disabled"} /><i>°C</i></label>
+    <label><span>${escapeHtml(t("fanCurve.speed"))}</span><input type="range" min="0" max="100" step="1" value="${escapeHtml(point.speedPercent)}" data-fan-speed ${mutable ? "" : "disabled"} /><output>${escapeHtml(point.speedPercent)}%</output></label>
+    <button type="button" data-fan-remove aria-label="${escapeHtml(t("fanCurve.removePoint"))}" ${mutable && count > 2 ? "" : "disabled"}>${icon("close")}</button>
+  </div>`;
+}
+
+function renderFanCurvePanel(data) {
+  const status = data.fanCurve;
+  if (!status?.supported) {
+    return `<div class="hardware-tool-empty">${escapeHtml(hardwareReason(status?.unavailableReason) || t("fanCurve.unavailable"))}</div>`;
+  }
+  const draft = state.fanCurveDraft || defaultFanCurveConfig(status);
+  const selectedZone = status.zones.find((zone) => zone.id === draft.zoneId) || status.zones[0];
+  const selectedDevice = status.coolingDevices.find((device) => device.id === draft.coolingDeviceId) || status.coolingDevices[0];
+  const configured = Boolean(status.config);
+  const statusKey = status.active ? "active" : configured ? "stopped" : "inactive";
+  const activeZone = configured ? status.zones.find((zone) => zone.id === status.config.zoneId) : null;
+  const activeDevice = configured ? status.coolingDevices.find((device) => device.id === status.config.coolingDeviceId) : null;
+  const statusDetail = configured
+    ? t("fanCurve.statusDetail", { zone: activeZone?.kind || activeZone?.id || status.config.zoneId, state: activeDevice?.currentState ?? "—", max: activeDevice?.maxState ?? "—" })
+    : t("fanCurve.statusKernelDetail");
+  return `
+    <div class="fan-curve-status" data-state="${statusKey}">
+      <span><i></i><b>${escapeHtml(t(`fanCurve.status.${statusKey}`))}</b><small>${escapeHtml(statusDetail)}</small></span>
+      ${configured ? `<button type="button" class="text-button" data-fan-disable-preview>${escapeHtml(t("fanCurve.disable"))}</button>` : ""}
+    </div>
+    <div class="fan-curve-chart" data-fan-chart>${fanCurveChart(draft.points, selectedZone?.temperatureC)}</div>
+    <div class="fan-curve-targets">
+      <label class="tool-field"><span>${escapeHtml(t("fanCurve.sensor"))}</span><select data-fan-zone ${status.mutable ? "" : "disabled"}>${status.zones.filter((zone) => zone.supportsUserSpace).map((zone) => `<option value="${escapeHtml(zone.id)}" ${zone.id === draft.zoneId ? "selected" : ""}>${escapeHtml(zone.kind)} · ${zone.temperatureC == null ? "—" : `${formatNumber(zone.temperatureC, 1)} °C`}</option>`).join("")}</select></label>
+      <label class="tool-field"><span>${escapeHtml(t("fanCurve.device"))}</span><select data-fan-device ${status.mutable ? "" : "disabled"}>${status.coolingDevices.map((device) => `<option value="${escapeHtml(device.id)}" ${device.id === draft.coolingDeviceId ? "selected" : ""}>${escapeHtml(device.kind)} · ${escapeHtml(t("thermal.state", { current: device.currentState ?? "—", max: device.maxState }))}</option>`).join("")}</select></label>
+    </div>
+    <div class="fan-curve-heading"><div><h3>${escapeHtml(t("fanCurve.points"))}</h3><p>${escapeHtml(t("fanCurve.pointsHint"))}</p></div><button type="button" class="text-button" data-fan-add ${status.mutable && draft.points.length < 8 ? "" : "disabled"}>${escapeHtml(t("fanCurve.addPoint"))}</button></div>
+    <div class="fan-curve-points">${draft.points.map((point, index) => fanCurvePointRow(point, index, draft.points.length, status.mutable)).join("")}</div>
+    <div class="fan-curve-settings">
+      <label><span>${escapeHtml(t("fanCurve.hysteresis"))}</span><input type="number" min="0" max="10" step="0.5" value="${escapeHtml(draft.hysteresisC)}" data-fan-hysteresis ${status.mutable ? "" : "disabled"} /><i>°C</i></label>
+      <label><span>${escapeHtml(t("fanCurve.poll"))}</span><select data-fan-poll ${status.mutable ? "" : "disabled"}>${[500, 1000, 2000, 5000, 10000].map((value) => `<option value="${value}" ${Number(draft.pollIntervalMs) === value ? "selected" : ""}>${value < 1000 ? `${value} ms` : `${value / 1000} s`}</option>`).join("")}</select></label>
+    </div>
+    ${!status.mutable && status.unavailableReason ? `<div class="tool-warning">${escapeHtml(hardwareReason(status.unavailableReason))}</div>` : ""}
+    <button class="secondary-button fan-curve-preview" type="button" data-fan-preview ${status.mutable ? "" : "disabled"}><span>${escapeHtml(t("fanCurve.preview"))}</span>${icon("run")}</button>
+    <div data-fan-plan></div>`;
+}
+
+function invalidateFanCurvePreview() {
+  resetFanCurvePlan();
+  const host = $("[data-fan-plan]");
+  if (host) host.innerHTML = "";
+}
+
+function updateFanCurveChart() {
+  const chart = $("[data-fan-chart]");
+  if (!chart) return;
+  const zone = state.hardwareData?.fanCurve?.zones?.find((item) => item.id === state.fanCurveDraft?.zoneId);
+  chart.innerHTML = fanCurveChart(state.fanCurveDraft?.points, zone?.temperatureC);
+}
+
+function bindFanCurvePanel(host) {
+  $("[data-fan-zone]", host)?.addEventListener("change", (event) => {
+    state.fanCurveDraft.zoneId = event.currentTarget.value;
+    invalidateFanCurvePreview();
+    renderThermalTool();
+  });
+  $("[data-fan-device]", host)?.addEventListener("change", (event) => {
+    state.fanCurveDraft.coolingDeviceId = event.currentTarget.value;
+    invalidateFanCurvePreview();
+    renderThermalTool();
+  });
+  $$("[data-fan-point]", host).forEach((row) => {
+    const index = Number(row.dataset.fanPoint);
+    $("[data-fan-temperature]", row).addEventListener("input", (event) => {
+      state.fanCurveDraft.points[index].temperatureC = Number(event.currentTarget.value);
+      invalidateFanCurvePreview();
+      updateFanCurveChart();
+    });
+    $("[data-fan-speed]", row).addEventListener("input", (event) => {
+      state.fanCurveDraft.points[index].speedPercent = Number(event.currentTarget.value);
+      $("output", row).textContent = `${event.currentTarget.value}%`;
+      invalidateFanCurvePreview();
+      updateFanCurveChart();
+    });
+    $("[data-fan-remove]", row).addEventListener("click", () => {
+      state.fanCurveDraft.points.splice(index, 1);
+      invalidateFanCurvePreview();
+      renderThermalTool();
+    });
+  });
+  $("[data-fan-add]", host)?.addEventListener("click", () => {
+    const last = state.fanCurveDraft.points.at(-1) || { temperatureC: 40, speedPercent: 20 };
+    state.fanCurveDraft.points.push({ temperatureC: Math.min(90, Number(last.temperatureC) + 8), speedPercent: Math.min(100, Number(last.speedPercent) + 10) });
+    invalidateFanCurvePreview();
+    renderThermalTool();
+  });
+  $("[data-fan-hysteresis]", host)?.addEventListener("input", (event) => {
+    state.fanCurveDraft.hysteresisC = Number(event.currentTarget.value);
+    invalidateFanCurvePreview();
+  });
+  $("[data-fan-poll]", host)?.addEventListener("change", (event) => {
+    state.fanCurveDraft.pollIntervalMs = Number(event.currentTarget.value);
+    invalidateFanCurvePreview();
+  });
+  $("[data-fan-preview]", host)?.addEventListener("click", () => previewFanCurve(fanCurveRequest()));
+  $("[data-fan-disable-preview]", host)?.addEventListener("click", () => previewFanCurve({ enabled: false, config: null }));
+  if (state.fanCurvePlan) renderFanCurvePlan();
+}
+
+async function previewFanCurve(requestBody) {
+  const validationKey = fanCurveValidationKey(requestBody);
+  if (validationKey) {
+    const host = $("[data-fan-plan]");
+    if (host) host.innerHTML = `<div class="tool-warning fan-curve-error">${escapeHtml(t(validationKey))}</div>`;
+    return;
+  }
+  const previewVersion = state.fanCurvePreviewVersion + 1;
+  state.fanCurvePreviewVersion = previewVersion;
+  state.fanCurvePlan = null;
+  const button = requestBody.enabled ? $("[data-fan-preview]") : $("[data-fan-disable-preview]");
+  if (button) {
+    button.disabled = true;
+    const copy = $("span", button);
+    if (copy) copy.textContent = t("fanCurve.previewing");
+  }
+  try {
+    const plan = await transport.planFanCurve(requestBody);
+    if (previewVersion !== state.fanCurvePreviewVersion || state.selectedHardware !== "thermal") return;
+    const current = requestBody.enabled ? fanCurveRequest() : { enabled: false, config: null };
+    if (!sameFanCurveRequest(current, requestBody) || !sameFanCurveRequest(plan.request, requestBody)) {
+      resetFanCurvePlan();
+      renderThermalTool();
+      toast(t("toast.failed"), t("api.stale_plan"), true);
+      return;
+    }
+    state.fanCurvePlan = plan;
+    renderThermalTool();
+  } catch (error) {
+    if (previewVersion !== state.fanCurvePreviewVersion || state.selectedHardware !== "thermal") return;
+    const host = $("[data-fan-plan]");
+    if (host) host.innerHTML = `<div class="tool-warning fan-curve-error">${escapeHtml(displayError(error))}</div>`;
+    if (button) {
+      button.disabled = false;
+      const copy = $("span", button);
+      if (copy) copy.textContent = t(requestBody.enabled ? "fanCurve.preview" : "fanCurve.disable");
+    }
+  }
+}
+
+function renderFanCurvePlan() {
+  const plan = state.fanCurvePlan;
+  const host = $("[data-fan-plan]");
+  if (!host || !plan) return;
+  const enabled = plan.request.enabled;
+  host.innerHTML = `<section class="hardware-plan fan-curve-plan">
+    <div class="hardware-plan-head"><strong>${escapeHtml(t(enabled ? "fanCurve.planEnable" : "fanCurve.planDisable"))}</strong><span>${escapeHtml(plan.synthetic ? t("activity.simulated") : t("drawer.root"))}</span></div>
+    ${enabled ? `<div class="fan-curve-resolved">${plan.resolvedPoints.map((point) => `<span><b>${formatNumber(point.temperatureC, 0)} °C</b><i>${point.speedPercent}% · ${escapeHtml(t("fanCurve.state", { state: point.coolingState }))}</i></span>`).join("")}</div>` : `<p class="fan-curve-restore">${escapeHtml(t("fanCurve.restore", { policy: plan.previousPolicy || "—" }))}</p>`}
+    ${(plan.warnings || []).map((warning) => `<div class="tool-warning">${escapeHtml(t(`fanCurve.warning.${warning}`))}</div>`).join("")}
+    <label class="confirm-line hardware-confirm"><input type="checkbox" data-fan-confirm /><span>${escapeHtml(t(enabled ? "fanCurve.confirmEnable" : "fanCurve.confirmDisable"))}</span></label>
+    <button class="execute-button hardware-execute" type="button" data-fan-apply disabled><span>${escapeHtml(t(enabled ? "fanCurve.apply" : "fanCurve.disable"))}</span>${icon("run")}</button>
+    <div class="drawer-result" data-fan-result hidden></div>
+  </section>`;
+  $("[data-fan-confirm]", host).addEventListener("change", (event) => {
+    $("[data-fan-apply]", host).disabled = !event.currentTarget.checked;
+  });
+  $("[data-fan-apply]", host).addEventListener("click", applyFanCurve);
+}
+
+async function applyFanCurve() {
+  const plan = state.fanCurvePlan;
+  if (!plan) return;
+  const current = plan.request.enabled ? fanCurveRequest() : { enabled: false, config: null };
+  if (!sameFanCurveRequest(current, plan.request)) {
+    resetFanCurvePlan();
+    renderThermalTool();
+    toast(t("toast.failed"), t("api.stale_plan"), true);
+    return;
+  }
+  const button = $("[data-fan-apply]");
+  const result = $("[data-fan-result]");
+  button.disabled = true;
+  $("span", button).textContent = t("fanCurve.applying");
+  result.hidden = false;
+  result.classList.remove("is-error");
+  result.textContent = t("drawer.runState");
+  try {
+    const response = await transport.applyFanCurve(plan.request, plan.planToken, true);
+    result.textContent = response.run.synthetic ? t("sources.planned") : t(plan.request.enabled ? "fanCurve.applied" : "fanCurve.disabled");
+    toast(response.run.synthetic ? t("toast.dryRun") : t("fanCurve.updated"), t(plan.request.enabled ? "fanCurve.applied" : "fanCurve.disabled"));
+    if (response.run.synthetic) {
+      $("span", button).textContent = t(plan.request.enabled ? "fanCurve.apply" : "fanCurve.disable");
+      button.disabled = false;
+    }
+    if (!response.run.synthetic) {
+      const [thermal, fanCurve] = await Promise.all([transport.thermalStatus(), transport.fanCurveStatus()]);
+      state.hardwareData = { ...thermal, fanCurve };
+      state.thermalPolicy = thermal.currentPolicy;
+      initializeFanCurveState(fanCurve);
+      renderThermalTool();
+    }
+    await refreshAll({ quiet: true });
+  } catch (error) {
+    result.classList.add("is-error");
+    result.textContent = displayError(error);
+    $("span", button).textContent = t(plan.request.enabled ? "fanCurve.apply" : "fanCurve.disable");
+    button.disabled = false;
+  }
 }
 
 async function applyThermalPolicy() {
@@ -1110,8 +1790,10 @@ async function applyThermalPolicy() {
     result.textContent = run.synthetic ? t("sources.planned") : t("thermal.applied");
     toast(run.synthetic ? t("toast.dryRun") : t("thermal.applied"), state.thermalPolicy);
     if (!run.synthetic) {
-      state.hardwareData = await transport.thermalStatus();
-      state.thermalPolicy = state.hardwareData.currentPolicy;
+      const [thermal, fanCurve] = await Promise.all([transport.thermalStatus(), transport.fanCurveStatus()]);
+      state.hardwareData = { ...thermal, fanCurve };
+      state.thermalPolicy = thermal.currentPolicy;
+      initializeFanCurveState(fanCurve);
       renderThermalTool();
     }
     await refreshAll({ quiet: true });
@@ -1120,6 +1802,232 @@ async function applyThermalPolicy() {
     result.classList.add("is-error");
     result.textContent = detail;
     $("span", button).textContent = t("thermal.apply");
+    button.disabled = false;
+  }
+}
+
+function standaloneLeds(data = state.hardwareData) {
+  return (data?.leds || []).filter((led) => !led.rgbGroup);
+}
+
+function defaultRgbLedConfig(group) {
+  return {
+    groupId: group?.id || "",
+    mode: "solid",
+    red: 91,
+    green: 104,
+    blue: 181,
+    brightness: 80,
+    cycleMs: 5_000,
+  };
+}
+
+function preferredLedTrigger(data, led) {
+  const saved = data.savedState?.triggers?.[led.id];
+  if (led.availableTriggers.includes(saved)) return saved;
+  if (led.availableTriggers.includes(led.currentTrigger)) return led.currentTrigger;
+  return led.availableTriggers[0] || "";
+}
+
+function initializeLedState(data) {
+  const leds = standaloneLeds(data);
+  const led = leds[0];
+  state.ledSelection = led ? {
+    ledId: led.id,
+    trigger: preferredLedTrigger(data, led),
+  } : null;
+  const group = data.rgbGroups?.[0];
+  state.rgbLedConfig = group
+    ? { ...defaultRgbLedConfig(group), ...(data.savedState?.rgb?.[group.id] || {}), groupId: group.id }
+    : null;
+  state.ledPanel = leds.length ? "status" : "rgb";
+}
+
+function rgbLedHex(config) {
+  const channel = (value) => Math.max(0, Math.min(255, Number(value) || 0)).toString(16).padStart(2, "0");
+  return `#${channel(config?.red)}${channel(config?.green)}${channel(config?.blue)}`;
+}
+
+function renderLedTool() {
+  const data = state.hardwareData;
+  const host = $("[data-hardware-body]");
+  if (!data.supported) {
+    host.innerHTML = `<div class="hardware-tool-empty">${escapeHtml(data.unavailableReason || t("hardware.unavailable"))}</div>`;
+    return;
+  }
+  const leds = standaloneLeds(data);
+  const groups = data.rgbGroups || [];
+  if (state.ledPanel === "status" && !leds.length && groups.length) state.ledPanel = "rgb";
+  if (state.ledPanel === "rgb" && !groups.length && leds.length) state.ledPanel = "status";
+  host.innerHTML = `
+    <div class="tool-fact-line"><span>${escapeHtml(t("led.detected", { status: leds.length, groups: groups.length }))}</span><b>LED CLASS</b></div>
+    <div class="led-tabs" role="tablist" aria-label="${escapeHtml(t("led.title"))}">
+      <button type="button" role="tab" data-led-panel="status" aria-selected="${state.ledPanel === "status"}" ${leds.length ? "" : "disabled"}>${icon("led")}<span>${escapeHtml(t("led.statusTab"))}</span><b>${leds.length}</b></button>
+      <button type="button" role="tab" data-led-panel="rgb" aria-selected="${state.ledPanel === "rgb"}" ${groups.length ? "" : "disabled"}>${icon("sun")}<span>${escapeHtml(t("led.rgbTab"))}</span><b>${groups.length}</b></button>
+    </div>
+    <div data-led-controls>${state.ledPanel === "rgb" ? renderRgbLedControls(data) : renderStatusLedControls(data)}</div>`;
+  $$('[data-led-panel]', host).forEach((button) => button.addEventListener("click", () => {
+    state.ledPanel = button.dataset.ledPanel;
+    renderLedTool();
+  }));
+  bindLedControls();
+}
+
+function renderStatusLedControls(data) {
+  const leds = standaloneLeds(data);
+  if (!leds.length) return `<div class="hardware-tool-empty compact">${escapeHtml(t("led.noStatus"))}</div>`;
+  const selected = leds.find((led) => led.id === state.ledSelection?.ledId) || leds[0];
+  if (!state.ledSelection || selected.id !== state.ledSelection.ledId) {
+    state.ledSelection = {
+      ledId: selected.id,
+      trigger: preferredLedTrigger(data, selected),
+    };
+  }
+  const saved = data.savedState?.triggers?.[selected.id] || "—";
+  const brightness = selected.maxBrightness
+    ? Math.round((selected.brightness || 0) / selected.maxBrightness * 100)
+    : null;
+  return `<section class="led-control-panel" role="tabpanel">
+    <div class="led-status-orbit" aria-hidden="true"><span style="--led-level:${brightness ?? 35}%"></span></div>
+    <div class="led-control-fields">
+      <label class="tool-field"><span>${escapeHtml(t("led.device"))}</span><select data-led-device ${data.mutable ? "" : "disabled"}>${leds.map((led) => `<option value="${escapeHtml(led.id)}" ${led.id === selected.id ? "selected" : ""}>${escapeHtml(led.id)}</option>`).join("")}</select></label>
+      <div class="led-facts"><span><i>${escapeHtml(t("led.current"))}</i><b>${escapeHtml(selected.currentTrigger || "—")}</b></span><span><i>${escapeHtml(t("led.saved"))}</i><b>${escapeHtml(saved)}</b></span><span><i>${escapeHtml(t("led.brightness"))}</i><b>${brightness == null ? "—" : `${brightness}%`}</b></span></div>
+      <label class="tool-field"><span>${escapeHtml(t("led.trigger"))}</span><select data-led-trigger ${data.mutable ? "" : "disabled"}>${selected.availableTriggers.map((trigger) => `<option value="${escapeHtml(trigger)}" ${trigger === state.ledSelection.trigger ? "selected" : ""}>${escapeHtml(trigger)}</option>`).join("")}</select></label>
+    </div>
+    ${!data.mutable && data.unavailableReason ? `<div class="tool-warning">${escapeHtml(data.unavailableReason)}</div>` : ""}
+    <label class="confirm-line hardware-confirm"><input type="checkbox" data-led-confirm ${data.mutable ? "" : "disabled"} /><span>${escapeHtml(t("led.confirm"))}</span></label>
+    <button class="execute-button hardware-execute" type="button" data-led-apply="trigger" disabled><span>${escapeHtml(t("led.applyTrigger"))}</span>${icon("run")}</button>
+    <div class="drawer-result" data-led-result hidden></div>
+  </section>`;
+}
+
+function renderRgbLedControls(data) {
+  const groups = data.rgbGroups || [];
+  if (!groups.length) return `<div class="hardware-tool-empty compact">${escapeHtml(t("led.noRgb"))}</div>`;
+  const group = groups.find((item) => item.id === state.rgbLedConfig?.groupId) || groups[0];
+  if (!state.rgbLedConfig || state.rgbLedConfig.groupId !== group.id) {
+    state.rgbLedConfig = { ...defaultRgbLedConfig(group), ...(data.savedState?.rgb?.[group.id] || {}), groupId: group.id };
+  }
+  const config = state.rgbLedConfig;
+  const color = rgbLedHex(config);
+  return `<section class="led-control-panel" role="tabpanel">
+    <div class="rgb-led-stage" data-mode="${escapeHtml(config.mode)}" style="--led-color:${color};--led-level:${config.brightness / 100};--led-cycle:${config.cycleMs}ms;--led-breath-phase:${config.cycleMs / 2}ms">
+      <span class="rgb-led-glow"></span><span class="rgb-led-core"></span><i>${escapeHtml(t("led.preview"))}</i>
+    </div>
+    <label class="tool-field"><span>${escapeHtml(t("led.rgbGroup"))}</span><select data-rgb-group ${data.mutable ? "" : "disabled"}>${groups.map((item) => `<option value="${escapeHtml(item.id)}" ${item.id === group.id ? "selected" : ""}>${escapeHtml(item.id)} · RGB</option>`).join("")}</select></label>
+    <fieldset class="led-mode-field" ${data.mutable ? "" : "disabled"}><legend>${escapeHtml(t("led.mode"))}</legend><div>${["solid", "breath", "rainbow"].map((mode) => `<label><input type="radio" name="led-mode" value="${mode}" ${config.mode === mode ? "checked" : ""} /><span>${escapeHtml(t(`led.mode.${mode}`))}</span></label>`).join("")}</div></fieldset>
+    <div class="led-adjust-grid">
+      <label class="led-color-field"><span>${escapeHtml(t("led.color"))}</span><input type="color" value="${color}" data-led-color ${config.mode === "rainbow" || !data.mutable ? "disabled" : ""} /><b>${color.toUpperCase()}</b></label>
+      <label class="led-range-field"><span>${escapeHtml(t("led.brightness"))}</span><input type="range" min="0" max="100" step="1" value="${config.brightness}" data-led-brightness ${data.mutable ? "" : "disabled"} /><b data-led-brightness-value>${config.brightness}%</b></label>
+      <label class="led-cycle-field"><span>${escapeHtml(t("led.cycle"))}</span><input type="number" min="200" max="60000" step="100" value="${config.cycleMs}" data-led-cycle ${data.mutable ? "" : "disabled"} /><b>${escapeHtml(t("led.milliseconds"))}</b></label>
+    </div>
+    ${!data.mutable && data.unavailableReason ? `<div class="tool-warning">${escapeHtml(data.unavailableReason)}</div>` : ""}
+    <label class="confirm-line hardware-confirm"><input type="checkbox" data-led-confirm ${data.mutable ? "" : "disabled"} /><span>${escapeHtml(t("led.confirm"))}</span></label>
+    <button class="execute-button hardware-execute" type="button" data-led-apply="rgb" disabled><span>${escapeHtml(t("led.applyRgb"))}</span>${icon("run")}</button>
+    <div class="drawer-result" data-led-result hidden></div>
+  </section>`;
+}
+
+function bindLedControls() {
+  const host = $("[data-hardware-body]");
+  $("[data-led-device]", host)?.addEventListener("change", (event) => {
+    const led = standaloneLeds().find((item) => item.id === event.currentTarget.value);
+    state.ledSelection = led ? {
+      ledId: led.id,
+      trigger: preferredLedTrigger(state.hardwareData, led),
+    } : null;
+    renderLedTool();
+  });
+  $("[data-led-trigger]", host)?.addEventListener("change", (event) => {
+    state.ledSelection.trigger = event.currentTarget.value;
+    resetLedConfirmation(host);
+  });
+  $("[data-rgb-group]", host)?.addEventListener("change", (event) => {
+    const group = state.hardwareData.rgbGroups.find((item) => item.id === event.currentTarget.value);
+    state.rgbLedConfig = { ...defaultRgbLedConfig(group), ...(state.hardwareData.savedState?.rgb?.[group.id] || {}), groupId: group.id };
+    renderLedTool();
+  });
+  $$('input[name="led-mode"]', host).forEach((input) => input.addEventListener("change", (event) => {
+    state.rgbLedConfig.mode = event.currentTarget.value;
+    renderLedTool();
+  }));
+  $("[data-led-color]", host)?.addEventListener("input", (event) => {
+    const value = event.currentTarget.value;
+    state.rgbLedConfig.red = parseInt(value.slice(1, 3), 16);
+    state.rgbLedConfig.green = parseInt(value.slice(3, 5), 16);
+    state.rgbLedConfig.blue = parseInt(value.slice(5, 7), 16);
+    const stage = $(".rgb-led-stage", host);
+    stage.style.setProperty("--led-color", value);
+    $(".led-color-field b", host).textContent = value.toUpperCase();
+    resetLedConfirmation(host);
+  });
+  $("[data-led-brightness]", host)?.addEventListener("input", (event) => {
+    state.rgbLedConfig.brightness = Number(event.currentTarget.value);
+    $("[data-led-brightness-value]", host).textContent = `${state.rgbLedConfig.brightness}%`;
+    $(".rgb-led-stage", host).style.setProperty("--led-level", state.rgbLedConfig.brightness / 100);
+    resetLedConfirmation(host);
+  });
+  $("[data-led-cycle]", host)?.addEventListener("input", (event) => {
+    const cycleMs = Number(event.currentTarget.value);
+    if (cycleMs >= 200 && cycleMs <= 60_000) {
+      state.rgbLedConfig.cycleMs = cycleMs;
+      $(".rgb-led-stage", host).style.setProperty("--led-cycle", `${cycleMs}ms`);
+      $(".rgb-led-stage", host).style.setProperty("--led-breath-phase", `${cycleMs / 2}ms`);
+    }
+    resetLedConfirmation(host);
+  });
+  $("[data-led-cycle]", host)?.addEventListener("change", (event) => {
+    state.rgbLedConfig.cycleMs = Math.max(200, Math.min(60_000, Number(event.currentTarget.value) || 5_000));
+    event.currentTarget.value = state.rgbLedConfig.cycleMs;
+    $(".rgb-led-stage", host).style.setProperty("--led-cycle", `${state.rgbLedConfig.cycleMs}ms`);
+    $(".rgb-led-stage", host).style.setProperty("--led-breath-phase", `${state.rgbLedConfig.cycleMs / 2}ms`);
+    resetLedConfirmation(host);
+  });
+  $("[data-led-confirm]", host)?.addEventListener("change", (event) => {
+    $("[data-led-apply]", host).disabled = !event.currentTarget.checked;
+  });
+  $("[data-led-apply]", host)?.addEventListener("click", applyLedConfiguration);
+}
+
+function resetLedConfirmation(host) {
+  const confirmation = $("[data-led-confirm]", host);
+  const apply = $("[data-led-apply]", host);
+  if (confirmation) confirmation.checked = false;
+  if (apply) apply.disabled = true;
+}
+
+async function applyLedConfiguration(event) {
+  const kind = event.currentTarget.dataset.ledApply;
+  const labelKey = kind === "rgb" ? "led.applyRgb" : "led.applyTrigger";
+  const button = event.currentTarget;
+  const result = $("[data-led-result]");
+  button.disabled = true;
+  $("span", button).textContent = t("led.applying");
+  result.hidden = false;
+  result.classList.remove("is-error");
+  result.textContent = t("drawer.runState");
+  try {
+    const run = kind === "rgb"
+      ? await transport.applyRgbLed(state.rgbLedConfig, true)
+      : await transport.applyLedTrigger(state.ledSelection.ledId, state.ledSelection.trigger, true);
+    result.textContent = run.synthetic ? t("sources.planned") : t("led.applied");
+    toast(run.synthetic ? t("toast.dryRun") : t("led.applied"), kind === "rgb" ? state.rgbLedConfig.mode : state.ledSelection.trigger);
+    $("span", button).textContent = t(labelKey);
+    const confirmation = $("[data-led-confirm]");
+    if (confirmation) confirmation.checked = false;
+    if (!run.synthetic) {
+      const panel = state.ledPanel;
+      state.hardwareData = await transport.ledStatus();
+      initializeLedState(state.hardwareData);
+      state.ledPanel = panel;
+      renderLedTool();
+    }
+    await refreshAll({ quiet: true });
+  } catch (error) {
+    const detail = displayError(error);
+    result.classList.add("is-error");
+    result.textContent = detail;
+    $("span", button).textContent = t(labelKey);
     button.disabled = false;
   }
 }

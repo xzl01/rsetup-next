@@ -1,0 +1,21 @@
+[Unit]
+Description=Apply the rsetup-next temperature-driven fan curve
+After=multi-user.target
+ConditionPathExists=/etc/rsetup-next/fan-curve.json
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/rsetup-next --live-execution hardware thermal fan-curve daemon
+ExecStop=/usr/bin/rsetup-next --live-execution hardware thermal fan-curve fail-safe
+Restart=on-failure
+RestartSec=2s
+KillSignal=SIGTERM
+TimeoutStopSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/sys/class/thermal
+
+[Install]
+WantedBy=multi-user.target

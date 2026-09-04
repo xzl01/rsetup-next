@@ -35,14 +35,21 @@ affected line before confirmation. Live application creates timestamped
 backups, writes atomically, runs `apt-get update`, and automatically restores
 the previous files if the refresh fails.
 
-The native hardware manager now covers four migrated workflows:
+The native hardware manager now covers seven migrated workflows:
 
 - Device-tree overlays are listed from the managed U-Boot directory, checked
   for declared resource conflicts and package requirements, previewed with an
   exact revision-bound token, and renamed transactionally before
   `u-boot-update`. Changes apply after reboot.
-- The 40-pin GPIO header is a read-only map. It resolves `PIN_n` line names
-  with libgpiod tools when available and never changes line direction or level.
+- The 40-pin GPIO header is a read-only map backed by 20 normalized SBC
+  profiles from `xzl01/pin-out`. Each physical pin shows exactly one configured
+  function: the saved enabled Overlay assignment takes priority, otherwise a
+  known SBC shows the Pinout `Function1` value used without an Overlay. Unknown
+  generic headers remain unassigned.
+  The drawer omits GPIO-chip, line, direction, consumer, and kernel-ownership
+  metadata. Saved Overlay changes are shown immediately and marked as requiring
+  a reboot to activate; the status path never invokes `gpioget` or requests a
+  GPIO line.
 - Video4Linux devices can capture a bounded single-frame webcam test through
   `ffmpeg`; device IDs are enumerated and validated rather than accepted as
   arbitrary paths.
@@ -50,6 +57,18 @@ The native hardware manager now covers four migrated workflows:
   original thermal-governor choice is preserved, including the
   `pwm-fan`/`power_allocator` incompatibility check, and the selected policy
   is restored at boot by a native systemd unit.
+- A temperature-driven `pwm-fan` curve accepts 2–8 points with increasing
+  temperatures and nondecreasing speeds, requires 100% cooling by 90 °C,
+  exposes bounded hysteresis and polling, and previews the resolved integer
+  cooling states before an exact plan can be confirmed. Disabling it restores
+  the preserved kernel governor.
+- Linux LED class devices expose validated status-light triggers and supported
+  RGB groups. Saved trigger and RGB state is restored at boot by the new
+  control plane.
+- SPI boot flash management detects NOR MTD targets and trusted installed
+  Rockchip U-Boot layouts. Write and erase operations require an exact
+  revision-bound plan, create a root-only backup, verify readback, and attempt
+  restoration if the operation fails.
 
 ## Safety model
 
@@ -64,9 +83,20 @@ rsetup separates observation from mutation:
 - The HTTP API accepts action identifiers from a fixed catalog; it does not
   expose arbitrary shell execution.
 - The Web server binds to `127.0.0.1:8788` by default.
+- Fan-curve apply and disable acquire an exclusive cross-process lock before
+  final status revalidation. The exact request and a revision that includes
+  the persisted `previous_policy` are bound to the preview token and require
+  explicit confirmation.
+- A missing temperature sample, fatal controller error, SIGTERM, or systemd
+  `ExecStop` forces the configured cooling device to its maximum state.
 
 Synthetic snapshots demonstrate the interface. They are not evidence that a
 physical board or peripheral has been tested.
+
+When a synthetic device is changed from the debug menu, the visible SBC
+identity and GPIO profile refresh together. A monotonically increasing load
+version prevents an older in-flight GPIO response from replacing the newer
+device selection.
 
 ## Build and run
 
@@ -97,10 +127,17 @@ rsetup-next --demo sources apply cqu --plan-token PLAN_TOKEN_FROM_PREVIEW --conf
 rsetup-next --demo hardware overlays status --json
 rsetup-next --demo hardware overlays plan --enable rk3588-uart2-m0.dtbo
 rsetup-next --demo hardware gpio --json
+rsetup-next --demo hardware leds status --json
+rsetup-next --demo hardware spi-flash status --json
+rsetup-next --demo hardware spi-flash plan install mtd0 --image rock-5b-rk3588:rockchip-rk35
 rsetup-next --demo hardware video status
 rsetup-next --demo hardware video capture video0 --output camera.svg
 rsetup-next --demo hardware thermal status
 rsetup-next --demo hardware thermal set step_wise --confirm
+rsetup-next --demo hardware thermal fan-curve status --json
+rsetup-next --demo hardware thermal fan-curve plan --zone thermal_zone0 \
+  --device cooling_device0 --point 40:20 --point 55:45 \
+  --point 70:75 --point 82:100 --json
 rsetup-next doctor
 ```
 
@@ -110,19 +147,39 @@ can still elevate explicitly:
 ```bash
 rsetup-next sources plan cqu
 sudo rsetup-next --live-execution sources apply cqu --plan-token PLAN_TOKEN_FROM_PREVIEW --confirm
+
+rsetup-next hardware thermal fan-curve plan --zone thermal_zone0 \
+  --device cooling_device0 --point 40:20 --point 55:45 \
+  --point 70:75 --point 82:100 --json
+sudo rsetup-next --live-execution hardware thermal fan-curve apply \
+  --zone thermal_zone0 --device cooling_device0 \
+  --point 40:20 --point 55:45 --point 70:75 --point 82:100 \
+  --plan-token PLAN_TOKEN_FROM_PREVIEW --confirm
 ```
 
-Copy `PLAN_TOKEN` from the immediately preceding plan output. The token binds
-application to the provider and complete source-file contents that were
-reviewed; if any APT source changes before execution, the command refuses the
-stale plan and requires a new preview.
+Copy `PLAN_TOKEN` from the immediately preceding plan output. A source token
+binds the provider and complete source-file contents; a fan-curve token binds
+the exact curve request and provider revision, including the persisted
+`previous_policy`. If the bound state changes before execution, the command
+refuses the stale plan and requires a new preview.
 
 The browser and desktop processes remain unprivileged. The Debian package ships
 `/usr/libexec/rsetup-next-helper` and a Polkit policy for live GUI operations.
-That helper accepts only fixed catalog action IDs, an exact previously reviewed
-source or overlay plan, a validated thermal policy, or the boot-time thermal
-restore verb. It has no arbitrary command mode. If authorization is cancelled,
-the interfaces report `authorization_failed` without changing the system.
+That helper accepts only fixed catalog action IDs, exact previously reviewed
+source, overlay, SPI, or fan-curve plans, validated thermal and LED
+configurations, or their fixed boot-time restore verbs. It has no arbitrary
+command mode. If authorization is cancelled, the interfaces report
+`authorization_failed` without changing the system.
+
+The native fan-curve contract is shared by the CLI commands under
+`hardware thermal fan-curve`, HTTP `GET /api/v1/hardware/thermal/fan-curve`,
+`POST /api/v1/hardware/thermal/fan-curve/plan`, and
+`POST /api/v1/hardware/thermal/fan-curve/apply`, Tauri invokes
+`fan_curve_status`, `plan_fan_curve`, and `apply_fan_curve`, and the helper's
+fixed `fan-curve-apply REQUEST_JSON PLAN_TOKEN --confirmed` verb. The Web drawer
+under Hardware > Thermal uses provider `status.config` and `status.active` for
+saved/running/stopped truth; selectors and edited points remain draft-only
+until the returned immutable plan is confirmed.
 
 ## English and Chinese
 
@@ -166,6 +223,8 @@ crates/rsetup-core/       typed telemetry, capability, action and audit models
 crates/rsetup-app/        clap CLI, ratatui TUI, axum API and embedded Web assets
 ui/                       browser/Tauri control center and presentation locale catalog
 apps/desktop/src-tauri/   optional desktop shell
+data/pinouts.json         normalized 20-profile SBC pinout catalog
+scripts/import-pinouts.mjs reproducible importer for the local pin-out checkout
 ```
 
 See [the architecture notes](docs/architecture.md) for provider boundaries,
@@ -174,10 +233,13 @@ API routes, action execution, and the planned remote-node seam.
 ## Debian package
 
 The package installs the `rsetup-next` CLI/TUI/Web binary, its narrow privileged
-helper, the matching Polkit policy, and the thermal-policy restore unit. It
-does not install the removed Bash implementation or run the browser process as
-root. Optional `device-tree-compiler`, `gpiod`, `v4l-utils`, and `ffmpeg`
-packages enrich the corresponding hardware tools.
+helper, the matching Polkit policy, the thermal, fan-curve, and LED units, and
+the `mtd-utils` dependency used by the fixed SPI operations. The fan service
+persists its root-only configuration at `/etc/rsetup-next/fan-curve.json` and
+runs as `rsetup-next-fan-curve.service`. It does not install
+the removed Bash implementation or run the browser process as root. Optional
+`device-tree-compiler`, `gpiod`, `v4l-utils`, and `ffmpeg` packages enrich the
+corresponding hardware tools.
 
 ```bash
 make deb-prepare
@@ -198,15 +260,26 @@ SoC vendor marks under `ui/assets` remain the property of their respective
 owners. They are used only for device-vendor identification and are not
 relicensed under this project's GPL-3+ license.
 
+The normalized 20-profile GPIO catalog is derived from
+[`xzl01/pin-out`](https://github.com/xzl01/pin-out). Its copyright owner
+authorized the transformed snapshot for distribution under
+`GPL-3.0-or-later`; exact source commit and regeneration instructions are in
+[`data/PINOUT_PROVENANCE.md`](data/PINOUT_PROVENANCE.md).
+
 ## Hardware validation boundary
 
 The Rust workspace, demo provider, CLI, HTTP API, and browser GUI can be tested
 on the development host. Live Linux probing still needs validation on supported
-Radxa boards. The overlay transaction, libgpiod mapping, real camera capture,
-sysfs policy writes and boot-time thermal restore are implemented but have not
-yet been exercised on physical hardware. Bootloader, SPI/eMMC, GPIO, overlay,
-thermal, networking, and power-changing actions must be tested individually on
-recoverable hardware before they are presented as production-ready.
+Radxa SBCs. The overlay transaction, Overlay-to-Pinout mapping, real camera capture,
+sysfs thermal/LED writes, boot-time restore, and backed-up SPI NOR operations
+are implemented but have not yet been exercised on physical hardware. In
+particular, the temperature-driven curve has not been physically validated
+with a real Linux SBC `pwm-fan` cooling device. Overlay filenames and mux modes
+still need verification against real packages across the supported Pinout
+profiles; unknown generic headers deliberately remain unassigned.
+Bootloader, SPI/eMMC, GPIO, overlay, thermal, networking, and power-changing
+actions must be tested individually on recoverable hardware before they are
+presented as production-ready.
 
 ## License
 

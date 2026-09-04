@@ -1,4 +1,10 @@
-use crate::{ActionRun, ActionStatus};
+use crate::{
+    ActionRun, ActionStatus,
+    pinout::{
+        FunctionEvidence, PinoutPin, PinoutProfile, profile_by_id, profile_for_root,
+        resolve_function_evidence,
+    },
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -12,6 +18,8 @@ use uuid::Uuid;
 
 const THERMAL_POLICY_FILE: &str = "/etc/rsetup-next/thermal-policy";
 const THERMAL_POLICY_UNIT: &str = "rsetup-next-thermal-policy.service";
+const LED_STATE_FILE: &str = "/etc/rsetup-next/led-state.json";
+const LED_STATE_UNIT: &str = "rsetup-next-led-state.service";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -75,9 +83,23 @@ pub struct GpioStatus {
     pub synthetic: bool,
     pub supported: bool,
     pub serial_console_detected: bool,
+    pub profile_id: Option<String>,
+    pub board_name: Option<String>,
+    pub profile_description: Option<String>,
+    pub layout: String,
+    pub connectors: Vec<GpioConnector>,
+    pub configured_overlays: Vec<String>,
     pub chips: Vec<GpioChip>,
     pub pins: Vec<GpioPin>,
     pub unavailable_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GpioConnector {
+    pub id: String,
+    pub label: String,
+    pub pin_numbers: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -92,11 +114,20 @@ pub struct GpioChip {
 #[serde(rename_all = "camelCase")]
 pub struct GpioPin {
     pub physical_pin: u8,
+    pub connector_id: String,
     pub label: String,
     pub kind: String,
+    pub gpio_number: Option<String>,
+    pub voltage: Option<String>,
+    pub description: Option<String>,
+    pub current_function: Option<String>,
+    pub function_kind: String,
+    pub function_source: String,
+    pub source_detail: Option<String>,
     pub chip: Option<String>,
     pub offset: Option<u32>,
-    pub value: Option<String>,
+    pub direction: Option<String>,
+    pub consumer: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,6 +195,71 @@ pub struct CoolingDevice {
     pub max_state: Option<u32>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LedStatus {
+    pub collected_at: DateTime<Utc>,
+    pub synthetic: bool,
+    pub supported: bool,
+    pub mutable: bool,
+    pub leds: Vec<LedDevice>,
+    pub rgb_groups: Vec<RgbLedGroup>,
+    pub saved_state: LedSavedState,
+    pub unavailable_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LedDevice {
+    pub id: String,
+    pub current_trigger: Option<String>,
+    pub available_triggers: Vec<String>,
+    pub brightness: Option<u32>,
+    pub max_brightness: Option<u32>,
+    pub supports_pattern: bool,
+    pub rgb_group: Option<String>,
+    pub rgb_channel: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RgbLedGroup {
+    pub id: String,
+    pub red: String,
+    pub green: String,
+    pub blue: String,
+    pub max_brightness: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RgbLedConfig {
+    pub group_id: String,
+    pub mode: String,
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+    pub brightness: u8,
+    pub cycle_ms: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LedSavedState {
+    #[serde(default)]
+    pub triggers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub rgb: BTreeMap<String, RgbLedConfig>,
+}
+
+#[derive(Debug, Clone)]
+struct RgbLedSnapshot {
+    id: String,
+    path: PathBuf,
+    trigger: String,
+    pattern: Vec<u8>,
+}
+
 #[derive(Debug, Error)]
 pub enum HardwareError {
     #[error("hardware tool is unavailable: {0}")]
@@ -174,9 +270,9 @@ pub enum HardwareError {
     Conflict(String),
     #[error("confirmation is required before changing hardware configuration")]
     ConfirmationRequired,
-    #[error("preview the overlay change before applying it")]
+    #[error("preview the hardware change before applying it")]
     PlanRequired,
-    #[error("the overlay directory changed after preview; create a fresh plan")]
+    #[error("the hardware state changed after preview; create a fresh plan")]
     StalePlan,
     #[error("changing hardware configuration requires root privileges")]
     RootRequired,
@@ -403,9 +499,101 @@ impl HardwareManager {
     }
 
     pub(crate) fn gpio_status(&self) -> Result<GpioStatus, HardwareError> {
-        if self.synthetic {
-            return Ok(demo_gpio_status());
+        self.gpio_status_for_profile(None)
+    }
+
+    pub(crate) fn gpio_status_for_profile(
+        &self,
+        profile_override: Option<&str>,
+    ) -> Result<GpioStatus, HardwareError> {
+        let mut chips = if self.synthetic {
+            (0..5)
+                .map(|index| GpioChip {
+                    id: format!("gpiochip{index}"),
+                    label: format!("GPIO controller {index}"),
+                    lines: Some(32),
+                })
+                .collect::<Vec<_>>()
+        } else {
+            self.discover_gpio_chips()
+        };
+        chips.sort_by(|left, right| left.id.cmp(&right.id));
+        let profile = if self.synthetic {
+            match profile_override {
+                Some("none") => None,
+                Some(id) => profile_by_id(id),
+                None => profile_by_id("rock5b"),
+            }
+        } else {
+            profile_for_root(&self.root)
+        };
+        let supported = self.synthetic
+            || profile.is_some()
+            || !chips.is_empty()
+            || self.root.join("dev/gpiochip0").exists();
+        let mut configured_overlays = self
+            .overlay_status()
+            .map(|status| {
+                status
+                    .overlays
+                    .into_iter()
+                    .filter(|overlay| overlay.enabled)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if self.synthetic
+            && profile
+                .as_ref()
+                .is_none_or(|profile| profile.id != "rock5b")
+        {
+            configured_overlays.clear();
         }
+        let overlay_evidence = configured_overlays
+            .iter()
+            .map(|overlay| FunctionEvidence {
+                id: overlay.id.clone(),
+                text: format!(
+                    "{} {} {}",
+                    overlay.id,
+                    overlay.title,
+                    overlay.description.as_deref().unwrap_or_default()
+                ),
+            })
+            .collect::<Vec<_>>();
+        let (profile_id, board_name, profile_description, layout, connectors, pins) =
+            if let Some(profile) = profile {
+                self.resolve_gpio_profile(profile, &overlay_evidence)
+            } else {
+                let connectors = vec![GpioConnector {
+                    id: "main".into(),
+                    label: "40-Pin GPIO Header".into(),
+                    pin_numbers: (1..=40).collect(),
+                }];
+                let pins = (1..=40).map(|pin| self.probe_gpio_pin(pin)).collect();
+                (None, None, None, "40-pin".into(), connectors, pins)
+            };
+        Ok(GpioStatus {
+            collected_at: Utc::now(),
+            synthetic: self.synthetic,
+            supported,
+            serial_console_detected: self.synthetic || self.serial_console_detected(),
+            profile_id,
+            board_name,
+            profile_description,
+            layout,
+            connectors,
+            configured_overlays: configured_overlays
+                .into_iter()
+                .map(|overlay| overlay.id)
+                .collect(),
+            chips,
+            pins,
+            unavailable_reason: (!supported)
+                .then(|| "No GPIO character device was detected.".into()),
+        })
+    }
+
+    fn discover_gpio_chips(&self) -> Vec<GpioChip> {
         let mut chips = Vec::new();
         let sys_gpio = self.root.join("sys/bus/gpio/devices");
         if let Ok(entries) = fs::read_dir(&sys_gpio) {
@@ -421,26 +609,130 @@ impl HardwareManager {
                 });
             }
         }
-        chips.sort_by(|left, right| left.id.cmp(&right.id));
-        let supported = !chips.is_empty() || self.root.join("dev/gpiochip0").exists();
-        let pins = (1..=40).map(|pin| self.probe_gpio_pin(pin)).collect();
+        chips
+    }
+
+    fn serial_console_detected(&self) -> bool {
         let cmdline = read_trimmed(self.root.join("proc/cmdline")).unwrap_or_default();
-        let serial_console_detected = cmdline.split_whitespace().any(|item| {
+        cmdline.split_whitespace().any(|item| {
             item.starts_with("console=ttyS")
                 || item.starts_with("console=ttyAMA")
                 || item.starts_with("console=ttyAML")
                 || item.starts_with("console=ttyFIQ")
-        });
-        Ok(GpioStatus {
-            collected_at: Utc::now(),
-            synthetic: false,
-            supported,
-            serial_console_detected,
-            chips,
-            pins,
-            unavailable_reason: (!supported)
-                .then(|| "No GPIO character device was detected.".into()),
         })
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn resolve_gpio_profile(
+        &self,
+        profile: PinoutProfile,
+        overlay_evidence: &[FunctionEvidence],
+    ) -> (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+        Vec<GpioConnector>,
+        Vec<GpioPin>,
+    ) {
+        let connectors = profile
+            .connectors
+            .iter()
+            .map(|connector| GpioConnector {
+                id: connector.id.clone(),
+                label: connector.name.clone(),
+                pin_numbers: connector.pins.iter().map(|pin| pin.number).collect(),
+            })
+            .collect::<Vec<_>>();
+        let pins = profile
+            .connectors
+            .iter()
+            .flat_map(|connector| {
+                connector
+                    .pins
+                    .iter()
+                    .map(|pin| self.probe_profile_gpio_pin(&connector.id, pin, overlay_evidence))
+            })
+            .collect();
+        (
+            Some(profile.id),
+            Some(profile.name),
+            profile.description,
+            profile.layout,
+            connectors,
+            pins,
+        )
+    }
+
+    fn probe_profile_gpio_pin(
+        &self,
+        connector_id: &str,
+        pin: &PinoutPin,
+        overlay_evidence: &[FunctionEvidence],
+    ) -> GpioPin {
+        let physical_kind = gpio_physical_kind(pin);
+        let resolved = match physical_kind.as_str() {
+            "3v3" | "5v" => (
+                pin.voltage.clone().or_else(|| Some(pin.name.clone())),
+                "power".to_owned(),
+                "fixed".to_owned(),
+                None,
+            ),
+            "ground" => (Some("GND".into()), "ground".into(), "fixed".into(), None),
+            "analog" => (
+                Some(pin.name.clone()),
+                "analog".into(),
+                "fixed".into(),
+                None,
+            ),
+            _ => {
+                let function = resolve_function_evidence(pin, overlay_evidence);
+                if function.kind == "conflict" {
+                    (
+                        None,
+                        function.kind,
+                        "conflict".into(),
+                        function.source_detail,
+                    )
+                } else if function.name.is_some() {
+                    (
+                        function.name,
+                        function.kind,
+                        "overlay".into(),
+                        function.source_detail,
+                    )
+                } else {
+                    (
+                        Some(pin.default_function.clone()),
+                        if physical_kind == "special" {
+                            "special"
+                        } else {
+                            "gpio"
+                        }
+                        .into(),
+                        "default".into(),
+                        None,
+                    )
+                }
+            }
+        };
+        GpioPin {
+            physical_pin: pin.number,
+            connector_id: connector_id.into(),
+            label: pin.name.clone(),
+            kind: physical_kind,
+            gpio_number: pin.gpio.clone(),
+            voltage: pin.voltage.clone(),
+            description: pin.description.clone(),
+            current_function: resolved.0,
+            function_kind: resolved.1,
+            function_source: resolved.2,
+            source_detail: resolved.3,
+            chip: None,
+            offset: None,
+            direction: None,
+            consumer: None,
+        }
     }
 
     fn probe_gpio_pin(&self, pin: u8) -> GpioPin {
@@ -453,36 +745,48 @@ impl HardwareManager {
         if kind != "gpio" {
             return GpioPin {
                 physical_pin: pin,
+                connector_id: "main".into(),
                 label: kind.to_ascii_uppercase(),
                 kind: kind.into(),
+                gpio_number: None,
+                voltage: match kind {
+                    "3v3" => Some("3.3V".into()),
+                    "5v" => Some("5V".into()),
+                    _ => None,
+                },
+                description: None,
+                current_function: Some(match kind {
+                    "ground" => "GND".into(),
+                    "3v3" => "3.3V".into(),
+                    "5v" => "5V".into(),
+                    _ => kind.into(),
+                }),
+                function_kind: if kind == "ground" { "ground" } else { "power" }.into(),
+                function_source: "fixed".into(),
+                source_detail: None,
                 chip: None,
                 offset: None,
-                value: None,
+                direction: None,
+                consumer: None,
             };
         }
         let label = format!("PIN_{pin}");
-        let location = command_text("gpiofind", &[&label]).and_then(|line| {
-            let mut parts = line.split_whitespace();
-            Some((parts.next()?.to_owned(), parts.next()?.parse::<u32>().ok()?))
-        });
-        let (chip, offset) = location.unzip();
-        let value = chip.as_deref().zip(offset).and_then(|(chip, offset)| {
-            let offset = offset.to_string();
-            command_text("gpioget", &[chip, &offset])
-                .or_else(|| command_text("gpioget", &["-c", chip, &offset]))
-                .and_then(|value| match value.as_str() {
-                    "0" | "inactive" => Some("low".into()),
-                    "1" | "active" => Some("high".into()),
-                    _ => None,
-                })
-        });
         GpioPin {
             physical_pin: pin,
+            connector_id: "main".into(),
             label,
-            kind: if chip.is_some() { "gpio" } else { "unmapped" }.into(),
-            chip,
-            offset,
-            value,
+            kind: "gpio".into(),
+            gpio_number: None,
+            voltage: None,
+            description: None,
+            current_function: None,
+            function_kind: "unassigned".into(),
+            function_source: "unassigned".into(),
+            source_detail: None,
+            chip: None,
+            offset: None,
+            direction: None,
+            consumer: None,
         }
     }
 
@@ -600,6 +904,325 @@ impl HardwareManager {
             base64: encode_base64(&output.stdout),
             synthetic: false,
         })
+    }
+
+    pub(crate) fn led_status(&self) -> Result<LedStatus, HardwareError> {
+        if self.synthetic {
+            return Ok(demo_led_status());
+        }
+        let nodes = self.led_nodes();
+        let mut leds = nodes
+            .iter()
+            .map(|(id, path)| read_led_device(id, path))
+            .collect::<Vec<_>>();
+        leds.sort_by(|left, right| left.id.cmp(&right.id));
+
+        let by_id = leds
+            .iter()
+            .map(|led| (led.id.as_str(), led))
+            .collect::<BTreeMap<_, _>>();
+        let mut channels = BTreeMap::<String, BTreeMap<String, String>>::new();
+        for led in &leds {
+            if let Some((group, channel)) = split_rgb_channel(&led.id) {
+                channels
+                    .entry(group)
+                    .or_default()
+                    .insert(channel.into(), led.id.clone());
+            }
+        }
+        let mut rgb_groups = channels
+            .into_iter()
+            .filter_map(|(id, channels)| {
+                let red = channels.get("red")?.clone();
+                let green = channels.get("green")?.clone();
+                let blue = channels.get("blue")?.clone();
+                let members = [
+                    by_id.get(red.as_str())?,
+                    by_id.get(green.as_str())?,
+                    by_id.get(blue.as_str())?,
+                ];
+                members
+                    .iter()
+                    .all(|led| {
+                        led.supports_pattern
+                            && led
+                                .available_triggers
+                                .iter()
+                                .any(|trigger| trigger == "pattern")
+                    })
+                    .then(|| RgbLedGroup {
+                        id,
+                        red,
+                        green,
+                        blue,
+                        max_brightness: members
+                            .iter()
+                            .filter_map(|led| led.max_brightness)
+                            .min()
+                            .unwrap_or(255),
+                    })
+            })
+            .collect::<Vec<_>>();
+        rgb_groups.sort_by(|left, right| left.id.cmp(&right.id));
+        let groups = rgb_groups
+            .iter()
+            .map(|group| group.id.as_str())
+            .collect::<BTreeSet<_>>();
+        for led in &mut leds {
+            if let Some((group, channel)) = split_rgb_channel(&led.id) {
+                if groups.contains(group.as_str()) {
+                    led.rgb_group = Some(group);
+                    led.rgb_channel = Some(channel.into());
+                }
+            }
+        }
+        let supported = !leds.is_empty();
+        let mutable = leds.iter().any(|led| !led.available_triggers.is_empty());
+        Ok(LedStatus {
+            collected_at: Utc::now(),
+            synthetic: false,
+            supported,
+            mutable,
+            leds,
+            rgb_groups,
+            saved_state: read_led_saved_state(&self.root)?,
+            unavailable_reason: if !supported {
+                Some("No Linux LED class device was detected.".into())
+            } else if !mutable {
+                Some("The detected LED devices do not expose writable triggers.".into())
+            } else {
+                None
+            },
+        })
+    }
+
+    pub(crate) fn apply_led_trigger_live(
+        &self,
+        led_id: &str,
+        trigger: &str,
+    ) -> Result<ActionRun, HardwareError> {
+        validate_led_id(led_id)?;
+        validate_led_trigger(trigger)?;
+        let status = self.led_status()?;
+        let led = status
+            .leds
+            .iter()
+            .find(|led| led.id == led_id)
+            .ok_or_else(|| HardwareError::InvalidInput(format!("unknown LED {led_id}")))?;
+        if !led.available_triggers.iter().any(|item| item == trigger) {
+            return Err(HardwareError::InvalidInput(format!(
+                "trigger {trigger} is not available for {led_id}"
+            )));
+        }
+        enable_led_persistence(&self.root)?;
+        let path = self
+            .led_nodes()
+            .remove(led_id)
+            .ok_or_else(|| HardwareError::Unsupported(format!("LED {led_id} disappeared")))?;
+        let previous_trigger = led.current_trigger.clone().ok_or_else(|| {
+            HardwareError::Unsupported(format!(
+                "LED {led_id} does not expose its current trigger for safe rollback"
+            ))
+        })?;
+        fs::write(path.join("trigger"), format!("{trigger}\n"))
+            .map_err(|error| HardwareError::Io(format!("unable to update {led_id}: {error}")))?;
+        let mut saved = status.saved_state;
+        saved.triggers.insert(led_id.into(), trigger.into());
+        if let Err(error) = write_led_saved_state(&self.root, &saved) {
+            let rollback = fs::write(path.join("trigger"), format!("{previous_trigger}\n"))
+                .map_err(|rollback| {
+                    HardwareError::Io(format!("unable to roll back {led_id}: {rollback}"))
+                });
+            return Err(with_rollback_result(error, rollback));
+        }
+        Ok(hardware_run(
+            "hardware.led-trigger",
+            "Set LED trigger",
+            ActionStatus::Succeeded,
+            false,
+            "LED trigger applied and saved for boot.",
+            Some(format!("led={led_id}\ntrigger={trigger}")),
+            Utc::now(),
+        ))
+    }
+
+    pub(crate) fn apply_rgb_led_live(
+        &self,
+        config: &RgbLedConfig,
+    ) -> Result<ActionRun, HardwareError> {
+        let status = self.validate_rgb_led_config(config)?;
+        let group = status
+            .rgb_groups
+            .iter()
+            .find(|group| group.id == config.group_id)
+            .expect("validated RGB group must remain in the captured status");
+        enable_led_persistence(&self.root)?;
+        let snapshot = self.apply_rgb_led_transactional(&status, group, config)?;
+        let mut saved = status.saved_state;
+        saved.rgb.insert(config.group_id.clone(), config.clone());
+        if let Err(error) = write_led_saved_state(&self.root, &saved) {
+            return Err(with_rollback_result(
+                error,
+                rollback_rgb_led_snapshot(&snapshot),
+            ));
+        }
+        Ok(hardware_run(
+            "hardware.rgb-led",
+            "Set RGB LED pattern",
+            ActionStatus::Succeeded,
+            false,
+            "RGB LED pattern applied and saved for boot.",
+            Some(format!(
+                "group={}\nmode={}\ncolor=#{:02x}{:02x}{:02x}\nbrightness={}\ncycle_ms={}",
+                config.group_id,
+                config.mode,
+                config.red,
+                config.green,
+                config.blue,
+                config.brightness,
+                config.cycle_ms
+            )),
+            Utc::now(),
+        ))
+    }
+
+    pub(crate) fn validate_rgb_led_config(
+        &self,
+        config: &RgbLedConfig,
+    ) -> Result<LedStatus, HardwareError> {
+        validate_rgb_config(config)?;
+        let status = self.led_status()?;
+        if !status
+            .rgb_groups
+            .iter()
+            .any(|group| group.id == config.group_id)
+        {
+            return Err(HardwareError::InvalidInput(format!(
+                "unknown RGB LED group {}",
+                config.group_id
+            )));
+        }
+        Ok(status)
+    }
+
+    pub(crate) fn restore_led_state_live(&self) -> Result<ActionRun, HardwareError> {
+        let saved = read_led_saved_state(&self.root)?;
+        let status = self.led_status()?;
+        let nodes = self.led_nodes();
+        let mut restored = 0usize;
+        for (led_id, trigger) in &saved.triggers {
+            let Some(led) = status.leds.iter().find(|led| led.id == *led_id) else {
+                continue;
+            };
+            if !led.available_triggers.iter().any(|item| item == trigger) {
+                continue;
+            }
+            if let Some(path) = nodes.get(led_id) {
+                fs::write(path.join("trigger"), format!("{trigger}\n"))
+                    .map_err(|error| HardwareError::Io(error.to_string()))?;
+                restored += 1;
+            }
+        }
+        for config in saved.rgb.values() {
+            let Some(group) = status
+                .rgb_groups
+                .iter()
+                .find(|group| group.id == config.group_id)
+            else {
+                continue;
+            };
+            self.apply_rgb_led_transactional(&status, group, config)?;
+            restored += 1;
+        }
+        Ok(hardware_run(
+            "hardware.led-restore",
+            "Restore LED state",
+            ActionStatus::Succeeded,
+            false,
+            "Saved LED state restored.",
+            Some(format!("restored={restored}")),
+            Utc::now(),
+        ))
+    }
+
+    fn apply_rgb_led_transactional(
+        &self,
+        status: &LedStatus,
+        group: &RgbLedGroup,
+        config: &RgbLedConfig,
+    ) -> Result<Vec<RgbLedSnapshot>, HardwareError> {
+        validate_rgb_config(config)?;
+        let nodes = self.led_nodes();
+        let patterns = rgb_patterns(group.max_brightness, config);
+        let snapshot = [&group.red, &group.green, &group.blue]
+            .into_iter()
+            .map(|id| {
+                let path = nodes
+                    .get(id)
+                    .ok_or_else(|| HardwareError::Unsupported(format!("LED {id} disappeared")))?;
+                let trigger = status
+                    .leds
+                    .iter()
+                    .find(|led| led.id == *id)
+                    .and_then(|led| led.current_trigger.clone())
+                    .ok_or_else(|| {
+                        HardwareError::Unsupported(format!(
+                            "LED {id} does not expose its current trigger for safe rollback"
+                        ))
+                    })?;
+                let pattern = fs::read(path.join("pattern")).map_err(|error| {
+                    HardwareError::Io(format!("unable to snapshot pattern on {id}: {error}"))
+                })?;
+                Ok(RgbLedSnapshot {
+                    id: (*id).clone(),
+                    path: path.clone(),
+                    trigger,
+                    pattern,
+                })
+            })
+            .collect::<Result<Vec<_>, HardwareError>>()?;
+        for ((id, pattern), previous) in [
+            (&group.red, &patterns[0]),
+            (&group.green, &patterns[1]),
+            (&group.blue, &patterns[2]),
+        ]
+        .into_iter()
+        .zip(&snapshot)
+        {
+            let applied = fs::write(previous.path.join("trigger"), "pattern\n")
+                .map_err(|error| {
+                    HardwareError::Io(format!("unable to select pattern on {id}: {error}"))
+                })
+                .and_then(|()| {
+                    fs::write(previous.path.join("pattern"), format!("{pattern}\n")).map_err(
+                        |error| {
+                            HardwareError::Io(format!("unable to update pattern on {id}: {error}"))
+                        },
+                    )
+                });
+            if let Err(error) = applied {
+                return Err(with_rollback_result(
+                    error,
+                    rollback_rgb_led_snapshot(&snapshot),
+                ));
+            }
+        }
+        Ok(snapshot)
+    }
+
+    fn led_nodes(&self) -> BTreeMap<String, PathBuf> {
+        let mut nodes = BTreeMap::new();
+        collect_led_directory(&self.root.join("sys/class/leds"), &mut nodes);
+        for driver in ["leds-gpio", "leds_pwm"] {
+            let root = self.root.join("sys/bus/platform/drivers").join(driver);
+            let Ok(devices) = fs::read_dir(root) else {
+                continue;
+            };
+            for device in devices.flatten() {
+                collect_led_directory(&device.path().join("leds"), &mut nodes);
+            }
+        }
+        nodes
     }
 
     pub(crate) fn thermal_status(&self) -> Result<ThermalStatus, HardwareError> {
@@ -921,6 +1544,228 @@ fn quoted_values(line: &str) -> Vec<String> {
     values
 }
 
+fn collect_led_directory(directory: &Path, nodes: &mut BTreeMap<String, PathBuf>) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let id = entry.file_name().to_string_lossy().into_owned();
+        if validate_led_id(&id).is_ok() && entry.path().join("trigger").exists() {
+            nodes.entry(id).or_insert_with(|| entry.path());
+        }
+    }
+}
+
+fn read_led_device(id: &str, path: &Path) -> LedDevice {
+    let trigger_text = read_trimmed(path.join("trigger")).unwrap_or_default();
+    let mut available_triggers = Vec::new();
+    let mut current_trigger = None;
+    for raw in trigger_text.split_whitespace() {
+        let selected = raw.starts_with('[') && raw.ends_with(']');
+        let trigger = raw.trim_matches(['[', ']']).to_owned();
+        if trigger.is_empty() {
+            continue;
+        }
+        if selected {
+            current_trigger = Some(trigger.clone());
+        }
+        if validate_led_trigger(&trigger).is_ok() {
+            available_triggers.push(trigger);
+        }
+    }
+    available_triggers.sort();
+    available_triggers.dedup();
+    LedDevice {
+        id: id.into(),
+        current_trigger,
+        available_triggers,
+        brightness: read_trimmed(path.join("brightness")).and_then(|value| value.parse().ok()),
+        max_brightness: read_trimmed(path.join("max_brightness"))
+            .and_then(|value| value.parse().ok()),
+        supports_pattern: path.join("pattern").exists(),
+        rgb_group: None,
+        rgb_channel: None,
+    }
+}
+
+fn split_rgb_channel(id: &str) -> Option<(String, &'static str)> {
+    for (suffix, channel) in [
+        ("-red", "red"),
+        ("-green", "green"),
+        ("-blue", "blue"),
+        (":red", "red"),
+        (":green", "green"),
+        (":blue", "blue"),
+    ] {
+        if let Some(group) = id.strip_suffix(suffix).filter(|group| !group.is_empty()) {
+            return Some((group.into(), channel));
+        }
+    }
+    None
+}
+
+fn validate_led_id(id: &str) -> Result<(), HardwareError> {
+    if id.is_empty()
+        || id.len() > 128
+        || id.contains("..")
+        || !id.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-' | b':')
+        })
+    {
+        return Err(HardwareError::InvalidInput("invalid LED identifier".into()));
+    }
+    Ok(())
+}
+
+fn validate_led_trigger(trigger: &str) -> Result<(), HardwareError> {
+    if trigger.is_empty()
+        || trigger.len() > 64
+        || !trigger.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-' | b':')
+        })
+    {
+        return Err(HardwareError::InvalidInput("invalid LED trigger".into()));
+    }
+    Ok(())
+}
+
+fn validate_rgb_config(config: &RgbLedConfig) -> Result<(), HardwareError> {
+    validate_led_id(&config.group_id)?;
+    if !matches!(config.mode.as_str(), "solid" | "breath" | "rainbow") {
+        return Err(HardwareError::InvalidInput("invalid RGB LED mode".into()));
+    }
+    if config.brightness > 100 {
+        return Err(HardwareError::InvalidInput(
+            "RGB LED brightness must be between 0 and 100".into(),
+        ));
+    }
+    if !(200..=60_000).contains(&config.cycle_ms) {
+        return Err(HardwareError::InvalidInput(
+            "RGB LED cycle must be between 200 and 60000 milliseconds".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn rgb_patterns(max_brightness: u32, config: &RgbLedConfig) -> [String; 3] {
+    let scale = |channel: u8| {
+        u32::from(channel) * u32::from(config.brightness) * max_brightness / (255 * 100)
+    };
+    match config.mode.as_str() {
+        "breath" => {
+            let half = (config.cycle_ms / 2).max(100);
+            [scale(config.red), scale(config.green), scale(config.blue)]
+                .map(|value| format!("0 {half} {value} {half}"))
+        }
+        "rainbow" => {
+            let value = u32::from(config.brightness) * max_brightness / 100;
+            let third = (config.cycle_ms / 3).max(100);
+            [
+                format!("{value} {third} 0 {third} 0 {third}"),
+                format!("0 {third} {value} {third} 0 {third}"),
+                format!("0 {third} 0 {third} {value} {third}"),
+            ]
+        }
+        _ => {
+            let hold = config.cycle_ms.max(200);
+            [scale(config.red), scale(config.green), scale(config.blue)]
+                .map(|value| format!("{value} {hold} {value} {hold}"))
+        }
+    }
+}
+
+fn rollback_rgb_led_snapshot(snapshot: &[RgbLedSnapshot]) -> Result<(), HardwareError> {
+    let mut failures = Vec::new();
+    for channel in snapshot {
+        let restored = fs::write(channel.path.join("trigger"), "pattern\n")
+            .and_then(|()| fs::write(channel.path.join("pattern"), &channel.pattern))
+            .and_then(|()| {
+                fs::write(
+                    channel.path.join("trigger"),
+                    format!("{}\n", channel.trigger),
+                )
+            });
+        if let Err(error) = restored {
+            failures.push(format!("{}: {error}", channel.id));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(HardwareError::Io(format!(
+            "unable to roll back RGB LED channels: {}",
+            failures.join(", ")
+        )))
+    }
+}
+
+fn with_rollback_result(
+    error: HardwareError,
+    rollback: Result<(), HardwareError>,
+) -> HardwareError {
+    match rollback {
+        Ok(()) => error,
+        Err(rollback) => HardwareError::Io(format!("{error}; rollback failed: {rollback}")),
+    }
+}
+
+fn read_led_saved_state(root: &Path) -> Result<LedSavedState, HardwareError> {
+    let path = root.join(LED_STATE_FILE.trim_start_matches('/'));
+    if !path.exists() {
+        return Ok(LedSavedState::default());
+    }
+    let bytes = fs::read(path).map_err(|error| HardwareError::Io(error.to_string()))?;
+    let state: LedSavedState = serde_json::from_slice(&bytes)
+        .map_err(|error| HardwareError::Io(format!("invalid saved LED state: {error}")))?;
+    for (led_id, trigger) in &state.triggers {
+        validate_led_id(led_id)?;
+        validate_led_trigger(trigger)?;
+    }
+    for (group_id, config) in &state.rgb {
+        if group_id != &config.group_id {
+            return Err(HardwareError::InvalidInput(
+                "saved RGB LED key does not match its group".into(),
+            ));
+        }
+        validate_rgb_config(config)?;
+    }
+    Ok(state)
+}
+
+fn write_led_saved_state(root: &Path, state: &LedSavedState) -> Result<(), HardwareError> {
+    let path = root.join(LED_STATE_FILE.trim_start_matches('/'));
+    let parent = path
+        .parent()
+        .ok_or_else(|| HardwareError::Io("invalid LED state path".into()))?;
+    fs::create_dir_all(parent).map_err(|error| HardwareError::Io(error.to_string()))?;
+    let temporary = parent.join(format!(".led-state.{}.json", std::process::id()));
+    let bytes =
+        serde_json::to_vec_pretty(state).map_err(|error| HardwareError::Io(error.to_string()))?;
+    fs::write(&temporary, bytes).map_err(|error| HardwareError::Io(error.to_string()))?;
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(HardwareError::Io(error.to_string()));
+    }
+    Ok(())
+}
+
+fn enable_led_persistence(root: &Path) -> Result<(), HardwareError> {
+    if root != Path::new("/") {
+        return Ok(());
+    }
+    let output = Command::new("systemctl")
+        .args(["enable", LED_STATE_UNIT])
+        .output()
+        .map_err(|error| HardwareError::Io(format!("unable to enable LED persistence: {error}")))?;
+    if !output.status.success() {
+        return Err(HardwareError::Io(format!(
+            "unable to enable LED persistence: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
 fn validate_overlay_id(id: &str) -> Result<(), HardwareError> {
     if id.len() > 128
         || !id.ends_with(".dtbo")
@@ -1073,12 +1918,16 @@ fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
         .map(|value| value.trim().to_owned())
 }
 
-fn command_text(program: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(program).args(args).output().ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+fn gpio_physical_kind(pin: &PinoutPin) -> String {
+    match pin.kind.to_ascii_lowercase().as_str() {
+        "power" if pin.voltage.as_deref() == Some("3.3V") => "3v3".into(),
+        "power" if pin.voltage.as_deref() == Some("5V") => "5v".into(),
+        "power" => "power".into(),
+        "ground" => "ground".into(),
+        "analog" => "analog".into(),
+        "special" => "special".into(),
+        _ => "gpio".into(),
+    }
 }
 
 fn command_exists(program: &str) -> bool {
@@ -1178,8 +2027,8 @@ fn demo_overlay_status() -> OverlayStatus {
             packages: vec![],
         },
         OverlayEntry {
-            id: "rk3588-i2c3-m0.dtbo".into(),
-            title: "I²C3 M0".into(),
+            id: "rk3588-i2c3-m1.dtbo".into(),
+            title: "I²C3 M1".into(),
             description: Some("Enable the I²C3 bus on header pins.".into()),
             category: Some("Bus".into()),
             enabled: true,
@@ -1236,46 +2085,6 @@ fn demo_overlay_status() -> OverlayStatus {
     }
 }
 
-fn demo_gpio_status() -> GpioStatus {
-    let pins = (1..=40)
-        .map(|pin| {
-            let kind = match pin {
-                1 | 17 => "3v3",
-                2 | 4 => "5v",
-                6 | 9 | 14 | 20 | 25 | 30 | 34 | 39 => "ground",
-                _ => "gpio",
-            };
-            GpioPin {
-                physical_pin: pin,
-                label: if kind == "gpio" {
-                    format!("PIN_{pin}")
-                } else {
-                    kind.to_ascii_uppercase()
-                },
-                kind: kind.into(),
-                chip: (kind == "gpio").then(|| format!("gpiochip{}", pin % 5)),
-                offset: (kind == "gpio").then_some(u32::from(pin) + 32),
-                value: (kind == "gpio").then(|| if pin % 3 == 0 { "high" } else { "low" }.into()),
-            }
-        })
-        .collect();
-    GpioStatus {
-        collected_at: Utc::now(),
-        synthetic: true,
-        supported: true,
-        serial_console_detected: true,
-        chips: (0..5)
-            .map(|index| GpioChip {
-                id: format!("gpiochip{index}"),
-                label: format!("RK3588 GPIO{index}"),
-                lines: Some(32),
-            })
-            .collect(),
-        pins,
-        unavailable_reason: None,
-    }
-}
-
 fn demo_video_status() -> VideoStatus {
     VideoStatus {
         collected_at: Utc::now(),
@@ -1318,18 +2127,94 @@ fn demo_video_frame(device_id: &str) -> VideoFrame {
     }
 }
 
+fn demo_led_status() -> LedStatus {
+    let triggers = vec![
+        "activity".into(),
+        "default-on".into(),
+        "heartbeat".into(),
+        "none".into(),
+        "timer".into(),
+    ];
+    let mut leds = vec![
+        LedDevice {
+            id: "power".into(),
+            current_trigger: Some("default-on".into()),
+            available_triggers: triggers.clone(),
+            brightness: Some(255),
+            max_brightness: Some(255),
+            supports_pattern: false,
+            rgb_group: None,
+            rgb_channel: None,
+        },
+        LedDevice {
+            id: "status".into(),
+            current_trigger: Some("heartbeat".into()),
+            available_triggers: triggers,
+            brightness: Some(96),
+            max_brightness: Some(255),
+            supports_pattern: false,
+            rgb_group: None,
+            rgb_channel: None,
+        },
+    ];
+    for (channel, brightness) in [("red", 42), ("green", 104), ("blue", 220)] {
+        leds.push(LedDevice {
+            id: format!("rgb0-{channel}"),
+            current_trigger: Some("pattern".into()),
+            available_triggers: vec!["none".into(), "pattern".into(), "timer".into()],
+            brightness: Some(brightness),
+            max_brightness: Some(255),
+            supports_pattern: true,
+            rgb_group: Some("rgb0".into()),
+            rgb_channel: Some(channel.into()),
+        });
+    }
+    let rgb_config = RgbLedConfig {
+        group_id: "rgb0".into(),
+        mode: "breath".into(),
+        red: 62,
+        green: 132,
+        blue: 255,
+        brightness: 80,
+        cycle_ms: 5_000,
+    };
+    LedStatus {
+        collected_at: Utc::now(),
+        synthetic: true,
+        supported: true,
+        mutable: true,
+        leds,
+        rgb_groups: vec![RgbLedGroup {
+            id: "rgb0".into(),
+            red: "rgb0-red".into(),
+            green: "rgb0-green".into(),
+            blue: "rgb0-blue".into(),
+            max_brightness: 255,
+        }],
+        saved_state: LedSavedState {
+            triggers: BTreeMap::from([
+                ("power".into(), "default-on".into()),
+                ("status".into(), "heartbeat".into()),
+            ]),
+            rgb: BTreeMap::from([("rgb0".into(), rgb_config)]),
+        },
+        unavailable_reason: None,
+    }
+}
+
 fn demo_thermal_status() -> ThermalStatus {
     ThermalStatus {
         collected_at: Utc::now(),
         synthetic: true,
         supported: true,
         pwm_fan_detected: true,
-        current_policy: Some("step_wise".into()),
+        current_policy: Some("user_space".into()),
         persisted_policy: Some("step_wise".into()),
         available_policies: vec![
             "bang_bang".into(),
             "power_allocator".into(),
             "step_wise".into(),
+            "user_space".into(),
         ],
         recommended_policy: Some("step_wise".into()),
         zones: vec![
@@ -1342,6 +2227,7 @@ fn demo_thermal_status() -> ThermalStatus {
                     "bang_bang".into(),
                     "power_allocator".into(),
                     "step_wise".into(),
+                    "user_space".into(),
                 ],
             },
             ThermalZone {
@@ -1353,6 +2239,7 @@ fn demo_thermal_status() -> ThermalStatus {
                     "bang_bang".into(),
                     "power_allocator".into(),
                     "step_wise".into(),
+                    "user_space".into(),
                 ],
             },
             ThermalZone {
@@ -1364,6 +2251,7 @@ fn demo_thermal_status() -> ThermalStatus {
                     "bang_bang".into(),
                     "power_allocator".into(),
                     "step_wise".into(),
+                    "user_space".into(),
                 ],
             },
         ],
@@ -1398,6 +2286,82 @@ mod tests {
     }
 
     #[test]
+    fn demo_gpio_combines_the_board_pinout_with_the_configured_overlays() {
+        let status = HardwareManager::new(true).gpio_status().unwrap();
+        assert_eq!(status.profile_id.as_deref(), Some("rock5b"));
+        assert_eq!(status.board_name.as_deref(), Some("Radxa ROCK 5B"));
+        let pin8 = status
+            .pins
+            .iter()
+            .find(|pin| pin.physical_pin == 8)
+            .unwrap();
+        assert_eq!(pin8.current_function.as_deref(), Some("UART2_TX_M0"));
+        assert_eq!(pin8.function_source, "overlay");
+        let pin13 = status
+            .pins
+            .iter()
+            .find(|pin| pin.physical_pin == 13)
+            .unwrap();
+        assert_eq!(pin13.current_function.as_deref(), Some("I2C3_SCL_M1"));
+        assert_eq!(pin13.function_source, "overlay");
+        let pin36 = status
+            .pins
+            .iter()
+            .find(|pin| pin.physical_pin == 36)
+            .unwrap();
+        assert_eq!(pin36.current_function.as_deref(), Some("GPIO3_B1"));
+        assert_eq!(pin36.function_source, "default");
+    }
+
+    #[test]
+    fn demo_gpio_profile_override_keeps_the_debug_device_consistent() {
+        let manager = HardwareManager::new(true);
+        let dragon = manager.gpio_status_for_profile(Some("dragonQ6a")).unwrap();
+        assert_eq!(dragon.profile_id.as_deref(), Some("dragonQ6a"));
+        assert_eq!(dragon.board_name.as_deref(), Some("Dragon Q6A"));
+        assert!(dragon.configured_overlays.is_empty());
+
+        let generic = manager.gpio_status_for_profile(Some("none")).unwrap();
+        assert_eq!(generic.profile_id, None);
+        assert_eq!(generic.pins.len(), 40);
+    }
+
+    #[test]
+    fn live_gpio_uses_the_configured_overlay_selection() {
+        let root = std::env::temp_dir().join(format!("rsetup-pinmux-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("proc/device-tree")).unwrap();
+        fs::write(root.join("proc/device-tree/model"), b"Radxa ROCK 5B\0").unwrap();
+        fs::create_dir_all(root.join("boot/dtbo")).unwrap();
+        fs::write(
+            root.join("boot/dtbo/rk3588-i2c3-m1.dtbo"),
+            b"configured-for-next-boot",
+        )
+        .unwrap();
+        let status = HardwareManager::at_root(root.clone())
+            .gpio_status()
+            .unwrap();
+        assert_eq!(
+            status.configured_overlays,
+            vec!["rk3588-i2c3-m1.dtbo".to_owned()]
+        );
+        let pin13 = status
+            .pins
+            .iter()
+            .find(|pin| pin.physical_pin == 13)
+            .unwrap();
+        assert_eq!(pin13.current_function.as_deref(), Some("I2C3_SCL_M1"));
+        assert_eq!(pin13.function_source, "overlay");
+        let pin36 = status
+            .pins
+            .iter()
+            .find(|pin| pin.physical_pin == 36)
+            .unwrap();
+        assert_eq!(pin36.current_function.as_deref(), Some("GPIO3_B1"));
+        assert_eq!(pin36.function_source, "default");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn live_overlay_probe_reads_enabled_and_disabled_files() {
         let root = std::env::temp_dir().join(format!("rsetup-hardware-{}", Uuid::new_v4()));
         let directory = root.join("boot/dtbo");
@@ -1419,6 +2383,133 @@ mod tests {
                 .iter()
                 .any(|item| item.id == "spi.dtbo" && !item.enabled)
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn led_probe_and_native_writes_use_fixed_sysfs_nodes() {
+        let root = std::env::temp_dir().join(format!("rsetup-led-{}", Uuid::new_v4()));
+        for id in ["status", "rgb0-red", "rgb0-green", "rgb0-blue"] {
+            let directory = root.join("sys/class/leds").join(id);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                directory.join("trigger"),
+                "none timer [heartbeat] pattern\n",
+            )
+            .unwrap();
+            fs::write(directory.join("brightness"), "64\n").unwrap();
+            fs::write(directory.join("max_brightness"), "255\n").unwrap();
+            if id.starts_with("rgb0-") {
+                fs::write(directory.join("pattern"), "0 100 0 100\n").unwrap();
+            }
+        }
+        let manager = HardwareManager::at_root(root.clone());
+        let status = manager.led_status().unwrap();
+        assert_eq!(status.leds.len(), 4);
+        assert_eq!(status.rgb_groups.len(), 1);
+        assert_eq!(status.leds[0].current_trigger.as_deref(), Some("heartbeat"));
+
+        manager.apply_led_trigger_live("status", "timer").unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("sys/class/leds/status/trigger")).unwrap(),
+            "timer\n"
+        );
+        let saved = read_led_saved_state(&root).unwrap();
+        assert_eq!(
+            saved.triggers.get("status").map(String::as_str),
+            Some("timer")
+        );
+
+        let config = RgbLedConfig {
+            group_id: "rgb0".into(),
+            mode: "breath".into(),
+            red: 255,
+            green: 64,
+            blue: 0,
+            brightness: 75,
+            cycle_ms: 2_000,
+        };
+        manager.apply_rgb_led_live(&config).unwrap();
+        assert!(
+            fs::read_to_string(root.join("sys/class/leds/rgb0-red/pattern"))
+                .unwrap()
+                .contains("1000")
+        );
+        assert_eq!(
+            read_led_saved_state(&root).unwrap().rgb.get("rgb0"),
+            Some(&config)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn led_inputs_cannot_escape_sysfs_or_exceed_safe_ranges() {
+        assert!(validate_led_id("../status").is_err());
+        assert!(validate_led_id("status").is_ok());
+        assert!(validate_led_trigger("timer;reboot").is_err());
+        assert!(validate_led_trigger("default-on").is_ok());
+        let invalid = RgbLedConfig {
+            group_id: "rgb0".into(),
+            mode: "strobe".into(),
+            red: 255,
+            green: 255,
+            blue: 255,
+            brightness: 100,
+            cycle_ms: 5_000,
+        };
+        assert!(validate_rgb_config(&invalid).is_err());
+    }
+
+    #[test]
+    fn led_changes_roll_back_when_persistence_fails() {
+        let root = std::env::temp_dir().join(format!("rsetup-led-rollback-{}", Uuid::new_v4()));
+        for id in ["status", "rgb0-red", "rgb0-green", "rgb0-blue"] {
+            let directory = root.join("sys/class/leds").join(id);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                directory.join("trigger"),
+                "none timer [heartbeat] pattern\n",
+            )
+            .unwrap();
+            fs::write(directory.join("brightness"), "64\n").unwrap();
+            fs::write(directory.join("max_brightness"), "255\n").unwrap();
+            if id.starts_with("rgb0-") {
+                fs::write(directory.join("pattern"), "0 100 0 100\n").unwrap();
+            }
+        }
+        let state_directory = root.join("etc/rsetup-next");
+        fs::create_dir_all(&state_directory).unwrap();
+        fs::write(state_directory.join("led-state.json"), "{}\n").unwrap();
+        fs::create_dir(state_directory.join(format!(".led-state.{}.json", std::process::id())))
+            .unwrap();
+        let manager = HardwareManager::at_root(root.clone());
+
+        assert!(manager.apply_led_trigger_live("status", "timer").is_err());
+        assert_eq!(
+            fs::read_to_string(root.join("sys/class/leds/status/trigger")).unwrap(),
+            "heartbeat\n"
+        );
+
+        let config = RgbLedConfig {
+            group_id: "rgb0".into(),
+            mode: "rainbow".into(),
+            red: 255,
+            green: 255,
+            blue: 255,
+            brightness: 100,
+            cycle_ms: 5_000,
+        };
+        assert!(manager.apply_rgb_led_live(&config).is_err());
+        for id in ["rgb0-red", "rgb0-green", "rgb0-blue"] {
+            assert_eq!(
+                fs::read_to_string(root.join("sys/class/leds").join(id).join("trigger")).unwrap(),
+                "heartbeat\n"
+            );
+            assert_eq!(
+                fs::read_to_string(root.join("sys/class/leds").join(id).join("pattern")).unwrap(),
+                "0 100 0 100\n"
+            );
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

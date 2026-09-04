@@ -1,0 +1,11 @@
+[Unit]
+Description=Restore rsetup-next LED state
+After=sysinit.target
+ConditionPathExists=/etc/rsetup-next/led-state.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/rsetup-next-helper led-restore
+
+[Install]
+WantedBy=multi-user.target
