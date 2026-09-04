@@ -7,9 +7,9 @@
   <vendor_url>https://github.com/xzl01/rsetup-next</vendor_url>
   <action id="com.radxa.rsetup-next.manage-local-system">
     <description>Manage the local SBC through rsetup-next</description>
-    <description xml:lang="zh_CN">通过 rsetup-next 管理本机开发板</description>
+    <description xml:lang="zh_CN">通过 rsetup-next 管理本机 SBC</description>
     <message>Authentication is required to change this SBC</message>
-    <message xml:lang="zh_CN">更改本机开发板需要管理员授权</message>
+    <message xml:lang="zh_CN">更改本机 SBC 系统设置需要管理员授权</message>
     <defaults>
       <allow_any>no</allow_any>
       <allow_inactive>no</allow_inactive>

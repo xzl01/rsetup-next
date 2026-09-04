@@ -70,7 +70,7 @@ impl Locale {
             (Self::ZhCn, "dry_run_enabled") => "已启用预演保护",
             (Self::ZhCn, "live_changes_enabled") => "已允许实时变更",
             (Self::ZhCn, "native_actions_ready") => "由 rsetup-next 控制中心直接提供",
-            (Self::ZhCn, "board_model_probe") => "开发板型号探测",
+            (Self::ZhCn, "board_model_probe") => "SBC 型号探测",
             (Self::ZhCn, "ready") => "就绪",
             (Self::ZhCn, "unavailable") => "缺失",
             (Self::ZhCn, "mission_control") => "SBC 控制中心",
@@ -83,7 +83,9 @@ impl Locale {
             (Self::ZhCn, "guided_operations") => "引导式操作",
             (Self::ZhCn, "task_brief") => "操作说明",
             (Self::ZhCn, "confirm_change") => "确认变更",
-            (Self::ZhCn, "confirm_help") => "此操作可能修改开发板。按 Y 继续，按 N 取消。",
+            (Self::ZhCn, "confirm_help") => {
+                "此操作会更改 SBC 系统设置，并可能带来网络安全风险。按 Y 接受风险并继续，按 N 取消。"
+            }
             (Self::ZhCn, "last_result") => "最近结果",
             (Self::ZhCn, "steps_short") => "步",
             (Self::ZhCn, "no_operation") => "未选择操作",
@@ -129,7 +131,7 @@ impl Locale {
             (_, "dry_run_enabled") => "dry-run guard enabled",
             (_, "live_changes_enabled") => "LIVE changes enabled",
             (_, "native_actions_ready") => "built into the rsetup-next control plane",
-            (_, "board_model_probe") => "board model probe",
+            (_, "board_model_probe") => "SBC model probe",
             (_, "ready") => "OK",
             (_, "unavailable") => "--",
             (_, "mission_control") => "SBC CONTROL CENTER",
@@ -143,7 +145,7 @@ impl Locale {
             (_, "task_brief") => "TASK BRIEF",
             (_, "confirm_change") => "CONFIRM CHANGE",
             (_, "confirm_help") => {
-                "This operation may change the board. Press Y to continue or N to cancel."
+                "This operation changes SBC system settings and may introduce network security risks. Press Y to accept the risks and continue, or N to cancel."
             }
             (_, "last_result") => "LAST RESULT",
             (_, "steps_short") => "step(s)",
@@ -236,7 +238,7 @@ impl Locale {
             return fallback.into();
         }
         match id {
-            "system.inspect" => "重新读取开发板身份、健康状态、服务与已检测硬件。",
+            "system.inspect" => "重新读取 SBC 身份、健康状态、服务与已检测硬件。",
             "system.update" => "刷新软件包索引并升级已安装的软件包。",
             "system.change-sources" => {
                 "选择可信的 Debian、Ubuntu 与 Radxa 镜像；执行前预览并备份，刷新失败时自动回滚。"
@@ -254,7 +256,7 @@ impl Locale {
             "storage.expand-root" => "将支持的根文件系统扩展至可用存储空间。",
             "power.enable-sleep" => "恢复 systemd 睡眠与休眠目标。",
             "power.disable-sleep" => "屏蔽系统睡眠与休眠目标，让 SBC 持续在线。",
-            "system.reboot" => "停止服务并立即重启本机开发板。",
+            "system.reboot" => "停止服务并立即重启本机 SBC。",
             _ => fallback,
         }
         .into()
@@ -496,6 +498,14 @@ mod tests {
         assert_eq!(
             Locale::ZhCn.action_title("system.reboot", "Reboot device"),
             "重启设备"
+        );
+    }
+
+    #[test]
+    fn confirmation_copy_names_sbc_settings_and_network_risk() {
+        assert_eq!(
+            Locale::ZhCn.text("confirm_help"),
+            "此操作会更改 SBC 系统设置，并可能带来网络安全风险。按 Y 接受风险并继续，按 N 取消。"
         );
     }
 

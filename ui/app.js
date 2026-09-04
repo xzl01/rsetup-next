@@ -818,7 +818,7 @@ function overlayDisplayCopy(overlay) {
     "rk3588-spi0-m2-cs0-spidev.dtbo": ["SPI0 M2", "通过 spidev 暴露 SPI0 片选 0。", "总线"],
     "rk3588-can1-m0.dtbo": ["CAN1 M0", "在扩展排针上启用 CAN1。", "现场总线"],
     "rk3588-pwm12-m0.dtbo": ["PWM12 M0", "暴露 PWM12，用于风扇或执行器控制。", "PWM"],
-    "rk3588-disable-led.dtbo": ["关闭状态灯", "启动后关闭开发板状态灯。", "开发板"],
+    "rk3588-disable-led.dtbo": ["关闭状态灯", "启动后关闭 SBC 状态灯。", "SBC"],
   };
   const copy = copies[overlay.id];
   return copy ? { ...overlay, title: copy[0], description: copy[1], category: copy[2] } : overlay;

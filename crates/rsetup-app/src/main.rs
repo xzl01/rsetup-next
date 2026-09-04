@@ -42,7 +42,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Print the current board snapshot / 显示当前开发板状态
+    /// Print the current SBC snapshot / 显示当前 SBC 状态
     Status {
         #[arg(long)]
         json: bool,
@@ -65,7 +65,7 @@ enum Commands {
         #[command(subcommand)]
         command: SourceCommands,
     },
-    /// Inspect and manage board hardware / 查看和管理开发板硬件
+    /// Inspect and manage SBC hardware / 查看和管理 SBC 硬件
     Hardware {
         #[command(subcommand)]
         command: HardwareCommands,
@@ -544,7 +544,7 @@ fn print_doctor(controller: &Controller, locale: Locale, json: bool) -> Result<(
         (
             "device-tree",
             std::path::Path::new("/proc/device-tree/model").exists(),
-            "board model probe",
+            "SBC model probe",
         ),
     ];
     if json {
@@ -565,7 +565,7 @@ fn print_doctor(controller: &Controller, locale: Locale, json: bool) -> Result<(
                 "dry-run guard enabled" => locale.text("dry_run_enabled"),
                 "LIVE changes enabled" => locale.text("live_changes_enabled"),
                 "built into the rsetup-next control plane" => locale.text("native_actions_ready"),
-                "board model probe" => locale.text("board_model_probe"),
+                "SBC model probe" => locale.text("board_model_probe"),
                 _ => detail,
             };
             println!(

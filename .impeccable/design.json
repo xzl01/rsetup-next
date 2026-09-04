@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-09-03T05:05:39Z",
+  "generatedAt": "2026-09-04T02:57:06Z",
   "title": "Design System: rsetup Soft Control Center",
   "extensions": {
     "colorMeta": {
@@ -171,6 +171,7 @@
       "Low-saturation indigo for actions, selection, focus, and the resolved board state.",
       "Deep rounding, circular icon wells, generous spacing, and diffused tinted shadows.",
       "A board-first overview with a generous guided-operations companion surface.",
+      "Focused hardware drawers for overlay selection, GPIO header mapping, camera test frames, and fan/thermal policy without turning the hardware route into a dense configuration table.",
       "Hover lift, pillow-like press feedback, and a broad halo for keyboard focus.",
       "Risk and provider truth communicated through words and structure as well as color.",
       "Equal English and Simplified Chinese presentation with locale-neutral control-plane semantics."

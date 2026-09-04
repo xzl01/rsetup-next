@@ -61,7 +61,23 @@ test("switches language, persists the choice, and keeps unknown provider copy", 
   assert.equal(i18n.t("contact.wechatQr"), "Radxa 官方微信群二维码");
   assert.equal(i18n.action({ id: "vendor.action", title: "Vendor action", description: "Vendor detail", category: "Vendor", steps: ["One"] }).title, "Vendor action");
   i18n.setLocale("en");
-  assert.equal(i18n.t("overview.title"), "Your board at a glance");
+  assert.equal(i18n.t("overview.title"), "Your SBC at a glance");
+});
+
+test("uses SBC terminology and explicit risk acknowledgement copy", () => {
+  const source = fs.readFileSync(new URL("./i18n.js", import.meta.url), "utf8");
+  const deprecatedTerm = String.fromCodePoint(0x5f00, 0x53d1, 0x677f);
+  const { i18n } = loadI18n("zh-CN");
+  assert.equal(source.includes(deprecatedTerm), false);
+  assert.equal(
+    i18n.t("drawer.confirm"),
+    "我已了解此操作会更改 SBC 系统设置，并接受由此带来的潜在网络安全风险。",
+  );
+  i18n.setLocale("en");
+  assert.equal(
+    i18n.t("drawer.confirm"),
+    "I understand this operation changes SBC system settings, and I accept the potential network security risks.",
+  );
 });
 
 test("localizes API error codes without changing the API payload", () => {
