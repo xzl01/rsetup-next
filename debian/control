@@ -17,6 +17,7 @@ Architecture: any
 Depends:
  apt,
  btrfs-progs,
+ device-tree-compiler,
  e2fsprogs,
  iproute2,
  mtd-utils,
@@ -25,7 +26,6 @@ Depends:
  ${misc:Depends},
  ${shlibs:Depends},
 Suggests:
- device-tree-compiler,
  docker.io,
  ffmpeg,
  gpiod,

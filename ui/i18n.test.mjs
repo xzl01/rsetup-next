@@ -64,6 +64,18 @@ test("switches language, persists the choice, and keeps unknown provider copy", 
   assert.equal(i18n.t("overview.title"), "Your SBC at a glance");
 });
 
+test("EFI authorization and review distinguish saved configuration from active hardware", () => {
+  const { i18n } = loadI18n("zh-CN");
+  assert.match(i18n.t("overlay.readRequired"), /不会修改系统/);
+  assert.match(i18n.t("overlay.kernelScope", { kernel: "7.0.11-5-qcom" }), /7\.0\.11-5-qcom/);
+  assert.match(i18n.t("overlay.kernelScope", { kernel: "test" }), /不会更改默认启动项/);
+  assert.match(i18n.t("overlay.cached", { time: "12:00" }), /上次授权读取/);
+  assert.equal(i18n.hardwareReason("EFI boot files require administrator authorization to read."), "读取 EFI 配置需要管理员授权。");
+  i18n.setLocale("en");
+  assert.match(i18n.t("overlay.savedView"), /not the running pin state/);
+  assert.match(i18n.t("overlay.kernelScope", { kernel: "test" }), /default boot entry is not changed/);
+});
+
 test("uses SBC terminology and explicit risk acknowledgement copy", () => {
   const source = fs.readFileSync(new URL("./i18n.js", import.meta.url), "utf8");
   const deprecatedTerm = String.fromCodePoint(0x5f00, 0x53d1, 0x677f);
@@ -133,7 +145,7 @@ test("localizes fan curve controls and thermal safety copy", () => {
   assert.match(i18n.t("fanCurve.confirmEnable"), /insufficient cooling/);
 });
 
-test("describes Overlay assignments and Function1 defaults", () => {
+test("describes Overlay assignments and defaults without assuming source column names", () => {
   const { i18n } = loadI18n("zh-CN");
   const capability = i18n.capability({
     id: "gpio",
@@ -145,10 +157,33 @@ test("describes Overlay assignments and Function1 defaults", () => {
   assert.match(i18n.t("gpio.currentOnly"), /Overlay 配置/);
   assert.equal(i18n.t("gpio.source.overlay"), "Overlay 配置");
   assert.equal(i18n.t("gpio.source.default"), "默认功能");
-  assert.equal(i18n.t("gpio.function1"), "Function1");
+  assert.doesNotMatch(i18n.t("gpio.profileDescription"), /Function[01]/);
+  assert.match(i18n.t("gpio.profileDescription"), /默认功能/);
+  assert.equal(i18n.t("gpio.configurationUnknown"), "配置未读取");
+  assert.match(i18n.t("gpio.baselineOnly"), /尚未读取 Overlay/);
   assert.equal(i18n.t("gpio.source.unassigned"), "未分配");
   assert.equal(i18n.t("gpio.overlays", { count: 2 }), "2 个已配置 Overlay");
   i18n.setLocale("en");
+  assert.doesNotMatch(i18n.t("gpio.profileDescription"), /Function[01]/);
+  assert.match(i18n.t("gpio.profileDescription"), /default function/);
+  assert.equal(i18n.t("gpio.configurationUnknown"), "Configuration not read");
+  assert.match(i18n.t("gpio.baselineOnly"), /not read yet/);
   assert.equal(i18n.t("gpio.unassigned"), "Unassigned");
   assert.equal(i18n.t("gpio.header.main"), "40-pin expansion header");
+});
+
+test("keeps UEFI + DT and capture-probe errors distinct from missing hardware", () => {
+  const { i18n } = loadI18n("zh-CN");
+  const reason = "UEFI + DT detected. Overlay configuration is not read or managed yet.";
+  const capability = { id: "device-tree", available: false, detail: reason };
+  assert.equal(i18n.capability(capability).detail, "UEFI + DT：尚未支持读取或修改 Overlay 配置。");
+  assert.equal(capability.detail, reason);
+  assert.match(i18n.hardwareReason("Unable to verify video capture devices. Check device permissions and driver readiness."), /权限和驱动/);
+  assert.equal(i18n.hardwareReason("No video capture device was detected."), "未检测到视频采集设备。");
+  assert.match(i18n.hardwareReason("Install ffmpeg to capture a webcam test frame."), /安装 ffmpeg/);
+  assert.equal(i18n.capability({ id: "gpio", available: true, detail: "40-pin defaults · overlay configuration unread" }).detail, "40Pin 默认功能 · Overlay 配置未读取");
+  assert.equal(i18n.hardwareReason("Unknown provider detail"), "Unknown provider detail");
+  i18n.setLocale("en");
+  assert.equal(i18n.hardwareReason(reason), reason);
+  assert.equal(i18n.capability(capability).detail, reason);
 });

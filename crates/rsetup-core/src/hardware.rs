@@ -29,6 +29,15 @@ pub struct OverlayStatus {
     pub supported: bool,
     pub mutable: bool,
     pub bootloader: String,
+    /// Whether overlay selection was read from a supported configuration backend.
+    #[serde(default)]
+    pub configuration_known: bool,
+    #[serde(default)]
+    pub requires_authorization: bool,
+    #[serde(default)]
+    pub cached: bool,
+    #[serde(default)]
+    pub boot_entry: Option<OverlayBootConfig>,
     pub directory: Option<String>,
     pub revision: String,
     pub overlays: Vec<OverlayEntry>,
@@ -57,6 +66,28 @@ pub struct OverlayChange {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct OverlayBootConfig {
+    pub kernel: String,
+    pub path: String,
+    pub devicetree: Option<String>,
+    pub available_devicetree: String,
+    /// Ordered paths from the saved BLS entry, not inferred from file suffixes.
+    pub overlays: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayBootChange {
+    pub kernel: String,
+    pub path: String,
+    pub devicetree_before: Option<String>,
+    pub devicetree_after: String,
+    pub overlays_before: Vec<String>,
+    pub overlays_after: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OverlayPlan {
     pub synthetic: bool,
     pub revision: String,
@@ -66,6 +97,8 @@ pub struct OverlayPlan {
     pub warnings: Vec<String>,
     pub requires_root: bool,
     pub reboot_required: bool,
+    #[serde(default)]
+    pub boot_change: Option<OverlayBootChange>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +107,8 @@ pub struct OverlayApplyResult {
     pub run: ActionRun,
     pub plan: OverlayPlan,
     pub reboot_required: bool,
+    #[serde(default)]
+    pub status: Option<OverlayStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +124,14 @@ pub struct GpioStatus {
     pub layout: String,
     pub connectors: Vec<GpioConnector>,
     pub configured_overlays: Vec<String>,
+    #[serde(default)]
+    pub configuration_known: bool,
+    #[serde(default)]
+    pub configuration_requires_authorization: bool,
+    #[serde(default)]
+    pub configuration_cached: bool,
+    #[serde(default)]
+    pub configuration_kernel: Option<String>,
     pub chips: Vec<GpioChip>,
     pub pins: Vec<GpioPin>,
     pub unavailable_reason: Option<String>,
@@ -298,7 +341,7 @@ impl HardwareManager {
     }
 
     #[cfg(test)]
-    fn at_root(root: PathBuf) -> Self {
+    pub(crate) fn at_root(root: PathBuf) -> Self {
         Self {
             root,
             synthetic: false,
@@ -309,6 +352,11 @@ impl HardwareManager {
         if self.synthetic {
             return Ok(demo_overlay_status());
         }
+        // Firmware and hardware description are separate. Never fall back to
+        // U-Boot files when the EFI backend is missing, ambiguous or unreadable.
+        if let Some(bootloader) = uefi_boot_mode(&self.root) {
+            return Ok(crate::efi_overlay::status(&self.root, bootloader));
+        }
         let (bootloader, directory) = self.find_overlay_directory();
         let Some(directory) = directory else {
             return Ok(OverlayStatus {
@@ -317,6 +365,10 @@ impl HardwareManager {
                 supported: false,
                 mutable: false,
                 bootloader,
+                configuration_known: false,
+                requires_authorization: false,
+                cached: false,
+                boot_entry: None,
                 directory: None,
                 revision: overlay_revision(&[]),
                 overlays: Vec::new(),
@@ -338,6 +390,10 @@ impl HardwareManager {
             supported: !overlays.is_empty(),
             mutable: !overlays.is_empty() && updater_available,
             bootloader,
+            configuration_known: true,
+            requires_authorization: false,
+            cached: false,
+            boot_entry: None,
             directory: Some(display_path(&self.root, &directory)),
             revision: overlay_revision(&overlays),
             overlays,
@@ -350,6 +406,14 @@ impl HardwareManager {
         selected_ids: &[String],
     ) -> Result<OverlayPlan, HardwareError> {
         let status = self.overlay_status()?;
+        self.plan_overlays_from_status(status, selected_ids)
+    }
+
+    pub(crate) fn plan_overlays_from_status(
+        &self,
+        status: OverlayStatus,
+        selected_ids: &[String],
+    ) -> Result<OverlayPlan, HardwareError> {
         if !status.supported {
             return Err(HardwareError::Unsupported(
                 status
@@ -412,6 +476,7 @@ impl HardwareManager {
             })
             .collect::<Vec<_>>();
         let plan_token = overlay_plan_token(&status.revision, &selected, &changes);
+        let boot_change = crate::efi_overlay::boot_change(&status, &selected)?;
         Ok(OverlayPlan {
             synthetic: self.synthetic,
             revision: status.revision,
@@ -421,6 +486,7 @@ impl HardwareManager {
             changes,
             warnings: vec!["applies_after_reboot".into(), "kernel_update_reset".into()],
             requires_root: true,
+            boot_change,
         })
     }
 
@@ -429,6 +495,11 @@ impl HardwareManager {
         selected_ids: &[String],
         plan_token: &str,
     ) -> Result<OverlayApplyResult, HardwareError> {
+        if uefi_boot_mode(&self.root).is_some() {
+            return crate::efi_overlay::apply(&self.root, selected_ids, plan_token, |status| {
+                self.plan_overlays_from_status(status, selected_ids)
+            });
+        }
         let plan = self.plan_overlays(selected_ids)?;
         verify_overlay_plan(&plan, plan_token)?;
         let started_at = Utc::now();
@@ -444,6 +515,7 @@ impl HardwareManager {
                     started_at,
                 ),
                 reboot_required: false,
+                status: None,
                 plan,
             });
         }
@@ -478,6 +550,7 @@ impl HardwareManager {
                         started_at,
                     ),
                     reboot_required: true,
+                    status: None,
                     plan,
                 })
             }
@@ -499,13 +572,23 @@ impl HardwareManager {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn gpio_status(&self) -> Result<GpioStatus, HardwareError> {
         self.gpio_status_for_profile(None)
     }
 
+    #[cfg(test)]
     pub(crate) fn gpio_status_for_profile(
         &self,
         profile_override: Option<&str>,
+    ) -> Result<GpioStatus, HardwareError> {
+        self.gpio_status_with_overlays(profile_override, self.overlay_status().ok())
+    }
+
+    pub(crate) fn gpio_status_with_overlays(
+        &self,
+        profile_override: Option<&str>,
+        overlay_status: Option<OverlayStatus>,
     ) -> Result<GpioStatus, HardwareError> {
         let mut chips = if self.synthetic {
             (0..5)
@@ -532,8 +615,18 @@ impl HardwareManager {
             || profile.is_some()
             || !chips.is_empty()
             || self.root.join("dev/gpiochip0").exists();
-        let mut configured_overlays = self
-            .overlay_status()
+        let configuration_requires_authorization = overlay_status
+            .as_ref()
+            .is_some_and(|status| status.requires_authorization);
+        let configuration_cached = overlay_status.as_ref().is_some_and(|status| status.cached);
+        let configuration_kernel = overlay_status
+            .as_ref()
+            .and_then(|status| status.boot_entry.as_ref().map(|entry| entry.kernel.clone()));
+        let configuration_known = overlay_status
+            .as_ref()
+            .is_some_and(|status| status.configuration_known);
+        let mut configured_overlays = overlay_status
+            .filter(|status| status.configuration_known)
             .map(|status| {
                 status
                     .overlays
@@ -588,6 +681,10 @@ impl HardwareManager {
                 .into_iter()
                 .map(|overlay| overlay.id)
                 .collect(),
+            configuration_known,
+            configuration_requires_authorization,
+            configuration_cached,
+            configuration_kernel,
             chips,
             pins,
             unavailable_reason: (!supported)
@@ -621,6 +718,7 @@ impl HardwareManager {
                 || item.starts_with("console=ttyAMA")
                 || item.starts_with("console=ttyAML")
                 || item.starts_with("console=ttyFIQ")
+                || item.starts_with("console=ttyMSM")
         })
     }
 
@@ -796,30 +894,7 @@ impl HardwareManager {
         if self.synthetic {
             return Ok(demo_video_status());
         }
-        let base = self.root.join("sys/class/video4linux");
-        let mut devices = Vec::new();
-        if let Ok(entries) = fs::read_dir(base) {
-            for entry in entries.flatten() {
-                let id = entry.file_name().to_string_lossy().into_owned();
-                if !valid_video_id(&id) {
-                    continue;
-                }
-                let path = format!("/dev/{id}");
-                let driver = fs::read_link(entry.path().join("device/driver"))
-                    .ok()
-                    .and_then(|path| {
-                        path.file_name()
-                            .map(|name| name.to_string_lossy().into_owned())
-                    });
-                devices.push(VideoDevice {
-                    id: id.clone(),
-                    path,
-                    name: read_trimmed(entry.path().join("name")).unwrap_or(id),
-                    driver,
-                });
-            }
-        }
-        devices.sort_by(|left, right| left.id.cmp(&right.id));
+        let (devices, probe_failed) = crate::video::capture_devices(&self.root);
         let supported = !devices.is_empty();
         let capture_available = supported && command_exists("ffmpeg") && command_exists("timeout");
         Ok(VideoStatus {
@@ -828,8 +903,10 @@ impl HardwareManager {
             supported,
             capture_available,
             devices,
-            unavailable_reason: if !supported {
-                Some("No Video4Linux device was detected.".into())
+            unavailable_reason: if !supported && probe_failed {
+                Some("Unable to verify video capture devices. Check device permissions and driver readiness.".into())
+            } else if !supported {
+                Some("No video capture device was detected.".into())
             } else if !capture_available {
                 Some("Install ffmpeg to capture a webcam test frame.".into())
             } else {
@@ -1463,7 +1540,20 @@ impl HardwareManager {
     }
 }
 
-fn read_overlays(directory: &Path) -> Result<Vec<OverlayEntry>, HardwareError> {
+pub(crate) fn uefi_boot_mode(root: &Path) -> Option<&'static str> {
+    root.join("sys/firmware/efi").is_dir().then(|| {
+        if root.join("sys/firmware/devicetree/base").is_dir()
+            || root.join("proc/device-tree").is_dir()
+        {
+            "uefi-dt"
+        } else {
+            // Absence of DT is not by itself proof that ACPI is in use.
+            "uefi"
+        }
+    })
+}
+
+pub(crate) fn read_overlays(directory: &Path) -> Result<Vec<OverlayEntry>, HardwareError> {
     let mut overlays = Vec::new();
     let entries = fs::read_dir(directory).map_err(|error| HardwareError::Io(error.to_string()))?;
     for entry in entries.flatten() {
@@ -1905,7 +1995,7 @@ fn overlay_plan_token(revision: &str, selected: &[String], changes: &[OverlayCha
     fingerprint("overlay-plan-v1", &bytes)
 }
 
-fn fingerprint(prefix: &str, bytes: &[u8]) -> String {
+pub(crate) fn fingerprint(prefix: &str, bytes: &[u8]) -> String {
     let mut left = 0xcbf2_9ce4_8422_2325u64;
     let mut right = 0x8422_2325_cbf2_9ce4u64;
     for byte in bytes {
@@ -1921,7 +2011,7 @@ fn rooted_path(root: &Path, value: &str) -> PathBuf {
     root.join(value.trim_start_matches('/'))
 }
 
-fn display_path(root: &Path, path: &Path) -> String {
+pub(crate) fn display_path(root: &Path, path: &Path) -> String {
     if root == Path::new("/") {
         return path.display().to_string();
     }
@@ -1973,7 +2063,7 @@ fn bounded_output(stdout: &[u8], stderr: &[u8]) -> Option<String> {
     (!text.is_empty()).then(|| text.chars().take(8_000).collect())
 }
 
-fn hardware_run(
+pub(crate) fn hardware_run(
     action_id: &str,
     title: &str,
     status: ActionStatus,
@@ -2096,6 +2186,10 @@ fn demo_overlay_status() -> OverlayStatus {
         supported: true,
         mutable: true,
         bootloader: "u-boot".into(),
+        configuration_known: true,
+        requires_authorization: false,
+        cached: false,
+        boot_entry: None,
         directory: Some("/boot/dtbo".into()),
         revision: overlay_revision(&overlays),
         overlays,
@@ -2288,6 +2382,79 @@ mod tests {
     use super::*;
 
     #[test]
+    fn uefi_dt_never_uses_leftover_u_boot_overlays_or_writes_them() {
+        let root = std::env::temp_dir().join(format!("rsetup-uefi-dt-{}", Uuid::new_v4()));
+        for path in [
+            "sys/firmware/efi",
+            "sys/firmware/devicetree/base",
+            "proc/device-tree",
+            "boot/dtbo",
+            "etc/default",
+        ] {
+            fs::create_dir_all(root.join(path)).unwrap();
+        }
+        fs::write(
+            root.join("proc/device-tree/compatible"),
+            b"radxa,dragon-q8b\0qcom,sc8280xp\0",
+        )
+        .unwrap();
+        fs::write(
+            root.join("etc/default/u-boot"),
+            "U_BOOT_FDT_OVERLAYS_DIR='/boot/dtbo'\n",
+        )
+        .unwrap();
+        let overlay = root.join("boot/dtbo/sc8280xp-uart18.dtbo");
+        fs::write(&overlay, b"not-the-uefi-configuration").unwrap();
+        let manager = HardwareManager::at_root(root.clone());
+        let status = manager.overlay_status().unwrap();
+        assert_eq!(status.bootloader, "uefi-dt");
+        assert!(!status.supported && !status.mutable && !status.configuration_known);
+        assert!(status.overlays.is_empty());
+        assert!(status.unavailable_reason.is_some());
+        assert!(manager.plan_overlays(&[]).is_err());
+        assert!(manager.apply_overlays_live(&[], "invalid-token").is_err());
+        assert_eq!(fs::read(&overlay).unwrap(), b"not-the-uefi-configuration");
+
+        let gpio = manager.gpio_status().unwrap();
+        assert_eq!(gpio.profile_id.as_deref(), Some("dragonQ8b"));
+        assert_eq!(gpio.pins.len(), 40);
+        assert!(!gpio.configuration_known);
+        assert!(gpio.configured_overlays.is_empty());
+        let pin16 = gpio.pins.iter().find(|pin| pin.physical_pin == 16).unwrap();
+        assert_eq!(pin16.current_function.as_deref(), Some("GPIO_68"));
+        assert_eq!(pin16.function_source, "default");
+        assert_eq!(
+            serde_json::to_value(gpio).unwrap()["configurationKnown"],
+            false
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn uefi_detection_keeps_firmware_and_dt_separate() {
+        let root = std::env::temp_dir().join(format!("rsetup-uefi-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("boot/dtbo")).unwrap();
+        fs::create_dir_all(root.join("sys/firmware/efi")).unwrap();
+        assert_eq!(uefi_boot_mode(&root), Some("uefi"));
+        assert!(
+            !HardwareManager::at_root(root.clone())
+                .overlay_status()
+                .unwrap()
+                .mutable
+        );
+        fs::create_dir_all(root.join("proc/device-tree")).unwrap();
+        assert_eq!(uefi_boot_mode(&root), Some("uefi-dt"));
+        fs::remove_dir(root.join("sys/firmware/efi")).unwrap();
+        assert_eq!(uefi_boot_mode(&root), None);
+        let status = HardwareManager::at_root(root.clone())
+            .overlay_status()
+            .unwrap();
+        assert_eq!(status.bootloader, "u-boot");
+        assert!(status.configuration_known);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn demo_overlay_plan_is_exact_and_rejects_stale_token() {
         let manager = HardwareManager::new(true);
         let selected = vec!["rk3588-can1-m0.dtbo".to_owned()];
@@ -2339,9 +2506,58 @@ mod tests {
         assert_eq!(dragon.board_name.as_deref(), Some("Dragon Q6A"));
         assert!(dragon.configured_overlays.is_empty());
 
+        let q8b = manager.gpio_status_for_profile(Some("dragonQ8b")).unwrap();
+        assert_eq!(q8b.board_name.as_deref(), Some("Radxa Dragon Q8B"));
+        assert_eq!(q8b.pins.len(), 40);
+        assert!(q8b.configured_overlays.is_empty());
+        let pin16 = q8b.pins.iter().find(|pin| pin.physical_pin == 16).unwrap();
+        assert_eq!(pin16.current_function.as_deref(), Some("GPIO_68"));
+        assert_eq!(pin16.function_source, "default");
+        assert!(pin16.chip.is_none());
+        assert!(pin16.offset.is_none());
+
         let generic = manager.gpio_status_for_profile(Some("none")).unwrap();
         assert_eq!(generic.profile_id, None);
         assert_eq!(generic.pins.len(), 40);
+    }
+
+    #[test]
+    fn live_q8b_gpio_uses_documented_defaults_and_detects_the_msm_console() {
+        let root = std::env::temp_dir().join(format!("rsetup-q8b-pinout-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("proc/device-tree")).unwrap();
+        fs::write(
+            root.join("proc/device-tree/compatible"),
+            b"radxa,dragon-q8b\0qcom,sc8280xp\0",
+        )
+        .unwrap();
+        fs::write(
+            root.join("proc/cmdline"),
+            "root=UUID=example console=ttyMSM0,115200n8",
+        )
+        .unwrap();
+        let status = HardwareManager::at_root(root.clone())
+            .gpio_status()
+            .unwrap();
+        assert_eq!(status.profile_id.as_deref(), Some("dragonQ8b"));
+        assert!(status.serial_console_detected);
+        assert!(!status.synthetic);
+        assert_eq!(status.pins.len(), 40);
+        let pin8 = status
+            .pins
+            .iter()
+            .find(|pin| pin.physical_pin == 8)
+            .unwrap();
+        assert_eq!(pin8.current_function.as_deref(), Some("GPIO_63"));
+        assert_eq!(pin8.function_source, "default");
+        assert!(
+            status
+                .pins
+                .iter()
+                .all(|pin| pin.chip.is_none() && pin.offset.is_none())
+        );
+        fs::write(root.join("proc/cmdline"), "root=UUID=example console=tty0").unwrap();
+        assert!(!HardwareManager::at_root(root.clone()).serial_console_detected());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2358,6 +2574,7 @@ mod tests {
         let status = HardwareManager::at_root(root.clone())
             .gpio_status()
             .unwrap();
+        assert!(status.configuration_known);
         assert_eq!(
             status.configured_overlays,
             vec!["rk3588-i2c3-m1.dtbo".to_owned()]

@@ -132,11 +132,25 @@ Runtime pinmux evidence used when debugfs is available and readable.
 .TP
 .I /usr/share/doc/rsetup-next/PINOUT_PROVENANCE.md
 Source commit, license, and regeneration instructions for the normalized
-20-profile pinout catalog.
+21-profile pinout catalog (20 imported profiles and an official Q8B profile).
 .SH NOTES
 The pinout snapshot is derived from
 .I xzl01/pin-out
 with copyright-owner authorization for distribution under GPL-3.0-or-later.
+The additional Q8B profile retains the Radxa documentation's CC-BY-4.0 license.
+Q6A/Q8B EFI + DT use a native BLS Type #1 Overlay backend. The running kernel's
+entry supplies the saved selection. Preview and apply affect only that entry,
+not the default boot choice or other kernels. Changes activate when that kernel
+is booted. Protected EFI files can be read explicitly with
+.B hardware overlays status --authorize
+or
+.B hardware overlays plan --authorize
+and
+.B hardware gpio --authorize.
+This authorization step is read-only; it never applies a plan.
+Root-only backups are saved under
+.I /var/lib/rsetup-next/overlay-backups/.
+Saved configuration is not proof of the currently running pinmux state.
 Runtime pinctrl and read-only GPIO metadata still require validation across
 real SBCs; absent evidence is intentionally left unconfirmed.
 .SH ENVIRONMENT

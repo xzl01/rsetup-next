@@ -74,6 +74,7 @@ pub struct Controller {
     hardware: Arc<HardwareManager>,
     spi_flash: Arc<SpiFlashManager>,
     fan_curve: Arc<FanCurveManager>,
+    overlay_cache: Arc<RwLock<Option<OverlayStatus>>>,
 }
 
 impl Controller {
@@ -107,6 +108,7 @@ impl Controller {
             hardware: Arc::new(HardwareManager::new(synthetic)),
             spi_flash: Arc::new(SpiFlashManager::new(synthetic)),
             fan_curve: Arc::new(FanCurveManager::new(synthetic)),
+            overlay_cache: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -120,7 +122,24 @@ impl Controller {
     }
 
     pub fn snapshot(&self) -> anyhow::Result<crate::DeviceSnapshot> {
-        collect_snapshot(self.mode)
+        let mut snapshot = collect_snapshot(self.mode)?;
+        // Polling remains unprivileged. Do not label the GPIO tool as unread
+        // after an explicit read; make the cached provenance visible instead.
+        if !snapshot.synthetic
+            && self
+                .overlay_cache
+                .read()
+                .expect("overlay cache lock")
+                .as_ref()
+                .is_some_and(|status| status.configuration_known)
+        {
+            for capability in &mut snapshot.capabilities {
+                if capability.available && capability.id == "gpio" {
+                    capability.detail = "40-pin map · last authorized Overlay configuration".into();
+                }
+            }
+        }
+        Ok(snapshot)
     }
 
     pub fn actions(&self) -> Vec<ActionSpec> {
@@ -156,14 +175,52 @@ impl Controller {
     }
 
     pub fn overlay_status(&self) -> Result<OverlayStatus, HardwareError> {
-        self.hardware.overlay_status()
+        let status = self.hardware.overlay_status()?;
+        if status.requires_authorization {
+            if let Some(cached) = self
+                .overlay_cache
+                .read()
+                .expect("overlay cache lock")
+                .as_ref()
+            {
+                let mut cached = cached.clone();
+                cached.cached = true;
+                return Ok(cached);
+            }
+        }
+        Ok(status)
+    }
+
+    /// Explicit read authorization only; never called by background polling.
+    pub fn authorize_overlay_read(&self) -> Result<OverlayStatus, HardwareError> {
+        let status = if self.synthetic || effective_uid() == Some(0) {
+            self.hardware.overlay_status()?
+        } else {
+            privileged_helper_ready().map_err(|_| HardwareError::RootRequired)?;
+            let output = Command::new(PKEXEC)
+                .args([PRIVILEGED_HELPER, "overlays-inspect"])
+                .output()
+                .map_err(|e| HardwareError::Authorization(e.to_string()))?;
+            if !output.status.success() {
+                return Err(HardwareError::Authorization(helper_error(
+                    &output.stderr,
+                    output.status,
+                )));
+            }
+            serde_json::from_slice::<OverlayStatus>(&output.stdout)
+                .map_err(|e| HardwareError::Io(format!("invalid helper response: {e}")))?
+        };
+        *self.overlay_cache.write().expect("overlay cache lock") =
+            status.configuration_known.then(|| status.clone());
+        Ok(status)
     }
 
     pub fn plan_overlay_change(
         &self,
         selected_ids: &[String],
     ) -> Result<OverlayPlan, HardwareError> {
-        self.hardware.plan_overlays(selected_ids)
+        self.hardware
+            .plan_overlays_from_status(self.overlay_status()?, selected_ids)
     }
 
     pub fn apply_overlay_change(
@@ -205,9 +262,11 @@ impl Controller {
                 ),
                 reboot_required: plan.reboot_required,
                 plan,
+                status: None,
             }
         } else if effective_uid() != Some(0) {
             let result = run_privileged_overlay_apply(selected_ids, plan_token)?;
+            *self.overlay_cache.write().expect("overlay cache lock") = result.status.clone();
             self.record_run(result.run.clone());
             return Ok(result);
         } else {
@@ -219,14 +278,15 @@ impl Controller {
     }
 
     pub fn gpio_status(&self) -> Result<GpioStatus, HardwareError> {
-        self.hardware.gpio_status()
+        self.gpio_status_for_profile(None)
     }
 
     pub fn gpio_status_for_profile(
         &self,
         profile_id: Option<&str>,
     ) -> Result<GpioStatus, HardwareError> {
-        self.hardware.gpio_status_for_profile(profile_id)
+        self.hardware
+            .gpio_status_with_overlays(profile_id, self.overlay_status().ok())
     }
 
     pub fn led_status(&self) -> Result<LedStatus, HardwareError> {

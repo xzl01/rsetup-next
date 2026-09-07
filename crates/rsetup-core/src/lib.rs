@@ -1,4 +1,5 @@
 mod actions;
+mod efi_overlay;
 mod fan_curve;
 mod hardware;
 mod model;
@@ -6,6 +7,7 @@ mod pinout;
 mod probe;
 mod sources;
 mod spi_flash;
+mod video;
 
 pub use actions::{ActionError, Controller, ExecutionPolicy};
 pub use fan_curve::{
@@ -14,9 +16,9 @@ pub use fan_curve::{
 };
 pub use hardware::{
     CoolingDevice, GpioChip, GpioConnector, GpioPin, GpioStatus, HardwareError, LedDevice,
-    LedSavedState, LedStatus, OverlayApplyResult, OverlayChange, OverlayEntry, OverlayPlan,
-    OverlayStatus, RgbLedConfig, RgbLedGroup, ThermalStatus, ThermalZone, VideoDevice, VideoFrame,
-    VideoStatus,
+    LedSavedState, LedStatus, OverlayApplyResult, OverlayBootChange, OverlayBootConfig,
+    OverlayChange, OverlayEntry, OverlayPlan, OverlayStatus, RgbLedConfig, RgbLedGroup,
+    ThermalStatus, ThermalZone, VideoDevice, VideoFrame, VideoStatus,
 };
 pub use model::{
     ActionRun, ActionSpec, ActionStatus, ActivityEvent, Alert, AlertLevel, Capability,

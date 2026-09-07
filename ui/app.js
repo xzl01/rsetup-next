@@ -57,6 +57,7 @@ const debugDeviceProfiles = [
   { id: "allwinner-a733", label: "Cubie A7A · A733", product: "Radxa Cubie A7A Demo", hostname: "debug-cubie-a7a", socVendor: "Allwinner", soc: "A733", architecture: "aarch64", pinoutProfile: "cubieA7a" },
   { id: "cix-p1", label: "Orion O6 · CIX P1", product: "Radxa Orion O6 Demo", hostname: "debug-orion-o6", socVendor: "CIX", soc: "P1", architecture: "aarch64", pinoutProfile: "orionO6" },
   { id: "qualcomm-qcs6490", label: "Dragon Q6A · QCS6490", product: "Radxa Dragon Q6A Demo", hostname: "debug-dragon-q6a", socVendor: "Qualcomm", soc: "QCS6490", architecture: "aarch64", pinoutProfile: "dragonQ6a" },
+  { id: "qualcomm-sc8280xp", label: "Dragon Q8B · SC8280XP", product: "Radxa Dragon Q8B Demo", hostname: "debug-dragon-q8b", socVendor: "Qualcomm", soc: "SC8280XP", architecture: "aarch64", pinoutProfile: "dragonQ8b" },
   { id: "amlogic-a311d", label: "ZERO 2 Pro · A311D", product: "Radxa ZERO 2 Pro Demo", hostname: "debug-zero-2-pro", socVendor: "Amlogic", soc: "A311D", architecture: "aarch64", pinoutProfile: "radxaZero2Pro" },
   { id: "mediatek-genio700", label: "MediaTek · Genio 700", product: "MediaTek Genio 700 Demo", hostname: "debug-genio700", socVendor: "MediaTek", soc: "Genio 700", architecture: "aarch64", pinoutProfile: null },
   { id: "starfive-jh7110", label: "StarFive · JH7110", product: "StarFive JH7110 Demo", hostname: "debug-jh7110", socVendor: "StarFive", soc: "JH7110", architecture: "riscv64", pinoutProfile: null },
@@ -211,6 +212,10 @@ const transport = {
     if (tauriInvoke) return tauriInvoke("overlay_status");
     return request("/api/v1/hardware/overlays");
   },
+  async authorizeOverlays() {
+    if (tauriInvoke) return tauriInvoke("authorize_overlay_read");
+    return request("/api/v1/hardware/overlays/authorize", { method: "POST" });
+  },
   async planOverlays(selectedIds) {
     if (tauriInvoke) return tauriInvoke("plan_overlays", { selectedIds });
     return request("/api/v1/hardware/overlays/plan", {
@@ -350,14 +355,7 @@ function displayError(error) {
 }
 
 function hardwareReason(reason) {
-  if (i18n.getLocale() !== "zh-CN") return reason;
-  if (reason === "No SPI NOR MTD device was detected.") return "未检测到 SPI NOR MTD 设备。";
-  if (reason === "Install mtd-utils to write or erase SPI boot flash.") return "请安装 mtd-utils 后再写入或擦除 SPI 启动闪存。";
-  if (reason === "No thermal zone with the user_space governor was detected.") return "未检测到支持 user_space 策略的温区。";
-  if (reason === "No controllable pwm-fan cooling device was detected.") return "未检测到可控制的 pwm-fan 散热设备。";
-  if (reason === "The detected thermal and fan controls are read-only.") return "检测到的温控与风扇接口为只读。";
-  if (reason === "Install the rsetup-next fan curve service before enabling a curve.") return "请先安装 rsetup-next 风扇曲线服务。";
-  return reason;
+  return i18n.hardwareReason(reason);
 }
 
 function setText(selector, value, scope = document) {
@@ -910,6 +908,7 @@ function hardwareToolCopy(id) {
 
 function overlayDisplayCopy(overlay) {
   if (!overlay) return {};
+  overlay = { ...overlay, description: overlay.description?.replace(/\\n/g, " ") };
   if (!state.hardwareData?.synthetic || i18n.getLocale() !== "zh-CN") return overlay;
   const copies = {
     "rk3588-uart2-m0.dtbo": ["UART2 M0", "将 UART2 路由到 40 针排针。", "串口"],
@@ -1026,11 +1025,17 @@ function renderOverlayTool() {
   const data = state.hardwareData;
   const selected = new Set(state.overlaySelection);
   const host = $("[data-hardware-body]");
+  if (data.requiresAuthorization) {
+    host.innerHTML = overlayReadControl(true);
+    bindOverlayRead(host);
+    return;
+  }
   if (!data.supported || !data.overlays.length) {
-    host.innerHTML = `<div class="hardware-tool-empty">${escapeHtml(data.unavailableReason || t("overlay.none"))}</div>`;
+    host.innerHTML = `<div class="hardware-tool-empty">${escapeHtml(hardwareReason(data.unavailableReason) || t("overlay.none"))}</div>`;
     return;
   }
   host.innerHTML = `
+    ${data.bootEntry ? `<div class="tool-warning">${escapeHtml(t("overlay.kernelScope", { kernel: data.bootEntry.kernel }))}<br><code>${escapeHtml(data.bootEntry.path)}</code></div>${overlayReadControl(false, data.cached, data.collectedAt)}` : ""}
     <div class="tool-fact-line"><span>${escapeHtml(t("overlay.location", { bootloader: data.bootloader, directory: data.directory || "—" }))}</span><b>${data.overlays.filter((item) => item.enabled).length}/${data.overlays.length}</b></div>
     <div class="overlay-list">
       ${data.overlays.map((rawOverlay) => {
@@ -1048,25 +1053,72 @@ function renderOverlayTool() {
   $$('input[type="checkbox"]', host).forEach((input) => input.addEventListener("change", () => {
     state.overlaySelection = $$('input[type="checkbox"]', host).filter((item) => item.checked).map((item) => item.value);
     state.overlayPlan = null;
+    state.overlayPreviewVersion = (state.overlayPreviewVersion || 0) + 1;
     renderOverlayTool();
   }));
   $("[data-overlay-preview]", host)?.addEventListener("click", previewOverlays);
+  bindOverlayRead(host);
   if (!data.mutable && data.unavailableReason) {
-    $("[data-overlay-plan]", host).innerHTML = `<div class="tool-warning">${escapeHtml(data.unavailableReason)}</div>`;
+    $("[data-overlay-plan]", host).innerHTML = `<div class="tool-warning">${escapeHtml(hardwareReason(data.unavailableReason))}</div>`;
   } else if (state.overlayPlan) {
     renderOverlayPlan();
   }
 }
 
+function overlayReadControl(required, cached = false, collectedAt = null) {
+  const time = collectedAt ? new Date(collectedAt).toLocaleTimeString(i18n.getLocale()) : "";
+  return `<div class="overlay-read-control">
+    <p>${escapeHtml(t(required ? "overlay.readRequired" : cached ? "overlay.cached" : "overlay.savedView", { time }))}</p>
+    <button class="secondary-button" type="button" data-overlay-authorize><span>${escapeHtml(t(required ? "overlay.authorize" : "overlay.refreshRead"))}</span>${icon("run")}</button>
+  </div>`;
+}
+
+function bindOverlayRead(host) {
+  $("[data-overlay-authorize]", host)?.addEventListener("click", authorizeOverlayRead);
+}
+
+async function authorizeOverlayRead(event) {
+  const button = event.currentTarget;
+  const id = state.selectedHardware;
+  const version = ++state.hardwareLoadVersion;
+  state.overlayPlan = null;
+  state.overlayPreviewVersion = (state.overlayPreviewVersion || 0) + 1;
+  $("[data-overlay-plan]")?.replaceChildren();
+  button.disabled = true;
+  $("span", button).textContent = t("overlay.authorizing");
+  try {
+    const overlays = await transport.authorizeOverlays();
+    const data = id === "gpio" ? await transport.gpioStatus(gpioProfileOverride()) : overlays;
+    if (state.selectedHardware !== id || state.hardwareLoadVersion !== version) return;
+    state.hardwareData = data;
+    if (id === "device-tree") state.overlaySelection = data.overlays.filter((item) => item.enabled).map((item) => item.id);
+    renderHardwareTool();
+  } catch (error) {
+    if (state.selectedHardware !== id || state.hardwareLoadVersion !== version) return;
+    toast(t("toast.failed"), displayError(error), true);
+    button.disabled = false;
+    $("span", button).textContent = t("overlay.authorize");
+  }
+}
+
 async function previewOverlays() {
+  const version = state.overlayPreviewVersion = (state.overlayPreviewVersion || 0) + 1;
+  const loadVersion = state.hardwareLoadVersion;
+  const selectedIds = [...state.overlaySelection];
+  state.overlayPlan = null;
   const button = $("[data-overlay-preview]");
   button.disabled = true;
   $("span", button).textContent = t("overlay.previewing");
   try {
-    state.overlayPlan = await transport.planOverlays(state.overlaySelection);
+    const plan = await transport.planOverlays(selectedIds);
+    if (state.selectedHardware !== "device-tree" || loadVersion !== state.hardwareLoadVersion || version !== state.overlayPreviewVersion) return;
+    state.overlayPlan = plan;
     renderOverlayTool();
+    requestAnimationFrame(() => $("[data-overlay-plan]")?.scrollIntoView({ block: "start" }));
   } catch (error) {
-    renderHardwareError(displayError(error));
+    if (state.selectedHardware !== "device-tree" || loadVersion !== state.hardwareLoadVersion || version !== state.overlayPreviewVersion) return;
+    renderOverlayTool();
+    toast(t("toast.failed"), displayError(error), true);
   }
 }
 
@@ -1080,7 +1132,13 @@ function renderOverlayPlan() {
       const overlay = overlayDisplayCopy(state.hardwareData.overlays.find((item) => item.id === change.id));
       return `<li><span>${escapeHtml(change.afterEnabled ? t("overlay.enable", { name: overlay?.title || change.id }) : t("overlay.disable", { name: overlay?.title || change.id }))}</span></li>`;
     }).join("")}</ul>` : `<p>${escapeHtml(t("overlay.noChanges"))}</p>`}
-    <div class="tool-warning"><span>${escapeHtml(t("overlay.warning.reboot"))}</span><span>${escapeHtml(t("overlay.warning.kernel"))}</span></div>
+    ${plan.bootChange ? `<div class="overlay-boot-change">
+      <strong>${escapeHtml(t("overlay.bootChange"))}</strong>
+      <code>${escapeHtml(plan.bootChange.path)}</code>
+      <dl><dt>${escapeHtml(t("overlay.before"))}</dt><dd><code>${escapeHtml(plan.bootChange.devicetreeBefore || "—")}</code><code>${escapeHtml(plan.bootChange.overlaysBefore.join("\n") || "—")}</code></dd>
+      <dt>${escapeHtml(t("overlay.after"))}</dt><dd><code>${escapeHtml(plan.bootChange.devicetreeAfter)}</code><code>${escapeHtml(plan.bootChange.overlaysAfter.join("\n") || "—")}</code></dd></dl>
+    </div>` : ""}
+    <div class="tool-warning"><span>${escapeHtml(plan.bootChange ? t("overlay.kernelScope", { kernel: plan.bootChange.kernel }) : t("overlay.warning.reboot"))}</span><span>${escapeHtml(t("overlay.warning.kernel"))}</span></div>
     <label class="confirm-line hardware-confirm"><input type="checkbox" data-overlay-confirm ${plan.changes.length ? "" : "disabled"} /><span>${escapeHtml(t("overlay.confirm"))}</span></label>
     <button class="execute-button hardware-execute" type="button" data-overlay-apply disabled><span>${escapeHtml(t("overlay.apply"))}</span>${icon("run")}</button>
     <div class="drawer-result" data-overlay-result hidden></div>
@@ -1094,6 +1152,7 @@ function renderOverlayPlan() {
 async function applyOverlays() {
   const plan = state.overlayPlan;
   if (!plan) return;
+  const loadVersion = state.hardwareLoadVersion;
   const button = $("[data-overlay-apply]");
   const result = $("[data-overlay-result]");
   button.disabled = true;
@@ -1102,17 +1161,21 @@ async function applyOverlays() {
   result.classList.remove("is-error");
   result.textContent = t("drawer.runState");
   try {
-    const applied = await transport.applyOverlays(state.overlaySelection, plan.planToken, true);
+    const applied = await transport.applyOverlays(plan.selectedIds, plan.planToken, true);
+    if (state.selectedHardware !== "device-tree" || loadVersion !== state.hardwareLoadVersion) return;
     result.textContent = applied.run.synthetic ? t("sources.planned") : t("overlay.saved");
     toast(applied.run.synthetic ? t("toast.dryRun") : t("overlay.saved"), t("overlay.warning.reboot"));
     if (!applied.run.synthetic) {
-      state.hardwareData = await transport.overlayStatus();
+      const data = applied.status || await transport.overlayStatus();
+      if (state.selectedHardware !== "device-tree" || loadVersion !== state.hardwareLoadVersion) return;
+      state.hardwareData = data;
       state.overlaySelection = state.hardwareData.overlays.filter((item) => item.enabled).map((item) => item.id);
       state.overlayPlan = null;
       renderOverlayTool();
     }
     await refreshAll({ quiet: true });
   } catch (error) {
+    if (state.selectedHardware !== "device-tree" || loadVersion !== state.hardwareLoadVersion) return;
     const detail = displayError(error);
     result.classList.add("is-error");
     result.textContent = detail;
@@ -1314,7 +1377,7 @@ function gpioPinCell(pin, selected) {
 function gpioPinDetail(pin) {
   const identity = pin.label;
   const pad = pin.functionSource === "default" ? "" : `<div><dt>${escapeHtml(t("gpio.pad"))}</dt><dd>${escapeHtml(identity)}</dd></div>`;
-  const source = pin.functionSource === "default" ? t("gpio.function1") : pin.sourceDetail || gpioSource(pin);
+  const source = pin.functionSource === "default" ? t("gpio.source.default") : pin.sourceDetail || gpioSource(pin);
   return `<section class="gpio-pin-detail" data-source="${escapeHtml(pin.functionSource || "unassigned")}" aria-live="polite">
     <header><span>${escapeHtml(t("gpio.pin", { pin: pin.physicalPin }))}</span><strong>${escapeHtml(gpioFunction(pin))}</strong><i>${escapeHtml(gpioSource(pin))}</i></header>
     <dl>
@@ -1341,6 +1404,8 @@ function gpioConnectorView(connector, pins, selectedPin, index) {
 
 function renderGpioTool() {
   const data = state.hardwareData;
+  // Configuration knowledge comes from the backend, not a hard-coded SBC name.
+  const baselineOnly = data.configurationKnown !== true;
   const host = $("[data-hardware-body]");
   if (!data.supported && !data.fanCurve?.supported) {
     host.innerHTML = `<div class="hardware-tool-empty">${escapeHtml(data.unavailableReason || t("hardware.unavailable"))}</div>`;
@@ -1356,13 +1421,15 @@ function renderGpioTool() {
   host.innerHTML = `
     <div class="gpio-profile-card">
       <div class="gpio-profile-title"><strong>${escapeHtml(data.boardName || t("gpio.genericHeader"))}</strong><span>${escapeHtml(t(data.profileId ? "gpio.profileMatched" : "gpio.profileFallback"))}</span></div>
-      <p>${escapeHtml(t(data.profileId ? "gpio.profileDescription" : "gpio.genericDescription"))}</p>
-      <div class="gpio-profile-facts"><b>${escapeHtml(t("gpio.overlays", { count: data.configuredOverlays?.length || 0 }))}</b><b>${escapeHtml(data.layout || "40-pin")}</b></div>
+      <p>${escapeHtml(t(data.profileId ? baselineOnly ? "gpio.baselineOnly" : "gpio.profileDescription" : "gpio.genericDescription"))}</p>
+      <div class="gpio-profile-facts"><b>${escapeHtml(baselineOnly ? t("gpio.configurationUnknown") : t("gpio.overlays", { count: data.configuredOverlays?.length || 0 }))}</b><b>${escapeHtml(data.layout || "40-pin")}</b></div>
     </div>
+    ${data.configurationRequiresAuthorization ? overlayReadControl(true) : data.configurationKernel ? `<div class="tool-warning">${escapeHtml(t("overlay.kernelScope", { kernel: data.configurationKernel }))}</div>${overlayReadControl(false, data.configurationCached)}` : ""}
     ${data.serialConsoleDetected ? `<div class="tool-warning">${escapeHtml(t("gpio.serialWarning"))}</div>` : ""}
-    <div class="gpio-view-note">${escapeHtml(t("gpio.currentOnly"))}</div>
+    ${baselineOnly ? "" : `<div class="gpio-view-note">${escapeHtml(t("gpio.currentOnly"))}</div>`}
     ${selected ? gpioPinDetail(selected) : ""}
     <div class="gpio-connectors">${connectors.map((connector, index) => gpioConnectorView(connector, pins, selectedPin, index)).join("")}</div>`;
+  bindOverlayRead(host);
   $$('[data-gpio-pin]', host).forEach((button) => {
     button.addEventListener("click", () => {
       state.gpioSelectedPin = Number(button.dataset.gpioPin);
@@ -1376,7 +1443,7 @@ function renderVideoTool() {
   const data = state.hardwareData;
   const host = $("[data-hardware-body]");
   if (!data.supported) {
-    host.innerHTML = `<div class="hardware-tool-empty">${escapeHtml(data.unavailableReason || t("hardware.unavailable"))}</div>`;
+    host.innerHTML = `<div class="hardware-tool-empty">${escapeHtml(hardwareReason(data.unavailableReason) || t("hardware.unavailable"))}</div>`;
     return;
   }
   const current = $("[data-video-device]", host)?.value || data.devices[0]?.id;
@@ -1386,7 +1453,7 @@ function renderVideoTool() {
     <div class="camera-stage" data-camera-stage>
       ${frame ? `<img src="data:${escapeHtml(frame.mimeType)};base64,${frame.base64}" alt="${escapeHtml(t("video.title"))}" /><span>${escapeHtml(frame.synthetic ? t("video.synthetic") : t("video.captured", { time: relativeTime(frame.capturedAt) }))}</span>` : `<div>${icon("video")}<span>${escapeHtml(t("video.ready"))}</span></div>`}
     </div>
-    ${!data.captureAvailable && data.unavailableReason ? `<div class="tool-warning">${escapeHtml(data.unavailableReason)}</div>` : ""}
+    ${!data.captureAvailable && data.unavailableReason ? `<div class="tool-warning">${escapeHtml(hardwareReason(data.unavailableReason))}</div>` : ""}
     <button class="execute-button hardware-execute" type="button" data-video-capture ${data.captureAvailable ? "" : "disabled"}><span>${escapeHtml(t("video.capture"))}</span>${icon("video")}</button>`;
   $("[data-video-device]", host).addEventListener("change", () => { state.videoFrame = null; renderVideoTool(); });
   $("[data-video-capture]", host).addEventListener("click", captureVideoFrame);

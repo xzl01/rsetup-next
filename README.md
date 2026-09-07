@@ -37,22 +37,43 @@ the previous files if the refresh fails.
 
 The native hardware manager now covers seven migrated workflows:
 
-- Device-tree overlays are listed from the managed U-Boot directory, checked
+- Device-tree overlays are listed from the managed boot directory, checked
   for declared resource conflicts and package requirements, previewed with an
   exact revision-bound token, and renamed transactionally before
-  `u-boot-update`. Changes apply after reboot.
+  `u-boot-update` on U-Boot systems. UEFI + DT uses a separate native EDK2/BLS
+  backend shared by Q6A and Q8B, following the layout in upstream rsetup's
+  [edk2-menu.sh](https://github.com/radxa-pkg/rsetup/blob/main/src/usr/lib/rsetup/cli/edk2-menu.sh)
+  without invoking it. The running kernel's exact Type #1 entry and ordered
+  `devicetree-overlay` references determine saved selection, not file suffixes.
+  The preview names the kernel, entry and DTB/DTBO paths. It does **not** change
+  the default entry or other kernel versions: changes activate only when booting
+  that kernel. `fdtoverlay` validates the selection before private backups,
+  atomic BLS replacement and failure rollback. Ambiguous/unsafe layouts fail
+  closed; EFI never falls back to leftover U-Boot configuration.
+  Protected ESP files require an explicit **Authorize read** action (CLI:
+  `hardware overlays status --authorize --json`, or `plan` / `gpio` with
+  `--authorize`). This fixed helper operation is read-only. Authorized snapshots
+  stay in process memory, are labeled as cached, and can be re-read explicitly;
+  applying always revalidates current root-owned inputs against the plan token.
 - The 40-pin GPIO header is a read-only map backed by 20 normalized SBC
-  profiles from `xzl01/pin-out`. Each physical pin shows exactly one configured
+  profiles from `xzl01/pin-out` plus an official Radxa Dragon Q8B profile.
+  Each physical pin shows exactly one configured
   function: the saved enabled Overlay assignment takes priority, otherwise a
-  known SBC shows the Pinout `Function1` value used without an Overlay. Unknown
+  known SBC shows its exact default function (`Function1` in pin-out,
+  `Function0` in Q8B's documentation). Unknown
   generic headers remain unassigned.
   The drawer omits GPIO-chip, line, direction, consumer, and kernel-ownership
   metadata. Saved Overlay changes are shown immediately and marked as requiring
   a reboot to activate; the status path never invokes `gpioget` or requests a
   GPIO line.
-- Video4Linux devices can capture a bounded single-frame webcam test through
-  `ffmpeg`; device IDs are enumerated and validated rather than accepted as
-  arbitrary paths.
+  EFI/BLS saved selections feed the same GPIO resolver. When configuration
+  cannot be read, only official defaults are shown, not a claim of active mux
+  state. Real overlay activation and electrical behavior still require hardware
+  testing after a separately confirmed write and reboot.
+- Verified Video4Linux capture nodes can capture a bounded single-frame webcam
+  test through `ffmpeg`. Discovery uses read-only `VIDIOC_QUERYCAP`, excluding
+  codec/M2M, output, metadata and unverified nodes. Device IDs are enumerated
+  and validated rather than accepted as arbitrary paths.
 - Thermal zones and cooling devices are inspected directly from sysfs. The
   original thermal-governor choice is preserved, including the
   `pwm-fan`/`power_allocator` incompatibility check, and the selected policy
@@ -167,7 +188,8 @@ The browser and desktop processes remain unprivileged. The Debian package ships
 `/usr/libexec/rsetup-next-helper` and a Polkit policy for live GUI operations.
 That helper accepts only fixed catalog action IDs, exact previously reviewed
 source, overlay, SPI, or fan-curve plans, validated thermal and LED
-configurations, or their fixed boot-time restore verbs. It has no arbitrary
+configurations, their fixed boot-time restore verbs, or the read-only
+`overlays-inspect` verb (no path or command arguments). It has no arbitrary
 command mode. If authorization is cancelled, the interfaces report
 `authorization_failed` without changing the system.
 
@@ -232,6 +254,7 @@ crates/rsetup-app/        clap CLI, ratatui TUI, axum API and embedded Web asset
 ui/                       browser/Tauri control center and presentation locale catalog
 apps/desktop/src-tauri/   optional desktop shell
 data/pinouts.json         normalized 20-profile SBC pinout catalog
+data/pinouts/dragon-q8b.json  official Q8B profile (maintained separately)
 scripts/import-pinouts.mjs reproducible importer for the local pin-out checkout
 ```
 
@@ -273,12 +296,16 @@ The normalized 20-profile GPIO catalog is derived from
 authorized the transformed snapshot for distribution under
 `GPL-3.0-or-later`; exact source commit and regeneration instructions are in
 [`data/PINOUT_PROVENANCE.md`](data/PINOUT_PROVENANCE.md).
+The additional Q8B profile is derived from Radxa's GPIO documentation and
+retains its CC-BY-4.0 attribution and license separately.
 
 ## Hardware validation boundary
 
 The Rust workspace, demo provider, CLI, HTTP API, and browser GUI can be tested
-on the development host. Live Linux probing still needs validation on supported
-Radxa SBCs. The overlay transaction, Overlay-to-Pinout mapping, real camera capture,
+on the development host. Q8B live read-only probing has been checked on Ubuntu
+26.04.1 with UEFI + DT; see the [test report](docs/testing/q8b-2026-09-07/report.md)
+for results and limitations. Other supported SBCs still need live validation.
+The overlay transaction, Overlay-to-Pinout mapping, real camera capture,
 sysfs thermal/LED writes, boot-time restore, and backed-up SPI NOR operations
 are implemented but have not yet been exercised on physical hardware. In
 particular, the temperature-driven curve has not been physically validated

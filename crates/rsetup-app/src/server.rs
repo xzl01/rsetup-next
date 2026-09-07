@@ -159,6 +159,10 @@ pub fn router(controller: Controller) -> Router {
         .route("/api/v1/sources/plan", post(plan_sources))
         .route("/api/v1/sources/apply", post(apply_sources))
         .route("/api/v1/hardware/overlays", get(overlay_status))
+        .route(
+            "/api/v1/hardware/overlays/authorize",
+            post(authorize_overlay_read),
+        )
         .route("/api/v1/hardware/overlays/plan", post(plan_overlays))
         .route("/api/v1/hardware/overlays/apply", post(apply_overlays))
         .route("/api/v1/hardware/gpio", get(gpio_status))
@@ -358,6 +362,18 @@ async fn plan_overlays(
 ) -> Result<Json<OverlayPlan>, ApiError> {
     controller
         .plan_overlay_change(&request.selected_ids)
+        .map(Json)
+        .map_err(ApiError::from_hardware)
+}
+
+async fn authorize_overlay_read(
+    State(controller): State<Arc<Controller>>,
+) -> Result<Json<OverlayStatus>, ApiError> {
+    tokio::task::spawn_blocking(move || controller.authorize_overlay_read())
+        .await
+        .map_err(|error| {
+            ApiError::from_hardware(rsetup_core::HardwareError::Io(error.to_string()))
+        })?
         .map(Json)
         .map_err(ApiError::from_hardware)
 }

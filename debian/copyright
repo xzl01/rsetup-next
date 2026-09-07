@@ -42,6 +42,19 @@ License: GPL-3+
  rsetup-next with the copyright owner's permission. Import provenance and the
  transformation scope are documented in data/PINOUT_PROVENANCE.md.
 
+Files: data/pinouts/dragon-q8b.json
+Copyright: 2026 Radxa Computer (Shenzhen) Co.,Ltd.
+License: CC-BY-4.0
+ Derived from the Radxa Dragon Q8B GPIO documentation, retrieved 2026-09-07:
+ https://docs.radxa.com/dragon/q8b/hardware-use/pin-gpio
+ Normalized to the rsetup pinout schema, with 3V3 normalized to 3.3V.
+ The original data attribution and license are preserved separately from
+ the GPL-3+ pin-out snapshot. See data/PINOUT_PROVENANCE.md for scope.
+
+License: CC-BY-4.0
+ The complete license text is installed as
+ /usr/share/doc/rsetup-next/CC-BY-4.0.txt.gz.
+
 License: GPL-3+
  This program is free software; you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by

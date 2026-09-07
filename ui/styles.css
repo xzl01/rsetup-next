@@ -1425,7 +1425,7 @@ body.is-resolving .core-node { animation: core-resolve 820ms var(--ease-soft) bo
 .overlay-copy strong { color: var(--bone); font-size: 14px; }
 .overlay-copy span { margin-top: 4px; color: var(--bone-muted); font-size: 12px; }
 .overlay-copy small { margin-top: 6px; overflow: hidden; color: var(--bone-muted); font-family: "Rsetup Mono", monospace; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
-.overlay-row > b { color: var(--bone-muted); font-size: 11px; font-weight: 700; }
+.overlay-row > b { color: var(--bone-muted); font-size: 11px; font-weight: 700; white-space: nowrap; }
 .overlay-preview { width: 100%; margin-top: 18px; }
 .hardware-plan { margin-top: 22px; padding-top: 22px; border-top: 1px solid var(--line-dim); }
 .hardware-plan-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
@@ -2668,3 +2668,11 @@ body.is-resolving .core-node { animation: core-resolve 820ms var(--ease-soft) bo
     transition-duration: 1ms !important;
   }
 }
+/* EFI configuration review shares the hardware drawer's existing controls. */
+.overlay-read-control { margin-block: 16px; }
+.overlay-read-control p { color: var(--bone-muted); font-size: 13px; line-height: 1.6; }
+.overlay-boot-change { margin-block: 20px; }
+.overlay-boot-change code, .tool-warning code { overflow-wrap: anywhere; white-space: pre-wrap; font-size: 11px; }
+.overlay-boot-change code { display: block; margin-block: 6px; }
+.overlay-boot-change dt { margin-top: 12px; font-weight: 600; }
+.overlay-boot-change dd { margin: 0; }

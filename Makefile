@@ -10,7 +10,7 @@ build:
 
 test:
 	cargo test --workspace --locked
-	node --test ui/i18n.test.mjs
+	node --test ui/*.test.mjs
 
 lint:
 	cargo fmt --all -- --check

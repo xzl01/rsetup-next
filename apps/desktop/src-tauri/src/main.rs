@@ -141,6 +141,17 @@ fn overlay_status(controller: tauri::State<'_, Controller>) -> Result<OverlaySta
 }
 
 #[tauri::command]
+async fn authorize_overlay_read(
+    controller: tauri::State<'_, Controller>,
+) -> Result<OverlayStatus, CommandError> {
+    let controller = controller.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || controller.authorize_overlay_read())
+        .await
+        .map_err(|error| CommandError::from(rsetup_core::HardwareError::Io(error.to_string())))?
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
 fn plan_overlays(
     controller: tauri::State<'_, Controller>,
     selected_ids: Vec<String>,
@@ -213,7 +224,9 @@ fn plan_fan_curve(
     controller: tauri::State<'_, Controller>,
     request: FanCurveRequest,
 ) -> Result<FanCurvePlan, CommandError> {
-    controller.plan_fan_curve(&request).map_err(CommandError::from)
+    controller
+        .plan_fan_curve(&request)
+        .map_err(CommandError::from)
 }
 
 #[tauri::command]
@@ -299,6 +312,7 @@ fn main() {
             plan_sources,
             apply_sources,
             overlay_status,
+            authorize_overlay_read,
             plan_overlays,
             apply_overlays,
             gpio_status,

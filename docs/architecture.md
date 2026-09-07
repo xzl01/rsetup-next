@@ -107,6 +107,7 @@ The loopback server exposes:
 | `POST` | `/api/v1/sources/plan` | preview managed source changes for one provider ID |
 | `POST` | `/api/v1/sources/apply` | confirm and apply an exact plan token; stale plans are rejected |
 | `GET` | `/api/v1/hardware/overlays` | list managed overlay state |
+| `POST` | `/api/v1/hardware/overlays/authorize` | explicitly authorize a read of protected EFI configuration; no writes |
 | `POST` | `/api/v1/hardware/overlays/plan` | validate and preview an overlay selection |
 | `POST` | `/api/v1/hardware/overlays/apply` | apply an exact overlay plan |
 | `GET` | `/api/v1/hardware/gpio` | read the 40-pin GPIO map |
@@ -115,6 +116,22 @@ The loopback server exposes:
 | `GET` | `/api/v1/hardware/thermal` | inspect thermal zones and cooling devices |
 | `POST` | `/api/v1/hardware/thermal/apply` | apply and persist a validated policy |
 | `GET` | `/api/v1/activity` | current in-memory event history |
+
+EFI + DT uses the native EDK2/BLS adapter shared by Q6A/Q8B, not U-Boot or
+legacy rsetup. The running kernel's unique Type #1 entry supplies ordered
+Overlay selection. Plans include `bootChange` (kernel, entry, DTB and ordered
+DTBO paths) and bind all BLS entries, managed DTBO bytes and the selected base
+DTB. Default boot choice and other kernel entries are never changed.
+
+Protected ESP reads use the helper's argument-free `overlays-inspect` verb.
+`requiresAuthorization` is not an empty selection. Authorized results are
+cached only in memory and marked `cached`; background reads never prompt.
+GPIO uses the same saved selection and exposes its kernel/cache provenance.
+Root apply acquires a lock, revalidates the token, tests the combination with
+`fdtoverlay`, creates a private recovery backup, and replaces the BLS entry
+atomically. DTBO renames are ordered to keep old/new entry references valid;
+reported failures trigger rollback. Unsupported, ambiguous or unsafe paths
+fail closed. Saved configuration is distinct from the currently running mux.
 
 Remote binding, authentication, persistent audit storage, multi-user policy,
 streaming job output, and cancellation are intentionally not implied by this

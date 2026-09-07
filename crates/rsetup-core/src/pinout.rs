@@ -5,6 +5,10 @@ const CATALOG_JSON: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../data/pinouts.json"
 ));
+const Q8B_JSON: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../data/pinouts/dragon-q8b.json"
+));
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -64,12 +68,19 @@ struct FunctionSelector {
     family: String,
     controller: String,
     mode: Option<String>,
+    high_speed_uart: bool,
 }
 
 fn catalog() -> &'static PinoutCatalog {
     static CATALOG: OnceLock<PinoutCatalog> = OnceLock::new();
     CATALOG.get_or_init(|| {
-        serde_json::from_str(CATALOG_JSON).expect("embedded pinout catalog must be valid")
+        let mut catalog: PinoutCatalog =
+            serde_json::from_str(CATALOG_JSON).expect("embedded pinout catalog must be valid");
+        // Keep documentation-derived profiles separate from the generated pin-out snapshot.
+        catalog
+            .profiles
+            .push(serde_json::from_str(Q8B_JSON).expect("embedded Q8B pinout must be valid"));
+        catalog
     })
 }
 
@@ -229,6 +240,7 @@ fn is_pad_resource(resource: &str) -> bool {
 fn selectors_match(evidence: &FunctionSelector, function: &FunctionSelector) -> bool {
     evidence.family == function.family
         && evidence.controller == function.controller
+        && evidence.high_speed_uart == function.high_speed_uart
         && evidence
             .mode
             .as_ref()
@@ -267,6 +279,8 @@ fn parse_selector(value: &str) -> Option<FunctionSelector> {
                     family: if family == "TWI" { "I2C" } else { family }.into(),
                     controller,
                     mode,
+                    high_speed_uart: family == "UART"
+                        && (prefix.ends_with("HS-") || prefix.ends_with("HS_")),
                 },
             ));
         }
@@ -320,7 +334,7 @@ mod tests {
 
     #[test]
     fn catalog_contains_the_imported_sbc_profiles() {
-        assert_eq!(catalog().profiles.len(), 20);
+        assert_eq!(catalog().profiles.len(), 21);
         let rock5b = profile_by_id("rock5b").unwrap();
         let pin3 = rock5b.connectors[0]
             .pins
@@ -335,6 +349,112 @@ mod tests {
     fn board_matching_prefers_the_specific_model() {
         let profile = match_profile(&["Radxa ROCK 5B".into(), "radxa,rock-5b".into()]).unwrap();
         assert_eq!(profile.id, "rock5b");
+    }
+
+    #[test]
+    fn q8b_matches_the_board_not_just_the_soc() {
+        for model in ["Radxa Dragon Q8B", "radxa,dragon-q8b"] {
+            assert_eq!(match_profile(&[model.into()]).unwrap().id, "dragonQ8b");
+        }
+        assert!(match_profile(&["qcom,sc8280xp".into()]).is_none());
+        assert_eq!(
+            match_profile(&["Radxa Dragon Q6A".into()]).unwrap().id,
+            "dragonQ6a"
+        );
+    }
+
+    #[test]
+    fn q8b_preserves_all_forty_function0_defaults() {
+        let profile = profile_by_id("dragonQ8b").unwrap();
+        assert_eq!(profile.connectors.len(), 1);
+        let pins = &profile.connectors[0].pins;
+        let expected = "3.3V 5V GPIO_41 5V GPIO_42 GND GPIO_175 GPIO_63 GND GPIO_64 \
+            GPIO_111 GPIO_174 GPIO_66 GND GPIO_67 GPIO_68 3.3V GPIO_110 GPIO_88 GND \
+            GPIO_87 GPIO_92 GPIO_89 GPIO_90 GND GPIO_91 GPIO_43 GPIO_44 GPIO_157 GND \
+            GPIO_156 GPIO_114 GPIO_115 GND GPIO_171 GPIO_112 GPIO_69 GPIO_172 GND GPIO_173";
+        assert_eq!(pins.len(), 40);
+        for (index, (pin, expected)) in pins.iter().zip(expected.split_whitespace()).enumerate() {
+            assert_eq!(pin.number as usize, index + 1);
+            assert_eq!(pin.default_function, expected);
+            assert_eq!(pin.name, expected);
+            if pin.kind == "GPIO" {
+                assert_eq!(pin.gpio.as_deref(), expected.strip_prefix("GPIO_"));
+                assert!(
+                    pin.voltage.is_none(),
+                    "the source does not specify GPIO voltage"
+                );
+            } else {
+                assert!(pin.functions.is_empty());
+                assert!(pin.gpio.is_none());
+            }
+        }
+        // Preserve the published labels, including unusual spellings, without guessing wiring.
+        assert_eq!(pins[31].functions, ["CCI_I2C_SCL0", "GCC_GP2_CLK_MIRA"]);
+        assert_eq!(pins[32].functions, ["CCI_I2C_SDA1", "GCC_GP3_CLK_MRIA"]);
+        assert_eq!(pins[39].functions, ["UART4_TX", "SPI4_SCKL"]);
+    }
+
+    #[test]
+    fn q8b_uart_and_high_speed_uart_are_distinct_muxes() {
+        let profile = profile_by_id("dragonQ8b").unwrap();
+        let pins = &profile.connectors[0].pins;
+        let mut uart = evidence("sc8280xp-uart18.dtbo");
+        uart.exclusive = ["spi18", "uart18", "i2c18", "gpio68", "gpio69"]
+            .map(String::from)
+            .to_vec();
+        for (number, expected) in [
+            (13, None),
+            (15, None),
+            (16, Some("UART18_TX")),
+            (37, Some("UART18_RX")),
+        ] {
+            let resolved = resolve_function_evidence(&pins[number - 1], &[uart.clone()]);
+            assert_eq!(resolved.name.as_deref(), expected, "pin {number}");
+            assert_ne!(resolved.kind, "conflict");
+        }
+        let hs_uart = evidence("function HS-UART18");
+        assert_eq!(
+            resolve_function_evidence(&pins[15], &[hs_uart])
+                .name
+                .as_deref(),
+            Some("HS-UART18_TX")
+        );
+    }
+
+    #[test]
+    fn q8b_spi_and_i2c_use_declared_overlay_pads() {
+        let profile = profile_by_id("dragonQ8b").unwrap();
+        let pins = &profile.connectors[0].pins;
+        // Resource lists from radxa-overlays sc8280xp-spi4-spidev and sc8280xp-i2c8.
+        let mut spi = evidence("sc8280xp-spi4-spidev.dtbo");
+        spi.exclusive = [
+            "spi4", "uart4", "i2c4", "gpio171", "gpio172", "gpio173", "gpio174",
+        ]
+        .map(String::from)
+        .to_vec();
+        let mut i2c = evidence("sc8280xp-i2c8.dtbo");
+        i2c.exclusive = ["spi8", "uart8", "i2c8", "gpio43", "gpio44"]
+            .map(String::from)
+            .to_vec();
+        for (number, expected) in [
+            (7, None),
+            (11, None),
+            (36, None),
+            (12, Some("SPI4_CS_0")),
+            (35, Some("SPI4_MISO")),
+            (38, Some("SPI4_MOSI")),
+            (40, Some("SPI4_SCKL")),
+            (27, Some("I2C8_SDA")),
+            (28, Some("I2C8_SCL")),
+        ] {
+            assert_eq!(
+                resolve_function_evidence(&pins[number - 1], &[spi.clone(), i2c.clone()])
+                    .name
+                    .as_deref(),
+                expected,
+                "pin {number}"
+            );
+        }
     }
 
     #[test]

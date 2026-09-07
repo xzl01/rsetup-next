@@ -122,6 +122,9 @@ enum HardwareCommands {
     Gpio {
         #[arg(long)]
         json: bool,
+        /// Authorize reading protected EFI configuration / 授权读取 EFI 配置
+        #[arg(long)]
+        authorize: bool,
     },
     /// Manage SPI boot flash / 管理 SPI 启动闪存
     SpiFlash {
@@ -150,12 +153,18 @@ enum OverlayCommands {
     Status {
         #[arg(long)]
         json: bool,
+        /// Authorize reading protected EFI configuration / 授权读取 EFI 配置
+        #[arg(long)]
+        authorize: bool,
     },
     Plan {
         #[arg(long = "enable")]
         selected_ids: Vec<String>,
         #[arg(long)]
         json: bool,
+        /// Authorize reading protected EFI configuration / 授权读取 EFI 配置
+        #[arg(long)]
+        authorize: bool,
     },
     Apply {
         #[arg(long = "enable")]
@@ -422,11 +431,21 @@ async fn main() -> Result<()> {
         },
         Commands::Hardware { command } => match command {
             HardwareCommands::Overlays { command } => match command {
-                OverlayCommands::Status { json } => {
+                OverlayCommands::Status { json, authorize } => {
+                    if authorize {
+                        controller.authorize_overlay_read()?;
+                    }
                     let status = controller.overlay_status()?;
                     print_json_or_debug(&status, json)?;
                 }
-                OverlayCommands::Plan { selected_ids, json } => {
+                OverlayCommands::Plan {
+                    selected_ids,
+                    json,
+                    authorize,
+                } => {
+                    if authorize {
+                        controller.authorize_overlay_read()?;
+                    }
                     let plan = controller.plan_overlay_change(&selected_ids)?;
                     print_json_or_debug(&plan, json)?;
                 }
@@ -441,7 +460,10 @@ async fn main() -> Result<()> {
                     print_json_or_debug(&result, json)?;
                 }
             },
-            HardwareCommands::Gpio { json } => {
+            HardwareCommands::Gpio { json, authorize } => {
+                if authorize {
+                    controller.authorize_overlay_read()?;
+                }
                 let status = controller.gpio_status()?;
                 print_json_or_debug(&status, json)?;
             }

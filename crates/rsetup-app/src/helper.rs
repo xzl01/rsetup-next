@@ -6,6 +6,7 @@ use std::{env, process::Command};
 
 #[derive(Debug, PartialEq)]
 enum HelperRequest {
+    OverlaysInspect,
     Action(String),
     SourcesApply {
         provider_id: String,
@@ -41,6 +42,7 @@ fn main() -> Result<()> {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
     let controller = Controller::new(ProbeMode::Live, ExecutionPolicy::Live);
     let response = match parse_request(&arguments)? {
+        HelperRequest::OverlaysInspect => serde_json::to_value(controller.overlay_status()?)?,
         HelperRequest::Action(action_id) => {
             serde_json::to_value(controller.execute(&action_id, true)?)?
         }
@@ -89,6 +91,7 @@ fn main() -> Result<()> {
 
 fn parse_request(arguments: &[String]) -> Result<HelperRequest> {
     match arguments {
+        [command] if command == "overlays-inspect" => Ok(HelperRequest::OverlaysInspect),
         [command, action_id, confirmation]
             if command == "action" && confirmation == "--confirmed" =>
         {
@@ -195,6 +198,11 @@ mod tests {
 
     #[test]
     fn helper_protocol_has_no_arbitrary_command_mode() {
+        assert_eq!(
+            parse_request(&["overlays-inspect".into()]).unwrap(),
+            HelperRequest::OverlaysInspect
+        );
+        assert!(parse_request(&["overlays-inspect".into(), "/arbitrary/path".into()]).is_err());
         assert!(parse_request(&["shell".into(), "id".into()]).is_err());
         assert!(
             parse_request(&[

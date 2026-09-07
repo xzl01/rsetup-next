@@ -1,10 +1,15 @@
 use crate::{
     Alert, AlertLevel, Capability, DeviceIdentity, DeviceSnapshot, MetricSet, NetworkInterface,
-    ProbeMode, ServiceState, ServiceSummary, StorageMetric,
+    ProbeMode, ServiceState, ServiceSummary, StorageMetric, hardware::HardwareManager,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
-use std::{collections::HashMap, env, fs, path::Path, process::Command};
+use std::{
+    collections::{BTreeSet, HashMap},
+    env, fs,
+    path::Path,
+    process::Command,
+};
 
 pub fn collect_snapshot(requested_mode: ProbeMode) -> Result<DeviceSnapshot> {
     let mode = resolve_mode(requested_mode);
@@ -30,10 +35,7 @@ fn live_snapshot() -> Result<DeviceSnapshot> {
         .or_else(|| read_trimmed("/sys/devices/virtual/dmi/id/product_name"))
         .unwrap_or_else(|| "Linux SBC".into());
     let compatibles = read_nul_lines("/proc/device-tree/compatible");
-    let soc = compatibles
-        .iter()
-        .find_map(|value| value.split_once(',').map(|(_, id)| id.to_owned()))
-        .unwrap_or_else(|| "unknown-soc".into());
+    let soc = detect_soc(&compatibles).unwrap_or_else(|| "unknown-soc".into());
     let soc_vendor = detect_soc_vendor(&compatibles, &soc).map(str::to_owned);
     let os_release = parse_key_values("/etc/os-release");
     let operating_system = os_release
@@ -68,12 +70,18 @@ fn live_snapshot() -> Result<DeviceSnapshot> {
         probe_service("NetworkManager.service", "Network manager"),
         probe_service("docker.service", "Container runtime"),
     ];
+    let hardware = HardwareManager::new(false);
+    let overlays = hardware.overlay_status().ok();
+    let video = hardware.video_status().ok();
     let capabilities = vec![
-        capability(
+        inspected_capability(
             "device-tree",
             "Device-tree overlays",
-            Path::new("/boot/dtbo").exists() || Path::new("/boot/overlays").exists(),
+            overlays.as_ref().is_some_and(|status| status.supported),
             "Overlay storage detected",
+            overlays
+                .as_ref()
+                .and_then(|status| status.unavailable_reason.as_deref()),
         ),
         capability(
             "gpio",
@@ -81,13 +89,23 @@ fn live_snapshot() -> Result<DeviceSnapshot> {
             Path::new("/proc/device-tree/model").exists()
                 || Path::new("/sys/firmware/devicetree/base/model").exists()
                 || Path::new("/dev/gpiochip0").exists(),
-            "Overlay-aware 40-pin map",
+            if overlays
+                .as_ref()
+                .is_some_and(|status| status.configuration_known)
+            {
+                "Overlay-aware 40-pin map"
+            } else {
+                "40-pin defaults · overlay configuration unread"
+            },
         ),
-        capability(
+        inspected_capability(
             "video",
             "Video capture",
-            Path::new("/dev/video0").exists(),
-            "Video4Linux device",
+            video.as_ref().is_some_and(|status| status.supported),
+            "Video4Linux capture device",
+            video
+                .as_ref()
+                .and_then(|status| status.unavailable_reason.as_deref()),
         ),
         capability(
             "thermal",
@@ -262,6 +280,11 @@ fn probe_storage() -> Vec<StorageMetric> {
     let Some(output) = command_text("df", &["-Pk", "/", "/boot"]) else {
         return Vec::new();
     };
+    parse_storage(&output, Path::new("/"))
+}
+
+fn parse_storage(output: &str, root: &Path) -> Vec<StorageMetric> {
+    let mut seen = BTreeSet::new();
     output
         .lines()
         .skip(1)
@@ -270,15 +293,55 @@ fn probe_storage() -> Vec<StorageMetric> {
             if fields.len() < 6 {
                 return None;
             }
-            Some(StorageMetric {
+            let metric = StorageMetric {
                 name: fields[0].trim_start_matches("/dev/").into(),
                 mount_point: fields[5].into(),
                 used_bytes: fields[2].parse::<u64>().ok()?.saturating_mul(1024),
                 total_bytes: fields[1].parse::<u64>().ok()?.saturating_mul(1024),
-                removable: fields[0].contains("mmc") || fields[0].contains("sd"),
-            })
+                removable: block_removable(root, fields[0]),
+            };
+            seen.insert((fields[0], fields[5])).then_some(metric)
         })
         .collect()
+}
+
+fn block_removable(root: &Path, device: &str) -> bool {
+    let Some(name) = device.strip_prefix("/dev/") else {
+        return false;
+    };
+    // Resolve aliases such as /dev/root and /dev/mapper/* when available.
+    let resolved = fs::canonicalize(root.join("dev").join(name)).ok();
+    let name = resolved
+        .as_ref()
+        .and_then(|path| path.file_name())
+        .or_else(|| Path::new(name).file_name());
+    let Some(name) = name else {
+        return false;
+    };
+    let Ok(mut sysfs) = fs::canonicalize(root.join("sys/class/block").join(name)) else {
+        return false;
+    };
+    // A partition has no removable attribute of its own; query its parent disk.
+    if sysfs.join("partition").is_file() {
+        sysfs.pop();
+    }
+    read_trimmed(sysfs.join("removable")).as_deref() == Some("1")
+}
+
+fn inspected_capability(
+    id: &str,
+    label: &str,
+    available: bool,
+    detail: &str,
+    reason: Option<&str>,
+) -> Capability {
+    let mut result = capability(id, label, available, detail);
+    if !available {
+        if let Some(reason) = reason {
+            result.detail = reason.into();
+        }
+    }
+    result
 }
 
 fn probe_interfaces() -> Vec<NetworkInterface> {
@@ -455,6 +518,39 @@ fn detect_soc_vendor<'a>(compatibles: &'a [String], soc: &'a str) -> Option<&'st
         })
 }
 
+fn detect_soc(compatibles: &[String]) -> Option<String> {
+    // DT compatibles run from specific (SBC) to general (SoC). Do not use an
+    // arbitrary board-vendor suffix as the SoC, and prefer the general SoC entry.
+    compatibles.iter().rev().find_map(|value| {
+        let (vendor, id) = value.split_once(',')?;
+        let family_prefixes: &[&str] = match vendor.to_ascii_lowercase().as_str() {
+            "qcom" => &["sc", "sm", "qcs", "qcm", "sdm", "msm", "apq", "ipq", "sa"],
+            "rockchip" => &["rk", "rv", "px"],
+            "allwinner" => &["sun"],
+            "cix" => &["sky", "p"],
+            "amlogic" => &["meson", "a", "s", "t"],
+            "brcm" => &["bcm"],
+            "mediatek" => &["mt"],
+            "nvidia" => &["tegra"],
+            "fsl" | "nxp" => &["imx", "ls", "lx"],
+            "starfive" => &["jh"],
+            "sophgo" => &["cv", "sg", "bm"],
+            "spacemit" => &["k"],
+            _ => return None,
+        };
+        let id = id.to_ascii_lowercase();
+        family_prefixes
+            .iter()
+            .any(|prefix| {
+                id.strip_prefix(prefix).is_some_and(|suffix| {
+                    suffix.starts_with(|ch: char| ch.is_ascii_digit())
+                        || (*prefix == "meson" && suffix.starts_with('-'))
+                })
+            })
+            .then(|| id.to_ascii_uppercase())
+    })
+}
+
 fn read_nul_lines(path: impl AsRef<Path>) -> Vec<String> {
     fs::read(path)
         .ok()
@@ -489,7 +585,79 @@ fn require_file(path: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::detect_soc_vendor;
+    use super::*;
+
+    #[test]
+    fn soc_identity_uses_soc_compatible_instead_of_the_sbc_name() {
+        for (values, expected) in [
+            (vec!["radxa,dragon-q8b", "qcom,sc8280xp"], "SC8280XP"),
+            (vec!["qcom,sc8280xp-crd", "qcom,sc8280xp"], "SC8280XP"),
+            (vec!["radxa,rock-5b", "rockchip,rk3588"], "RK3588"),
+            (vec!["radxa,orion-o6", "cix,sky1"], "SKY1"),
+            (
+                vec!["radxa,zero", "amlogic,g12a", "amlogic,meson-g12a"],
+                "MESON-G12A",
+            ),
+            (
+                vec!["radxa,cubie-a5e", "allwinner,sun55i-a527"],
+                "SUN55I-A527",
+            ),
+        ] {
+            let values = values.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert_eq!(detect_soc(&values).as_deref(), Some(expected));
+        }
+        assert_eq!(detect_soc(&["radxa,dragon-q8b".into()]), None);
+        assert_eq!(detect_soc(&["qcom,unknown-board".into()]), None);
+        assert_eq!(detect_soc(&[]), None);
+    }
+
+    #[test]
+    fn storage_deduplicates_mounts_and_reads_parent_disk_removable_attribute() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("rsetup-storage-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("sys/class/block")).unwrap();
+        for (disk, partition, removable) in [
+            ("sda", "sda3", "0"),
+            ("sdb", "sdb1", "1"),
+            ("mmcblk0", "mmcblk0p1", "0"),
+        ] {
+            let disk_dir = root.join("sys/devices/block").join(disk);
+            fs::create_dir_all(disk_dir.join(partition)).unwrap();
+            fs::write(disk_dir.join("removable"), removable).unwrap();
+            fs::write(disk_dir.join(partition).join("partition"), "1").unwrap();
+            symlink(&disk_dir, root.join("sys/class/block").join(disk)).unwrap();
+            symlink(
+                disk_dir.join(partition),
+                root.join("sys/class/block").join(partition),
+            )
+            .unwrap();
+        }
+        let output = "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda3 100 25 75 25% /\n/dev/sda3 100 25 75 25% /\n/dev/sdb1 200 50 150 25% /boot\n/dev/mmcblk0p1 40 10 30 25% /config\nmalformed\n";
+        let storage = parse_storage(output, &root);
+        assert_eq!(storage.len(), 3);
+        assert_eq!(storage[0].mount_point, "/");
+        assert_eq!(storage[0].used_bytes, 25 * 1024);
+        assert!(!storage[0].removable);
+        assert!(storage[1].removable);
+        assert!(!storage[2].removable);
+        assert!(block_removable(&root, "/dev/sdb"));
+        assert!(!block_removable(&root, "tmpfs"));
+        assert!(!block_removable(&root, "/dev/unknown"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unavailable_capability_preserves_a_known_backend_reason() {
+        let capability = inspected_capability(
+            "device-tree",
+            "Device-tree overlays",
+            false,
+            "detected",
+            Some("UEFI + DT detected. Overlay configuration is not read or managed yet."),
+        );
+        assert!(!capability.available);
+        assert!(capability.detail.contains("UEFI + DT"));
+    }
 
     #[test]
     fn detects_vendor_after_board_compatible() {

@@ -193,7 +193,7 @@
       "overlay.preview": "Review changes",
       "overlay.previewing": "Reviewing selection…",
       "overlay.changeCount": "{count} change(s)",
-      "overlay.noChanges": "The active selection already matches.",
+      "overlay.noChanges": "The saved selection already matches.",
       "overlay.enable": "Enable {name}",
       "overlay.disable": "Disable {name}",
       "overlay.warning.reboot": "The new selection takes effect after a reboot.",
@@ -202,15 +202,27 @@
       "overlay.apply": "Save overlay selection",
       "overlay.applying": "Saving selection…",
       "overlay.saved": "Overlay selection saved",
+      "overlay.readRequired": "EFI configuration needs administrator authorization to read. This step makes no changes.",
+      "overlay.authorize": "Authorize read",
+      "overlay.refreshRead": "Re-read configuration",
+      "overlay.authorizing": "Reading with authorization…",
+      "overlay.cached": "Showing the last authorized configuration {time}; re-read if it changed elsewhere.",
+      "overlay.savedView": "Showing saved configuration, not the running pin state.",
+      "overlay.kernelScope": "Applies only when booting kernel {kernel}. The default boot entry is not changed.",
+      "overlay.bootChange": "Boot entry changes",
+      "overlay.before": "Before",
+      "overlay.after": "After",
       "gpio.title": "40-pin GPIO",
-      "gpio.description": "See how the current Overlay configuration assigns the expansion header.",
+      "gpio.description": "Inspect expansion-header functions and their configuration source.",
       "gpio.overlays": "{count} configured overlays",
-      "gpio.serialWarning": "The serial console is using header pins.",
+      "gpio.serialWarning": "Serial console detected. Check whether it uses the header before wiring.",
       "gpio.pin": "Physical pin {pin}",
       "gpio.pinCount": "{count} pins",
       "gpio.profileMatched": "Matched pinout",
       "gpio.profileFallback": "Generic pinout",
-      "gpio.profileDescription": "Overlay assignments replace Function1; all other pins show their default Function1 value.",
+      "gpio.profileDescription": "Pins show their configured Overlay function or their default function.",
+      "gpio.baselineOnly": "Default pin functions only. Overlay configuration is not read yet; verify the active function before wiring.",
+      "gpio.configurationUnknown": "Configuration not read",
       "gpio.genericHeader": "Generic 40-pin header",
       "gpio.genericDescription": "No board-specific pinout matched this SBC, so Overlay functions cannot be mapped.",
       "gpio.currentOnly": "Shown from the saved Overlay configuration · reboot the SBC to activate changes.",
@@ -218,7 +230,6 @@
       "gpio.header.connector": "Expansion connector {index}",
       "gpio.pad": "SoC pad",
       "gpio.configuration": "Function source",
-      "gpio.function1": "Function1",
       "gpio.unassigned": "Unassigned",
       "gpio.conflict": "Mux conflict",
       "gpio.source.fixed": "Fixed",
@@ -654,15 +665,27 @@
       "overlay.apply": "保存叠加层选择",
       "overlay.applying": "正在保存选择…",
       "overlay.saved": "叠加层选择已保存",
+      "overlay.readRequired": "读取 EFI 配置需要管理员授权，此步骤不会修改系统。",
+      "overlay.authorize": "授权读取",
+      "overlay.refreshRead": "重新读取配置",
+      "overlay.authorizing": "正在授权读取…",
+      "overlay.cached": "显示上次授权读取的配置 {time}；如在其他工具中改动，请重新读取。",
+      "overlay.savedView": "显示已保存的配置，并非当前运行中的引脚状态。",
+      "overlay.kernelScope": "仅在启动内核 {kernel} 时生效，不会更改默认启动项。",
+      "overlay.bootChange": "启动项变更",
+      "overlay.before": "变更前",
+      "overlay.after": "变更后",
       "gpio.title": "40 针 GPIO",
-      "gpio.description": "查看当前 Overlay 配置如何分配扩展排针功能。",
+      "gpio.description": "查看扩展排针的功能及配置来源。",
       "gpio.overlays": "{count} 个已配置 Overlay",
-      "gpio.serialWarning": "串口控制台正在占用排针引脚。",
+      "gpio.serialWarning": "检测到串口控制台，接线前请确认是否占用排针。",
       "gpio.pin": "物理引脚 {pin}",
       "gpio.pinCount": "{count} 针",
       "gpio.profileMatched": "已匹配 Pinout",
       "gpio.profileFallback": "通用 Pinout",
-      "gpio.profileDescription": "Overlay 配置会替换 Function1；其余引脚显示默认的 Function1。",
+      "gpio.profileDescription": "引脚显示 Overlay 配置对应的功能；未配置时显示默认功能。",
+      "gpio.baselineOnly": "当前仅显示默认引脚功能，尚未读取 Overlay 配置；接线前请确认实际功能。",
+      "gpio.configurationUnknown": "配置未读取",
       "gpio.genericHeader": "通用 40 针排针",
       "gpio.genericDescription": "当前 SBC 未匹配到板级 Pinout，无法映射 Overlay 功能。",
       "gpio.currentOnly": "按已保存的 Overlay 配置显示 · 更改将在重启 SBC 后生效。",
@@ -670,7 +693,6 @@
       "gpio.header.connector": "扩展排针 {index}",
       "gpio.pad": "SoC 引脚",
       "gpio.configuration": "功能来源",
-      "gpio.function1": "Function1",
       "gpio.unassigned": "未分配",
       "gpio.conflict": "复用冲突",
       "gpio.source.fixed": "固定功能",
@@ -1001,9 +1023,12 @@
     const copy = capabilityCopy[value.id];
     if (!copy) return value;
     let detail = value.detail;
-    if (!value.available) detail = "此设备未检测到";
+    if (!value.available) detail = hardwareReason(detail);
     else if (value.id === "device-tree" && /^\d+ overlays available$/.test(detail)) detail = detail.replace(" overlays available", " 个叠加层可用");
     else if (value.id === "gpio" && detail === "Overlay-aware 40-pin map") detail = copy[1];
+    else if (value.id === "gpio" && detail === "40-pin map · last authorized Overlay configuration") detail = "40Pin 图 · 上次授权读取的 Overlay 配置";
+    else if (value.id === "gpio" && detail === "40-pin defaults · overlay configuration unread") detail = "40Pin 默认功能 · Overlay 配置未读取";
+    else if (value.id === "video" && detail === "Video4Linux capture device") detail = "Video4Linux 采集设备";
     else if (value.id === "video" && /^\d+ Video4Linux devices$/.test(detail)) detail = detail.replace(" Video4Linux devices", " 个 Video4Linux 设备");
     else if (value.id === "thermal" && /^\d+ zones/.test(detail)) detail = detail.replace(" zones", " 个温区");
     else if (value.id === "led" && /^\d+ status LEDs/.test(detail)) detail = detail.replace(" status LEDs", " 个状态灯").replace(" RGB group", " 组 RGB 灯");
@@ -1082,6 +1107,29 @@
     return dictionaries[locale][key] || fallback || t("api.internal_error");
   }
 
+  function hardwareReason(reason) {
+    if (locale !== "zh-CN") return reason;
+    const translations = {
+      "Not detected on this device": "此设备未检测到",
+      "EFI boot files require administrator authorization to read.": "读取 EFI 配置需要管理员授权。",
+      "UEFI + DT detected. Overlay configuration is not read or managed yet.": "UEFI + DT：尚未支持读取或修改 Overlay 配置。",
+      "UEFI detected. No supported overlay configuration backend is available.": "UEFI：当前没有可用的 Overlay 配置后端。",
+      "No managed overlay directory was detected.": "未检测到受管的 Overlay 目录。",
+      "No device-tree overlay was found in the managed directory.": "受管目录中没有设备树叠加层。",
+      "A supported U-Boot overlay updater was not detected.": "未检测到支持的 U-Boot Overlay 更新工具。",
+      "No video capture device was detected.": "未检测到视频采集设备。",
+      "Unable to verify video capture devices. Check device permissions and driver readiness.": "无法确认视频采集设备，请检查设备权限和驱动状态。",
+      "Install ffmpeg to capture a webcam test frame.": "请安装 ffmpeg 后再测试摄像头。",
+      "No SPI NOR MTD device was detected.": "未检测到 SPI NOR MTD 设备。",
+      "Install mtd-utils to write or erase SPI boot flash.": "请安装 mtd-utils 后再写入或擦除 SPI 启动闪存。",
+      "No thermal zone with the user_space governor was detected.": "未检测到支持 user_space 策略的温区。",
+      "No controllable pwm-fan cooling device was detected.": "未检测到可控制的 pwm-fan 散热设备。",
+      "The detected thermal and fan controls are read-only.": "检测到的温控与风扇接口为只读。",
+      "Install the rsetup-next fan curve service before enabling a curve.": "请先安装 rsetup-next 风扇曲线服务。",
+    };
+    return translations[reason] || reason;
+  }
+
   setLocale(locale, { persist: false, announce: false });
-  window.RsetupI18n = { t, setLocale, getLocale: () => locale, action, capability, service, enumLabel, activity, runSummary, apiError };
+  window.RsetupI18n = { t, setLocale, getLocale: () => locale, action, capability, service, enumLabel, activity, runSummary, apiError, hardwareReason };
 })();

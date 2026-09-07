@@ -1,0 +1,517 @@
+{
+  "schemaVersion": 2,
+  "source": {
+    "url": "https://docs.radxa.com/dragon/q8b/hardware-use/pin-gpio",
+    "retrieved": "2026-09-07",
+    "copyright": "2026 Radxa Computer (Shenzhen) Co.,Ltd.",
+    "license": "CC-BY-4.0",
+    "defaultFunctionColumn": "Function0",
+    "transformations": "Normalized to the rsetup pinout schema; 3V3 normalized to 3.3V. Mux labels otherwise preserved verbatim."
+  },
+  "id": "dragonQ8b",
+  "name": "Radxa Dragon Q8B",
+  "description": "Qualcomm SC8280XP 40-pin expansion header",
+  "layout": "40-pin",
+  "patterns": [
+    "Radxa Dragon Q8B",
+    "radxa,dragon-q8b"
+  ],
+  "connectors": [
+    {
+      "id": "main",
+      "name": "40-Pin GPIO Header",
+      "pins": [
+        {
+          "number": 1,
+          "name": "3.3V",
+          "defaultFunction": "3.3V",
+          "type": "Power",
+          "gpio": null,
+          "voltage": "3.3V",
+          "functions": [],
+          "description": null
+        },
+        {
+          "number": 2,
+          "name": "5V",
+          "defaultFunction": "5V",
+          "type": "Power",
+          "gpio": null,
+          "voltage": "5V",
+          "functions": [],
+          "description": null
+        },
+        {
+          "number": 3,
+          "name": "GPIO_41",
+          "defaultFunction": "GPIO_41",
+          "type": "GPIO",
+          "gpio": "41",
+          "voltage": null,
+          "functions": [
+            "I2C9_SDA",
+            "UART9_CTS",
+            "SPI9_MISO"
+          ],
+          "description": null
+        },
+        {
+          "number": 4,
+          "name": "5V",
+          "defaultFunction": "5V",
+          "type": "Power",
+          "gpio": null,
+          "voltage": "5V",
+          "functions": [],
+          "description": null
+        },
+        {
+          "number": 5,
+          "name": "GPIO_42",
+          "defaultFunction": "GPIO_42",
+          "type": "GPIO",
+          "gpio": "42",
+          "voltage": null,
+          "functions": [
+            "I2C9_SCL",
+            "UART9_RFR",
+            "SPI9_MOSI"
+          ],
+          "description": null
+        },
+        {
+          "number": 6,
+          "name": "GND",
+          "defaultFunction": "GND",
+          "type": "Ground",
+          "gpio": null,
+          "voltage": null,
+          "functions": [],
+          "description": null
+        },
+        {
+          "number": 7,
+          "name": "GPIO_175",
+          "defaultFunction": "GPIO_175",
+          "type": "GPIO",
+          "gpio": "175",
+          "voltage": null,
+          "functions": [
+            "SPI4_CS_3"
+          ],
+          "description": null
+        },
+        {
+          "number": 8,
+          "name": "GPIO_63",
+          "defaultFunction": "GPIO_63",
+          "type": "GPIO",
+          "gpio": "63",
+          "voltage": null,
+          "functions": [
+            "UART17_TX"
+          ],
+          "description": null
+        },
+        {
+          "number": 9,
+          "name": "GND",
+          "defaultFunction": "GND",
+          "type": "Ground",
+          "gpio": null,
+          "voltage": null,
+          "functions": [],
+          "description": null
+        },
+        {
+          "number": 10,
+          "name": "GPIO_64",
+          "defaultFunction": "GPIO_64",
+          "type": "GPIO",
+          "gpio": "64",
+          "voltage": null,
+          "functions": [
+            "UART17_RX"
+          ],
+          "description": null
+        },
+        {
+          "number": 11,
+          "name": "GPIO_111",
+          "defaultFunction": "GPIO_111",
+          "type": "GPIO",
+          "gpio": "111",
+          "voltage": null,
+          "functions": [
+            "I2C5_SDA",
+            "SPI4_CS_1"
+          ],
+          "description": null
+        },
+        {
+          "number": 12,
+          "name": "GPIO_174",
+          "defaultFunction": "GPIO_174",
+          "type": "GPIO",
+          "gpio": "174",
+          "voltage": null,
+          "functions": [
+            "UART4_RX",
+            "SPI4_CS_0"
+          ],
+          "description": null
+        },
+        {
+          "number": 13,
+          "name": "GPIO_66",
+          "defaultFunction": "GPIO_66",
+          "type": "GPIO",
+          "gpio": "66",
+          "voltage": null,
+          "functions": [
+            "I2C18_SDA",
+            "UART18_CTS",
+            "SPI18_MISO",
+            "HS-UART18_CTS"
+          ],
+          "description": null
+        },
+        {
+          "number": 14,
+          "name": "GND",
+          "defaultFunction": "GND",
+          "type": "Ground",
+          "gpio": null,
+          "voltage": null,
+          "functions": [],
+          "description": null
+        },
+        {
+          "number": 15,
+          "name": "GPIO_67",
+          "defaultFunction": "GPIO_67",
+          "type": "GPIO",
+          "gpio": "67",
+          "voltage": null,
+          "functions": [
+            "I2C18_SCL",
+            "UART18_RFR",
+            "SPI18_MOSI",
+            "HS-UART18_RFR"
+          ],
+          "description": null
+        },
+        {
+          "number": 16,
+          "name": "GPIO_68",
+          "defaultFunction": "GPIO_68",
+          "type": "GPIO",
+          "gpio": "68",
+          "voltage": null,
+          "functions": [
+            "UART18_TX",
+            "SPI18_SCKL",
+            "HS-UART18_TX"
+          ],
+          "description": null
+        },
+        {
+          "number": 17,
+          "name": "3.3V",
+          "defaultFunction": "3.3V",
+          "type": "Power",
+          "gpio": null,
+          "voltage": "3.3V",
+          "functions": [],
+          "description": null
+        },
+        {
+          "number": 18,
+          "name": "GPIO_110",
+          "defaultFunction": "GPIO_110",
+          "type": "GPIO",
+          "gpio": "110",
+          "voltage": null,
+          "functions": [],
+          "description": null
+        },
+        {
+          "number": 19,
+          "name": "GPIO_88",
+          "defaultFunction": "GPIO_88",
+          "type": "GPIO",
+          "gpio": "88",
+          "voltage": null,
+          "functions": [
+            "I2C20_SCL",
+            "UART20_RFR",
+            "SPI20_MOSI"
+          ],
+          "description": null
+        },
+        {
+          "number": 20,
+          "name": "GND",
+          "defaultFunction": "GND",
+          "type": "Ground",
+          "gpio": null,
+          "voltage": null,
+          "functions": [],
+          "description": null
+        },
+        {
+          "number": 21,
+          "name": "GPIO_87",
+          "defaultFunction": "GPIO_87",
+          "type": "GPIO",
+          "gpio": "87",
+          "voltage": null,
+          "functions": [
+            "I2C20_SDA",
+            "UART20_CTS",
+            "SPI20_MISO"
+          ],
+          "description": null
+        },
+        {
+          "number": 22,
+          "name": "GPIO_92",
+          "defaultFunction": "GPIO_92",
+          "type": "GPIO",
+          "gpio": "92",
+          "voltage": null,
+          "functions": [
+            "SPI20_CS_2"
+          ],
+          "description": null
+        },
+        {
+          "number": 23,
+          "name": "GPIO_89",
+          "defaultFunction": "GPIO_89",
+          "type": "GPIO",
+          "gpio": "89",
+          "voltage": null,
+          "functions": [
+            "UART20_TX",
+            "SPI20_SCKL"
+          ],
+          "description": null
+        },
+        {
+          "number": 24,
+          "name": "GPIO_90",
+          "defaultFunction": "GPIO_90",
+          "type": "GPIO",
+          "gpio": "90",
+          "voltage": null,
+          "functions": [
+            "UART20_RX",
+            "SPI20_CS_0"
+          ],
+          "description": null
+        },
+        {
+          "number": 25,
+          "name": "GND",
+          "defaultFunction": "GND",
+          "type": "Ground",
+          "gpio": null,
+          "voltage": null,
+          "functions": [],
+          "description": null
+        },
+        {
+          "number": 26,
+          "name": "GPIO_91",
+          "defaultFunction": "GPIO_91",
+          "type": "GPIO",
+          "gpio": "91",
+          "voltage": null,
+          "functions": [
+            "SPI20_CS_1"
+          ],
+          "description": null
+        },
+        {
+          "number": 27,
+          "name": "GPIO_43",
+          "defaultFunction": "GPIO_43",
+          "type": "GPIO",
+          "gpio": "43",
+          "voltage": null,
+          "functions": [
+            "I2C8_SDA",
+            "UART9_TX",
+            "SPI9_SCKL"
+          ],
+          "description": null
+        },
+        {
+          "number": 28,
+          "name": "GPIO_44",
+          "defaultFunction": "GPIO_44",
+          "type": "GPIO",
+          "gpio": "44",
+          "voltage": null,
+          "functions": [
+            "I2C8_SCL",
+            "UART9_RX",
+            "SPI9_CS_0"
+          ],
+          "description": null
+        },
+        {
+          "number": 29,
+          "name": "GPIO_157",
+          "defaultFunction": "GPIO_157",
+          "type": "GPIO",
+          "gpio": "157",
+          "voltage": null,
+          "functions": [
+            "UART6_RX",
+            "SPI6_CS_0"
+          ],
+          "description": null
+        },
+        {
+          "number": 30,
+          "name": "GND",
+          "defaultFunction": "GND",
+          "type": "Ground",
+          "gpio": null,
+          "voltage": null,
+          "functions": [],
+          "description": null
+        },
+        {
+          "number": 31,
+          "name": "GPIO_156",
+          "defaultFunction": "GPIO_156",
+          "type": "GPIO",
+          "gpio": "156",
+          "voltage": null,
+          "functions": [
+            "UART6_TX",
+            "SPI6_SCKL"
+          ],
+          "description": null
+        },
+        {
+          "number": 32,
+          "name": "GPIO_114",
+          "defaultFunction": "GPIO_114",
+          "type": "GPIO",
+          "gpio": "114",
+          "voltage": null,
+          "functions": [
+            "CCI_I2C_SCL0",
+            "GCC_GP2_CLK_MIRA"
+          ],
+          "description": null
+        },
+        {
+          "number": 33,
+          "name": "GPIO_115",
+          "defaultFunction": "GPIO_115",
+          "type": "GPIO",
+          "gpio": "115",
+          "voltage": null,
+          "functions": [
+            "CCI_I2C_SDA1",
+            "GCC_GP3_CLK_MRIA"
+          ],
+          "description": null
+        },
+        {
+          "number": 34,
+          "name": "GND",
+          "defaultFunction": "GND",
+          "type": "Ground",
+          "gpio": null,
+          "voltage": null,
+          "functions": [],
+          "description": null
+        },
+        {
+          "number": 35,
+          "name": "GPIO_171",
+          "defaultFunction": "GPIO_171",
+          "type": "GPIO",
+          "gpio": "171",
+          "voltage": null,
+          "functions": [
+            "I2C4_SDA",
+            "UART4_CTS",
+            "SPI4_MISO"
+          ],
+          "description": null
+        },
+        {
+          "number": 36,
+          "name": "GPIO_112",
+          "defaultFunction": "GPIO_112",
+          "type": "GPIO",
+          "gpio": "112",
+          "voltage": null,
+          "functions": [
+            "I2C5_SCL",
+            "SPI4_CS_2"
+          ],
+          "description": null
+        },
+        {
+          "number": 37,
+          "name": "GPIO_69",
+          "defaultFunction": "GPIO_69",
+          "type": "GPIO",
+          "gpio": "69",
+          "voltage": null,
+          "functions": [
+            "UART18_RX",
+            "SPI18_CS_0",
+            "HS-UART18_RX"
+          ],
+          "description": null
+        },
+        {
+          "number": 38,
+          "name": "GPIO_172",
+          "defaultFunction": "GPIO_172",
+          "type": "GPIO",
+          "gpio": "172",
+          "voltage": null,
+          "functions": [
+            "I2C4_SCL",
+            "UART4_RFR",
+            "SPI4_MOSI"
+          ],
+          "description": null
+        },
+        {
+          "number": 39,
+          "name": "GND",
+          "defaultFunction": "GND",
+          "type": "Ground",
+          "gpio": null,
+          "voltage": null,
+          "functions": [],
+          "description": null
+        },
+        {
+          "number": 40,
+          "name": "GPIO_173",
+          "defaultFunction": "GPIO_173",
+          "type": "GPIO",
+          "gpio": "173",
+          "voltage": null,
+          "functions": [
+            "UART4_TX",
+            "SPI4_SCKL"
+          ],
+          "description": null
+        }
+      ]
+    }
+  ]
+}

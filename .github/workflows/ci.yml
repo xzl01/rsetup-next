@@ -28,8 +28,13 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test Rust workspace
         run: cargo test --workspace
-      - name: Test browser localization
-        run: node --test ui/i18n.test.mjs
+      - name: Test native EFI Overlay validation
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y device-tree-compiler
+          cargo test -p rsetup-core native_fdtoverlay_validation_and_apply --locked -- --ignored
+      - name: Test browser localization and Overlay handlers
+        run: node --test ui/*.test.mjs
 
   rust-msrv:
     runs-on: ubuntu-latest
