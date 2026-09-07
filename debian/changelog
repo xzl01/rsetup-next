@@ -1,3 +1,15 @@
+rsetup-next (0.5.0-1) bookworm; urgency=medium
+
+  * Release the native CLI, TUI, and Web SBC control center.
+  * Add bounded, read-only APT mirror latency and index speed tests.
+  * Display system and Radxa measurements separately with bilingual results.
+  * Add curl and CA certificates for verified HTTPS mirror sampling.
+  * Support native EFI/BLS overlays shared by Dragon Q6A and Q8B.
+  * Include Q8B pin functions and corrected live hardware probing.
+  * Run all browser regression tests during Debian package builds.
+
+ -- xzl <xiangzelong@radxa.com>  Mon, 07 Sep 2026 18:18:14 +0800
+
 rsetup-next (0.5.0~alpha1-1) bookworm; urgency=medium
 
   * Initial package for the Rust control center.

@@ -1,4 +1,4 @@
-.TH RSETUP-NEXT 1 "2026-09-04" "rsetup-next 0.5.0-alpha.1" "User Commands"
+.TH RSETUP-NEXT 1 "2026-09-07" "rsetup-next 0.5.0" "User Commands"
 .SH NAME
 rsetup-next \- local control center for Linux single-board computers
 .SH SYNOPSIS
@@ -25,21 +25,22 @@ List guided operations.
 Preview or execute a catalog action.
 .TP
 .B sources COMMAND
-Inspect, plan, or apply APT source changes.
+Inspect, benchmark, preview, or change APT mirrors. Benchmarking is read-only:
+.B sources benchmark --mirror official
+tests one provider; omit --mirror to test all. Results measure index samples,
+not peak bandwidth. Each provider samples at most two 512 KiB indexes with
+six-second request timeouts. Demo mode returns labeled simulated measurements.
 .TP
 .B hardware COMMAND
 Inspect and manage overlays, the 40-pin GPIO map, cameras, thermal policy,
 temperature-driven fan curves, LEDs, and SPI boot flash. Mutations require
 explicit confirmation.
 .PP
-The GPIO map matches the SBC against an embedded catalog of 20 pinout profiles
-and reports at most one current function per physical pin. Running functions
-require evidence from debugfs pinctrl or read-only
-.BR gpioinfo (1)
-metadata. Saved Overlay files under
-.I /boot
-describe the configured next boot, not the current pinmux. Missing evidence is
-reported as unconfirmed; status inspection does not invoke
+The GPIO map matches 20 imported pinout profiles plus Dragon Q8B and reports one
+configured function per physical pin. Saved Overlay assignments take priority;
+unassigned pins on known SBCs show their documented default function.
+Saved configuration describes the next matching boot, not a claim of the
+currently active electrical function. Status inspection does not invoke
 .BR gpioget (1)
 or request a GPIO line.
 .TP

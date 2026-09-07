@@ -134,6 +134,8 @@ const state = {
   activity: [],
   sources: null,
   sourcePlan: null,
+  sourcePreviewVersion: 0,
+  sourceBenchmark: { version: 0, running: false, stop: false, results: [], completed: 0, total: 0 },
   selectedAction: null,
   selectedHardware: null,
   hardwareData: null,
@@ -191,6 +193,13 @@ const transport = {
   async sourceStatus() {
     if (tauriInvoke) return tauriInvoke("source_status");
     return request("/api/v1/sources");
+  },
+  async benchmarkSource(providerId) {
+    if (tauriInvoke) return tauriInvoke("benchmark_source", { providerId });
+    return request("/api/v1/sources/benchmark", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ providerId }),
+    });
   },
   async planSources(providerId) {
     if (tauriInvoke) return tauriInvoke("plan_sources", { providerId });
@@ -331,6 +340,7 @@ async function request(path, options) {
     response = await fetch(path, options);
   } catch {
     const error = new Error(t("api.transport_failure"));
+    error.translationKey = "api.transport_failure";
     error.localized = true;
     throw error;
   }
@@ -341,6 +351,11 @@ async function request(path, options) {
       : t("api.http_failure", { status: response.status });
     const error = new Error(message);
     error.code = body.error?.code;
+    error.providerMessage = body.error?.message;
+    if (!error.code) {
+      error.translationKey = "api.http_failure";
+      error.translationParams = { status: response.status };
+    }
     error.localized = true;
     throw error;
   }
@@ -601,7 +616,8 @@ async function refreshAll({ quiet = false } = {}) {
     const sourceChanged = previousSourceRevision
       && previousSourceRevision !== sources.sourceRevision;
     state.sources = sources;
-    if (sourceChanged && state.sourcePlan) clearSourcePlan();
+    if (sourceChanged) clearSourcePlan();
+    if (sourceChanged) resetSourceBenchmark();
     renderAll();
     document.body.dataset.state = snapshot.synthetic ? "demo" : "live";
     if (shouldResolve) resolveSignals();
@@ -658,6 +674,7 @@ function providerLocation(location) {
 }
 
 function renderSources() {
+  renderSourceBenchmark();
   const source = state.sources;
   const status = $$('[data-source-status] dd');
   const select = $("[data-source-provider]");
@@ -690,6 +707,69 @@ function renderSources() {
   if (state.sourcePlan) renderSourcePlan(state.sourcePlan, { preserveConfirmation: true });
 }
 
+function resetSourceBenchmark() {
+  state.sourceBenchmark = { version: state.sourceBenchmark.version + 1, running: false, stop: false, results: [], completed: 0, total: 0 };
+}
+
+async function benchmarkSources() {
+  if (state.sourceBenchmark.running || !state.sources?.supported) return;
+  const revision = state.sources.sourceRevision;
+  const providers = state.sources.providers.map((provider) => provider.id);
+  const version = state.sourceBenchmark.version + 1;
+  const test = { version, running: true, stop: false, results: [], completed: 0, total: providers.length };
+  state.sourceBenchmark = test;
+  renderSourceBenchmark();
+  for (const providerId of providers) {
+    if (test.stop || state.sourceBenchmark.version !== version) break;
+    try {
+      const result = await transport.benchmarkSource(providerId);
+      if (state.sourceBenchmark.version !== version) return;
+      if (result.sourceRevision !== revision || result.providerId !== providerId) {
+        resetSourceBenchmark();
+        renderSourceBenchmark();
+        toast(t("toast.failed"), t("sources.benchmarkStale"), true);
+        return;
+      }
+      test.results.push(result);
+    } catch (error) {
+      if (state.sourceBenchmark.version !== version) return;
+      test.results.push({ providerId, error, probes: [] });
+    }
+    test.completed += 1;
+    renderSourceBenchmark();
+  }
+  if (state.sourceBenchmark.version !== version) return;
+  test.running = false;
+  renderSourceBenchmark();
+}
+
+function renderSourceBenchmark() {
+  const test = state.sourceBenchmark;
+  const button = $("[data-source-benchmark]");
+  button.disabled = test.running || !state.sources?.supported;
+  $("[data-source-benchmark-stop]").hidden = !test.running;
+  $("[data-source-benchmark-stop]").disabled = test.stop;
+  $("[data-source-benchmark-panel]").hidden = !test.running && !test.total;
+  const mode = test.running ? (test.stop ? "stoppingTest" : "testing") : (test.stop ? "testStopped" : "testComplete");
+  setText("[data-source-benchmark-progress]", `${state.sources?.synthetic ? `${t("sources.simulatedTest")} · ` : ""}${t(`sources.${mode}`, { done: test.completed, total: test.total })}`);
+  const focusId = document.activeElement?.dataset?.benchmarkChoose;
+  $("[data-source-benchmark-results]").innerHTML = test.results.map((result) => `<div class="benchmark-row">
+    <button type="button" class="secondary-button benchmark-choice" data-benchmark-choose="${escapeHtml(result.providerId)}" aria-label="${escapeHtml(t("sources.chooseTested", { name: providerName(result.providerId) }))}">${escapeHtml(providerName(result.providerId))}</button>
+    <div>${result.error ? `<p class="benchmark-error">${escapeHtml(benchmarkError(result.error))}</p>` : !result.probes.length ? `<p>${escapeHtml(t("sources.noTestTarget"))}</p>` : result.probes.map((probe) => {
+      const label = probe.kind === "radxa" ? "Radxa" : t("sources.systemProbe");
+      const measured = probe.status === "ok" && Number.isFinite(probe.latencyMs) && Number.isFinite(probe.bytesPerSecond);
+      const detail = measured ? `${t("sources.latency")} ${Math.round(probe.latencyMs)} ms · ${t("sources.sampleSpeed")} ${(probe.bytesPerSecond / 1024).toFixed(1)} KiB/s` : t(`sources.testStatus.${probe.status}`);
+      return `<div class="benchmark-probe" data-status="${escapeHtml(probe.status)}" title="${escapeHtml(probe.url)}"><strong>${label}</strong><span>${escapeHtml(detail)}${!measured && probe.httpStatus ? ` (HTTP ${Number(probe.httpStatus)})` : ""}</span></div>`;
+    }).join("")}</div></div>`).join("");
+  if (focusId) $$('[data-benchmark-choose]').find((item) => item.dataset.benchmarkChoose === focusId)?.focus({ preventScroll: true });
+}
+
+function benchmarkError(error) {
+  if (error?.translationKey) return t(error.translationKey, error.translationParams);
+  if (error?.code) return i18n.apiError(error.code, error.providerMessage || error.message);
+  return displayError(error);
+}
+
 function renderProviderDetail() {
   const providerId = $("[data-source-provider]")?.value;
   const provider = state.sources?.providers.find((item) => item.id === providerId);
@@ -702,6 +782,7 @@ function renderProviderDetail() {
 }
 
 function clearSourcePlan() {
+  state.sourcePreviewVersion += 1;
   state.sourcePlan = null;
   const host = $("[data-source-plan]");
   const confirm = $("[data-source-confirm]");
@@ -709,6 +790,11 @@ function clearSourcePlan() {
   if (host) host.hidden = true;
   if (confirm) confirm.checked = false;
   if (apply) apply.disabled = true;
+  const preview = $("[data-source-preview]");
+  if (preview) {
+    preview.disabled = !state.sources?.supported;
+    $("span", preview).textContent = t("sources.preview");
+  }
   const result = $("[data-source-result]");
   if (result) {
     result.hidden = true;
@@ -738,20 +824,31 @@ function renderSourcePlan(plan, { preserveConfirmation = false } = {}) {
 
 async function previewSources() {
   const providerId = $("[data-source-provider]").value;
+  const revision = state.sources?.sourceRevision;
+  clearSourcePlan();
+  const version = state.sourcePreviewVersion;
   const button = $("[data-source-preview]");
   button.disabled = true;
   $("span", button).textContent = t("sources.previewing");
   try {
     const plan = await transport.planSources(providerId);
+    if (state.sourcePreviewVersion !== version || $("[data-source-provider]").value !== providerId) return;
+    if (plan.provider.id !== providerId || plan.sourceRevision !== revision) {
+      toast(t("toast.failed"), t("api.stale_plan"), true);
+      return;
+    }
     state.sourcePlan = plan;
     renderSourcePlan(plan);
     $("[data-source-plan]").scrollIntoView({ behavior: "smooth", block: "nearest" });
   } catch (error) {
+    if (state.sourcePreviewVersion !== version) return;
     const detail = displayError(error);
     toast(t("toast.failed"), detail, true);
   } finally {
-    $("span", button).textContent = t("sources.preview");
-    button.disabled = !state.sources?.supported;
+    if (state.sourcePreviewVersion === version) {
+      $("span", button).textContent = t("sources.preview");
+      button.disabled = !state.sources?.supported;
+    }
   }
 }
 
@@ -2391,6 +2488,16 @@ function bindEvents() {
   $("[data-hardware-drawer]").addEventListener("cancel", (event) => { event.preventDefault(); closeHardwareTool(); });
   $("[data-source-provider]").addEventListener("change", () => { clearSourcePlan(); renderProviderDetail(); });
   $("[data-source-preview]").addEventListener("click", previewSources);
+  $("[data-source-benchmark]").addEventListener("click", benchmarkSources);
+  $("[data-source-benchmark-stop]").addEventListener("click", () => { state.sourceBenchmark.stop = true; renderSourceBenchmark(); });
+  $("[data-source-benchmark-results]").addEventListener("click", (event) => {
+    const providerId = event.target.closest("[data-benchmark-choose]")?.dataset.benchmarkChoose;
+    if (!state.sources?.providers.some((provider) => provider.id === providerId)) return;
+    $("[data-source-provider]").value = providerId;
+    clearSourcePlan();
+    renderProviderDetail();
+    $("[data-source-provider]").focus();
+  });
   $("[data-source-confirm]").addEventListener("change", (event) => {
     $("[data-source-apply]").disabled = !event.currentTarget.checked || !state.sourcePlan?.changes.length;
   });

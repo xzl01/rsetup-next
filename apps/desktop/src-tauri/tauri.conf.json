@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "rsetup",
-  "version": "0.5.0-alpha.1",
+  "version": "0.5.0",
   "identifier": "com.radxa.rsetup",
   "build": {
     "frontendDist": "../../../ui"

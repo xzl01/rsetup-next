@@ -1121,6 +1121,22 @@ body.is-resolving .core-node { animation: core-resolve 820ms var(--ease-soft) bo
   white-space: nowrap;
 }
 .source-workflow { min-width: 0; padding: 16px; border-radius: 22px; background: var(--field); }
+.source-buttons { display: flex; flex-wrap: wrap; gap: 12px; }
+.source-benchmark { margin: 0 28px 28px; }
+.source-benchmark h3 { margin: 0; font-size: 18px; }
+.source-benchmark p { color: var(--bone-muted); font-size: 12px; }
+.benchmark-note { max-width: 75ch; }
+.benchmark-row { display: grid; grid-template-columns: minmax(150px, 1fr) minmax(0, 2fr); gap: 16px; padding: 16px 0; border-bottom: 1px solid var(--line-dim); }
+.benchmark-choice { align-self: start; justify-self: start; max-width: 100%; text-align: left; overflow-wrap: anywhere; }
+.benchmark-probe { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; margin: 8px 0; font-size: 12px; }
+.benchmark-probe strong { min-width: 44px; }
+.benchmark-probe span { color: var(--bone-muted); font-variant-numeric: tabular-nums; }
+.benchmark-probe[data-status="ok"] span { color: var(--success); }
+.benchmark-error { color: var(--coral); font-size: 12px; overflow-wrap: anywhere; }
+@media (max-width: 600px) {
+  .source-benchmark { margin: 0 20px 20px; }
+  .benchmark-row { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+}
 .field-label { display: block; color: var(--bone-muted); font-size: 12px; font-weight: 700; }
 .field-label select {
   width: 100%;

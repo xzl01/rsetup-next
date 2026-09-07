@@ -156,6 +156,7 @@ pub fn router(controller: Controller) -> Router {
         .route("/api/v1/actions", get(actions))
         .route("/api/v1/actions/{id}/run", post(run_action))
         .route("/api/v1/sources", get(source_status))
+        .route("/api/v1/sources/benchmark", post(benchmark_source))
         .route("/api/v1/sources/plan", post(plan_sources))
         .route("/api/v1/sources/apply", post(apply_sources))
         .route("/api/v1/hardware/overlays", get(overlay_status))
@@ -329,6 +330,17 @@ async fn plan_sources(
 ) -> Result<Json<SourcePlan>, ApiError> {
     controller
         .plan_source_change(&request.provider_id)
+        .map(Json)
+        .map_err(ApiError::from_source)
+}
+
+async fn benchmark_source(
+    State(controller): State<Arc<Controller>>,
+    Json(request): Json<SourceRequest>,
+) -> Result<Json<rsetup_core::MirrorBenchmark>, ApiError> {
+    tokio::task::spawn_blocking(move || controller.benchmark_source(&request.provider_id))
+        .await
+        .map_err(ApiError::internal)?
         .map(Json)
         .map_err(ApiError::from_source)
 }

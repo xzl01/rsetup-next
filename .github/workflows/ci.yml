@@ -33,7 +33,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y device-tree-compiler
           cargo test -p rsetup-core native_fdtoverlay_validation_and_apply --locked -- --ignored
-      - name: Test browser localization and Overlay handlers
+      - name: Test bounded mirror transfers
+        run: cargo test -p rsetup-core curl_benchmark_fixture --locked -- --ignored
+      - name: Test browser localization and async handlers
         run: node --test ui/*.test.mjs
 
   rust-msrv:
@@ -113,6 +115,7 @@ jobs:
         run: |
           rsetup-next --demo status --json | grep -q '"identity"'
           rsetup-next --demo actions --json | grep -q '"system.update"'
+          rsetup-next --demo sources benchmark --mirror official --json | grep -q 'bytesPerSecond'
           test -x /usr/libexec/rsetup-next-helper
           test -f /usr/share/polkit-1/actions/com.radxa.rsetup-next.policy
           test -f /usr/lib/systemd/system/rsetup-next-thermal-policy.service

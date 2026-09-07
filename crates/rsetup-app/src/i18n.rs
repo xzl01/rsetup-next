@@ -17,6 +17,74 @@ pub enum Locale {
 }
 
 impl Locale {
+    pub fn mirror_benchmark(self, result: &rsetup_core::MirrorBenchmark) -> String {
+        let mut lines = vec![format!(
+            "{}{}",
+            result.provider_id,
+            if result.synthetic {
+                if self.is_zh() {
+                    " · 模拟测速"
+                } else {
+                    " · Simulated test"
+                }
+            } else {
+                ""
+            }
+        )];
+        for probe in &result.probes {
+            let kind = if probe.kind == rsetup_core::SourceKind::Radxa {
+                "Radxa"
+            } else if self.is_zh() {
+                "系统"
+            } else {
+                "System"
+            };
+            let measurement = match (probe.latency_ms, probe.bytes_per_second) {
+                (Some(latency), Some(speed))
+                    if probe.status == rsetup_core::MirrorProbeStatus::Ok =>
+                {
+                    format!(
+                        "{latency:.0} ms · {:.1} KiB/s · {} B",
+                        speed / 1024.0,
+                        probe.downloaded_bytes
+                    )
+                }
+                _ => self.mirror_probe_status(probe.status).into(),
+            };
+            lines.push(format!("{kind}: {measurement}\n  {}", probe.url));
+        }
+        if result.probes.is_empty() {
+            lines.push(
+                if self.is_zh() {
+                    "无可测试的源条目"
+                } else {
+                    "No applicable source entries"
+                }
+                .into(),
+            );
+        }
+        lines.join("\n")
+    }
+
+    pub fn mirror_probe_status(self, status: rsetup_core::MirrorProbeStatus) -> &'static str {
+        use rsetup_core::MirrorProbeStatus::*;
+        match (self.is_zh(), status) {
+            (true, Ok) => "可用",
+            (false, Ok) => "Available",
+            (true, Timeout) => "连接超时",
+            (false, Timeout) => "Timed out",
+            (true, HttpError) => "索引不可访问",
+            (false, HttpError) => "Index unavailable",
+            (true, NetworkError) => "网络或 TLS 错误",
+            (false, NetworkError) => "Network or TLS error",
+            (true, InvalidIndex) => "返回内容不是软件包索引",
+            (false, InvalidIndex) => "Not a package index",
+            (true, SampleTooLarge) => "样本超出大小限制",
+            (false, SampleTooLarge) => "Sample exceeds limit",
+            (true, CurlMissing) => "请安装 curl 后重试",
+            (false, CurlMissing) => "Install curl and retry",
+        }
+    }
     pub fn resolve(requested: LocaleArg) -> Self {
         match requested {
             LocaleArg::En => Self::En,

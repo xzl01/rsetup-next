@@ -174,6 +174,13 @@ impl Controller {
         self.sources.status()
     }
 
+    pub fn benchmark_source(
+        &self,
+        provider_id: &str,
+    ) -> Result<crate::MirrorBenchmark, SourceError> {
+        self.sources.benchmark(provider_id)
+    }
+
     pub fn overlay_status(&self) -> Result<OverlayStatus, HardwareError> {
         let status = self.hardware.overlay_status()?;
         if status.requires_authorization {

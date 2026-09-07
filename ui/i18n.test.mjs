@@ -36,6 +36,22 @@ test("auto-detects Chinese and localizes known actions by stable id", () => {
   assert.equal(i18n.action({ id: "service.docker-enable", title: "Enable container runtime", description: "", category: "Services", steps: [] }).title, "启用容器运行时");
 });
 
+test("mirror benchmark states are bilingual and distinguish simulated sampling", () => {
+  const { i18n } = loadI18n("zh-CN");
+  assert.equal(i18n.t("sources.simulatedTest"), "模拟测速");
+  assert.match(i18n.t("sources.benchmarkNote"), /不修改配置/);
+  assert.equal(i18n.t("sources.testing", { done: 2, total: 10 }), "正在测速 2/10…");
+  for (const locale of ["zh-CN", "en"]) {
+    i18n.setLocale(locale);
+    for (const status of ["ok", "timeout", "http_error", "network_error", "invalid_index", "sample_too_large", "curl_missing"]) {
+      const key = `sources.testStatus.${status}`;
+      assert.notEqual(i18n.t(key), key);
+    }
+  }
+  assert.equal(i18n.t("sources.simulatedTest"), "Simulated test");
+  assert.match(i18n.t("sources.benchmarkNote"), /not peak bandwidth/);
+});
+
 test("keeps action availability and localizes its reason", () => {
   const { i18n } = loadI18n("zh-CN");
   const action = i18n.action({

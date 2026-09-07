@@ -17,6 +17,8 @@ Architecture: any
 Depends:
  apt,
  btrfs-progs,
+ ca-certificates,
+ curl (>= 7.63),
  device-tree-compiler,
  e2fsprogs,
  iproute2,

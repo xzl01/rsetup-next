@@ -222,9 +222,19 @@
                   <select id="source-provider" data-source-provider disabled><option data-i18n="sources.loading">Detecting mirrors…</option></select>
                 </label>
                 <div class="provider-detail" data-source-provider-detail></div>
-                <button class="secondary-button" type="button" data-source-preview disabled><svg aria-hidden="true"><use href="#icon-search"></use></svg><span data-i18n="sources.preview">Preview changes</span></button>
+                <div class="source-buttons">
+                  <button class="secondary-button" type="button" data-source-preview disabled><svg aria-hidden="true"><use href="#icon-search"></use></svg><span data-i18n="sources.preview">Preview changes</span></button>
+                  <button class="secondary-button" type="button" data-source-benchmark disabled><svg aria-hidden="true"><use href="#icon-pulse"></use></svg><span data-i18n="sources.benchmark">Test mirrors</span></button>
+                  <button class="secondary-button" type="button" data-source-benchmark-stop hidden data-i18n="sources.stopTest">Stop testing</button>
+                </div>
               </div>
             </div>
+            <section class="source-benchmark" data-source-benchmark-panel hidden aria-labelledby="source-benchmark-title">
+              <h3 id="source-benchmark-title" data-i18n="sources.benchmarkTitle">Mirror speed test</h3>
+              <p data-source-benchmark-progress role="status"></p>
+              <p class="benchmark-note" data-i18n="sources.benchmarkNote">Index samples from this SBC, not peak bandwidth. Up to 1 MiB per mirror; settings stay unchanged.</p>
+              <div class="benchmark-results" data-source-benchmark-results></div>
+            </section>
             <div class="source-plan" data-source-plan hidden aria-live="polite">
               <div class="source-plan-head"><strong data-source-plan-title>—</strong><span data-source-plan-count>—</span></div>
               <div class="source-diff-list" data-source-diff-list></div>

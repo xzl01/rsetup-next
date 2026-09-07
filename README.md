@@ -5,7 +5,7 @@
 One control plane for a Linux SBC, available as a scriptable CLI, an interactive
 TUI, a loopback Web console, and an optional Tauri desktop application.
 
-This branch is an alpha architecture built from the original
+This is the Rust-based successor to the original
 [`radxa-pkg/rsetup`](https://github.com/radxa-pkg/rsetup). The new Rust control
 plane owns probing, policy, and action execution directly; it does not invoke or
 require the legacy `rsetup` command at runtime.
@@ -34,6 +34,19 @@ endpoints, leaves third-party repositories untouched, and previews every
 affected line before confirmation. Live application creates timestamped
 backups, writes atomically, runs `apt-get update`, and automatically restores
 the previous files if the refresh fails.
+
+Mirror speed testing is read-only and needs no administrator authorization.
+Use **Test mirrors** in the package-mirror panel, `b` on a selected mirror in
+the TUI, or `rsetup-next sources benchmark --mirror official --json` (omit
+`--mirror` to test the catalog). Each provider samples one configured system
+`InRelease` index and, where applicable, one Radxa index. Results separate
+time-to-first-byte from sample transfer rate; small indexes do not measure peak
+bandwidth or prove that every package/pocket is available. At most 512 KiB is
+consumed per index, with a 2-second connection and 6-second total timeout.
+Only catalog HTTPS endpoints are used, TLS is verified, redirects are not
+followed, and curl configuration files are ignored. No APT refresh, file write,
+or automatic mirror selection occurs. Demo mode uses labeled synthetic results.
+Selecting a tested mirror still requires preview and confirmation before apply.
 
 The native hardware manager now covers seven migrated workflows:
 

@@ -87,6 +87,14 @@ enum Commands {
 
 #[derive(Debug, Subcommand)]
 enum SourceCommands {
+    /// Sample mirror index latency and speed, without changing sources / 软件源测速，不修改配置
+    Benchmark {
+        /// Test one mirror; omit to test all / 指定镜像，省略则测试全部
+        #[arg(long)]
+        mirror: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Show detected source files and current providers / 显示已检测源文件与当前镜像
     Status {
         #[arg(long)]
@@ -405,6 +413,27 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Sources { command } => match command {
+            SourceCommands::Benchmark { mirror, json } => {
+                let providers = mirror.map(|id| vec![id]).unwrap_or_else(|| {
+                    rsetup_core::provider_catalog()
+                        .into_iter()
+                        .map(|provider| provider.id)
+                        .collect()
+                });
+                let mut results = Vec::new();
+                for id in providers {
+                    let result = controller
+                        .benchmark_source(&id)
+                        .map_err(|error| anyhow!(locale.source_error(&error)))?;
+                    if !json {
+                        println!("{}", locale.mirror_benchmark(&result));
+                    }
+                    results.push(result);
+                }
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&results)?);
+                }
+            }
             SourceCommands::Status { json } => {
                 let status = controller
                     .source_status()

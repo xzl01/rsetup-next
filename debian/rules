@@ -16,7 +16,7 @@ override_dh_auto_build:
 override_dh_auto_test:
 ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
 	cargo test --workspace --release --locked --offline
-	node --test ui/i18n.test.mjs
+	node --test ui/*.test.mjs
 endif
 
 override_dh_auto_install:

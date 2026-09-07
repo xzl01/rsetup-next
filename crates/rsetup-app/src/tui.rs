@@ -48,6 +48,7 @@ fn run_loop(
 ) -> Result<()> {
     let mut state = App::new(controller, locale)?;
     loop {
+        state.poll_benchmark();
         terminal.draw(|frame| render(frame, &mut state))?;
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
@@ -61,6 +62,7 @@ fn run_loop(
                     KeyCode::Char('j') | KeyCode::Down => state.next(),
                     KeyCode::Char('k') | KeyCode::Up => state.previous(),
                     KeyCode::Char('r') => state.refresh()?,
+                    KeyCode::Char('b') if state.source_picker => state.start_benchmark(),
                     KeyCode::Enter => state.request_run(),
                     KeyCode::Char('y') if state.confirm_pending => state.execute_selected()?,
                     KeyCode::Char('n') if state.confirm_pending => state.confirm_pending = false,
@@ -85,6 +87,10 @@ struct App {
     source_picker: bool,
     source_selected: usize,
     notice: Option<String>,
+    benchmark_rx: Option<
+        std::sync::mpsc::Receiver<Result<rsetup_core::MirrorBenchmark, rsetup_core::SourceError>>,
+    >,
+    benchmarks: std::collections::BTreeMap<String, rsetup_core::MirrorBenchmark>,
 }
 
 impl App {
@@ -114,6 +120,8 @@ impl App {
             source_picker: false,
             source_selected,
             notice: None,
+            benchmark_rx: None,
+            benchmarks: Default::default(),
         })
     }
 
@@ -127,6 +135,44 @@ impl App {
         }
         self.selected = (self.selected + 1).min(self.actions.len().saturating_sub(1));
         self.confirm_pending = false;
+    }
+
+    fn start_benchmark(&mut self) {
+        if self.benchmark_rx.is_some() {
+            return;
+        }
+        let Some(provider) = self.source_status.providers.get(self.source_selected) else {
+            return;
+        };
+        let id = provider.id.clone();
+        let controller = self.controller.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.benchmark_rx = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(controller.benchmark_source(&id));
+        });
+    }
+
+    fn poll_benchmark(&mut self) {
+        let Some(rx) = &self.benchmark_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.benchmark_rx = None;
+                match result {
+                    Ok(result) if result.source_revision == self.source_status.source_revision => {
+                        self.benchmarks.insert(result.provider_id.clone(), result);
+                    }
+                    Ok(_) => {}
+                    Err(error) => self.notice = Some(self.locale.source_error(&error)),
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.benchmark_rx = None;
+            }
+        }
     }
 
     fn previous(&mut self) {
@@ -538,7 +584,7 @@ fn render_source_picker(frame: &mut Frame, app: &mut App, rows: std::rc::Rc<[Rec
         &mut list_state,
     );
 
-    let detail = if app.confirm_pending {
+    let mut detail = if app.confirm_pending {
         format!(
             "{}\n{}",
             app.locale.text("confirm_change"),
@@ -571,12 +617,45 @@ fn render_source_picker(frame: &mut Frame, app: &mut App, rows: std::rc::Rc<[Rec
             .unwrap_or_else(|| app.locale.text("no_operation").into())
     };
     frame.render_widget(
-        Paragraph::new(detail)
-            .style(Style::default().fg(if app.confirm_pending { AMBER } else { MUTED }))
-            .block(instrument(app.locale.text("source_plan")))
-            .wrap(Wrap { trim: true }),
+        Paragraph::new({
+            if !app.confirm_pending {
+                detail.push_str(&benchmark_detail(app));
+            }
+            detail
+        })
+        .style(Style::default().fg(if app.confirm_pending { AMBER } else { MUTED }))
+        .block(instrument(app.locale.text("source_plan")))
+        .wrap(Wrap { trim: true }),
         rows[1],
     );
+}
+
+fn benchmark_detail(app: &App) -> String {
+    let hint = if app.benchmark_rx.is_some() {
+        if app.locale.is_zh() {
+            "正在测速…"
+        } else {
+            "Testing mirror…"
+        }
+    } else if app.locale.is_zh() {
+        "[b] 测试选中镜像 · 索引采样，非带宽上限"
+    } else {
+        "[b] Test selected mirror · Index sample, not peak bandwidth"
+    };
+    let mut text = format!("\n\n{hint}");
+    if let Some(result) = app
+        .source_status
+        .providers
+        .get(app.source_selected)
+        .and_then(|provider| app.benchmarks.get(&provider.id))
+        .filter(|result| result.source_revision == app.source_status.source_revision)
+    {
+        text.push_str(&format!("\n{}", app.locale.mirror_benchmark(result)));
+    }
+    if let Some(notice) = &app.notice {
+        text.push_str(&format!("\n{notice}"));
+    }
+    text
 }
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {

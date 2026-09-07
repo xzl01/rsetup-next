@@ -27,8 +27,9 @@ pub use model::{
 };
 pub use probe::collect_snapshot;
 pub use sources::{
-    MirrorProvider, SourceApplyResult, SourceError, SourceFileChange, SourceFileSummary,
-    SourceKind, SourcePlan, SourceStatus, provider_catalog,
+    MirrorBenchmark, MirrorProbe, MirrorProbeStatus, MirrorProvider, SourceApplyResult,
+    SourceError, SourceFileChange, SourceFileSummary, SourceKind, SourcePlan, SourceStatus,
+    provider_catalog,
 };
 pub use spi_flash::{
     SpiBootComponent, SpiBootImage, SpiFlashApplyResult, SpiFlashDevice, SpiFlashPlan,

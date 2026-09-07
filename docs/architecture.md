@@ -104,6 +104,7 @@ The loopback server exposes:
 | `GET` | `/api/v1/actions` | guided operation catalog |
 | `POST` | `/api/v1/actions/{id}/run` | execute or dry-run one catalog action |
 | `GET` | `/api/v1/sources` | detected APT source state and trusted mirror catalog |
+| `POST` | `/api/v1/sources/benchmark` | read-only bounded index samples for `{ "providerId": "official" }`; no root or APT update |
 | `POST` | `/api/v1/sources/plan` | preview managed source changes for one provider ID |
 | `POST` | `/api/v1/sources/apply` | confirm and apply an exact plan token; stale plans are rejected |
 | `GET` | `/api/v1/hardware/overlays` | list managed overlay state |
@@ -135,7 +136,8 @@ fail closed. Saved configuration is distinct from the currently running mux.
 
 Remote binding, authentication, persistent audit storage, multi-user policy,
 streaming job output, and cancellation are intentionally not implied by this
-alpha API.
+pre-1.0 API. Mirror benchmarking can stop between providers; this does not imply
+cancellation of state-changing operations.
 
 ## Native action boundary
 

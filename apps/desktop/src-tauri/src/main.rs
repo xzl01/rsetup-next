@@ -114,6 +114,18 @@ fn source_status(controller: tauri::State<'_, Controller>) -> Result<SourceStatu
 }
 
 #[tauri::command]
+async fn benchmark_source(
+    controller: tauri::State<'_, Controller>,
+    provider_id: String,
+) -> Result<rsetup_core::MirrorBenchmark, CommandError> {
+    let controller = controller.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || controller.benchmark_source(&provider_id))
+        .await
+        .map_err(CommandError::internal)?
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
 fn plan_sources(
     controller: tauri::State<'_, Controller>,
     provider_id: String,
@@ -309,6 +321,7 @@ fn main() {
             list_activity,
             run_action,
             source_status,
+            benchmark_source,
             plan_sources,
             apply_sources,
             overlay_status,

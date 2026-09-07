@@ -11,6 +11,9 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
+mod benchmark;
+pub use benchmark::{MirrorBenchmark, MirrorProbe, MirrorProbeStatus};
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MirrorProvider {
