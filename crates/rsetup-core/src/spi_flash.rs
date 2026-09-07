@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::{
+        fs::{OpenOptionsExt, PermissionsExt},
+        io::AsRawFd,
+    },
     path::{Path, PathBuf},
     process::Command,
 };
@@ -14,9 +17,54 @@ const FLASHCP: &str = "/usr/sbin/flashcp";
 const FLASH_ERASE: &str = "/usr/sbin/flash_erase";
 const BACKUP_DIRECTORY: &str = "/var/lib/rsetup-next/spi-backups";
 const WORK_DIRECTORY: &str = "/run/rsetup-next/spi";
+const APPLY_LOCK_FILE: &str = "/run/lock/rsetup-next-spi-flash.lock";
 const RK3399_IMAGE_SIZE: u64 = 4 * 1024 * 1024;
 const RK35_IMAGE_SIZE: u64 = 16 * 1024 * 1024;
 const RK33_IMAGE_SIZE: u64 = 4 * 1024 * 1024;
+
+// Lock all MTD operations together: different MTD IDs may be overlapping partitions.
+struct SpiFlashLock(File);
+
+impl SpiFlashLock {
+    fn acquire(root: &Path) -> Result<Self, HardwareError> {
+        let path = rooted_path(root, APPLY_LOCK_FILE);
+        fs::create_dir_all(path.parent().expect("fixed lock path")).map_err(io_error)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(io_error)?;
+        loop {
+            // SAFETY: the descriptor is owned by `file` for the entire transaction.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(Self(file));
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.kind() == io::ErrorKind::WouldBlock {
+                return Err(HardwareError::Conflict(
+                    "Another SPI flash operation is in progress.".into(),
+                ));
+            }
+            return Err(io_error(error));
+        }
+    }
+}
+
+impl Drop for SpiFlashLock {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor remains open until this value is dropped.
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -225,6 +273,7 @@ impl SpiFlashManager {
         if self.synthetic {
             return Err(HardwareError::RootRequired);
         }
+        let _lock = SpiFlashLock::acquire(&self.root)?;
         let plan = self.plan(request)?;
         if supplied_token.trim().is_empty() {
             return Err(HardwareError::PlanRequired);
@@ -542,12 +591,12 @@ fn validate_request(request: &SpiFlashRequest) -> Result<(), HardwareError> {
             "invalid SPI flash target identifier".into(),
         ));
     }
-    if let Some(image_id) = &request.image_id
-        && (!valid_asset_id(image_id) || !image_id.contains(':'))
-    {
-        return Err(HardwareError::InvalidInput(
-            "invalid installed boot image identifier".into(),
-        ));
+    if let Some(image_id) = &request.image_id {
+        if !valid_asset_id(image_id) || !image_id.contains(':') {
+            return Err(HardwareError::InvalidInput(
+                "invalid installed boot image identifier".into(),
+            ));
+        }
     }
     if request.operation == "erase" && request.image_id.is_some() {
         return Err(HardwareError::InvalidInput(
@@ -963,6 +1012,124 @@ mod tests {
                 }
             )
         );
+    }
+
+    #[test]
+    fn lock_blocks_other_processes_and_all_mtd_targets() {
+        let root = fixture_root();
+        let lock = SpiFlashLock::acquire(&root).unwrap();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "spi_flash::tests::locked_apply_child",
+                "--nocapture",
+            ])
+            .env("RSETUP_SPI_TEST_LOCK_ROOT", &root)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        drop(lock);
+        let manager = SpiFlashManager::at_root(root.clone());
+        let request = SpiFlashRequest {
+            operation: "erase".into(),
+            target_id: "mtd0".into(),
+            image_id: None,
+        };
+        // A failed plan must also release its transaction lock.
+        assert!(manager.apply_live(&request, "invalid").is_err());
+        assert!(SpiFlashLock::acquire(&root).is_ok());
+        assert!(!rooted_path(&root, BACKUP_DIRECTORY).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn locked_apply_child() {
+        let Some(root) = std::env::var_os("RSETUP_SPI_TEST_LOCK_ROOT") else {
+            return;
+        };
+        let manager = SpiFlashManager::at_root(PathBuf::from(root));
+        for target in ["mtd0", "mtd1"] {
+            for operation in ["erase", "install"] {
+                let request = SpiFlashRequest {
+                    operation: operation.into(),
+                    target_id: target.into(),
+                    image_id: None,
+                };
+                assert!(matches!(
+                    manager.apply_live(&request, "ignored"),
+                    Err(HardwareError::Conflict(_))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn lock_does_not_follow_symlinks() {
+        let root = fixture_root();
+        let path = rooted_path(&root, APPLY_LOCK_FILE);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(root.join("other-file"), &path).unwrap();
+        assert!(SpiFlashLock::acquire(&root).is_err());
+        assert!(!root.join("other-file").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn transaction_keeps_lock_during_erase_and_rollback() {
+        let root = fixture_root();
+        add_mtd(&root, "mtd0", "nor", 4096);
+        fs::create_dir_all(root.join("usr/sbin")).unwrap();
+        // Regular-file fixtures only. Each fake tool waits until the test has
+        // attempted another apply while the first transaction is still active.
+        for (tool, marker, exit_code) in [(FLASH_ERASE, "erase", 1), (FLASHCP, "rollback", 0)] {
+            let path = rooted_path(&root, tool);
+            fs::write(&path, format!(
+                "#!/bin/sh\nset -eu\ntouch \"$0.{marker}\"\ni=0\nwhile [ ! -f \"$0.release\" ]; do\n  i=$((i+1))\n  [ \"$i\" -lt 1000 ] || exit 2\n  sleep 0.01\ndone\nexit {exit_code}\n"
+            )).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let manager = SpiFlashManager::at_root(root.clone());
+        let request = SpiFlashRequest {
+            operation: "erase".into(),
+            target_id: "mtd0".into(),
+            image_id: None,
+        };
+        let token = manager.plan(&request).unwrap().plan_token;
+        let worker = {
+            let manager = manager.clone();
+            let request = request.clone();
+            let token = token.clone();
+            std::thread::spawn(move || manager.apply_live(&request, &token))
+        };
+        for (tool, marker) in [(FLASH_ERASE, "erase"), (FLASHCP, "rollback")] {
+            let marker_path = rooted_path(&root, &format!("{tool}.{marker}"));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !marker_path.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(marker_path.exists(), "{marker} tool did not start");
+            assert!(matches!(
+                manager.apply_live(&request, &token),
+                Err(HardwareError::Conflict(_))
+            ));
+            assert_eq!(
+                fs::read_dir(rooted_path(&root, BACKUP_DIRECTORY))
+                    .unwrap()
+                    .count(),
+                1
+            );
+            fs::write(rooted_path(&root, &format!("{tool}.release")), b"release").unwrap();
+        }
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(error.to_string().contains("previous image was restored"));
+        assert_eq!(fs::read(root.join("dev/mtd0")).unwrap(), vec![0xaa; 4096]);
+        assert!(SpiFlashLock::acquire(&root).is_ok());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

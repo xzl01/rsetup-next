@@ -31,6 +31,14 @@ jobs:
       - name: Test browser localization
         run: node --test ui/i18n.test.mjs
 
+  rust-msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - name: Test minimum supported Rust version
+        run: cargo test --workspace --locked
+
   debian-package:
     strategy:
       matrix:

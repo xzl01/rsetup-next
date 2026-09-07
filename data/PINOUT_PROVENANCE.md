@@ -12,7 +12,10 @@ fields and preserves board, connector, physical-pin, voltage, GPIO and mux
 metadata. The source `name` field is normalized as `defaultFunction`: it is the
 Function1 column used when no Overlay changes that physical pin. Function2 and
 later mux entries remain Overlay candidates. Saved enabled Overlay files under
-`/boot` replace Function1 only when their controller and mux mode match.
+`/boot` replace Function1 only when their controller and mux mode match. When
+an Overlay supplies physical pads in its `exclusive` metadata, only those pads
+are mapped. Without that metadata, UART matching is limited to TX/RX; CTS/RTS
+require explicit pad evidence.
 
 Regenerate the snapshot from a local pin-out checkout with:
 

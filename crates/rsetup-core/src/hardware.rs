@@ -257,7 +257,8 @@ struct RgbLedSnapshot {
     id: String,
     path: PathBuf,
     trigger: String,
-    pattern: Vec<u8>,
+    pattern: Option<Vec<u8>>,
+    brightness: Vec<u8>,
 }
 
 #[derive(Debug, Error)]
@@ -552,6 +553,7 @@ impl HardwareManager {
             .iter()
             .map(|overlay| FunctionEvidence {
                 id: overlay.id.clone(),
+                exclusive: overlay.exclusive.clone(),
                 text: format!(
                     "{} {} {}",
                     overlay.id,
@@ -1170,14 +1172,22 @@ impl HardwareManager {
                             "LED {id} does not expose its current trigger for safe rollback"
                         ))
                     })?;
-                let pattern = fs::read(path.join("pattern")).map_err(|error| {
-                    HardwareError::Io(format!("unable to snapshot pattern on {id}: {error}"))
+                let pattern = if trigger == "pattern" {
+                    Some(fs::read(path.join("pattern")).map_err(|error| {
+                        HardwareError::Io(format!("unable to snapshot pattern on {id}: {error}"))
+                    })?)
+                } else {
+                    None
+                };
+                let brightness = fs::read(path.join("brightness")).map_err(|error| {
+                    HardwareError::Io(format!("unable to snapshot brightness on {id}: {error}"))
                 })?;
                 Ok(RgbLedSnapshot {
                     id: (*id).clone(),
                     path: path.clone(),
                     trigger,
                     pattern,
+                    brightness,
                 })
             })
             .collect::<Result<Vec<_>, HardwareError>>()?;
@@ -1578,11 +1588,13 @@ fn read_led_device(id: &str, path: &Path) -> LedDevice {
     LedDevice {
         id: id.into(),
         current_trigger,
+        supports_pattern: available_triggers
+            .iter()
+            .any(|trigger| trigger == "pattern"),
         available_triggers,
         brightness: read_trimmed(path.join("brightness")).and_then(|value| value.parse().ok()),
         max_brightness: read_trimmed(path.join("max_brightness"))
             .and_then(|value| value.parse().ok()),
-        supports_pattern: path.join("pattern").exists(),
         rgb_group: None,
         rgb_channel: None,
     }
@@ -1677,14 +1689,20 @@ fn rgb_patterns(max_brightness: u32, config: &RgbLedConfig) -> [String; 3] {
 fn rollback_rgb_led_snapshot(snapshot: &[RgbLedSnapshot]) -> Result<(), HardwareError> {
     let mut failures = Vec::new();
     for channel in snapshot {
-        let restored = fs::write(channel.path.join("trigger"), "pattern\n")
-            .and_then(|()| fs::write(channel.path.join("pattern"), &channel.pattern))
-            .and_then(|()| {
-                fs::write(
-                    channel.path.join("trigger"),
-                    format!("{}\n", channel.trigger),
-                )
-            });
+        let restored = (|| -> std::io::Result<()> {
+            // Restore brightness before the trigger: writing zero brightness after
+            // selecting a trigger would deactivate it on Linux.
+            fs::write(channel.path.join("trigger"), "none\n")?;
+            fs::write(channel.path.join("brightness"), &channel.brightness)?;
+            fs::write(
+                channel.path.join("trigger"),
+                format!("{}\n", channel.trigger),
+            )?;
+            if let Some(pattern) = &channel.pattern {
+                fs::write(channel.path.join("pattern"), pattern)?;
+            }
+            Ok(())
+        })();
         if let Err(error) = restored {
             failures.push(format!("{}: {error}", channel.id));
         }
@@ -2399,9 +2417,6 @@ mod tests {
             .unwrap();
             fs::write(directory.join("brightness"), "64\n").unwrap();
             fs::write(directory.join("max_brightness"), "255\n").unwrap();
-            if id.starts_with("rgb0-") {
-                fs::write(directory.join("pattern"), "0 100 0 100\n").unwrap();
-            }
         }
         let manager = HardwareManager::at_root(root.clone());
         let status = manager.led_status().unwrap();
@@ -2439,6 +2454,26 @@ mod tests {
             read_led_saved_state(&root).unwrap().rgb.get("rgb0"),
             Some(&config)
         );
+        // On reboot Linux only creates `pattern` after its trigger is selected.
+        for id in ["rgb0-red", "rgb0-green", "rgb0-blue"] {
+            let directory = root.join("sys/class/leds").join(id);
+            fs::write(
+                directory.join("trigger"),
+                "[none] timer heartbeat pattern\n",
+            )
+            .unwrap();
+            fs::remove_file(directory.join("pattern")).unwrap();
+        }
+        let restored = manager.restore_led_state_live().unwrap();
+        assert_eq!(restored.output.as_deref(), Some("restored=2"));
+        for id in ["rgb0-red", "rgb0-green", "rgb0-blue"] {
+            let directory = root.join("sys/class/leds").join(id);
+            assert_eq!(
+                fs::read_to_string(directory.join("trigger")).unwrap(),
+                "pattern\n"
+            );
+            assert!(directory.join("pattern").is_file());
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2474,6 +2509,11 @@ mod tests {
             fs::write(directory.join("brightness"), "64\n").unwrap();
             fs::write(directory.join("max_brightness"), "255\n").unwrap();
             if id.starts_with("rgb0-") {
+                fs::write(
+                    directory.join("trigger"),
+                    "none timer heartbeat [pattern]\n",
+                )
+                .unwrap();
                 fs::write(directory.join("pattern"), "0 100 0 100\n").unwrap();
             }
         }
@@ -2503,11 +2543,53 @@ mod tests {
         for id in ["rgb0-red", "rgb0-green", "rgb0-blue"] {
             assert_eq!(
                 fs::read_to_string(root.join("sys/class/leds").join(id).join("trigger")).unwrap(),
-                "heartbeat\n"
+                "pattern\n"
             );
             assert_eq!(
                 fs::read_to_string(root.join("sys/class/leds").join(id).join("pattern")).unwrap(),
                 "0 100 0 100\n"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rgb_rollback_restores_default_trigger_and_brightness_without_prior_pattern() {
+        let root = std::env::temp_dir().join(format!("rsetup-led-default-{}", Uuid::new_v4()));
+        for channel in ["red", "green", "blue"] {
+            let directory = root.join(format!("sys/class/leds/rgb0-{channel}"));
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("trigger"), "[none] heartbeat pattern\n").unwrap();
+            fs::write(directory.join("brightness"), "64\n").unwrap();
+            fs::write(directory.join("max_brightness"), "255\n").unwrap();
+        }
+        let manager = HardwareManager::at_root(root.clone());
+        let config = RgbLedConfig {
+            group_id: "rgb0".into(),
+            mode: "breath".into(),
+            red: 255,
+            green: 64,
+            blue: 0,
+            brightness: 75,
+            cycle_ms: 2_000,
+        };
+        let status = manager.validate_rgb_led_config(&config).unwrap();
+        let snapshot = manager
+            .apply_rgb_led_transactional(&status, &status.rgb_groups[0], &config)
+            .unwrap();
+        for channel in &snapshot {
+            assert!(channel.pattern.is_none());
+            fs::write(channel.path.join("brightness"), "0\n").unwrap();
+        }
+        rollback_rgb_led_snapshot(&snapshot).unwrap();
+        for channel in &snapshot {
+            assert_eq!(
+                fs::read_to_string(channel.path.join("brightness")).unwrap(),
+                "64\n"
+            );
+            assert_eq!(
+                fs::read_to_string(channel.path.join("trigger")).unwrap(),
+                "none\n"
             );
         }
         fs::remove_dir_all(root).unwrap();

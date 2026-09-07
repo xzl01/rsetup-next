@@ -181,6 +181,14 @@ under Hardware > Thermal uses provider `status.config` and `status.active` for
 saved/running/stopped truth; selectors and edited points remain draft-only
 until the returned immutable plan is confirmed.
 
+Fan curves require a thermal zone bound exclusively to the selected PWM fan,
+with no other zone controlling that fan. Mixed CPU/GPU cooling zones are rejected
+to preserve kernel throttling. Bindings are checked again on every daemon tick;
+invalid saved bindings trigger recovery of the kernel governor.
+
+SPI apply operations share a cross-process lock across all MTD targets, held
+through backup, erase, write, verification, and any rollback.
+
 ## English and Chinese
 
 The Web and Tauri interfaces detect the browser or operating-system language on
@@ -235,7 +243,7 @@ API routes, action execution, and the planned remote-node seam.
 The package installs the `rsetup-next` CLI/TUI/Web binary, its narrow privileged
 helper, the matching Polkit policy, the thermal, fan-curve, and LED units, and
 the `mtd-utils` dependency used by the fixed SPI operations. The fan service
-persists its root-only configuration at `/etc/rsetup-next/fan-curve.json` and
+persists its root-writable, user-readable configuration at `/etc/rsetup-next/fan-curve.json` and
 runs as `rsetup-next-fan-curve.service`. It does not install
 the removed Bash implementation or run the browser process as root. Optional
 `device-tree-compiler`, `gpiod`, `v4l-utils`, and `ffmpeg` packages enrich the

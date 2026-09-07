@@ -44,6 +44,7 @@ pub(crate) struct PinoutPin {
 pub(crate) struct FunctionEvidence {
     pub id: String,
     pub text: String,
+    pub exclusive: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,7 +138,9 @@ pub(crate) fn resolve_function_evidence(
             let Some(function_selector) = parse_selector(function) else {
                 continue;
             };
-            if selectors_match(&evidence_selector, &function_selector) {
+            if selectors_match(&evidence_selector, &function_selector)
+                && evidence_covers_pin(item, pin, function, &function_selector.family)
+            {
                 matches.push((
                     function.clone(),
                     function_selector.family.to_ascii_lowercase(),
@@ -186,6 +189,41 @@ pub(crate) fn resolve_function_evidence(
         kind: kind.clone(),
         source_detail: Some(sources),
     }
+}
+
+fn evidence_covers_pin(
+    item: &FunctionEvidence,
+    pin: &PinoutPin,
+    function: &str,
+    family: &str,
+) -> bool {
+    let pads = item
+        .exclusive
+        .iter()
+        .map(|resource| normalize(resource))
+        .filter(|resource| is_pad_resource(resource))
+        .collect::<Vec<_>>();
+    if !pads.is_empty() {
+        return [&pin.default_function, &pin.name]
+            .into_iter()
+            .chain(pin.gpio.iter())
+            .any(|name| pads.contains(&normalize(name)));
+    }
+    // Without pin metadata a UART overlay only establishes its data pair.
+    // CTS/RTS need explicit pad evidence, not just the same controller/mux.
+    family != "UART"
+        || function
+            .to_ascii_uppercase()
+            .split('_')
+            .any(|signal| matches!(signal, "TX" | "RX"))
+}
+
+fn is_pad_resource(resource: &str) -> bool {
+    let bytes = resource.as_bytes();
+    (resource.starts_with("gpio") && bytes.get(4).is_some_and(u8::is_ascii_digit))
+        || (bytes.first() == Some(&b'p')
+            && bytes.get(1).is_some_and(u8::is_ascii_alphabetic)
+            && bytes.get(2).is_some_and(u8::is_ascii_digit))
 }
 
 fn selectors_match(evidence: &FunctionSelector, function: &FunctionSelector) -> bool {
@@ -276,6 +314,7 @@ mod tests {
         FunctionEvidence {
             id: id.into(),
             text: id.into(),
+            exclusive: vec![],
         }
     }
 
@@ -310,6 +349,42 @@ mod tests {
             Some("UART2_TX_M0")
         );
         assert_eq!(resolve_function_evidence(pin36, &active).name, None);
+    }
+
+    #[test]
+    fn two_wire_uart_does_not_claim_flow_control_pins() {
+        let profile = profile_by_id("rock5b").unwrap();
+        let pins = &profile.connectors[0].pins;
+        let mut uart = evidence("rk3588-uart7-m1.dtbo");
+        for resources in [vec![], vec!["uart7"], vec!["GPIO3_C1", "GPIO3_C0"]] {
+            uart.exclusive = resources.into_iter().map(String::from).collect();
+            for (number, expected) in [
+                (7, None),
+                (32, None),
+                (11, Some("UART7_RX_M1")),
+                (15, Some("UART7_TX_M1")),
+            ] {
+                let pin = pins.iter().find(|pin| pin.number == number).unwrap();
+                assert_eq!(
+                    resolve_function_evidence(pin, &[uart.clone()])
+                        .name
+                        .as_deref(),
+                    expected,
+                    "pin {number}"
+                );
+            }
+        }
+        uart.exclusive
+            .extend(["GPIO3_C3".into(), "GPIO3_C2".into()]);
+        for (number, expected) in [(7, "UART7_CTSN_M1"), (32, "UART7_RTSN_M1")] {
+            let pin = pins.iter().find(|pin| pin.number == number).unwrap();
+            assert_eq!(
+                resolve_function_evidence(pin, &[uart.clone()])
+                    .name
+                    .as_deref(),
+                Some(expected)
+            );
+        }
     }
 
     #[test]

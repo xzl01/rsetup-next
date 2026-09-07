@@ -1,0 +1,17 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # Older releases saved this non-secret configuration with mode 0600,
+        # which prevented the unprivileged UI from preparing changes.
+        config=/etc/rsetup-next/fan-curve.json
+        if [ -f "$config" ] && [ ! -L "$config" ] && [ "$(stat -c %u "$config")" = 0 ]; then
+            chmod 0644 "$config"
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

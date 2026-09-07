@@ -53,6 +53,9 @@ pub struct FanCurveZone {
     pub temperature_c: Option<f32>,
     pub policy: Option<String>,
     pub supports_user_space: bool,
+    /// None means the kernel bindings could not be inspected safely.
+    #[serde(default)]
+    pub cooling_device_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -264,14 +267,14 @@ impl FanCurveManager {
     pub(crate) fn plan(&self, request: &FanCurveRequest) -> Result<FanCurvePlan, HardwareError> {
         validate_request(request)?;
         let status = self.status()?;
-        if !status.supported {
+        if request.enabled && !status.supported {
             return Err(HardwareError::Unsupported(
                 status
                     .unavailable_reason
                     .unwrap_or_else(|| "fan curve control is unavailable".into()),
             ));
         }
-        if !self.synthetic && !status.mutable {
+        if request.enabled && !self.synthetic && !status.mutable {
             return Err(HardwareError::Unsupported(
                 status
                     .unavailable_reason
@@ -306,6 +309,7 @@ impl FanCurveManager {
                         config.cooling_device_id
                     ))
                 })?;
+            validate_fan_binding(&status.zones, &zone.id, &device.id)?;
             if !self.synthetic
                 && (!writable_node(
                     &self
@@ -481,18 +485,28 @@ impl FanCurveManager {
             .root
             .join("sys/class/thermal")
             .join(&saved.config.cooling_device_id);
-        let max_state = read_u32(device_path.join("max_state")).ok_or_else(|| {
-            HardwareError::Unsupported(format!(
-                "{} no longer exposes max_state",
-                saved.config.cooling_device_id
-            ))
-        })?;
-        if max_state == 0 {
-            return Err(HardwareError::Unsupported(
-                "pwm-fan cooling device has no controllable states".into(),
-            ));
+        // Recover the governor even if the saved fan has disappeared or its
+        // cooling-device ID now belongs to a CPU/GPU driver.
+        let binding = validate_fan_binding(
+            &discover_zones(&self.root),
+            &saved.config.zone_id,
+            &saved.config.cooling_device_id,
+        );
+        let device = discover_devices(&self.root)
+            .into_iter()
+            .find(|device| device.id == saved.config.cooling_device_id);
+        if binding.is_err() || device.is_none() {
+            restore_saved_kernel_policy(&self.root, &saved)?;
         }
-        write_policy(&self.root, &saved.config.zone_id, USER_SPACE_POLICY)?;
+        let device = device.ok_or_else(|| {
+            HardwareError::Unsupported("The saved cooling device is no longer a pwm-fan.".into())
+        })?;
+        let max_state = device.max_state;
+        // A saved configuration can outlive its device-tree bindings. Do not
+        // disable CPU/GPU cooling even while recovering from a failed daemon.
+        if binding.is_ok() {
+            write_policy(&self.root, &saved.config.zone_id, USER_SPACE_POLICY)?;
+        }
         fs::write(device_path.join("cur_state"), format!("{max_state}\n"))
             .map_err(|error| HardwareError::Io(format!("unable to set pwm-fan state: {error}")))?;
         Ok(FanCurveTick {
@@ -524,10 +538,10 @@ impl FanCurveManager {
         }
         let operation: Result<(), HardwareError> = (|| {
             run_systemctl(&self.root, &["stop", SERVICE_UNIT])?;
-            if let Some(saved) = &prior_saved
-                && saved.config.zone_id != config.zone_id
-            {
-                write_policy(&self.root, &saved.config.zone_id, &saved.previous_policy)?;
+            if let Some(saved) = &prior_saved {
+                if saved.config.zone_id != config.zone_id {
+                    write_policy(&self.root, &saved.config.zone_id, &saved.previous_policy)?;
+                }
             }
             write_policy(&self.root, &config.zone_id, USER_SPACE_POLICY)?;
             let previous_policy = prior_saved
@@ -630,10 +644,84 @@ fn discover_zones(root: &Path) -> Vec<FanCurveZone> {
             temperature_c: read_temperature(entry.path().join("temp")),
             policy: read_trimmed(entry.path().join("policy")),
             supports_user_space: policies.iter().any(|policy| policy == USER_SPACE_POLICY),
+            cooling_device_ids: read_cooling_bindings(&entry.path()),
         });
     }
     zones.sort_by(|left, right| left.id.cmp(&right.id));
     zones
+}
+
+fn read_cooling_bindings(zone_path: &Path) -> Option<Vec<String>> {
+    let mut devices = Vec::new();
+    for entry in fs::read_dir(zone_path).ok()? {
+        let entry = entry.ok()?;
+        if !valid_thermal_id(&entry.file_name().to_string_lossy(), "cdev") {
+            continue;
+        }
+        let target = fs::canonicalize(entry.path()).ok()?;
+        let id = target.file_name()?.to_str()?;
+        if !valid_thermal_id(id, "cooling_device")
+            || fs::canonicalize(zone_path.parent()?.join(id)).ok()? != target
+        {
+            return None;
+        }
+        devices.push(id.to_owned());
+    }
+    devices.sort();
+    devices.dedup();
+    Some(devices)
+}
+
+fn validate_fan_binding(
+    zones: &[FanCurveZone],
+    zone_id: &str,
+    device_id: &str,
+) -> Result<(), HardwareError> {
+    let selected = zones
+        .iter()
+        .find(|zone| zone.id == zone_id)
+        .ok_or_else(|| {
+            HardwareError::Unsupported("The saved thermal zone is unavailable.".into())
+        })?;
+    if selected.cooling_device_ids.as_deref() != Some(&[device_id.to_owned()]) {
+        return Err(HardwareError::Conflict(
+            "Fan curves require a thermal zone bound only to the selected fan; CPU/GPU cooling must remain under kernel control.".into(),
+        ));
+    }
+    for zone in zones {
+        let bindings = zone.cooling_device_ids.as_ref().ok_or_else(|| {
+            HardwareError::Conflict("Unable to verify thermal cooling-device bindings.".into())
+        })?;
+        if zone.id != zone_id && bindings.iter().any(|id| id == device_id) {
+            return Err(HardwareError::Conflict(
+                "The selected fan is also managed by another thermal zone.".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn restore_saved_kernel_policy(root: &Path, saved: &SavedFanCurve) -> Result<(), HardwareError> {
+    let path = root.join("sys/class/thermal").join(&saved.config.zone_id);
+    if read_trimmed(path.join("policy")).as_deref() != Some(USER_SPACE_POLICY) {
+        return Ok(());
+    }
+    let available = read_trimmed(path.join("available_policies")).unwrap_or_default();
+    let policy = [
+        &saved.previous_policy[..],
+        "step_wise",
+        "power_allocator",
+        "bang_bang",
+        "fair_share",
+    ]
+    .into_iter()
+    .find(|policy| {
+        *policy != USER_SPACE_POLICY && available.split_whitespace().any(|item| item == *policy)
+    })
+    .ok_or_else(|| {
+        HardwareError::Unsupported("No kernel thermal governor is available for recovery.".into())
+    })?;
+    write_policy(root, &saved.config.zone_id, policy)
 }
 
 fn discover_devices(root: &Path) -> Vec<FanCurveDevice> {
@@ -761,6 +849,23 @@ fn percent_to_state(percent: u8, max_state: u32) -> u32 {
 
 fn tick_saved(root: &Path, saved: &SavedFanCurve) -> Result<FanCurveTick, HardwareError> {
     let config = &saved.config;
+    if let Err(error) = validate_fan_binding(
+        &discover_zones(root),
+        &config.zone_id,
+        &config.cooling_device_id,
+    ) {
+        restore_saved_kernel_policy(root, saved)?;
+        return Err(error);
+    }
+    if !discover_devices(root)
+        .iter()
+        .any(|device| device.id == config.cooling_device_id)
+    {
+        restore_saved_kernel_policy(root, saved)?;
+        return Err(HardwareError::Unsupported(
+            "The saved cooling device is no longer a pwm-fan.".into(),
+        ));
+    }
     let zone_path = root.join("sys/class/thermal").join(&config.zone_id);
     let device_path = root
         .join("sys/class/thermal")
@@ -835,6 +940,10 @@ fn write_saved(root: &Path, saved: &SavedFanCurve) -> Result<(), HardwareError> 
         serde_json::to_vec_pretty(saved).map_err(|error| HardwareError::Io(error.to_string()))?;
     file.write_all(&bytes)
         .and_then(|()| file.sync_all())
+        .map_err(|error| HardwareError::Io(error.to_string()))?;
+    // No secrets are stored here. The unprivileged UI must be able to inspect
+    // the saved curve and prepare a new plan; only root may change the file.
+    file.set_permissions(fs::Permissions::from_mode(0o644))
         .map_err(|error| HardwareError::Io(error.to_string()))?;
     fs::rename(&temporary, &path).map_err(|error| HardwareError::Io(error.to_string()))
 }
@@ -946,16 +1055,19 @@ fn status_revision(
         hash.update(zone.kind.as_bytes());
         hash.update(zone.policy.as_deref().unwrap_or("").as_bytes());
         hash.update(&[u8::from(zone.supports_user_space)]);
+        if let Ok(bytes) = serde_json::to_vec(&zone.cooling_device_ids) {
+            hash.update(&bytes);
+        }
     }
     for device in devices {
         hash.update(device.id.as_bytes());
         hash.update(device.kind.as_bytes());
         hash.update(&device.max_state.to_le_bytes());
     }
-    if let Some(saved) = saved
-        && let Ok(bytes) = serde_json::to_vec(saved)
-    {
-        hash.update(&bytes);
+    if let Some(saved) = saved {
+        if let Ok(bytes) = serde_json::to_vec(saved) {
+            hash.update(&bytes);
+        }
     }
     format!("fan-{:016x}", hash.finish())
 }
@@ -1049,6 +1161,7 @@ fn demo_status() -> FanCurveStatus {
             temperature_c: Some(54.8),
             policy: Some(USER_SPACE_POLICY.into()),
             supports_user_space: true,
+            cooling_device_ids: Some(vec!["cooling_device0".into()]),
         },
         FanCurveZone {
             id: "thermal_zone1".into(),
@@ -1056,6 +1169,7 @@ fn demo_status() -> FanCurveStatus {
             temperature_c: Some(50.2),
             policy: Some("step_wise".into()),
             supports_user_space: true,
+            cooling_device_ids: Some(vec![]),
         },
     ];
     let cooling_devices = vec![FanCurveDevice {
@@ -1123,6 +1237,7 @@ mod tests {
         write_fixture(&device.join("type"), "pwm-fan\n");
         write_fixture(&device.join("cur_state"), "2\n");
         write_fixture(&device.join("max_state"), "4\n");
+        std::os::unix::fs::symlink("../cooling_device0", zone.join("cdev0")).unwrap();
     }
 
     fn add_fixture_service(root: &Path) {
@@ -1250,6 +1365,129 @@ mod tests {
         assert!(FanCurveApplyLock::try_acquire(&root).is_err());
         drop(first);
         assert!(FanCurveApplyLock::try_acquire(&root).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mixed_cpu_fan_zone_is_rejected_and_saved_governor_is_recovered() {
+        let root = fixture_root();
+        add_fixture_hardware(&root);
+        add_fixture_service(&root);
+        let saved = SavedFanCurve {
+            config: demo_config(),
+            previous_policy: "step_wise".into(),
+        };
+        write_saved(&root, &saved).unwrap();
+        let manager = FanCurveManager::at_root(root.clone());
+        let before = manager.status().unwrap().revision;
+        let thermal = root.join("sys/class/thermal");
+        write_fixture(&thermal.join("cooling_device1/type"), "thermal-cpufreq-0\n");
+        std::os::unix::fs::symlink("../cooling_device1", thermal.join("thermal_zone0/cdev1"))
+            .unwrap();
+        assert_ne!(before, manager.status().unwrap().revision);
+        assert!(matches!(
+            manager.plan(&FanCurveRequest {
+                enabled: true,
+                config: Some(demo_config()),
+            }),
+            Err(HardwareError::Conflict(_))
+        ));
+        assert!(manager.tick().is_err());
+        assert_eq!(
+            read_trimmed(thermal.join("thermal_zone0/policy")).as_deref(),
+            Some("step_wise")
+        );
+        // Legacy persisted curves must not retake CPU cooling during service stop.
+        fs::write(thermal.join("thermal_zone0/policy"), "user_space\n").unwrap();
+        manager.shutdown_failsafe().unwrap();
+        assert_eq!(
+            read_trimmed(thermal.join("thermal_zone0/policy")).as_deref(),
+            Some("step_wise")
+        );
+        assert_eq!(read_u32(thermal.join("cooling_device0/cur_state")), Some(4));
+        assert!(
+            manager
+                .plan(&FanCurveRequest {
+                    enabled: false,
+                    config: None
+                })
+                .is_ok()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fan_bindings_must_be_exclusive_and_readable() {
+        let root = fixture_root();
+        add_fixture_hardware(&root);
+        let thermal = root.join("sys/class/thermal");
+        assert!(
+            validate_fan_binding(&discover_zones(&root), "thermal_zone0", "cooling_device0")
+                .is_ok()
+        );
+        write_fixture(&thermal.join("thermal_zone1/type"), "gpu-thermal\n");
+        std::os::unix::fs::symlink("../cooling_device0", thermal.join("thermal_zone1/cdev0"))
+            .unwrap();
+        assert!(
+            validate_fan_binding(&discover_zones(&root), "thermal_zone0", "cooling_device0")
+                .is_err()
+        );
+        fs::remove_file(thermal.join("thermal_zone1/cdev0")).unwrap();
+        std::os::unix::fs::symlink(
+            "../cooling_device_missing",
+            thermal.join("thermal_zone1/cdev0"),
+        )
+        .unwrap();
+        assert!(
+            validate_fan_binding(&discover_zones(&root), "thermal_zone0", "cooling_device0")
+                .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn replaced_fan_id_does_not_disable_cpu_cooling_during_shutdown() {
+        let root = fixture_root();
+        add_fixture_hardware(&root);
+        write_saved(
+            &root,
+            &SavedFanCurve {
+                config: demo_config(),
+                previous_policy: "step_wise".into(),
+            },
+        )
+        .unwrap();
+        let thermal = root.join("sys/class/thermal");
+        fs::write(thermal.join("cooling_device0/type"), "thermal-cpufreq-0\n").unwrap();
+        let manager = FanCurveManager::at_root(root.clone());
+        assert!(manager.shutdown_failsafe().is_err());
+        assert_eq!(
+            read_trimmed(thermal.join("thermal_zone0/policy")).as_deref(),
+            Some("step_wise")
+        );
+        assert_eq!(read_u32(thermal.join("cooling_device0/cur_state")), Some(2));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn saved_curve_is_user_readable_but_only_root_writable() {
+        let root = fixture_root();
+        let saved = SavedFanCurve {
+            config: demo_config(),
+            previous_policy: "step_wise".into(),
+        };
+        write_saved(&root, &saved).unwrap();
+        let path = rooted_path(&root, CONFIG_FILE);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        write_saved(&root, &saved).unwrap();
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
