@@ -4,6 +4,7 @@ use crate::{
         FunctionEvidence, PinoutPin, PinoutProfile, profile_by_id, profile_for_root,
         resolve_function_evidence,
     },
+    transaction::{ProcessLock, atomic_replace},
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -500,6 +501,8 @@ impl HardwareManager {
                 self.plan_overlays_from_status(status, selected_ids)
             });
         }
+        let _lock = ProcessLock::acquire(&self.root, "rsetup-next-uboot-overlays.lock")
+            .map_err(|error| HardwareError::Io(error.to_string()))?;
         let plan = self.plan_overlays(selected_ids)?;
         verify_overlay_plan(&plan, plan_token)?;
         let started_at = Utc::now();
@@ -527,11 +530,10 @@ impl HardwareManager {
         for change in &plan.changes {
             let (from, to) = overlay_paths(&directory, &change.id, change.after_enabled);
             if let Err(error) = fs::rename(&from, &to) {
-                rollback_renames(&completed);
-                return Err(HardwareError::Io(format!(
-                    "unable to update {}: {error}",
-                    change.id
-                )));
+                return Err(with_rollback_result(
+                    HardwareError::Io(format!("unable to update {}: {error}", change.id)),
+                    rollback_renames(&completed),
+                ));
             }
             completed.push((from, to));
         }
@@ -555,19 +557,21 @@ impl HardwareManager {
                 })
             }
             Ok(output) => {
-                rollback_renames(&completed);
-                let _ = Command::new("u-boot-update").output();
-                Err(HardwareError::Io(format!(
-                    "u-boot-update failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                )))
+                let rollback = rollback_overlays(&completed);
+                Err(with_rollback_result(
+                    HardwareError::Io(format!(
+                        "u-boot-update failed: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    )),
+                    rollback,
+                ))
             }
             Err(error) => {
-                rollback_renames(&completed);
-                let _ = Command::new("u-boot-update").output();
-                Err(HardwareError::Io(format!(
-                    "unable to start u-boot-update: {error}"
-                )))
+                let rollback = rollback_overlays(&completed);
+                Err(with_rollback_result(
+                    HardwareError::Io(format!("unable to start u-boot-update: {error}")),
+                    rollback,
+                ))
             }
         }
     }
@@ -1080,6 +1084,8 @@ impl HardwareManager {
         led_id: &str,
         trigger: &str,
     ) -> Result<ActionRun, HardwareError> {
+        let _lock = ProcessLock::acquire(&self.root, "rsetup-next-led.lock")
+            .map_err(|error| HardwareError::Io(error.to_string()))?;
         validate_led_id(led_id)?;
         validate_led_trigger(trigger)?;
         let status = self.led_status()?;
@@ -1129,6 +1135,8 @@ impl HardwareManager {
         &self,
         config: &RgbLedConfig,
     ) -> Result<ActionRun, HardwareError> {
+        let _lock = ProcessLock::acquire(&self.root, "rsetup-next-led.lock")
+            .map_err(|error| HardwareError::Io(error.to_string()))?;
         let status = self.validate_rgb_led_config(config)?;
         let group = status
             .rgb_groups
@@ -1185,6 +1193,8 @@ impl HardwareManager {
     }
 
     pub(crate) fn restore_led_state_live(&self) -> Result<ActionRun, HardwareError> {
+        let _lock = ProcessLock::acquire(&self.root, "rsetup-next-led.lock")
+            .map_err(|error| HardwareError::Io(error.to_string()))?;
         let saved = read_led_saved_state(&self.root)?;
         let status = self.led_status()?;
         let nodes = self.led_nodes();
@@ -1395,6 +1405,13 @@ impl HardwareManager {
         &self,
         policy: &str,
     ) -> Result<ActionRun, HardwareError> {
+        let _lock = ProcessLock::acquire(&self.root, "rsetup-next-fan-curve.lock")
+            .map_err(|error| HardwareError::Io(error.to_string()))?;
+        if self.root.join("etc/rsetup-next/fan-curve.json").exists() {
+            return Err(HardwareError::Conflict(
+                "disable the fan curve before changing the thermal policy".into(),
+            ));
+        }
         validate_policy(policy)?;
         let status = self.thermal_status()?;
         if !status.supported {
@@ -1452,16 +1469,17 @@ impl HardwareManager {
                 .join(&zone.id)
                 .join("policy");
             if let Err(error) = fs::write(&path, format!("{policy}\n")) {
-                restore_zone_policies(&self.root, &previous);
-                return Err(HardwareError::Io(format!(
-                    "unable to update {}: {error}",
-                    zone.id
-                )));
+                return Err(with_rollback_result(
+                    HardwareError::Io(format!("unable to update {}: {error}", zone.id)),
+                    restore_zone_policies(&self.root, &previous),
+                ));
             }
         }
         if let Err(error) = write_thermal_policy(&self.root, policy) {
-            restore_zone_policies(&self.root, &previous);
-            return Err(error);
+            return Err(with_rollback_result(
+                error,
+                restore_zone_policies(&self.root, &previous),
+            ));
         }
         Ok(hardware_run(
             "hardware.thermal-policy",
@@ -1475,6 +1493,13 @@ impl HardwareManager {
     }
 
     pub(crate) fn restore_thermal_policy_live(&self) -> Result<ActionRun, HardwareError> {
+        let _lock = ProcessLock::acquire(&self.root, "rsetup-next-fan-curve.lock")
+            .map_err(|error| HardwareError::Io(error.to_string()))?;
+        if self.root.join("etc/rsetup-next/fan-curve.json").exists() {
+            return Err(HardwareError::Conflict(
+                "disable the fan curve before changing the thermal policy".into(),
+            ));
+        }
         let path = self.root.join(THERMAL_POLICY_FILE.trim_start_matches('/'));
         let policy = read_trimmed(path)
             .ok_or_else(|| HardwareError::Unsupported("no saved thermal policy".into()))?;
@@ -1846,15 +1871,9 @@ fn write_led_saved_state(root: &Path, state: &LedSavedState) -> Result<(), Hardw
         .parent()
         .ok_or_else(|| HardwareError::Io("invalid LED state path".into()))?;
     fs::create_dir_all(parent).map_err(|error| HardwareError::Io(error.to_string()))?;
-    let temporary = parent.join(format!(".led-state.{}.json", std::process::id()));
     let bytes =
         serde_json::to_vec_pretty(state).map_err(|error| HardwareError::Io(error.to_string()))?;
-    fs::write(&temporary, bytes).map_err(|error| HardwareError::Io(error.to_string()))?;
-    if let Err(error) = fs::rename(&temporary, path) {
-        let _ = fs::remove_file(&temporary);
-        return Err(HardwareError::Io(error.to_string()));
-    }
-    Ok(())
+    atomic_replace(&path, &bytes).map_err(|error| HardwareError::Io(error.to_string()))
 }
 
 fn enable_led_persistence(root: &Path) -> Result<(), HardwareError> {
@@ -1927,18 +1946,56 @@ fn overlay_paths(directory: &Path, id: &str, after_enabled: bool) -> (PathBuf, P
     }
 }
 
-fn rollback_renames(completed: &[(PathBuf, PathBuf)]) {
+fn rollback_renames(completed: &[(PathBuf, PathBuf)]) -> Result<(), HardwareError> {
+    let mut errors = Vec::new();
     for (from, to) in completed.iter().rev() {
-        let _ = fs::rename(to, from);
+        if let Err(error) = fs::rename(to, from) {
+            errors.push(format!("{}: {error}", from.display()));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(HardwareError::Io(errors.join("; ")))
     }
 }
 
-fn restore_zone_policies(root: &Path, previous: &[(String, String)]) {
+fn rollback_overlays(completed: &[(PathBuf, PathBuf)]) -> Result<(), HardwareError> {
+    let renames = rollback_renames(completed);
+    let update = Command::new("u-boot-update")
+        .output()
+        .map_err(|error| HardwareError::Io(error.to_string()))
+        .and_then(|output| {
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(HardwareError::Io(format!(
+                    "rollback u-boot-update failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )))
+            }
+        });
+    match (renames, update) {
+        (Err(first), Err(second)) => Err(HardwareError::Io(format!("{first}; {second}"))),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        _ => Ok(()),
+    }
+}
+
+fn restore_zone_policies(root: &Path, previous: &[(String, String)]) -> Result<(), HardwareError> {
+    let mut errors = Vec::new();
     for (zone, policy) in previous {
-        let _ = fs::write(
+        if let Err(error) = fs::write(
             root.join("sys/class/thermal").join(zone).join("policy"),
             format!("{policy}\n"),
-        );
+        ) {
+            errors.push(format!("{zone}: {error}"));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(HardwareError::Io(errors.join("; ")))
     }
 }
 
@@ -1948,10 +2005,8 @@ fn write_thermal_policy(root: &Path, policy: &str) -> Result<(), HardwareError> 
         .parent()
         .ok_or_else(|| HardwareError::Io("invalid thermal policy path".into()))?;
     fs::create_dir_all(parent).map_err(|error| HardwareError::Io(error.to_string()))?;
-    let temporary = parent.join(format!(".thermal-policy.{}", std::process::id()));
-    fs::write(&temporary, format!("{policy}\n"))
-        .map_err(|error| HardwareError::Io(error.to_string()))?;
-    fs::rename(&temporary, &path).map_err(|error| HardwareError::Io(error.to_string()))
+    atomic_replace(&path, format!("{policy}\n").as_bytes())
+        .map_err(|error| HardwareError::Io(error.to_string()))
 }
 
 fn policy_intersection(zones: &[ThermalZone]) -> Vec<String> {
@@ -2736,9 +2791,9 @@ mod tests {
         }
         let state_directory = root.join("etc/rsetup-next");
         fs::create_dir_all(&state_directory).unwrap();
-        fs::write(state_directory.join("led-state.json"), "{}\n").unwrap();
-        fs::create_dir(state_directory.join(format!(".led-state.{}.json", std::process::id())))
-            .unwrap();
+        // Readable prior state, but atomic replacement must reject a symlink.
+        fs::write(state_directory.join("prior.json"), "{}\n").unwrap();
+        std::os::unix::fs::symlink("prior.json", state_directory.join("led-state.json")).unwrap();
         let manager = HardwareManager::at_root(root.clone());
 
         assert!(manager.apply_led_trigger_live("status", "timer").is_err());
