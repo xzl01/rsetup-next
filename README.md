@@ -204,7 +204,20 @@ source, overlay, SPI, or fan-curve plans, validated thermal and LED
 configurations, their fixed boot-time restore verbs, or the read-only
 `overlays-inspect` verb (no path or command arguments). It has no arbitrary
 command mode. If authorization is cancelled, the interfaces report
-`authorization_failed` without changing the system.
+`authorization_canceled` without changing the system.
+
+The desktop launcher defaults to inspection/preview. Start
+`rsetup-desktop --live-execution` (or `npm run dev -- -- --live-execution`
+from `apps/desktop`) to opt into live operations; each change still requires
+its confirmation and Polkit authorization. `--demo` never mutates hardware.
+The desktop build stages production UI files only; browser tests are not bundled.
+
+The HTTP server rejects non-loopback listeners and non-local Host/Origin headers.
+For remote use, keep the server on the SBC loopback and forward it with
+`ssh -L 8788:127.0.0.1:8788 radxa@SBC_ADDRESS`, then open
+`http://127.0.0.1:8788`. Non-browser API clients must include
+`X-Rsetup-Request: 1` on POST requests. This is a browser-origin boundary,
+not authentication against other local processes. Do not expose it via a public proxy.
 
 The native fan-curve contract is shared by the CLI commands under
 `hardware thermal fan-curve`, HTTP `GET /api/v1/hardware/thermal/fan-curve`,
