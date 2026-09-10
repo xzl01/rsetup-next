@@ -380,6 +380,7 @@ impl SpiFlashManager {
             Uuid::new_v4().simple()
         ));
         copy_exact_to_new_file(target_path, &path, plan.target.size_bytes)?;
+        crate::transaction::sync_directory(&directory).map_err(io_error)?;
         Ok(path)
     }
 
@@ -671,6 +672,7 @@ fn plan_token(revision: &str, request: &SpiFlashRequest) -> String {
     format!("spi-plan-{:016x}", hash.finish())
 }
 
+// State-change detection only. This token does not grant authorization.
 struct StableHash(u64);
 
 impl StableHash {

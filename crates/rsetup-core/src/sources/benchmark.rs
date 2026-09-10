@@ -319,6 +319,7 @@ fn parse_metrics(values: &[&str]) -> Option<(f64, f64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     #[ignore = "requires curl and loopback sockets; run explicitly in CI"]

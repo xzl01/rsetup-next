@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use rsetup_core::{
     Controller, ExecutionPolicy, FanCurveRequest, ProbeMode, RgbLedConfig, SpiFlashRequest,
 };
-use std::{env, process::Command};
+use std::env;
 
 #[derive(Debug, PartialEq)]
 enum HelperRequest {
@@ -184,12 +184,8 @@ fn parse_request(arguments: &[String]) -> Result<HelperRequest> {
 }
 
 fn effective_uid() -> Option<u32> {
-    let output = Command::new("id")
-        .arg("-u")
-        .output()
-        .context("unable to inspect effective user")
-        .ok()?;
-    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+    // SAFETY: geteuid has no preconditions and does not depend on PATH.
+    Some(unsafe { libc::geteuid() })
 }
 
 #[cfg(test)]

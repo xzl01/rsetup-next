@@ -7,6 +7,7 @@ mod pinout;
 mod probe;
 mod sources;
 mod spi_flash;
+mod transaction;
 mod video;
 
 pub use actions::{ActionError, Controller, ExecutionPolicy};

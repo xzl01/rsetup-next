@@ -1,9 +1,10 @@
 use anyhow::Result;
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::{StatusCode, header},
-    response::{Html, IntoResponse},
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
 use rsetup_core::{
@@ -121,6 +122,10 @@ struct RgbLedRequest {
 }
 
 pub async fn serve(controller: Controller, listen: SocketAddr) -> Result<()> {
+    anyhow::ensure!(
+        listen.ip().is_loopback(),
+        "The unauthenticated control console only accepts loopback listeners. Use an SSH tunnel for remote access."
+    );
     let app = router(controller);
     let listener = TcpListener::bind(listen).await?;
     tracing::info!("control center ready at http://{listen}");
@@ -187,8 +192,92 @@ pub fn router(controller: Controller) -> Router {
             post(apply_fan_curve),
         )
         .route("/api/v1/activity", get(activity))
+        .layer(middleware::from_fn(local_boundary))
         .layer(TraceLayer::new_for_http())
         .with_state(Arc::new(controller))
+}
+
+async fn local_boundary(request: Request, next: Next) -> Response {
+    let valid = valid_request_boundary(&request);
+    let mut response = if valid {
+        next.run(request).await
+    } else {
+        (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": {"code": "request_forbidden", "message": "Use the local console or an SSH tunnel; cross-origin requests are forbidden."}}))).into_response()
+    };
+    let headers = response.headers_mut();
+    headers.insert("content-security-policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'".parse().unwrap());
+    headers.insert("x-content-type-options", "nosniff".parse().unwrap());
+    headers.insert("referrer-policy", "no-referrer".parse().unwrap());
+    headers.insert("cache-control", "no-store".parse().unwrap());
+    response
+}
+
+fn valid_request_boundary(request: &Request) -> bool {
+    let headers = request.headers();
+    if headers.get_all(header::HOST).iter().count() != 1 {
+        return false;
+    }
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    if host.contains('@') {
+        return false;
+    }
+    let Ok(authority) = host.parse::<axum::http::uri::Authority>() else {
+        return false;
+    };
+    let hostname = authority.host().trim_matches(['[', ']']);
+    if !hostname.eq_ignore_ascii_case("localhost")
+        && !hostname
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+    {
+        return false;
+    }
+    if headers.get_all(header::ORIGIN).iter().count() > 1 {
+        return false;
+    }
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        if origin.to_str().ok() != Some(format!("http://{host}").as_str()) {
+            return false;
+        }
+    }
+    if let Some(site) = headers.get("sec-fetch-site") {
+        if !matches!(site.to_str(), Ok("same-origin" | "none")) {
+            return false;
+        }
+    }
+    request.method() == axum::http::Method::GET
+        || request.method() == axum::http::Method::HEAD
+        || headers
+            .get("x-rsetup-request")
+            .is_some_and(|value| value == "1")
+}
+
+async fn blocking<T: Send + 'static>(
+    operation: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
+) -> Result<T, ApiError> {
+    static SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    let permit = SLOTS
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(8)))
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "server_busy",
+                "Too many operations are running; retry after they complete.".into(),
+            )
+        })?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation()
+    })
+    .await
+    .map_err(ApiError::internal)?
 }
 
 async fn index() -> Html<&'static str> {
@@ -262,15 +351,19 @@ async fn health() -> Json<serde_json::Value> {
 async fn snapshot(
     State(controller): State<Arc<Controller>>,
 ) -> Result<Json<DeviceSnapshot>, ApiError> {
-    controller.snapshot().map(Json).map_err(ApiError::internal)
+    blocking(move || controller.snapshot().map(Json).map_err(ApiError::internal)).await
 }
 
-async fn actions(State(controller): State<Arc<Controller>>) -> Json<Vec<ActionSpec>> {
-    Json(controller.actions())
+async fn actions(
+    State(controller): State<Arc<Controller>>,
+) -> Result<Json<Vec<ActionSpec>>, ApiError> {
+    blocking(move || Ok(Json(controller.actions()))).await
 }
 
-async fn activity(State(controller): State<Arc<Controller>>) -> Json<Vec<ActivityEvent>> {
-    Json(controller.activity())
+async fn activity(
+    State(controller): State<Arc<Controller>>,
+) -> Result<Json<Vec<ActivityEvent>>, ApiError> {
+    blocking(move || Ok(Json(controller.activity()))).await
 }
 
 async fn run_action(
@@ -278,273 +371,343 @@ async fn run_action(
     Path(id): Path<String>,
     Json(request): Json<RunRequest>,
 ) -> Result<Json<ActionRun>, ApiError> {
-    controller
-        .execute(&id, request.confirm)
-        .map(Json)
-        .map_err(|error| {
-            use rsetup_core::ActionError;
-            match error {
-                ActionError::Unknown(_) => {
-                    ApiError::new(StatusCode::NOT_FOUND, "unknown_action", error.to_string())
+    blocking(move || {
+        controller
+            .execute(&id, request.confirm)
+            .map(Json)
+            .map_err(|error| {
+                use rsetup_core::ActionError;
+                match error {
+                    ActionError::Unknown(_) => {
+                        ApiError::new(StatusCode::NOT_FOUND, "unknown_action", error.to_string())
+                    }
+                    ActionError::ConfirmationRequired(_) => ApiError::new(
+                        StatusCode::CONFLICT,
+                        "confirmation_required",
+                        error.to_string(),
+                    ),
+                    ActionError::Unavailable(_) => ApiError::new(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "action_unavailable",
+                        error.to_string(),
+                    ),
+                    ActionError::RootRequired(_) => {
+                        ApiError::new(StatusCode::FORBIDDEN, "root_required", error.to_string())
+                    }
+                    ActionError::AuthorizationCanceled => ApiError::new(
+                        StatusCode::FORBIDDEN,
+                        "authorization_canceled",
+                        error.to_string(),
+                    ),
+                    ActionError::Authorization(_, _) => ApiError::new(
+                        StatusCode::FORBIDDEN,
+                        "authorization_failed",
+                        error.to_string(),
+                    ),
+                    ActionError::InputRequired(_) => ApiError::new(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "input_required",
+                        error.to_string(),
+                    ),
+                    ActionError::Launch(_) => ApiError::internal(error),
                 }
-                ActionError::ConfirmationRequired(_) => ApiError::new(
-                    StatusCode::CONFLICT,
-                    "confirmation_required",
-                    error.to_string(),
-                ),
-                ActionError::Unavailable(_) => ApiError::new(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "action_unavailable",
-                    error.to_string(),
-                ),
-                ActionError::RootRequired(_) => {
-                    ApiError::new(StatusCode::FORBIDDEN, "root_required", error.to_string())
-                }
-                ActionError::Authorization(_, _) => ApiError::new(
-                    StatusCode::FORBIDDEN,
-                    "authorization_failed",
-                    error.to_string(),
-                ),
-                ActionError::InputRequired(_) => ApiError::new(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "input_required",
-                    error.to_string(),
-                ),
-                ActionError::Launch(_) => ApiError::internal(error),
-            }
-        })
+            })
+    })
+    .await
 }
 
 async fn source_status(
     State(controller): State<Arc<Controller>>,
 ) -> Result<Json<SourceStatus>, ApiError> {
-    controller
-        .source_status()
-        .map(Json)
-        .map_err(ApiError::from_source)
+    blocking(move || {
+        controller
+            .source_status()
+            .map(Json)
+            .map_err(ApiError::from_source)
+    })
+    .await
 }
 
 async fn plan_sources(
     State(controller): State<Arc<Controller>>,
     Json(request): Json<SourceRequest>,
 ) -> Result<Json<SourcePlan>, ApiError> {
-    controller
-        .plan_source_change(&request.provider_id)
-        .map(Json)
-        .map_err(ApiError::from_source)
+    blocking(move || {
+        controller
+            .plan_source_change(&request.provider_id)
+            .map(Json)
+            .map_err(ApiError::from_source)
+    })
+    .await
 }
 
 async fn benchmark_source(
     State(controller): State<Arc<Controller>>,
     Json(request): Json<SourceRequest>,
 ) -> Result<Json<rsetup_core::MirrorBenchmark>, ApiError> {
-    tokio::task::spawn_blocking(move || controller.benchmark_source(&request.provider_id))
-        .await
-        .map_err(ApiError::internal)?
-        .map(Json)
-        .map_err(ApiError::from_source)
+    blocking(move || {
+        controller
+            .benchmark_source(&request.provider_id)
+            .map(Json)
+            .map_err(ApiError::from_source)
+    })
+    .await
 }
 
 async fn apply_sources(
     State(controller): State<Arc<Controller>>,
     Json(request): Json<SourceRequest>,
 ) -> Result<Json<SourceApplyResult>, ApiError> {
-    controller
-        .apply_source_change(
-            &request.provider_id,
-            request.plan_token.as_deref().unwrap_or_default(),
-            request.confirm,
-        )
-        .map(Json)
-        .map_err(ApiError::from_source)
+    blocking(move || {
+        controller
+            .apply_source_change(
+                &request.provider_id,
+                request.plan_token.as_deref().unwrap_or_default(),
+                request.confirm,
+            )
+            .map(Json)
+            .map_err(ApiError::from_source)
+    })
+    .await
 }
 
 async fn overlay_status(
     State(controller): State<Arc<Controller>>,
 ) -> Result<Json<OverlayStatus>, ApiError> {
-    controller
-        .overlay_status()
-        .map(Json)
-        .map_err(ApiError::from_hardware)
+    blocking(move || {
+        controller
+            .overlay_status()
+            .map(Json)
+            .map_err(ApiError::from_hardware)
+    })
+    .await
 }
 
 async fn plan_overlays(
     State(controller): State<Arc<Controller>>,
     Json(request): Json<OverlayRequest>,
 ) -> Result<Json<OverlayPlan>, ApiError> {
-    controller
-        .plan_overlay_change(&request.selected_ids)
-        .map(Json)
-        .map_err(ApiError::from_hardware)
+    blocking(move || {
+        controller
+            .plan_overlay_change(&request.selected_ids)
+            .map(Json)
+            .map_err(ApiError::from_hardware)
+    })
+    .await
 }
 
 async fn authorize_overlay_read(
     State(controller): State<Arc<Controller>>,
 ) -> Result<Json<OverlayStatus>, ApiError> {
-    tokio::task::spawn_blocking(move || controller.authorize_overlay_read())
-        .await
-        .map_err(|error| {
-            ApiError::from_hardware(rsetup_core::HardwareError::Io(error.to_string()))
-        })?
-        .map(Json)
-        .map_err(ApiError::from_hardware)
+    blocking(move || {
+        controller
+            .authorize_overlay_read()
+            .map(Json)
+            .map_err(ApiError::from_hardware)
+    })
+    .await
 }
 
 async fn apply_overlays(
     State(controller): State<Arc<Controller>>,
     Json(request): Json<OverlayRequest>,
 ) -> Result<Json<OverlayApplyResult>, ApiError> {
-    controller
-        .apply_overlay_change(
-            &request.selected_ids,
-            request.plan_token.as_deref().unwrap_or_default(),
-            request.confirm,
-        )
-        .map(Json)
-        .map_err(ApiError::from_hardware)
+    blocking(move || {
+        controller
+            .apply_overlay_change(
+                &request.selected_ids,
+                request.plan_token.as_deref().unwrap_or_default(),
+                request.confirm,
+            )
+            .map(Json)
+            .map_err(ApiError::from_hardware)
+    })
+    .await
 }
 
 async fn gpio_status(
     State(controller): State<Arc<Controller>>,
     Query(query): Query<GpioQuery>,
 ) -> Result<Json<GpioStatus>, ApiError> {
-    controller
-        .gpio_status_for_profile(query.profile.as_deref())
-        .map(Json)
-        .map_err(ApiError::from_hardware)
+    blocking(move || {
+        controller
+            .gpio_status_for_profile(query.profile.as_deref())
+            .map(Json)
+            .map_err(ApiError::from_hardware)
+    })
+    .await
 }
 
 async fn spi_flash_status(
     State(controller): State<Arc<Controller>>,
 ) -> Result<Json<SpiFlashStatus>, ApiError> {
-    controller
-        .spi_flash_status()
-        .map(Json)
-        .map_err(ApiError::from_hardware)
+    blocking(move || {
+        controller
+            .spi_flash_status()
+            .map(Json)
+            .map_err(ApiError::from_hardware)
+    })
+    .await
 }
 
 async fn plan_spi_flash(
     State(controller): State<Arc<Controller>>,
     Json(request): Json<SpiFlashApiRequest>,
 ) -> Result<Json<SpiFlashPlan>, ApiError> {
-    controller
-        .plan_spi_flash(&request.request)
-        .map(Json)
-        .map_err(ApiError::from_hardware)
+    blocking(move || {
+        controller
+            .plan_spi_flash(&request.request)
+            .map(Json)
+            .map_err(ApiError::from_hardware)
+    })
+    .await
 }
 
 async fn apply_spi_flash(
     State(controller): State<Arc<Controller>>,
     Json(request): Json<SpiFlashApiRequest>,
 ) -> Result<Json<SpiFlashApplyResult>, ApiError> {
-    controller
-        .apply_spi_flash(
-            &request.request,
-            request.plan_token.as_deref().unwrap_or_default(),
-            request.confirm,
-        )
-        .map(Json)
-        .map_err(ApiError::from_hardware)
+    blocking(move || {
+        controller
+            .apply_spi_flash(
+                &request.request,
+                request.plan_token.as_deref().unwrap_or_default(),
+                request.confirm,
+            )
+            .map(Json)
+            .map_err(ApiError::from_hardware)
+    })
+    .await
 }
 
 async fn led_status(
     State(controller): State<Arc<Controller>>,
 ) -> Result<Json<LedStatus>, ApiError> {
-    controller
-        .led_status()
-        .map(Json)
-        .map_err(ApiError::from_hardware)
+    blocking(move || {
+        controller
+            .led_status()
+            .map(Json)
+            .map_err(ApiError::from_hardware)
+    })
+    .await
 }
 
 async fn apply_led_trigger(
     State(controller): State<Arc<Controller>>,
     Json(request): Json<LedTriggerRequest>,
 ) -> Result<Json<ActionRun>, ApiError> {
-    controller
-        .apply_led_trigger(&request.led_id, &request.trigger, request.confirm)
-        .map(Json)
-        .map_err(ApiError::from_hardware)
+    blocking(move || {
+        controller
+            .apply_led_trigger(&request.led_id, &request.trigger, request.confirm)
+            .map(Json)
+            .map_err(ApiError::from_hardware)
+    })
+    .await
 }
 
 async fn apply_rgb_led(
     State(controller): State<Arc<Controller>>,
     Json(request): Json<RgbLedRequest>,
 ) -> Result<Json<ActionRun>, ApiError> {
-    controller
-        .apply_rgb_led(&request.config, request.confirm)
-        .map(Json)
-        .map_err(ApiError::from_hardware)
+    blocking(move || {
+        controller
+            .apply_rgb_led(&request.config, request.confirm)
+            .map(Json)
+            .map_err(ApiError::from_hardware)
+    })
+    .await
 }
 
 async fn video_status(
     State(controller): State<Arc<Controller>>,
 ) -> Result<Json<VideoStatus>, ApiError> {
-    controller
-        .video_status()
-        .map(Json)
-        .map_err(ApiError::from_hardware)
+    blocking(move || {
+        controller
+            .video_status()
+            .map(Json)
+            .map_err(ApiError::from_hardware)
+    })
+    .await
 }
 
 async fn capture_video(
     State(controller): State<Arc<Controller>>,
     Json(request): Json<VideoCaptureRequest>,
 ) -> Result<Json<VideoFrame>, ApiError> {
-    controller
-        .capture_video_frame(&request.device_id)
-        .map(Json)
-        .map_err(ApiError::from_hardware)
+    blocking(move || {
+        controller
+            .capture_video_frame(&request.device_id)
+            .map(Json)
+            .map_err(ApiError::from_hardware)
+    })
+    .await
 }
 
 async fn thermal_status(
     State(controller): State<Arc<Controller>>,
 ) -> Result<Json<ThermalStatus>, ApiError> {
-    controller
-        .thermal_status()
-        .map(Json)
-        .map_err(ApiError::from_hardware)
+    blocking(move || {
+        controller
+            .thermal_status()
+            .map(Json)
+            .map_err(ApiError::from_hardware)
+    })
+    .await
 }
 
 async fn apply_thermal_policy(
     State(controller): State<Arc<Controller>>,
     Json(request): Json<ThermalPolicyRequest>,
 ) -> Result<Json<ActionRun>, ApiError> {
-    controller
-        .apply_thermal_policy(&request.policy, request.confirm)
-        .map(Json)
-        .map_err(ApiError::from_hardware)
+    blocking(move || {
+        controller
+            .apply_thermal_policy(&request.policy, request.confirm)
+            .map(Json)
+            .map_err(ApiError::from_hardware)
+    })
+    .await
 }
 
 async fn fan_curve_status(
     State(controller): State<Arc<Controller>>,
 ) -> Result<Json<FanCurveStatus>, ApiError> {
-    controller
-        .fan_curve_status()
-        .map(Json)
-        .map_err(ApiError::from_hardware)
+    blocking(move || {
+        controller
+            .fan_curve_status()
+            .map(Json)
+            .map_err(ApiError::from_hardware)
+    })
+    .await
 }
 
 async fn plan_fan_curve(
     State(controller): State<Arc<Controller>>,
     Json(request): Json<FanCurveApiRequest>,
 ) -> Result<Json<FanCurvePlan>, ApiError> {
-    controller
-        .plan_fan_curve(&request.request)
-        .map(Json)
-        .map_err(ApiError::from_hardware)
+    blocking(move || {
+        controller
+            .plan_fan_curve(&request.request)
+            .map(Json)
+            .map_err(ApiError::from_hardware)
+    })
+    .await
 }
 
 async fn apply_fan_curve(
     State(controller): State<Arc<Controller>>,
     Json(request): Json<FanCurveApiRequest>,
 ) -> Result<Json<FanCurveApplyResult>, ApiError> {
-    controller
-        .apply_fan_curve(
-            &request.request,
-            request.plan_token.as_deref().unwrap_or_default(),
-            request.confirm,
-        )
-        .map(Json)
-        .map_err(ApiError::from_hardware)
+    blocking(move || {
+        controller
+            .apply_fan_curve(
+                &request.request,
+                request.plan_token.as_deref().unwrap_or_default(),
+                request.confirm,
+            )
+            .map(Json)
+            .map_err(ApiError::from_hardware)
+    })
+    .await
 }
 
 struct ApiError {
@@ -595,6 +758,11 @@ impl ApiError {
             SourceError::RootRequired => {
                 Self::new(StatusCode::FORBIDDEN, "root_required", error.to_string())
             }
+            SourceError::AuthorizationCanceled => Self::new(
+                StatusCode::FORBIDDEN,
+                "authorization_canceled",
+                error.to_string(),
+            ),
             SourceError::Authorization(_) => Self::new(
                 StatusCode::FORBIDDEN,
                 "authorization_failed",
@@ -634,6 +802,11 @@ impl ApiError {
             HardwareError::RootRequired => {
                 Self::new(StatusCode::FORBIDDEN, "root_required", error.to_string())
             }
+            HardwareError::AuthorizationCanceled => Self::new(
+                StatusCode::FORBIDDEN,
+                "authorization_canceled",
+                error.to_string(),
+            ),
             HardwareError::Authorization(_) => Self::new(
                 StatusCode::FORBIDDEN,
                 "authorization_failed",
@@ -655,7 +828,17 @@ impl IntoResponse for ApiError {
 }
 
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 #[cfg(test)]
@@ -672,5 +855,130 @@ mod tests {
     fn community_qr_assets_are_embedded() {
         assert!(COMMUNITY_QQ.starts_with(b"RIFF"));
         assert!(COMMUNITY_WECHAT.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    use axum::body::Body;
+    use rsetup_core::{ExecutionPolicy, ProbeMode};
+    use tower::ServiceExt;
+
+    fn app() -> Router {
+        router(Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun))
+    }
+
+    #[tokio::test]
+    async fn http_rejects_rebinding_and_cross_origin_and_sets_headers() {
+        for host in [
+            "evil.example:8788",
+            "192.168.2.186:8788",
+            "evil@localhost:8788",
+        ] {
+            let request = Request::builder()
+                .uri("/api/v1/health")
+                .header("host", host)
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                app().oneshot(request).await.unwrap().status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        for origin in ["https://evil.example", "null", "http://localhost:9999"] {
+            let request = Request::builder()
+                .uri("/api/v1/health")
+                .header("host", "localhost:8788")
+                .header("origin", origin)
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                app().oneshot(request).await.unwrap().status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        let request = Request::builder()
+            .uri("/app.js")
+            .header("host", "127.0.0.1:8788")
+            .body(Body::empty())
+            .unwrap();
+        let response = app().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+        assert!(
+            response.headers()["content-security-policy"]
+                .to_str()
+                .unwrap()
+                .contains("style-src 'self'")
+        );
+    }
+
+    #[tokio::test]
+    async fn mutation_requires_non_simple_request_header() {
+        for allowed in [false, true] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/api/v1/sources/plan")
+                .header("host", "localhost:8788")
+                .header("origin", "http://localhost:8788")
+                .header("content-type", "application/json");
+            if allowed {
+                request = request.header("x-rsetup-request", "1");
+            }
+            let response = app()
+                .oneshot(request.body(Body::from(r#"{"providerId":"cqu"}"#)).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if allowed {
+                    StatusCode::OK
+                } else {
+                    StatusCode::FORBIDDEN
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_non_loopback_listener_before_binding() {
+        assert!(
+            serve(
+                Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun),
+                "0.0.0.0:0".parse().unwrap()
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn synchronous_jobs_do_not_starve_health() {
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let job = tokio::spawn(blocking(move || {
+            let _ = started.send(());
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            Ok(())
+        }));
+        started_rx.await.unwrap();
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .header("host", "[::1]:8788")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        release.send(()).unwrap();
+        assert!(job.await.unwrap().is_ok());
     }
 }

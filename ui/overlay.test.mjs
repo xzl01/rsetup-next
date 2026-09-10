@@ -23,7 +23,7 @@ function harness() {
     toast(title, detail, error) { if (error) context.errors.push(detail); },
   };
   vm.createContext(context);
-  vm.runInContext(`${handler("previewOverlays")}\n${handler("applyOverlays")}`, context);
+  vm.runInContext(`${handler("beginApply")}\n${handler("showApplyError")}\n${handler("previewOverlays")}\n${handler("applyOverlays")}`, context);
   return context;
 }
 

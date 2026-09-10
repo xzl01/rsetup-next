@@ -55,6 +55,8 @@ pub enum ActionError {
     ConfirmationRequired(String),
     #[error("{0} requires root privileges")]
     RootRequired(String),
+    #[error("administrator authorization canceled")]
+    AuthorizationCanceled,
     #[error("administrator authorization failed for {0}: {1}")]
     Authorization(String, String),
     #[error("{0} requires guided input")]
@@ -208,6 +210,9 @@ impl Controller {
                 .args([PRIVILEGED_HELPER, "overlays-inspect"])
                 .output()
                 .map_err(|e| HardwareError::Authorization(e.to_string()))?;
+            if output.status.code() == Some(126) {
+                return Err(HardwareError::AuthorizationCanceled);
+            }
             if !output.status.success() {
                 return Err(HardwareError::Authorization(helper_error(
                     &output.stderr,
@@ -1207,8 +1212,8 @@ fn sleep_targets() -> [&'static str; 5] {
 }
 
 fn effective_uid() -> Option<u32> {
-    let output = Command::new("id").arg("-u").output().ok()?;
-    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+    // SAFETY: geteuid has no preconditions and does not depend on PATH.
+    Some(unsafe { libc::geteuid() })
 }
 
 fn run_privileged_action(action_id: &str, title: &str) -> Result<ActionRun, ActionError> {
@@ -1217,6 +1222,9 @@ fn run_privileged_action(action_id: &str, title: &str) -> Result<ActionRun, Acti
         .args([PRIVILEGED_HELPER, "action", action_id, "--confirmed"])
         .output()
         .map_err(|error| ActionError::Authorization(title.into(), error.to_string()))?;
+    if output.status.code() == Some(126) {
+        return Err(ActionError::AuthorizationCanceled);
+    }
     if !output.status.success() {
         return Err(ActionError::Authorization(
             title.into(),
@@ -1242,6 +1250,9 @@ fn run_privileged_source_apply(
         ])
         .output()
         .map_err(|error| SourceError::Authorization(error.to_string()))?;
+    if output.status.code() == Some(126) {
+        return Err(SourceError::AuthorizationCanceled);
+    }
     if !output.status.success() {
         return Err(SourceError::Authorization(helper_error(
             &output.stderr,
@@ -1268,6 +1279,9 @@ fn run_privileged_overlay_apply(
         ])
         .output()
         .map_err(|error| HardwareError::Authorization(error.to_string()))?;
+    if output.status.code() == Some(126) {
+        return Err(HardwareError::AuthorizationCanceled);
+    }
     if !output.status.success() {
         return Err(HardwareError::Authorization(helper_error(
             &output.stderr,
@@ -1296,6 +1310,9 @@ fn run_privileged_spi_flash_apply(
         ])
         .output()
         .map_err(|error| HardwareError::Authorization(error.to_string()))?;
+    if output.status.code() == Some(126) {
+        return Err(HardwareError::AuthorizationCanceled);
+    }
     if !output.status.success() {
         return Err(HardwareError::Authorization(helper_error(
             &output.stderr,
@@ -1312,6 +1329,9 @@ fn run_privileged_thermal_apply(policy: &str) -> Result<ActionRun, HardwareError
         .args([PRIVILEGED_HELPER, "thermal-apply", policy, "--confirmed"])
         .output()
         .map_err(|error| HardwareError::Authorization(error.to_string()))?;
+    if output.status.code() == Some(126) {
+        return Err(HardwareError::AuthorizationCanceled);
+    }
     if !output.status.success() {
         return Err(HardwareError::Authorization(helper_error(
             &output.stderr,
@@ -1339,6 +1359,9 @@ fn run_privileged_fan_curve_apply(
         ])
         .output()
         .map_err(|error| HardwareError::Authorization(error.to_string()))?;
+    if output.status.code() == Some(126) {
+        return Err(HardwareError::AuthorizationCanceled);
+    }
     if !output.status.success() {
         return Err(HardwareError::Authorization(helper_error(
             &output.stderr,
@@ -1361,6 +1384,9 @@ fn run_privileged_led_trigger(led_id: &str, trigger: &str) -> Result<ActionRun, 
         ])
         .output()
         .map_err(|error| HardwareError::Authorization(error.to_string()))?;
+    if output.status.code() == Some(126) {
+        return Err(HardwareError::AuthorizationCanceled);
+    }
     if !output.status.success() {
         return Err(HardwareError::Authorization(helper_error(
             &output.stderr,
@@ -1389,6 +1415,9 @@ fn run_privileged_rgb_led(config: &RgbLedConfig) -> Result<ActionRun, HardwareEr
         .args(arguments)
         .output()
         .map_err(|error| HardwareError::Authorization(error.to_string()))?;
+    if output.status.code() == Some(126) {
+        return Err(HardwareError::AuthorizationCanceled);
+    }
     if !output.status.success() {
         return Err(HardwareError::Authorization(helper_error(
             &output.stderr,

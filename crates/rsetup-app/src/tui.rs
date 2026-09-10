@@ -1,10 +1,6 @@
 use crate::i18n::Locale;
 use anyhow::{Result, anyhow};
-use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -26,19 +22,17 @@ const BONE: Color = Color::Rgb(232, 227, 213);
 const MUTED: Color = Color::Rgb(139, 145, 128);
 
 pub fn run(controller: Controller, locale: Locale) -> Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    // Ratatui installs a panic hook; the guard also covers initialization errors.
+    struct RestoreTerminal;
+    impl Drop for RestoreTerminal {
+        fn drop(&mut self) {
+            ratatui::restore();
+        }
+    }
+    let _restore = RestoreTerminal;
+    let mut terminal = ratatui::try_init()?;
     terminal.clear()?;
-
-    let result = run_loop(&mut terminal, controller, locale);
-
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    result
+    run_loop(&mut terminal, controller, locale)
 }
 
 fn run_loop(

@@ -1,10 +1,12 @@
-use crate::{ActionRun, ActionStatus};
+use crate::{
+    ActionRun, ActionStatus,
+    transaction::{ProcessLock, atomic_replace, sync_directory},
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
-    fs::{self, OpenOptions},
-    io::Write,
+    fs,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -105,6 +107,8 @@ pub enum SourceError {
     StalePlan,
     #[error("changing APT sources requires root privileges")]
     RootRequired,
+    #[error("administrator authorization canceled")]
+    AuthorizationCanceled,
     #[error("administrator authorization failed: {0}")]
     Authorization(String),
     #[error("unable to manage APT sources: {0}")]
@@ -312,6 +316,17 @@ impl SourceManager {
         provider_id: &str,
         plan_token: &str,
     ) -> Result<LiveApplyOutcome, SourceError> {
+        self.apply_with_refresh(provider_id, plan_token, apt_update)
+    }
+
+    fn apply_with_refresh(
+        &self,
+        provider_id: &str,
+        plan_token: &str,
+        refresh: impl FnOnce() -> Result<Option<String>, String>,
+    ) -> Result<LiveApplyOutcome, SourceError> {
+        let _lock = ProcessLock::acquire(&self.root, "rsetup-next-sources.lock")
+            .map_err(|error| SourceError::Io(error.to_string()))?;
         let (plan, pending) = self.build_plan(provider_id)?;
         verify_plan_token(&plan, plan_token)?;
         if pending.is_empty() {
@@ -327,39 +342,50 @@ impl SourceManager {
 
         let mut written = Vec::new();
         let mut backups = Vec::new();
-        for change in &pending {
-            let path = change
-                .document
-                .actual_path
-                .as_ref()
-                .ok_or_else(|| SourceError::Io("synthetic source cannot be written".into()))?;
-            let current = fs::read_to_string(path)
-                .map_err(|error| SourceError::Io(format!("{}: {error}", path.display())))?;
-            if current != change.document.content {
-                restore_written(&written);
-                return Err(SourceError::StalePlan);
+        let write_result = (|| -> Result<(), SourceError> {
+            for change in &pending {
+                let path =
+                    change.document.actual_path.as_ref().ok_or_else(|| {
+                        SourceError::Io("synthetic source cannot be written".into())
+                    })?;
+                let current = fs::read_to_string(path)
+                    .map_err(|error| SourceError::Io(format!("{}: {error}", path.display())))?;
+                if current != change.document.content {
+                    return Err(SourceError::StalePlan);
+                }
+                let backup = backup_path(path);
+                if let Err(error) = fs::copy(path, &backup) {
+                    return Err(SourceError::Io(format!(
+                        "unable to back up {}: {error}",
+                        change.document.display_path
+                    )));
+                }
+                fs::File::open(&backup)
+                    .and_then(|file| file.sync_all())
+                    .and_then(|()| sync_directory(backup.parent().expect("backup parent")))
+                    .map_err(|error| {
+                        SourceError::Io(format!("unable to persist backup: {error}"))
+                    })?;
+                backups.push(display_for_root(&self.root, &backup));
+                // Include the current file: rename may succeed before directory sync fails.
+                written.push((path.clone(), backup));
+                if let Err(error) = atomic_write(path, change.updated.as_bytes()) {
+                    return Err(SourceError::Io(format!(
+                        "unable to write {}: {error}",
+                        change.document.display_path
+                    )));
+                }
             }
-            let backup = backup_path(path);
-            if let Err(error) = fs::copy(path, &backup) {
-                restore_written(&written);
-                return Err(SourceError::Io(format!(
-                    "unable to back up {}: {error}",
-                    change.document.display_path
-                )));
-            }
-            backups.push(display_for_root(&self.root, &backup));
-            if let Err(error) = atomic_write(path, change.updated.as_bytes()) {
-                let _ = fs::copy(&backup, path);
-                restore_written(&written);
-                return Err(SourceError::Io(format!(
-                    "unable to write {}: {error}",
-                    change.document.display_path
-                )));
-            }
-            written.push((path.clone(), backup));
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            return Err(match restore_written(&written) {
+                Ok(()) => error,
+                Err(rollback) => SourceError::Io(format!("{error}; rollback failed: {rollback}")),
+            });
         }
 
-        let update = apt_update();
+        let update = refresh();
         match update {
             Ok(output) => Ok(LiveApplyOutcome {
                 plan,
@@ -370,15 +396,23 @@ impl SourceManager {
                 output,
             }),
             Err(message) => {
-                restore_written(&written);
+                let rollback = restore_written(&written);
+                let rolled_back = rollback.is_ok();
+                let summary = match rollback {
+                    Ok(()) => {
+                        "Package metadata refresh failed; the previous APT sources were restored."
+                            .into()
+                    }
+                    Err(error) => format!(
+                        "Package metadata refresh failed; rollback failed: {error}. Restore the listed backups before retrying."
+                    ),
+                };
                 Ok(LiveApplyOutcome {
                     plan,
                     backups,
-                    rolled_back: true,
+                    rolled_back,
                     status: ActionStatus::Failed,
-                    summary:
-                        "Package metadata refresh failed; the previous APT sources were restored."
-                            .into(),
+                    summary,
                     output: Some(message),
                 })
             }
@@ -858,6 +892,7 @@ fn plan_token(provider_id: &str, source_revision: &str, pending: &[PendingChange
     fingerprint.finish("plan-v1")
 }
 
+// State revision only: this non-cryptographic fingerprint is not an authorization credential.
 struct Fingerprint {
     left: u64,
     right: u64,
@@ -919,43 +954,24 @@ fn backup_path(path: &Path) -> PathBuf {
 }
 
 fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() {
-        return Err(std::io::Error::other("refusing to replace a symbolic link"));
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| std::io::Error::other("source file has no parent directory"))?;
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("sources");
-    let temporary = parent.join(format!(".{name}.rsetup-{}.tmp", Uuid::new_v4().simple()));
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
-        file.write_all(content)?;
-        file.set_permissions(metadata.permissions())?;
-        file.sync_all()?;
-        fs::rename(&temporary, path)?;
-        if let Ok(directory) = OpenOptions::new().read(true).open(parent) {
-            let _ = directory.sync_all();
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+    atomic_replace(path, content)
 }
 
-fn restore_written(written: &[(PathBuf, PathBuf)]) {
+fn restore_written(written: &[(PathBuf, PathBuf)]) -> std::io::Result<()> {
+    let mut errors = Vec::new();
     for (path, backup) in written.iter().rev() {
-        if let Ok(content) = fs::read(backup) {
-            let _ = atomic_write(path, &content);
+        if let Err(error) = fs::read(backup).and_then(|content| atomic_write(path, &content)) {
+            errors.push(format!(
+                "{} from {}: {error}",
+                path.display(),
+                backup.display()
+            ));
         }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(errors.join("; ")))
     }
 }
 
@@ -1007,6 +1023,70 @@ pub(crate) fn source_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rollback_fixture() -> (PathBuf, SourceManager, String) {
+        let root = std::env::temp_dir().join(format!("rsetup-rollback-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("etc/apt/sources.list.d")).unwrap();
+        fs::write(root.join("etc/os-release"), "ID=debian\n").unwrap();
+        let original = "deb https://deb.debian.org/debian bookworm main\n".to_string();
+        fs::write(root.join("etc/apt/sources.list"), &original).unwrap();
+        (root.clone(), SourceManager::at_root(root), original)
+    }
+
+    #[test]
+    fn failed_refresh_restores_atomically_and_reports_restore_failure() {
+        for sabotage in [false, true] {
+            let (root, manager, original) = rollback_fixture();
+            let plan = manager.plan("cqu").unwrap();
+            let result = manager
+                .apply_with_refresh("cqu", &plan.plan_token, || {
+                    assert_ne!(
+                        fs::read_to_string(root.join("etc/apt/sources.list")).unwrap(),
+                        original
+                    );
+                    if sabotage {
+                        // Break only the private fixture backup; never touch real APT files.
+                        for entry in fs::read_dir(root.join("etc/apt")).unwrap().flatten() {
+                            if entry.file_name().to_string_lossy().contains("rsetup") {
+                                fs::remove_file(entry.path()).unwrap();
+                            }
+                        }
+                    }
+                    Err("injected apt refresh failure".into())
+                })
+                .unwrap();
+            assert_eq!(result.status, ActionStatus::Failed);
+            assert_eq!(result.rolled_back, !sabotage);
+            if sabotage {
+                assert!(result.summary.contains("rollback failed"));
+                assert!(!result.backups.is_empty());
+            } else {
+                assert_eq!(
+                    fs::read_to_string(root.join("etc/apt/sources.list")).unwrap(),
+                    original
+                );
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn sources_lock_is_held_before_revalidation_and_refresh() {
+        let (root, manager, original) = rollback_fixture();
+        let plan = manager.plan("cqu").unwrap();
+        let lock = ProcessLock::acquire(&root, "rsetup-next-sources.lock").unwrap();
+        assert!(
+            manager
+                .apply_with_refresh("cqu", &plan.plan_token, || panic!("must not refresh"))
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("etc/apt/sources.list")).unwrap(),
+            original
+        );
+        drop(lock);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn plan_changes_deb822_and_radxa_without_touching_third_party() {

@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::Write,
     os::unix::{
         fs::{OpenOptionsExt, PermissionsExt},
         io::AsRawFd,
@@ -539,11 +538,9 @@ impl FanCurveManager {
         let operation: Result<(), HardwareError> = (|| {
             run_systemctl(&self.root, &["stop", SERVICE_UNIT])?;
             if let Some(saved) = &prior_saved {
-                if saved.config.zone_id != config.zone_id {
-                    write_policy(&self.root, &saved.config.zone_id, &saved.previous_policy)?;
-                }
+                write_policy(&self.root, &saved.config.zone_id, &saved.previous_policy)?;
             }
-            write_policy(&self.root, &config.zone_id, USER_SPACE_POLICY)?;
+            // Keep kernel cooling in charge until the long-lived daemon takes over.
             let previous_policy = prior_saved
                 .as_ref()
                 .filter(|saved| saved.config.zone_id == config.zone_id)
@@ -555,9 +552,14 @@ impl FanCurveManager {
                 previous_policy,
             };
             write_saved(&self.root, &saved)?;
-            tick_saved(&self.root, &saved)?;
+            // Only the daemon may take a curve tick and lower the fan speed.
             run_systemctl(&self.root, &["enable", SERVICE_UNIT])?;
             run_systemctl(&self.root, &["restart", SERVICE_UNIT])?;
+            if self.root == Path::new("/") && !service_active(&self.root) {
+                return Err(HardwareError::Io(
+                    "fan curve service did not become active".into(),
+                ));
+            }
             Ok(())
         })();
         if let Err(error) = operation {
@@ -882,7 +884,12 @@ fn tick_saved(root: &Path, saved: &SavedFanCurve) -> Result<FanCurveTick, Hardwa
         ));
     }
     if read_trimmed(zone_path.join("policy")).as_deref() != Some(USER_SPACE_POLICY) {
+        // Establish maximum cooling on both sides of the governor hand-off.
+        fs::write(device_path.join("cur_state"), format!("{max_state}\n"))
+            .map_err(|error| HardwareError::Io(error.to_string()))?;
         write_policy(root, &config.zone_id, USER_SPACE_POLICY)?;
+        fs::write(device_path.join("cur_state"), format!("{max_state}\n"))
+            .map_err(|error| HardwareError::Io(error.to_string()))?;
     }
     let temperature_c = read_temperature(zone_path.join("temp"));
     let current_state = read_u32(device_path.join("cur_state")).unwrap_or(max_state);
@@ -929,23 +936,10 @@ fn write_saved(root: &Path, saved: &SavedFanCurve) -> Result<(), HardwareError> 
         .parent()
         .ok_or_else(|| HardwareError::Io("invalid fan curve path".into()))?;
     fs::create_dir_all(parent).map_err(|error| HardwareError::Io(error.to_string()))?;
-    let temporary = parent.join(format!(".fan-curve-{}.json", Uuid::new_v4()));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temporary)
-        .map_err(|error| HardwareError::Io(error.to_string()))?;
     let bytes =
         serde_json::to_vec_pretty(saved).map_err(|error| HardwareError::Io(error.to_string()))?;
-    file.write_all(&bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|error| HardwareError::Io(error.to_string()))?;
-    // No secrets are stored here. The unprivileged UI must be able to inspect
-    // the saved curve and prepare a new plan; only root may change the file.
-    file.set_permissions(fs::Permissions::from_mode(0o644))
-        .map_err(|error| HardwareError::Io(error.to_string()))?;
-    fs::rename(&temporary, &path).map_err(|error| HardwareError::Io(error.to_string()))
+    crate::transaction::atomic_replace_with_mode(&path, &bytes, Some(0o644))
+        .map_err(|error| HardwareError::Io(error.to_string()))
 }
 
 fn restore_snapshot(
@@ -956,15 +950,28 @@ fn restore_snapshot(
     restart_service: bool,
 ) -> Result<(), HardwareError> {
     let config_path = rooted_path(root, CONFIG_FILE);
+    let mut saved_curve = None;
     if let Some(bytes) = prior_file {
         let saved: SavedFanCurve = serde_json::from_slice(bytes)
             .map_err(|error| HardwareError::Io(format!("invalid rollback curve: {error}")))?;
         write_saved(root, &saved)?;
+        saved_curve = Some(saved);
     } else {
-        let _ = fs::remove_file(config_path);
+        match fs::remove_file(&config_path) {
+            Ok(()) => crate::transaction::sync_directory(config_path.parent().unwrap())
+                .map_err(|error| HardwareError::Io(error.to_string()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(HardwareError::Io(error.to_string())),
+        }
     }
     for (zone, policy) in policies {
-        write_policy(root, zone, policy)?;
+        // Never restore userspace ownership before a controller is running.
+        let restored_policy = saved_curve
+            .as_ref()
+            .filter(|saved| saved.config.zone_id == *zone && policy == USER_SPACE_POLICY)
+            .map(|saved| saved.previous_policy.as_str())
+            .unwrap_or(policy);
+        write_policy(root, zone, restored_policy)?;
     }
     for (device, state) in states {
         fs::write(
@@ -979,7 +986,7 @@ fn restore_snapshot(
         run_systemctl(root, &["enable", SERVICE_UNIT])?;
         run_systemctl(root, &["restart", SERVICE_UNIT])?;
     } else {
-        let _ = run_systemctl(root, &["disable", SERVICE_UNIT]);
+        run_systemctl(root, &["disable", SERVICE_UNIT])?;
     }
     Ok(())
 }
@@ -1192,6 +1199,7 @@ fn demo_status() -> FanCurveStatus {
     }
 }
 
+// State-change detection only. This token does not grant authorization.
 struct StableHash(u64);
 
 impl StableHash {
@@ -1246,6 +1254,30 @@ mod tests {
             &root.join("usr/lib/systemd/system/rsetup-next-fan-curve.service"),
             "fixture\n",
         );
+    }
+
+    #[test]
+    fn enable_keeps_kernel_cooling_until_daemon_tick() {
+        let root = fixture_root();
+        add_fixture_hardware(&root);
+        add_fixture_service(&root);
+        let systemctl = root.join("usr/bin/systemctl");
+        fs::write(&systemctl, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o700)).unwrap();
+        let policy = root.join("sys/class/thermal/thermal_zone0/policy");
+        fs::write(&policy, "step_wise\n").unwrap();
+        let manager = FanCurveManager::at_root(root.clone());
+        let request = FanCurveRequest {
+            enabled: true,
+            config: Some(demo_config()),
+        };
+        let plan = manager.plan(&request).unwrap();
+        manager.enable_live(&plan).unwrap();
+        assert_eq!(read_trimmed(policy.clone()).as_deref(), Some("step_wise"));
+        assert!(read_saved(&root).unwrap().is_some());
+        manager.tick().unwrap();
+        assert_eq!(read_trimmed(policy.clone()).as_deref(), Some("user_space"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
