@@ -1,9 +1,9 @@
 use rsetup_core::{
-    ActionError, ActionRun, ActionSpec, ActivityEvent, Controller, DeviceSnapshot,
+    ActionError, ActionRun, ActionSpec, ActivityEvent, Controller, DeviceSnapshot, ExecutionPolicy,
     FanCurveApplyResult, FanCurvePlan, FanCurveRequest, FanCurveStatus, GpioStatus, HardwareError,
-    LedStatus, OverlayApplyResult, OverlayPlan, OverlayStatus, RgbLedConfig, SourceApplyResult,
-    SourceError, SourcePlan, SourceStatus, SpiFlashApplyResult, SpiFlashPlan, SpiFlashRequest,
-    SpiFlashStatus, ThermalStatus, VideoFrame, VideoStatus,
+    LedStatus, OverlayApplyResult, OverlayPlan, OverlayStatus, ProbeMode, RgbLedConfig,
+    SourceApplyResult, SourceError, SourcePlan, SourceStatus, SpiFlashApplyResult, SpiFlashPlan,
+    SpiFlashRequest, SpiFlashStatus, ThermalStatus, VideoFrame, VideoStatus,
 };
 use serde::Serialize;
 
@@ -30,6 +30,7 @@ impl From<ActionError> for CommandError {
             ActionError::ConfirmationRequired(_) => "confirmation_required",
             ActionError::Unavailable(_) => "action_unavailable",
             ActionError::RootRequired(_) => "root_required",
+            ActionError::AuthorizationCanceled => "authorization_canceled",
             ActionError::Authorization(_, _) => "authorization_failed",
             ActionError::InputRequired(_) => "input_required",
             ActionError::Launch(_) => "internal_error",
@@ -50,6 +51,7 @@ impl From<SourceError> for CommandError {
             SourceError::PlanRequired => "plan_required",
             SourceError::StalePlan => "stale_plan",
             SourceError::RootRequired => "root_required",
+            SourceError::AuthorizationCanceled => "authorization_canceled",
             SourceError::Authorization(_) => "authorization_failed",
             SourceError::Io(_) => "internal_error",
         };
@@ -70,6 +72,7 @@ impl From<HardwareError> for CommandError {
             HardwareError::PlanRequired => "plan_required",
             HardwareError::StalePlan => "stale_plan",
             HardwareError::RootRequired => "root_required",
+            HardwareError::AuthorizationCanceled => "authorization_canceled",
             HardwareError::Authorization(_) => "authorization_failed",
             HardwareError::Io(_) => "internal_error",
         };
@@ -313,8 +316,38 @@ fn apply_thermal_policy(
 }
 
 fn main() {
+    // Opt in explicitly; never infer permission to mutate from launching the GUI.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args
+        .iter()
+        .any(|arg| arg != "--live-execution" && arg != "--demo" && arg != "--help")
+    {
+        eprintln!("Usage: rsetup-desktop [--live-execution] [--demo]");
+        std::process::exit(2);
+    }
+    if args.iter().any(|arg| arg == "--help") {
+        println!(
+            "Usage: rsetup-desktop [--live-execution] [--demo]\nDefault: inspect and preview only. Live operations still require confirmation and administrator authorization."
+        );
+        return;
+    }
+    let from_env = Controller::from_environment();
+    let mode = if args.iter().any(|arg| arg == "--demo")
+        || std::env::var("RSETUP_MODE").as_deref() == Ok("demo")
+    {
+        ProbeMode::Demo
+    } else {
+        ProbeMode::Auto
+    };
+    let controller = if args.iter().any(|arg| arg == "--live-execution") {
+        Controller::new(mode, ExecutionPolicy::Live)
+    } else if args.iter().any(|arg| arg == "--demo") {
+        Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun)
+    } else {
+        from_env
+    };
     tauri::Builder::default()
-        .manage(Controller::from_environment())
+        .manage(controller)
         .invoke_handler(tauri::generate_handler![
             system_snapshot,
             list_actions,

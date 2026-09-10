@@ -1,6 +1,7 @@
 # Rust and desktop build output
 /target
 /apps/desktop/node_modules
+/apps/desktop/dist
 /apps/desktop/src-tauri/target
 /apps/desktop/src-tauri/gen/schemas
 

@@ -4,7 +4,7 @@
   "version": "0.5.0",
   "identifier": "com.radxa.rsetup",
   "build": {
-    "frontendDist": "../../../ui"
+    "frontendDist": "../dist"
   },
   "app": {
     "withGlobalTauri": true,
