@@ -1046,7 +1046,13 @@ fn decode_base64(value: &str) -> Option<Vec<u8>> {
         return None;
     }
     let mut output = Vec::with_capacity(value.len() / 4 * 3);
-    for chunk in value.as_bytes().chunks_exact(4) {
+    let chunk_count = value.len() / 4;
+    for (index, chunk) in value.as_bytes().chunks_exact(4).enumerate() {
+        if (chunk.contains(&b'=') && index + 1 != chunk_count)
+            || (chunk[2] == b'=' && chunk[3] != b'=')
+        {
+            return None;
+        }
         let a = u32::from(decode(chunk[0])?);
         let b = u32::from(decode(chunk[1])?);
         let c = if chunk[2] == b'=' {
@@ -1059,6 +1065,10 @@ fn decode_base64(value: &str) -> Option<Vec<u8>> {
         } else {
             u32::from(decode(chunk[3])?)
         };
+        if (chunk[2] == b'=' && b & 15 != 0) || (chunk[3] == b'=' && chunk[2] != b'=' && c & 3 != 0)
+        {
+            return None;
+        }
         let bits = (a << 18) | (b << 12) | (c << 6) | d;
         output.push((bits >> 16) as u8);
         if chunk[2] != b'=' {
@@ -1069,4 +1079,19 @@ fn decode_base64(value: &str) -> Option<Vec<u8>> {
         }
     }
     Some(output)
+}
+
+#[cfg(test)]
+mod decoding_tests {
+    use super::decode_base64;
+
+    #[test]
+    fn base64_requires_canonical_padding() {
+        for invalid in ["AB=C", "Zg==AAAA", "Zh==", "Zm9=", "====", "A===", "abc"] {
+            assert!(decode_base64(invalid).is_none(), "{invalid}");
+        }
+        assert_eq!(decode_base64("Zg==").unwrap(), b"f");
+        assert_eq!(decode_base64("Zm8=").unwrap(), b"fo");
+        assert_eq!(decode_base64("Zm9v").unwrap(), b"foo");
+    }
 }
