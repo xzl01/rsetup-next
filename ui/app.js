@@ -337,7 +337,7 @@ const transport = {
 async function request(path, options) {
   let response;
   try {
-    response = await fetch(path, options);
+    response = await fetch(path, { ...options, headers: { ...options?.headers, "x-rsetup-request": "1" } });
   } catch {
     const error = new Error(t("api.transport_failure"));
     error.translationKey = "api.transport_failure";
@@ -598,7 +598,21 @@ function dismissDialog(dialog) {
 }
 
 async function refreshAll({ quiet = false } = {}) {
-  if (state.refreshing) return;
+  state.refreshRequested = true;
+  if (!quiet) state.refreshLoud = true;
+  if (state.refreshPromise) return state.refreshPromise;
+  state.refreshPromise = (async () => {
+    while (state.refreshRequested) {
+      state.refreshRequested = false;
+      const nextQuiet = !state.refreshLoud;
+      state.refreshLoud = false;
+      await refreshOnce({ quiet: nextQuiet });
+    }
+  })().finally(() => { state.refreshPromise = null; });
+  return state.refreshPromise;
+}
+
+async function refreshOnce({ quiet = false } = {}) {
   const shouldResolve = !state.snapshot || !quiet;
   state.refreshing = true;
   document.body.dataset.state = "loading";
@@ -609,6 +623,7 @@ async function refreshAll({ quiet = false } = {}) {
     const [snapshot, actions, activity, sources] = await Promise.all([
       transport.snapshot(), transport.actions(), transport.activity(), transport.sourceStatus(),
     ]);
+    if (state.refreshRequested) return; // A queued read must supersede this older snapshot.
     state.providerSnapshot = snapshot;
     state.snapshot = applyDebugDevice(snapshot);
     state.actions = actions;
@@ -857,6 +872,8 @@ async function applySourcePlan() {
   if (!plan || !$("[data-source-confirm]").checked) return;
   const button = $("[data-source-apply]");
   const result = $("[data-source-result]");
+  const finish = beginApply(button, "[data-source-confirm]");
+  if (!finish) return;
   button.disabled = true;
   $("span", button).textContent = t("sources.applying");
   result.hidden = false;
@@ -868,10 +885,10 @@ async function applySourcePlan() {
       ? t("sources.planned")
       : applied.rolledBack
         ? t("sources.rolledBack")
-        : t("sources.applied");
+        : applied.run.status === "failed" ? t("drawer.failed") : t("sources.applied");
     result.classList.toggle("is-error", applied.run.status === "failed");
     const rawOutput = applied.run.output && !applied.run.synthetic ? `\n\n${applied.run.output}` : "";
-    result.textContent = `${heading}\n${i18n.runSummary(applied.run)}${applied.backups.length ? `\n${t("sources.backups", { count: applied.backups.length })}` : ""}${rawOutput}`;
+    result.textContent = `${heading}\n${applied.run.status === "failed" ? applied.run.summary : i18n.runSummary(applied.run)}${applied.backups.length ? `\n${t("sources.backups", { count: applied.backups.length })}\n${applied.backups.join("\n")}` : ""}${rawOutput}`;
     toast(heading, i18n.runSummary(applied.run), applied.run.status === "failed");
     await refreshAll({ quiet: true });
   } catch (error) {
@@ -880,12 +897,9 @@ async function applySourcePlan() {
       state.sourcePlan = null;
       $("[data-source-confirm]").checked = false;
     }
-    result.classList.add("is-error");
-    result.textContent = `${t("drawer.failed")}\n${detail}`;
-    toast(t("toast.failed"), detail, true);
+    showApplyError(result, error);
   } finally {
-    $("span", button).textContent = t("sources.apply");
-    button.disabled = !$("[data-source-confirm]").checked || !state.sourcePlan?.changes.length;
+    finish("sources.apply");
   }
 }
 
@@ -1118,10 +1132,36 @@ function renderHardwareTool() {
   else if (state.selectedHardware === "spi-flash") renderSpiFlashTool();
 }
 
+function preserveToolFocus(host) {
+  const active = document.activeElement;
+  if (!host?.contains(active)) return;
+  const selector = "button, input, select, textarea, a[href]";
+  const before = Array.from(host.querySelectorAll(selector));
+  const index = before.indexOf(active);
+  const identity = (node) => JSON.stringify([node.tagName, node.id, node.name,
+    Object.entries(node.dataset), node.type === "radio" || node.type === "checkbox" ? node.value : null]);
+  const key = identity(active);
+  const start = active.selectionStart;
+  const end = active.selectionEnd;
+  const scroll = host.scrollTop;
+  queueMicrotask(() => {
+    if (active.isConnected || (document.activeElement !== document.body && document.activeElement !== active)) return;
+    const after = Array.from(host.querySelectorAll(selector));
+    const target = after.find((node) => identity(node) === key) || after[Math.min(index, after.length - 1)];
+    if (!target || target.disabled) return;
+    target.focus({ preventScroll: true });
+    if (typeof start === "number" && target.setSelectionRange) {
+      try { target.setSelectionRange(start, end); } catch { /* Number inputs have no text selection. */ }
+    }
+    host.scrollTop = scroll;
+  });
+}
+
 function renderOverlayTool() {
   const data = state.hardwareData;
   const selected = new Set(state.overlaySelection);
   const host = $("[data-hardware-body]");
+  preserveToolFocus(host);
   if (data.requiresAuthorization) {
     host.innerHTML = overlayReadControl(true);
     bindOverlayRead(host);
@@ -1246,12 +1286,38 @@ function renderOverlayPlan() {
   $("[data-overlay-apply]", host).addEventListener("click", applyOverlays);
 }
 
+function beginApply(button, selector) {
+  if (button.rsetupRunning) return null;
+  button.rsetupRunning = true;
+  const confirmation = $(selector);
+  const wasDisabled = confirmation?.disabled;
+  if (confirmation) confirmation.disabled = true;
+  return (labelKey, safe = false) => {
+    button.rsetupRunning = false;
+    $("span", button).textContent = t(labelKey);
+    button.disabled = !safe;
+    if (confirmation) {
+      confirmation.checked = false;
+      confirmation.disabled = wasDisabled;
+    }
+  };
+}
+
+function showApplyError(result, error) {
+  const canceled = error?.code === "authorization_canceled";
+  result.classList.toggle("is-error", !canceled);
+  result.textContent = canceled ? t("api.authorization_canceled") : displayError(error);
+  toast(t(canceled ? "toast.canceled" : "toast.failed"), result.textContent, !canceled);
+}
+
 async function applyOverlays() {
   const plan = state.overlayPlan;
   if (!plan) return;
   const loadVersion = state.hardwareLoadVersion;
   const button = $("[data-overlay-apply]");
   const result = $("[data-overlay-result]");
+  const finish = beginApply(button, "[data-overlay-confirm]");
+  if (!finish) return;
   button.disabled = true;
   $("span", button).textContent = t("overlay.applying");
   result.hidden = false;
@@ -1274,10 +1340,11 @@ async function applyOverlays() {
   } catch (error) {
     if (state.selectedHardware !== "device-tree" || loadVersion !== state.hardwareLoadVersion) return;
     const detail = displayError(error);
-    result.classList.add("is-error");
-    result.textContent = detail;
+    showApplyError(result, error);
     $("span", button).textContent = t("overlay.apply");
     button.disabled = false;
+  } finally {
+    finish("overlay.apply");
   }
 }
 
@@ -1310,6 +1377,7 @@ function resetSpiFlashPlan() {
 function renderSpiFlashTool() {
   const data = state.hardwareData;
   const host = $("[data-hardware-body]");
+  preserveToolFocus(host);
   if (!data.supported || !data.devices.length) {
     host.innerHTML = `<div class="hardware-tool-empty">${escapeHtml(hardwareReason(data.unavailableReason) || t("spiFlash.none"))}</div>`;
     return;
@@ -1417,6 +1485,8 @@ async function applySpiFlash() {
   }
   const button = $("[data-spi-apply]");
   const result = $("[data-spi-result]");
+  const finish = beginApply(button, "[data-spi-confirm]");
+  if (!finish) return;
   button.disabled = true;
   $("span", button).textContent = t("spiFlash.applying");
   result.hidden = false;
@@ -1447,10 +1517,11 @@ async function applySpiFlash() {
       toast(t("toast.failed"), detail, true);
       return;
     }
-    result.classList.add("is-error");
-    result.textContent = detail;
+    showApplyError(result, error);
     $("span", button).textContent = t(`spiFlash.apply.${plan.request.operation}`);
     button.disabled = true;
+  } finally {
+    finish(`spiFlash.apply.${plan.request.operation}`);
   }
 }
 
@@ -1539,6 +1610,7 @@ function renderGpioTool() {
 function renderVideoTool() {
   const data = state.hardwareData;
   const host = $("[data-hardware-body]");
+  preserveToolFocus(host);
   if (!data.supported) {
     host.innerHTML = `<div class="hardware-tool-empty">${escapeHtml(hardwareReason(data.unavailableReason) || t("hardware.unavailable"))}</div>`;
     return;
@@ -1548,7 +1620,7 @@ function renderVideoTool() {
   host.innerHTML = `
     <label class="tool-field"><span>${escapeHtml(t("video.device"))}</span><select data-video-device>${data.devices.map((device) => `<option value="${escapeHtml(device.id)}" ${device.id === current ? "selected" : ""}>${escapeHtml(device.name)} · ${escapeHtml(device.path)}</option>`).join("")}</select></label>
     <div class="camera-stage" data-camera-stage>
-      ${frame ? `<img src="data:${escapeHtml(frame.mimeType)};base64,${frame.base64}" alt="${escapeHtml(t("video.title"))}" /><span>${escapeHtml(frame.synthetic ? t("video.synthetic") : t("video.captured", { time: relativeTime(frame.capturedAt) }))}</span>` : `<div>${icon("video")}<span>${escapeHtml(t("video.ready"))}</span></div>`}
+      ${frame ? `<img src="data:${escapeHtml(frame.mimeType)};base64,${escapeHtml(frame.base64)}" alt="${escapeHtml(t("video.title"))}" /><span>${escapeHtml(frame.synthetic ? t("video.synthetic") : t("video.captured", { time: relativeTime(frame.capturedAt) }))}</span>` : `<div>${icon("video")}<span>${escapeHtml(t("video.ready"))}</span></div>`}
     </div>
     ${!data.captureAvailable && data.unavailableReason ? `<div class="tool-warning">${escapeHtml(hardwareReason(data.unavailableReason))}</div>` : ""}
     <button class="execute-button hardware-execute" type="button" data-video-capture ${data.captureAvailable ? "" : "disabled"}><span>${escapeHtml(t("video.capture"))}</span>${icon("video")}</button>`;
@@ -1667,7 +1739,7 @@ function fanCurveChart(points, currentTemperature) {
       <path class="fan-curve-axes" vector-effect="non-scaling-stroke" d="M0 0V100H100"></path>
       ${marker}<polyline class="fan-curve-line" vector-effect="non-scaling-stroke" points="${path}"></polyline>
     </svg>
-    ${clean.map((point) => `<i class="fan-curve-dot" style="--fan-x:${x(point.temperatureC).toFixed(1)}%;--fan-y:${y(point.speedPercent).toFixed(1)}%"></i>`).join("")}
+    ${clean.map((point) => `<i class="fan-curve-dot" data-fan-x="${x(point.temperatureC).toFixed(1)}" data-fan-y="${y(point.speedPercent).toFixed(1)}"></i>`).join("")}
   </div>
   <span class="fan-curve-axis fan-curve-axis-y is-top" aria-hidden="true">100%</span>
   <span class="fan-curve-axis fan-curve-axis-y is-middle" aria-hidden="true">50%</span>
@@ -1682,6 +1754,7 @@ function fanCurveChart(points, currentTemperature) {
 function renderThermalTool() {
   const data = state.hardwareData;
   const host = $("[data-hardware-body]");
+  preserveToolFocus(host);
   if (!data.supported) {
     host.innerHTML = `<div class="hardware-tool-empty">${escapeHtml(data.unavailableReason || t("hardware.unavailable"))}</div>`;
     return;
@@ -1789,9 +1862,18 @@ function updateFanCurveChart() {
   if (!chart) return;
   const zone = state.hardwareData?.fanCurve?.zones?.find((item) => item.id === state.fanCurveDraft?.zoneId);
   chart.innerHTML = fanCurveChart(state.fanCurveDraft?.points, zone?.temperatureC);
+  applyFanCurveStyles(chart);
+}
+
+function applyFanCurveStyles(host) {
+  $$("[data-fan-x]", host).forEach((dot) => {
+    dot.style.setProperty("--fan-x", Number(dot.dataset.fanX) + "%");
+    dot.style.setProperty("--fan-y", Number(dot.dataset.fanY) + "%");
+  });
 }
 
 function bindFanCurvePanel(host) {
+  applyFanCurveStyles(host);
   $("[data-fan-zone]", host)?.addEventListener("change", (event) => {
     state.fanCurveDraft.zoneId = event.currentTarget.value;
     invalidateFanCurvePreview();
@@ -1911,6 +1993,8 @@ async function applyFanCurve() {
   }
   const button = $("[data-fan-apply]");
   const result = $("[data-fan-result]");
+  const finish = beginApply(button, "[data-fan-confirm]");
+  if (!finish) return;
   button.disabled = true;
   $("span", button).textContent = t("fanCurve.applying");
   result.hidden = false;
@@ -1933,10 +2017,11 @@ async function applyFanCurve() {
     }
     await refreshAll({ quiet: true });
   } catch (error) {
-    result.classList.add("is-error");
-    result.textContent = displayError(error);
+    showApplyError(result, error);
     $("span", button).textContent = t(plan.request.enabled ? "fanCurve.apply" : "fanCurve.disable");
     button.disabled = false;
+  } finally {
+    finish(plan.request.enabled ? "fanCurve.apply" : "fanCurve.disable");
   }
 }
 
@@ -1944,6 +2029,8 @@ async function applyThermalPolicy() {
   if (!state.thermalPolicy) return;
   const button = $("[data-thermal-apply]");
   const result = $("[data-thermal-result]");
+  const finish = beginApply(button, "[data-thermal-confirm]");
+  if (!finish) return;
   button.disabled = true;
   $("span", button).textContent = t("thermal.applying");
   result.hidden = false;
@@ -1963,10 +2050,11 @@ async function applyThermalPolicy() {
     await refreshAll({ quiet: true });
   } catch (error) {
     const detail = displayError(error);
-    result.classList.add("is-error");
-    result.textContent = detail;
+    showApplyError(result, error);
     $("span", button).textContent = t("thermal.apply");
     button.disabled = false;
+  } finally {
+    finish("thermal.apply");
   }
 }
 
@@ -2015,6 +2103,7 @@ function rgbLedHex(config) {
 function renderLedTool() {
   const data = state.hardwareData;
   const host = $("[data-hardware-body]");
+  preserveToolFocus(host);
   if (!data.supported) {
     host.innerHTML = `<div class="hardware-tool-empty">${escapeHtml(data.unavailableReason || t("hardware.unavailable"))}</div>`;
     return;
@@ -2052,7 +2141,7 @@ function renderStatusLedControls(data) {
     ? Math.round((selected.brightness || 0) / selected.maxBrightness * 100)
     : null;
   return `<section class="led-control-panel" role="tabpanel">
-    <div class="led-status-orbit" aria-hidden="true"><span style="--led-level:${brightness ?? 35}%"></span></div>
+    <div class="led-status-orbit" aria-hidden="true"><span data-led-level="${brightness ?? 35}"></span></div>
     <div class="led-control-fields">
       <label class="tool-field"><span>${escapeHtml(t("led.device"))}</span><select data-led-device ${data.mutable ? "" : "disabled"}>${leds.map((led) => `<option value="${escapeHtml(led.id)}" ${led.id === selected.id ? "selected" : ""}>${escapeHtml(led.id)}</option>`).join("")}</select></label>
       <div class="led-facts"><span><i>${escapeHtml(t("led.current"))}</i><b>${escapeHtml(selected.currentTrigger || "—")}</b></span><span><i>${escapeHtml(t("led.saved"))}</i><b>${escapeHtml(saved)}</b></span><span><i>${escapeHtml(t("led.brightness"))}</i><b>${brightness == null ? "—" : `${brightness}%`}</b></span></div>
@@ -2072,10 +2161,10 @@ function renderRgbLedControls(data) {
   if (!state.rgbLedConfig || state.rgbLedConfig.groupId !== group.id) {
     state.rgbLedConfig = { ...defaultRgbLedConfig(group), ...(data.savedState?.rgb?.[group.id] || {}), groupId: group.id };
   }
-  const config = state.rgbLedConfig;
+  const config = { ...state.rgbLedConfig, brightness: Math.max(0, Math.min(100, Number(state.rgbLedConfig.brightness) || 0)), cycleMs: Math.max(200, Math.min(60000, Number(state.rgbLedConfig.cycleMs) || 5000)) };
   const color = rgbLedHex(config);
   return `<section class="led-control-panel" role="tabpanel">
-    <div class="rgb-led-stage" data-mode="${escapeHtml(config.mode)}" style="--led-color:${color};--led-level:${config.brightness / 100};--led-cycle:${config.cycleMs}ms;--led-breath-phase:${config.cycleMs / 2}ms">
+    <div class="rgb-led-stage" data-mode="${escapeHtml(config.mode)}">
       <span class="rgb-led-glow"></span><span class="rgb-led-core"></span><i>${escapeHtml(t("led.preview"))}</i>
     </div>
     <label class="tool-field"><span>${escapeHtml(t("led.rgbGroup"))}</span><select data-rgb-group ${data.mutable ? "" : "disabled"}>${groups.map((item) => `<option value="${escapeHtml(item.id)}" ${item.id === group.id ? "selected" : ""}>${escapeHtml(item.id)} · RGB</option>`).join("")}</select></label>
@@ -2094,6 +2183,16 @@ function renderRgbLedControls(data) {
 
 function bindLedControls() {
   const host = $("[data-hardware-body]");
+  $$("[data-led-level]", host).forEach((dot) => dot.style.setProperty("--led-level", Math.max(0, Math.min(100, Number(dot.dataset.ledLevel))) + "%"));
+  const stage = $(".rgb-led-stage", host);
+  if (stage) {
+    const config = state.rgbLedConfig;
+    const cycle = Math.max(200, Math.min(60000, Number(config.cycleMs) || 5000));
+    stage.style.setProperty("--led-color", rgbLedHex(config));
+    stage.style.setProperty("--led-level", Math.max(0, Math.min(100, Number(config.brightness) || 0)) / 100);
+    stage.style.setProperty("--led-cycle", cycle + "ms");
+    stage.style.setProperty("--led-breath-phase", cycle / 2 + "ms");
+  }
   $("[data-led-device]", host)?.addEventListener("change", (event) => {
     const led = standaloneLeds().find((item) => item.id === event.currentTarget.value);
     state.ledSelection = led ? {
@@ -2165,6 +2264,8 @@ async function applyLedConfiguration(event) {
   const labelKey = kind === "rgb" ? "led.applyRgb" : "led.applyTrigger";
   const button = event.currentTarget;
   const result = $("[data-led-result]");
+  const finish = beginApply(button, "[data-led-confirm]");
+  if (!finish) return;
   button.disabled = true;
   $("span", button).textContent = t("led.applying");
   result.hidden = false;
@@ -2189,10 +2290,11 @@ async function applyLedConfiguration(event) {
     await refreshAll({ quiet: true });
   } catch (error) {
     const detail = displayError(error);
-    result.classList.add("is-error");
-    result.textContent = detail;
+    showApplyError(result, error);
     $("span", button).textContent = t(labelKey);
     button.disabled = false;
+  } finally {
+    finish(labelKey);
   }
 }
 
@@ -2398,6 +2500,8 @@ async function executeSelectedAction() {
   const button = $("[data-task-execute]");
   const result = $("[data-task-result]");
   const confirm = action.risk === "safe" || $("[data-task-confirm]").checked;
+  const finish = beginApply(button, "[data-task-confirm]");
+  if (!finish) return;
   button.disabled = true;
   $("span", button).textContent = t("drawer.running");
   result.hidden = false;
@@ -2414,12 +2518,9 @@ async function executeSelectedAction() {
     await refreshAll({ quiet: true });
   } catch (error) {
     const detail = displayError(error);
-    result.classList.add("is-error");
-    result.textContent = `${t("drawer.failed")}\n${detail}`;
-    toast(t("toast.failed"), detail, true);
+    showApplyError(result, error);
   } finally {
-    $("span", button).textContent = t("drawer.run");
-    button.disabled = !action.available || (action.risk !== "safe" && !$("[data-task-confirm]").checked);
+    finish("drawer.run", action.risk === "safe");
   }
 }
 

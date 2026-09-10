@@ -481,6 +481,11 @@
       "api.stale_plan": "System state changed after preview. Build and review a fresh plan.",
       "api.root_required": "This operation requires root privileges.",
       "api.authorization_failed": "Administrator authorization was not completed.",
+      "api.authorization_canceled": "Administrator authorization canceled.",
+      "text.unavailable": "Details unavailable",
+      "api.server_busy": "Other operations are running. Try again shortly.",
+      "api.request_forbidden": "Open the console through loopback or an SSH tunnel.",
+      "toast.canceled": "Canceled",
       "api.internal_error": "The local control plane encountered an error.",
       "api.transport_failure": "Unable to reach the local control plane.",
       "api.http_failure": "The local control plane returned HTTP {status}.",
@@ -966,6 +971,11 @@
       "api.stale_plan": "系统状态已在预览后变化，请重新生成并检查计划。",
       "api.root_required": "此操作需要管理员权限。",
       "api.authorization_failed": "未完成管理员授权。",
+      "api.authorization_canceled": "已取消管理员授权。",
+      "text.unavailable": "暂无详细信息",
+      "api.server_busy": "正在处理其他操作，请稍后重试。",
+      "api.request_forbidden": "请通过本机地址或 SSH 隧道访问控制台。",
+      "toast.canceled": "已取消",
       "api.internal_error": "本机控制中心发生错误。",
       "api.transport_failure": "无法连接本机控制中心。",
       "api.http_failure": "本机控制中心返回 HTTP {status}。",
@@ -1018,8 +1028,8 @@
   let locale = normalize(storedLocale() || navigator.languages?.[0] || navigator.language || "en");
 
   function t(key, values = {}) {
-    const template = dictionaries[locale][key] ?? dictionaries.en[key] ?? key;
-    return template.replace(/\{(\w+)\}/g, (_, name) => values[name] ?? `{${name}}`);
+    const template = dictionaries[locale][key] ?? dictionaries.en[key] ?? dictionaries[locale]["text.unavailable"];
+    return template.replace(/\{(\w+)\}/g, (_, name) => values[name] ?? "—");
   }
 
   function setLocale(next, { persist = true, announce = true } = {}) {
@@ -1156,7 +1166,6 @@
     const translations = {
       "Not detected on this device": "此设备未检测到",
       "EFI boot files require administrator authorization to read.": "读取 EFI 配置需要管理员授权。",
-      "UEFI + DT detected. Overlay configuration is not read or managed yet.": "UEFI + DT：尚未支持读取或修改 Overlay 配置。",
       "UEFI detected. No supported overlay configuration backend is available.": "UEFI：当前没有可用的 Overlay 配置后端。",
       "No managed overlay directory was detected.": "未检测到受管的 Overlay 目录。",
       "No device-tree overlay was found in the managed directory.": "受管目录中没有设备树叠加层。",

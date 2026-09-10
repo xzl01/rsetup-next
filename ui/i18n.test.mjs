@@ -192,7 +192,7 @@ test("keeps UEFI + DT and capture-probe errors distinct from missing hardware", 
   const { i18n } = loadI18n("zh-CN");
   const reason = "UEFI + DT detected. Overlay configuration is not read or managed yet.";
   const capability = { id: "device-tree", available: false, detail: reason };
-  assert.equal(i18n.capability(capability).detail, "UEFI + DT：尚未支持读取或修改 Overlay 配置。");
+  assert.equal(i18n.capability(capability).detail, reason);
   assert.equal(capability.detail, reason);
   assert.match(i18n.hardwareReason("Unable to verify video capture devices. Check device permissions and driver readiness."), /权限和驱动/);
   assert.equal(i18n.hardwareReason("No video capture device was detected."), "未检测到视频采集设备。");
@@ -202,4 +202,23 @@ test("keeps UEFI + DT and capture-probe errors distinct from missing hardware", 
   i18n.setLocale("en");
   assert.equal(i18n.hardwareReason(reason), reason);
   assert.equal(i18n.capability(capability).detail, reason);
+});
+
+test("dictionaries keep identical keys and placeholders", () => {
+  const source = fs.readFileSync(new URL("./i18n.js", import.meta.url), "utf8");
+  // Export only a test copy of the dictionaries, without changing the public runtime API.
+  const match = source.match(/const dictionaries = ([\s\S]*?);\n/);
+  assert.ok(match);
+  const dictionaries = vm.runInNewContext("(" + match[1] + ")");
+  assert.deepEqual(Object.keys(dictionaries.en).sort(), Object.keys(dictionaries["zh-CN"]).sort());
+  const slots = (text) => [...text.matchAll(/\{(\w+)\}/g)].map((m) => m[1]).sort();
+  for (const key of Object.keys(dictionaries.en)) {
+    assert.deepEqual(slots(dictionaries.en[key]), slots(dictionaries["zh-CN"][key]), key);
+  }
+});
+
+test("unknown dynamic keys and missing parameters do not leak template syntax", () => {
+  const { i18n } = loadI18n("zh-CN");
+  assert.equal(i18n.t("sources.warning.future"), "暂无详细信息");
+  assert.doesNotMatch(i18n.t("gpio.overlays"), /\{count\}/);
 });
