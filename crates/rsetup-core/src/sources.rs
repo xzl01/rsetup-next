@@ -107,6 +107,8 @@ pub enum SourceError {
     StalePlan,
     #[error("changing APT sources requires root privileges")]
     RootRequired,
+    #[error("administrator authorization canceled")]
+    AuthorizationCanceled,
     #[error("administrator authorization failed: {0}")]
     Authorization(String),
     #[error("unable to manage APT sources: {0}")]

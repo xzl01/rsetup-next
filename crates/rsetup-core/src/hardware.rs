@@ -321,6 +321,8 @@ pub enum HardwareError {
     StalePlan,
     #[error("changing hardware configuration requires root privileges")]
     RootRequired,
+    #[error("administrator authorization canceled")]
+    AuthorizationCanceled,
     #[error("administrator authorization failed: {0}")]
     Authorization(String),
     #[error("unable to manage hardware: {0}")]

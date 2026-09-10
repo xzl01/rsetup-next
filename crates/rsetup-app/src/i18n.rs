@@ -481,6 +481,7 @@ impl Locale {
             ActionError::RootRequired(title) => {
                 format!("操作“{}”需要管理员权限", self.known_action_title(title))
             }
+            ActionError::AuthorizationCanceled => "已取消管理员授权。".into(),
             ActionError::Authorization(title, detail) => format!(
                 "操作“{}”的管理员授权失败：{detail}",
                 self.known_action_title(title)
@@ -503,6 +504,7 @@ impl Locale {
             SourceError::PlanRequired => "请先预览软件源变更，再使用返回的计划令牌应用".into(),
             SourceError::StalePlan => "软件源文件已在预览后变化，请重新预览".into(),
             SourceError::RootRequired => "切换软件源需要管理员权限".into(),
+            SourceError::AuthorizationCanceled => "已取消管理员授权。".into(),
             SourceError::Authorization(detail) => format!("管理员授权失败：{detail}"),
             SourceError::Io(detail) => format!("无法管理 APT 软件源：{detail}"),
         }
