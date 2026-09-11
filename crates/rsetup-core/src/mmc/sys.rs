@@ -24,6 +24,16 @@ pub fn read_block_device_size(sysfs_root: &Path, block_name: &str) -> u64 {
     0
 }
 
+/// Check if a block device name is a primary mmcblk device (e.g. "mmcblk0", "mmcblk1"),
+/// excluding partitions ("mmcblk0p1"), boot partitions ("mmcblk0boot0"), rpmb ("mmcblk0rpmb"), etc.
+pub fn is_primary_mmcblk(name: &str) -> bool {
+    if let Some(suffix) = name.strip_prefix("mmcblk") {
+        !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit())
+    } else {
+        false
+    }
+}
+
 /// Read sysfs MMC/SD device info and construct an MmcDevice.
 pub fn read_device_sysfs(sysfs_root: &Path, dev_name: &str) -> Result<MmcDevice, MmcError> {
     let dev_dir = if sysfs_root == Path::new("/") {
@@ -78,7 +88,7 @@ pub fn read_device_sysfs(sysfs_root: &Path, dev_name: &str) -> Result<MmcDevice,
         if let Ok(entries) = fs::read_dir(&block_dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with("mmcblk") {
+                if is_primary_mmcblk(&name) {
                     block_name = Some(name);
                     break;
                 }
@@ -86,12 +96,12 @@ pub fn read_device_sysfs(sysfs_root: &Path, dev_name: &str) -> Result<MmcDevice,
         }
     }
 
-    // Fallback: check dev_dir entries directly for mmcblk*
+    // Fallback: check dev_dir entries directly for primary mmcblk*
     if block_name.is_none() {
         if let Ok(entries) = fs::read_dir(&dev_dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with("mmcblk") {
+                if is_primary_mmcblk(&name) {
                     block_name = Some(name);
                     break;
                 }

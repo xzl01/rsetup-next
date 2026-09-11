@@ -387,4 +387,41 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn test_mmc_primary_block_device_selection() {
+        let root = std::env::temp_dir().join(format!("rsetup-mmc-blk-filter-{}", uuid::Uuid::new_v4()));
+        let dev_dir = root.join("sys/bus/mmc/devices/mmc0:0001");
+        std::fs::create_dir_all(&dev_dir).expect("create dev_dir");
+        std::fs::write(dev_dir.join("type"), "MMC\n").unwrap();
+        std::fs::write(dev_dir.join("name"), "TEST_MMC\n").unwrap();
+
+        let block_dir = dev_dir.join("block");
+        // Create boot0 as the ONLY file first to see if it mistakenly matches
+        std::fs::create_dir_all(block_dir.join("mmcblk0boot0")).unwrap();
+
+        let class_blk0boot0 = root.join("sys/class/block/mmcblk0boot0");
+        std::fs::create_dir_all(&class_blk0boot0).unwrap();
+        std::fs::write(class_blk0boot0.join("size"), "10\n").unwrap();
+
+        // If only boot0 is present, it shouldn't match mmcblk0
+        let dev = sys::read_device_sysfs(&root, "mmc0:0001").expect("read_device_sysfs");
+        assert_eq!(dev.block_path, "");
+
+        // Now add boot0, boot1, rpmb, p1, and mmcblk0
+        std::fs::create_dir_all(block_dir.join("mmcblk0boot1")).unwrap();
+        std::fs::create_dir_all(block_dir.join("mmcblk0rpmb")).unwrap();
+        std::fs::create_dir_all(block_dir.join("mmcblk0p1")).unwrap();
+        std::fs::create_dir_all(block_dir.join("mmcblk0")).unwrap();
+
+        let class_blk0 = root.join("sys/class/block/mmcblk0");
+        std::fs::create_dir_all(&class_blk0).unwrap();
+        std::fs::write(class_blk0.join("size"), "1000\n").unwrap();
+
+        let dev2 = sys::read_device_sysfs(&root, "mmc0:0001").expect("read_device_sysfs");
+        assert_eq!(dev2.block_path, "/dev/mmcblk0");
+        assert_eq!(dev2.total_bytes, 1000 * 512);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
