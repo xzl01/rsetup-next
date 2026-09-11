@@ -113,10 +113,16 @@ fn parse_hex_or_dec_u8(s: &str) -> Option<u8> {
     }
 }
 
-fn map_life_time_val(val: u8) -> Option<u8> {
-    match val {
+/// Map a raw EXT_CSD / sysfs life-time estimate byte to a percentage.
+///
+/// Per the eMMC specification: `0x00` is "Not defined" and `0x01..=0x0A`
+/// represent 10%..100% wear. `0x0B` means the estimated lifetime has been
+/// exceeded (reported as 101 to distinguish it from an exact 100%); all
+/// other values are reserved/undefined and yield `None`.
+pub fn map_life_time_byte_to_percent(byte_val: u8) -> Option<u8> {
+    match byte_val {
         0x00 => None,
-        0x01..=0x0A => Some(val * 10),
+        0x01..=0x0A => Some(byte_val * 10),
         0x0B => Some(101),
         _ => None,
     }
@@ -128,8 +134,10 @@ pub fn parse_life_time_str(s: &str) -> (Option<u8>, Option<u8>) {
         return (None, None);
     }
 
-    let val_a = parse_hex_or_dec_u8(tokens[0]).and_then(map_life_time_val);
-    let val_b = parse_hex_or_dec_u8(tokens[1]).and_then(map_life_time_val);
+    let val_a = parse_hex_or_dec_u8(tokens[0])
+        .and_then(map_life_time_byte_to_percent);
+    let val_b = parse_hex_or_dec_u8(tokens[1])
+        .and_then(map_life_time_byte_to_percent);
 
     (val_a, val_b)
 }
@@ -384,6 +392,48 @@ mod tests {
         assert_eq!(d1.serial, "0x87654321");
         assert_eq!(d1.block_path, "/dev/mmcblk1");
         assert_eq!(d1.total_bytes, 124735488 * 512);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_map_life_time_byte_to_percent() {
+        assert_eq!(map_life_time_byte_to_percent(0x00), None);
+        assert_eq!(map_life_time_byte_to_percent(0x01), Some(10));
+        assert_eq!(map_life_time_byte_to_percent(0x05), Some(50));
+        assert_eq!(map_life_time_byte_to_percent(0x0A), Some(100));
+        assert_eq!(map_life_time_byte_to_percent(0x0B), Some(101));
+        assert_eq!(map_life_time_byte_to_percent(0x0C), None);
+    }
+
+    #[test]
+    fn test_sysfs_fallback_to_ioctl_when_attributes_missing() {
+        let root = std::env::temp_dir().join(format!("rsetup-mmc-fallback-{}", uuid::Uuid::new_v4()));
+        let dev_dir = root.join("sys/bus/mmc/devices/mmc0:0001");
+        std::fs::create_dir_all(&dev_dir).expect("create dev_dir");
+        std::fs::write(dev_dir.join("type"), "MMC\n").unwrap();
+        std::fs::write(dev_dir.join("name"), "FALLBACK\n").unwrap();
+        std::fs::write(dev_dir.join("manfid"), "0x000015\n").unwrap();
+        std::fs::write(dev_dir.join("serial"), "0xDEADBEEF\n").unwrap();
+        // Deliberately NO life_time / pre_eol_info / fwrev / prv / hwrev files:
+        // this forces the ioctl fallback path in read_device_sysfs.
+        let blk_dir = dev_dir.join("block/mmcblk0");
+        std::fs::create_dir_all(&blk_dir).expect("create blk_dir");
+        let class_blk0 = root.join("sys/class/block/mmcblk0");
+        std::fs::create_dir_all(&class_blk0).expect("create class_blk0");
+        std::fs::write(class_blk0.join("size"), "122142720\n").unwrap();
+
+        // On the test machine there is no /dev/mmcblk0, so the ioctl fallback
+        // fails; the device must still be built normally without panicking:
+        // health stays 0/None, firmware stays empty, block detection is intact.
+        let dev = sys::read_device_sysfs(&root, "mmc0:0001").expect("read_device_sysfs");
+        assert_eq!(dev.block_path, "/dev/mmcblk0");
+        assert_eq!(dev.total_bytes, 122_142_720u64 * 512);
+        assert_eq!(dev.health.pre_eol_info, 0);
+        assert_eq!(dev.health.life_time_est_a_percent, None);
+        assert_eq!(dev.health.life_time_est_b_percent, None);
+        assert!(dev.health.warning_flags.is_empty());
+        assert_eq!(dev.firmware, "");
 
         let _ = std::fs::remove_dir_all(&root);
     }
