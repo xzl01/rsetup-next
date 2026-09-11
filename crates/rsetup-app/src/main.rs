@@ -1024,7 +1024,7 @@ fn print_doctor(controller: &Controller, locale: Locale, json: bool) -> Result<(
     Ok(())
 }
 
-fn format_bytes(bytes: u64) -> String {
+pub(crate) fn format_bytes(bytes: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = 1024 * KIB;
     const GIB: u64 = 1024 * MIB;

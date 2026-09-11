@@ -181,6 +181,13 @@ impl Locale {
             (Self::ZhCn, "source_files_short") => "个文件",
             (Self::ZhCn, "source_rolled_back") => "软件包刷新失败，已自动回滚。",
             (Self::ZhCn, "source_plan_ready") => "预演完成，未修改系统文件。",
+            (Self::ZhCn, "nvme_telemetry") => "NVMe 存储遥测",
+            (Self::ZhCn, "nvme_healthy") => "正常",
+            (Self::ZhCn, "nvme_warning") => "告警",
+            (Self::ZhCn, "nvme_endurance") => "已用寿命",
+            (Self::ZhCn, "nvme_spare") => "可用备用",
+            (Self::ZhCn, "nvme_io") => "累计读写",
+            (Self::ZhCn, "nvme_not_detected") => "未检测到 NVMe 存储设备，模块未激活",
             (_, "live_linux_only") => "live execution is only supported on Linux SBC hosts",
             (_, "not_available") => "n/a",
             (_, "synthetic_data") => "SYNTHETIC DATA",
@@ -244,6 +251,15 @@ impl Locale {
                 "Package refresh failed and the source files were rolled back."
             }
             (_, "source_plan_ready") => "Dry run complete; no system file was changed.",
+            (_, "nvme_telemetry") => "NVMe Storage Telemetry",
+            (_, "nvme_healthy") => "Healthy",
+            (_, "nvme_warning") => "Warning",
+            (_, "nvme_endurance") => "Used Endurance",
+            (_, "nvme_spare") => "Available Spare",
+            (_, "nvme_io") => "Data Read/Written",
+            (_, "nvme_not_detected") => {
+                "No NVMe storage devices detected; module is uninitialized."
+            }
             _ => "",
         }
     }
@@ -562,6 +578,28 @@ impl Locale {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_nvme_tui_dictionary_keys() {
+        let expected = [
+            ("nvme_telemetry", "NVMe 存储遥测", "NVMe Storage Telemetry"),
+            ("nvme_healthy", "正常", "Healthy"),
+            ("nvme_warning", "告警", "Warning"),
+            ("nvme_endurance", "已用寿命", "Used Endurance"),
+            ("nvme_spare", "可用备用", "Available Spare"),
+            ("nvme_io", "累计读写", "Data Read/Written"),
+            (
+                "nvme_not_detected",
+                "未检测到 NVMe 存储设备，模块未激活",
+                "No NVMe storage devices detected; module is uninitialized.",
+            ),
+        ];
+
+        for (key, zh, en) in expected {
+            assert_eq!(Locale::ZhCn.text(key), zh, "ZhCn translation for {key}");
+            assert_eq!(Locale::En.text(key), en, "En translation for {key}");
+        }
+    }
 
     #[test]
     fn chinese_action_copy_is_keyed_by_stable_id() {

@@ -81,6 +81,7 @@ struct App {
     source_picker: bool,
     source_selected: usize,
     notice: Option<String>,
+    pub(crate) nvme_status: rsetup_core::NvmeStatus,
     benchmark_rx: Option<
         std::sync::mpsc::Receiver<Result<rsetup_core::MirrorBenchmark, rsetup_core::SourceError>>,
     >,
@@ -101,6 +102,11 @@ impl App {
                 Some(provider.id.as_str()) == source_status.current_system_provider.as_deref()
             })
             .unwrap_or(0);
+        let nvme_status = controller.nvme_status().unwrap_or_else(|_| rsetup_core::NvmeStatus {
+            initialized: false,
+            devices: vec![],
+            message: Some("Failed to query NVMe status".into()),
+        });
         Ok(Self {
             controller,
             locale,
@@ -114,6 +120,7 @@ impl App {
             source_picker: false,
             source_selected,
             notice: None,
+            nvme_status,
             benchmark_rx: None,
             benchmarks: Default::default(),
         })
@@ -188,6 +195,14 @@ impl App {
             .controller
             .source_status()
             .map_err(|error| anyhow!(self.locale.source_error(&error)))?;
+        self.nvme_status = self
+            .controller
+            .nvme_status()
+            .unwrap_or_else(|_| rsetup_core::NvmeStatus {
+                initialized: false,
+                devices: vec![],
+                message: Some("Failed to query NVMe status".into()),
+            });
         if self.source_picker {
             self.update_source_plan();
         }
@@ -353,12 +368,22 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_mission(frame: &mut Frame, app: &App, area: Rect) {
+    let has_nvme_devices = app.nvme_status.initialized && !app.nvme_status.devices.is_empty();
+    // The telemetry card needs four content rows plus its two border rows: the
+    // device line alone wraps to two rows on a 100-column terminal, so a shorter
+    // card clips the spare/threshold line instead of showing it.
+    let desired_nvme_height = if has_nvme_devices { 6 } else { 3 };
+    // On short viewports keep the two cards above and the service list below
+    // intact rather than growing the telemetry card past the available room.
+    let nvme_headroom = area.height.saturating_sub(6 + 6 + 4);
+    let nvme_height = desired_nvme_height.min(nvme_headroom).max(3);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(6),
             Constraint::Length(6),
-            Constraint::Min(5),
+            Constraint::Length(nvme_height),
+            Constraint::Min(4),
         ])
         .split(area);
     let cpu = app.snapshot.metrics.cpu_percent.clamp(0.0, 100.0) as u16;
@@ -419,6 +444,8 @@ fn render_mission(frame: &mut Frame, app: &App, area: Rect) {
         rows[1],
     );
 
+    render_nvme_summary(frame, app, rows[2]);
+
     let services = app
         .snapshot
         .services
@@ -438,7 +465,107 @@ fn render_mission(frame: &mut Frame, app: &App, area: Rect) {
             .style(Style::default().fg(MUTED))
             .block(instrument(app.locale.text("service_signals")))
             .wrap(Wrap { trim: true }),
-        rows[2],
+        rows[3],
+    );
+}
+
+fn render_nvme_summary(frame: &mut Frame, app: &App, area: Rect) {
+    let block = instrument(app.locale.text("nvme_telemetry"));
+    if !app.nvme_status.initialized || app.nvme_status.devices.is_empty() {
+        let msg = Paragraph::new(app.locale.text("nvme_not_detected"))
+            .style(Style::default().fg(MUTED))
+            .block(block)
+            .wrap(Wrap { trim: true });
+        frame.render_widget(msg, area);
+        return;
+    }
+
+    let mut lines = Vec::new();
+    for (idx, dev) in app.nvme_status.devices.iter().enumerate() {
+        if idx > 0 {
+            lines.push(Line::from(""));
+        }
+        let size_str = crate::format_bytes(dev.total_bytes);
+        // Line 1: dev.name, dev.path, model, capacity
+        lines.push(Line::from(vec![
+            Span::styled(format!("{} ", dev.name), Style::default().fg(BONE).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("({}) · ", dev.path), Style::default().fg(MUTED)),
+            Span::styled(format!("{} · ", dev.model), Style::default().fg(BONE)),
+            Span::styled(size_str, Style::default().fg(AMBER)),
+        ]));
+
+        // Line 2: Health state, temperature, used endurance, available spare
+        let is_healthy = dev.smart.critical_warning == 0 && dev.smart.warning_flags.is_empty();
+        let (status_text, status_color) = if is_healthy {
+            (app.locale.text("nvme_healthy"), SIGNAL)
+        } else {
+            (app.locale.text("nvme_warning"), CORAL)
+        };
+        let status_label = if app.locale.is_zh() { "状态: " } else { "Health: " };
+        let temp_label = if app.locale.is_zh() { "温度: " } else { "Temp: " };
+        let spare_label = if app.locale.is_zh() { "备用: " } else { "Spare: " };
+        let endurance_label = if app.locale.is_zh() { "已用寿命: " } else { "Used Endurance: " };
+        // "Used Endurance:" is long enough to push the mandatory available-spare
+        // value past the 59 columns the mission panel gets on a 100-column
+        // terminal, so fall back to the short spelling when the full one does
+        // not fit next to the warning flags.
+        let short_endurance_label = if app.locale.is_zh() { endurance_label } else { "Used: " };
+        let inner_width = area.width.saturating_sub(2) as usize;
+
+        let build_telemetry_line = |endurance_label: &'static str| -> Line<'static> {
+            let mut spans = vec![
+                Span::styled(status_label, Style::default().fg(MUTED)),
+                Span::styled(status_text, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+            ];
+            if !is_healthy && !dev.smart.warning_flags.is_empty() {
+                spans.push(Span::styled(
+                    format!(" ({})", dev.smart.warning_flags.join(", ")),
+                    Style::default().fg(CORAL),
+                ));
+            }
+            spans.extend(vec![
+                Span::styled(" · ", Style::default().fg(MUTED)),
+                Span::styled(temp_label, Style::default().fg(MUTED)),
+                Span::styled(format!("{:.1} °C", dev.smart.temperature_c), Style::default().fg(BONE)),
+                Span::styled(" · ", Style::default().fg(MUTED)),
+                Span::styled(endurance_label, Style::default().fg(MUTED)),
+                Span::styled(format!("{}%", dev.smart.percentage_used), Style::default().fg(BONE)),
+                Span::styled(" · ", Style::default().fg(MUTED)),
+                Span::styled(spare_label, Style::default().fg(MUTED)),
+                Span::styled(format!("{}%", dev.smart.available_spare_percent), Style::default().fg(BONE)),
+            ]);
+            Line::from(spans)
+        };
+        let full_line = build_telemetry_line(endurance_label);
+        let line2 = if full_line.width() > inner_width {
+            build_telemetry_line(short_endurance_label)
+        } else {
+            full_line
+        };
+        lines.push(line2);
+
+        // Line 3: Data read & written plus the available-spare threshold
+        let io_label = if app.locale.is_zh() { "读写: " } else { "I/O: " };
+        let threshold_label = if app.locale.is_zh() { "阈值" } else { "threshold" };
+        let read_str = crate::format_bytes(dev.smart.data_read_bytes);
+        let write_str = crate::format_bytes(dev.smart.data_written_bytes);
+
+        lines.push(Line::from(vec![
+            Span::styled(io_label, Style::default().fg(MUTED)),
+            Span::styled(format!("Read {read_str} / Written {write_str}"), Style::default().fg(BONE)),
+            Span::styled(" · ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!("{threshold_label} {}%", dev.smart.spare_threshold_percent),
+                Style::default().fg(BONE),
+            ),
+        ]));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: true }),
+        area,
     );
 }
 
@@ -711,3 +838,266 @@ fn duration(seconds: u64, locale: Locale) -> String {
         format!("{days}d {hours}h")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::Terminal;
+    use rsetup_core::{ExecutionPolicy, ProbeMode};
+
+    #[test]
+    fn test_tui_app_loads_and_refreshes_nvme_status() {
+        let controller = Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun);
+        let mut app = App::new(controller, Locale::En).expect("init app");
+        assert!(app.nvme_status.initialized);
+        assert_eq!(app.nvme_status.devices.len(), 1);
+        app.refresh().expect("refresh app");
+        assert!(app.nvme_status.initialized);
+    }
+
+    #[test]
+    fn test_render_nvme_summary_demo() {
+        let controller = Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun);
+        let app = App::new(controller, Locale::ZhCn).expect("init app");
+        let backend = ratatui::backend::TestBackend::new(80, 25);
+        let mut terminal = Terminal::new(backend).expect("init test terminal");
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, 80, 6);
+                render_nvme_summary(frame, &app, area);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let text = buffer.content().iter().map(|c| c.symbol()).collect::<String>();
+        let norm_text = text.split_whitespace().collect::<Vec<_>>().join("");
+        assert!(text.contains("Radxa M.2 NVMe SSD 512GB") || text.contains("nvme0"));
+        assert!(text.contains("38.5") || text.contains("温度"));
+        // Available spare and its threshold must both be on screen, not clipped.
+        assert!(
+            norm_text.contains("备用:100%"),
+            "Expected available spare '备用: 100%' in buffer, got: {text:?}"
+        );
+        assert!(
+            norm_text.contains("阈值10%"),
+            "Expected spare threshold '阈值 10%' in buffer, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_render_nvme_summary_fits_available_spare() {
+        // Real device geometry: left panel is 61% of a 100-column terminal,
+        // so the NVMe box has 61 display columns (59 inner columns).
+        for (locale, spare_label, threshold_label) in
+            [(Locale::ZhCn, "备用", "阈值"), (Locale::En, "Spare", "threshold")]
+        {
+            let controller = Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun);
+            let mut app = App::new(controller, locale).expect("init app");
+            let mut dev = app.nvme_status.devices[0].clone();
+            // Mirror the real Rock 5B device: 100% spare against a 1% threshold.
+            dev.smart.available_spare_percent = 100;
+            dev.smart.spare_threshold_percent = 1;
+            app.nvme_status.devices = vec![dev];
+
+            let backend = ratatui::backend::TestBackend::new(61, 6);
+            let mut terminal = Terminal::new(backend).expect("init test terminal");
+            terminal
+                .draw(|frame| {
+                    render_nvme_summary(frame, &app, Rect::new(0, 0, 61, 6));
+                })
+                .expect("draw");
+            let buffer = terminal.backend().buffer();
+            let raw_text = buffer.content().iter().map(|c| c.symbol()).collect::<String>();
+            let norm_text = raw_text.split_whitespace().collect::<Vec<_>>().join("");
+
+            assert!(
+                norm_text.contains(&format!("{spare_label}:100%")),
+                "Expected available spare '{spare_label}: 100%' inside 59 columns, got: {raw_text:?}"
+            );
+            assert!(
+                raw_text.contains("1%"),
+                "Expected spare threshold '1%' (label '{threshold_label}') in buffer, got: {raw_text:?}"
+            );
+            assert!(
+                norm_text.contains(threshold_label),
+                "Expected threshold label '{threshold_label}' in buffer, got: {raw_text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_render_nvme_summary_uses_full_endurance_label_when_wide() {
+        let render_norm = |locale: Locale, width: u16| -> String {
+            let controller = Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun);
+            let app = App::new(controller, locale).expect("init app");
+            let backend = ratatui::backend::TestBackend::new(width, 6);
+            let mut terminal = Terminal::new(backend).expect("init test terminal");
+            terminal
+                .draw(|frame| {
+                    render_nvme_summary(frame, &app, Rect::new(0, 0, width, 6));
+                })
+                .expect("draw");
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join("")
+        };
+
+        // 59 inner columns cannot hold "Used Endurance:" next to the mandatory
+        // available-spare value, so the short spelling is used there.
+        let narrow = render_norm(Locale::En, 61);
+        assert!(narrow.contains("Used:2%"), "Expected compact endurance label at 59 columns, got: {narrow}");
+        assert!(narrow.contains("Spare:100%"), "Expected available spare at 59 columns, got: {narrow}");
+
+        // With room to spare the full label is kept.
+        let wide = render_norm(Locale::En, 90);
+        assert!(
+            wide.contains("UsedEndurance:2%"),
+            "Expected full 'Used Endurance' label on a wide panel, got: {wide}"
+        );
+    }
+
+
+    #[test]
+    fn test_render_full_tui_with_nvme_zh() {
+        let controller = Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun);
+        let mut app = App::new(controller, Locale::ZhCn).expect("init app");
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("init test terminal");
+        terminal
+            .draw(|frame| {
+                render(frame, &mut app);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let raw_text = buffer.content().iter().map(|c| c.symbol()).collect::<String>();
+        let norm_text = raw_text.split_whitespace().collect::<Vec<_>>().join("");
+        assert!(norm_text.contains("NVMe存储遥测"), "Expected 'NVMe 存储遥测' in buffer, got: {raw_text}");
+        assert!(raw_text.contains("Radxa M.2 NVMe SSD 512GB"), "Expected 'Radxa M.2 NVMe SSD 512GB' in buffer");
+        assert!(norm_text.contains("正常"), "Expected '正常' in buffer");
+        assert!(raw_text.contains("38.5 °C"), "Expected '38.5 °C' in buffer");
+        // Regression for the live Rock 5B screenshot: on a 100x30 terminal the
+        // telemetry card must show the compacted health line (including the
+        // available spare) and the read/write line with its threshold, instead
+        // of clipping the wrapped overflow row.
+        assert!(
+            norm_text.contains("状态:正常·温度:38.5°C·已用寿命:2%·备用:100%"),
+            "Expected compacted telemetry line 2 in buffer, got: {raw_text}"
+        );
+        assert!(
+            norm_text.contains("读写:Read1.14TiB/Written791.62GiB·阈值10%"),
+            "Expected telemetry line 3 with spare threshold in buffer, got: {raw_text}"
+        );
+    }
+
+    #[test]
+    fn test_render_full_tui_uninitialized_nvme() {
+        // Test in Chinese
+        {
+            let controller = Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun);
+            let mut app = App::new(controller, Locale::ZhCn).expect("init app");
+            app.nvme_status = rsetup_core::NvmeStatus {
+                initialized: false,
+                devices: vec![],
+                message: Some("No NVMe".into()),
+            };
+            let backend = ratatui::backend::TestBackend::new(100, 30);
+            let mut terminal = Terminal::new(backend).expect("init test terminal");
+            terminal
+                .draw(|frame| {
+                    render(frame, &mut app);
+                })
+                .expect("draw");
+            let buffer = terminal.backend().buffer();
+            let raw_text = buffer.content().iter().map(|c| c.symbol()).collect::<String>();
+            let norm_text = raw_text.split_whitespace().collect::<Vec<_>>().join("");
+            assert!(
+                norm_text.contains("未检测到NVMe存储设备，模块未激活"),
+                "Expected Chinese uninitialized message in buffer, got: {raw_text}"
+            );
+        }
+
+        // Test in English
+        {
+            let controller = Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun);
+            let mut app = App::new(controller, Locale::En).expect("init app");
+            app.nvme_status = rsetup_core::NvmeStatus {
+                initialized: false,
+                devices: vec![],
+                message: Some("No NVMe".into()),
+            };
+            let backend = ratatui::backend::TestBackend::new(100, 30);
+            let mut terminal = Terminal::new(backend).expect("init test terminal");
+            terminal
+                .draw(|frame| {
+                    render(frame, &mut app);
+                })
+                .expect("draw");
+            let buffer = terminal.backend().buffer();
+            let raw_text = buffer.content().iter().map(|c| c.symbol()).collect::<String>();
+            assert!(
+                raw_text.contains("No NVMe storage devices detected; module is uninitialized."),
+                "Expected English uninitialized message in buffer, got: {raw_text}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_render_tui_small_viewport() {
+        let viewports = [(60, 18), (40, 12)];
+        for (w, h) in viewports {
+            let controller = Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun);
+            let mut app = App::new(controller, Locale::ZhCn).expect("init app");
+            let backend = ratatui::backend::TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).expect("init test terminal");
+            let res = terminal.draw(|frame| {
+                render(frame, &mut app);
+            });
+            assert!(res.is_ok(), "Rendering failed on viewport {w}x{h}");
+        }
+    }
+
+    #[test]
+    fn test_render_nvme_summary_warning_state() {
+        let controller = Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun);
+        let mut app = App::new(controller, Locale::ZhCn).expect("init app");
+        let mut dev = app.nvme_status.devices[0].clone();
+        dev.smart.critical_warning = 0x03;
+        dev.smart.warning_flags = vec!["spare_below_threshold".into(), "temperature_exceeded".into()];
+        app.nvme_status.devices = vec![dev];
+
+        let backend = ratatui::backend::TestBackend::new(100, 10);
+        let mut terminal = Terminal::new(backend).expect("init test terminal");
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, 100, 6);
+                render_nvme_summary(frame, &app, area);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let raw_text = buffer.content().iter().map(|c| c.symbol()).collect::<String>();
+        let norm_text = raw_text.split_whitespace().collect::<Vec<_>>().join("");
+        assert!(norm_text.contains("告警"), "Expected '告警' in buffer, got: {raw_text}");
+        assert!(raw_text.contains("spare_below_threshold"), "Expected 'spare_below_threshold' in buffer");
+        assert!(raw_text.contains("temperature_exceeded"), "Expected 'temperature_exceeded' in buffer");
+
+        // Also test English locale
+        app.locale = Locale::En;
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, 100, 6);
+                render_nvme_summary(frame, &app, area);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let text_en = buffer.content().iter().map(|c| c.symbol()).collect::<String>();
+        assert!(text_en.contains("Warning"), "Expected 'Warning' in buffer, got: {text_en}");
+        assert!(text_en.contains("spare_below_threshold"), "Expected 'spare_below_threshold' in buffer");
+    }
+}
+
