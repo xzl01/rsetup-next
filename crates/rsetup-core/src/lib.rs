@@ -9,6 +9,7 @@ mod sources;
 mod spi_flash;
 mod transaction;
 mod video;
+pub mod mmc;
 pub mod nvme;
 
 pub use actions::{ActionError, Controller, ExecutionPolicy};
