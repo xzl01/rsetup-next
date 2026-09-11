@@ -1914,7 +1914,7 @@ body.is-resolving .core-node { animation: core-resolve 820ms var(--ease-soft) bo
 }
 .nvme-specs-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
 }
 .nvme-spec-item {
@@ -2006,7 +2006,7 @@ body.is-resolving .core-node { animation: core-resolve 820ms var(--ease-soft) bo
 }
 
 @media (max-width: 768px) {
-  .nvme-specs-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .nvme-specs-grid { grid-template-columns: 1fr; }
   .nvme-metrics-grid { grid-template-columns: 1fr; }
   .nvme-stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
