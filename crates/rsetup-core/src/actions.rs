@@ -1,7 +1,7 @@
 use crate::{
-    ActionRun, ActionSpec, ActionStatus, ActivityEvent, NvmeDevice, NvmeManager, NvmeSmartLog,
-    NvmeStatus, ProbeMode, RiskLevel, SourceApplyResult, SourceError, SourcePlan, SourceStatus,
-    collect_snapshot,
+    ActionRun, ActionSpec, ActionStatus, ActivityEvent, MmcDevice, MmcHealth, MmcManager,
+    MmcStatus, NvmeDevice, NvmeManager, NvmeSmartLog, NvmeStatus, ProbeMode, RiskLevel,
+    SourceApplyResult, SourceError, SourcePlan, SourceStatus, StorageStatus, collect_snapshot,
     fan_curve::{
         FanCurveApplyResult, FanCurveManager, FanCurvePlan, FanCurveRequest, FanCurveStatus,
         FanCurveTick,
@@ -78,6 +78,7 @@ pub struct Controller {
     spi_flash: Arc<SpiFlashManager>,
     fan_curve: Arc<FanCurveManager>,
     nvme: Arc<NvmeManager>,
+    mmc: Arc<MmcManager>,
     overlay_cache: Arc<RwLock<Option<OverlayStatus>>>,
 }
 
@@ -113,6 +114,7 @@ impl Controller {
             spi_flash: Arc::new(SpiFlashManager::new(synthetic)),
             fan_curve: Arc::new(FanCurveManager::new(synthetic)),
             nvme: Arc::new(NvmeManager::new()),
+            mmc: Arc::new(MmcManager::new()),
             overlay_cache: Arc::new(RwLock::new(None)),
         }
     }
@@ -515,6 +517,20 @@ impl Controller {
             return Ok(demo_nvme_status());
         }
         Ok(self.nvme.status())
+    }
+
+    pub fn mmc_status(&self) -> Result<MmcStatus, HardwareError> {
+        if self.synthetic {
+            return Ok(demo_mmc_status());
+        }
+        Ok(self.mmc.status())
+    }
+
+    pub fn storage_status(&self) -> Result<StorageStatus, HardwareError> {
+        Ok(StorageStatus {
+            nvme: self.nvme_status()?,
+            mmc: self.mmc_status()?,
+        })
     }
 
     pub fn plan_fan_curve(&self, request: &FanCurveRequest) -> Result<FanCurvePlan, HardwareError> {
@@ -1838,6 +1854,48 @@ fn demo_nvme_status() -> NvmeStatus {
     }
 }
 
+fn demo_mmc_status() -> MmcStatus {
+    MmcStatus {
+        initialized: true,
+        devices: vec![
+            MmcDevice {
+                name: "mmc0:0001".into(),
+                block_path: "/dev/mmcblk0".into(),
+                card_type: "MMC".into(),
+                model: "FE4MB4".into(),
+                manufacturer: "Samsung (0x000015)".into(),
+                serial: "0x12345678".into(),
+                firmware: "0x01".into(),
+                total_bytes: 62_537_072_640, // ~58.2 GiB
+                health: MmcHealth {
+                    pre_eol_info: 1,
+                    life_time_est_a_percent: Some(10),
+                    life_time_est_b_percent: Some(10),
+                    warning_flags: Vec::new(),
+                },
+            },
+            MmcDevice {
+                name: "mmc1:59b4".into(),
+                block_path: "/dev/mmcblk1".into(),
+                card_type: "SD".into(),
+                model: "SC64G".into(),
+                manufacturer: "SanDisk (0x000045)".into(),
+                serial: "0x87654321".into(),
+                firmware: "0x01".into(),
+                total_bytes: 64_026_691_584, // ~59.6 GiB
+                // SD cards carry no life-time estimate; pre_eol 0 means undefined.
+                health: MmcHealth {
+                    pre_eol_info: 0,
+                    life_time_est_a_percent: None,
+                    life_time_est_b_percent: None,
+                    warning_flags: Vec::new(),
+                },
+            },
+        ],
+        message: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2013,6 +2071,44 @@ mod tests {
         if !status.initialized {
             assert!(status.message.is_some());
         }
+    }
+
+    #[test]
+    fn test_controller_mmc_status_demo() {
+        let controller = Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun);
+        let status = controller.mmc_status().expect("mmc status in demo mode");
+        assert!(status.initialized);
+        assert_eq!(status.devices.len(), 2);
+
+        let emmc = &status.devices[0];
+        assert_eq!(emmc.card_type, "MMC");
+        assert_eq!(emmc.block_path, "/dev/mmcblk0");
+        assert_eq!(emmc.total_bytes, 62_537_072_640);
+        assert_eq!(emmc.health.life_time_est_a_percent, Some(10));
+
+        let sd = &status.devices[1];
+        assert_eq!(sd.card_type, "SD");
+        assert_eq!(sd.health.life_time_est_a_percent, None);
+    }
+
+    #[test]
+    fn test_controller_mmc_status_live() {
+        let controller = Controller::new(ProbeMode::Live, ExecutionPolicy::DryRun);
+        let status = controller.mmc_status().expect("mmc status in live mode");
+        // Whether initialized is true or false depends on host, but it must not panic and must return Ok.
+        if !status.initialized {
+            assert!(status.message.is_some());
+        }
+    }
+
+    #[test]
+    fn test_controller_storage_status_demo() {
+        let controller = Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun);
+        let storage = controller.storage_status().expect("storage status in demo mode");
+        assert!(storage.nvme.initialized);
+        assert_eq!(storage.nvme.devices.len(), 1);
+        assert!(storage.mmc.initialized);
+        assert_eq!(storage.mmc.devices.len(), 2);
     }
 
     #[test]
