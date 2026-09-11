@@ -48,9 +48,10 @@ const capabilityVisuals = {
   thermal: { icon: "thermal", tone: "amber" },
   led: { icon: "led", tone: "coral" },
   "spi-flash": { icon: "spi-flash", tone: "signal" },
+  nvme: { icon: "nvme", tone: "cyan" },
 };
 
-const hardwareToolIds = new Set(["device-tree", "gpio", "video", "thermal", "led", "spi-flash"]);
+const hardwareToolIds = new Set(["device-tree", "gpio", "video", "thermal", "led", "spi-flash", "nvme"]);
 
 const debugDeviceProfiles = [
   { id: "rockchip-rk3588", label: "ROCK 5B · RK3588", product: "Radxa ROCK 5B Demo", hostname: "debug-rock-5b", socVendor: "Rockchip", soc: "RK3588", architecture: "aarch64", pinoutProfile: "rock5b" },
@@ -331,6 +332,10 @@ const transport = {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ config, confirm }),
     });
+  },
+  async nvmeStatus() {
+    if (tauriInvoke) return tauriInvoke("nvme_status");
+    return request("/api/v1/hardware/nvme");
   },
 };
 
@@ -1013,6 +1018,7 @@ function hardwareToolCopy(id) {
     thermal: "thermal",
     led: "led",
     "spi-flash": "spiFlash",
+    nvme: "nvme",
   }[id] || "hardware";
   return { title: t(`${prefix}.title`), description: t(`${prefix}.description`) };
 }
@@ -1080,6 +1086,7 @@ async function openHardwareTool(id) {
       },
       led: () => transport.ledStatus(),
       "spi-flash": () => transport.spiFlashStatus(),
+      nvme: () => transport.nvmeStatus(),
     };
     const data = await loaders[id]();
     if (state.selectedHardware !== id || state.hardwareLoadVersion !== loadVersion) return;
@@ -1130,6 +1137,7 @@ function renderHardwareTool() {
   else if (state.selectedHardware === "thermal") renderThermalTool();
   else if (state.selectedHardware === "led") renderLedTool();
   else if (state.selectedHardware === "spi-flash") renderSpiFlashTool();
+  else if (state.selectedHardware === "nvme") renderNvmeTool();
 }
 
 function preserveToolFocus(host) {
@@ -2296,6 +2304,145 @@ async function applyLedConfiguration(event) {
   } finally {
     finish(labelKey);
   }
+}
+
+function renderNvmeTool() {
+  const data = state.hardwareData;
+  const host = $("[data-hardware-body]");
+  preserveToolFocus(host);
+
+  if (!data || !data.initialized) {
+    host.innerHTML = `<div class="hardware-tool-empty">${escapeHtml(data?.message || t("nvme.uninitialized"))}</div>`;
+    return;
+  }
+
+  const devices = data.devices || [];
+  if (!devices.length) {
+    host.innerHTML = `<div class="hardware-tool-empty">${escapeHtml(t("nvme.noDevices"))}</div>`;
+    return;
+  }
+
+  host.innerHTML = `
+    <div class="tool-fact-line">
+      <span>${escapeHtml(t("nvme.description"))}</span>
+      <b>${devices.length} NVMe</b>
+    </div>
+    <div class="nvme-tool-container">
+      ${devices.map((dev) => renderNvmeDeviceCard(dev)).join("")}
+    </div>
+  `;
+  applyNvmeMetricStyles(host);
+}
+
+function applyNvmeMetricStyles(host) {
+  $$("[data-metric-percent]", host).forEach((bar) => {
+    bar.style.setProperty("--metric-percent", `${Number(bar.dataset.metricPercent || 0)}%`);
+  });
+}
+
+function renderNvmeDeviceCard(device) {
+  const smart = device.smart || {};
+  const isHealthy = smart.criticalWarning === 0;
+  const badgeClass = isHealthy ? "nvme-badge-healthy" : "nvme-badge-critical";
+  const healthLabel = isHealthy ? t("nvme.healthy") : (smart.warningFlags?.join(", ") || t("nvme.warning"));
+
+  const temp = smart.temperatureC != null ? smart.temperatureC : null;
+  const tempWarn = temp != null && temp >= 70;
+  const tempCritical = temp != null && temp >= 80;
+  const tempStatusClass = tempCritical ? "is-critical" : tempWarn ? "is-warning" : "is-normal";
+  const tempText = temp != null ? `${formatNumber(temp, 1)} °C` : "—";
+
+  const spare = smart.availableSparePercent != null ? smart.availableSparePercent : null;
+  const spareThreshold = smart.spareThresholdPercent != null ? smart.spareThresholdPercent : 10;
+  const spareWarn = spare != null && spare <= spareThreshold;
+  const spareStatusClass = spareWarn ? "is-critical" : "is-cyan";
+
+  const used = smart.percentageUsed != null ? smart.percentageUsed : null;
+  const usedWarn = used != null && used >= 90;
+  const usedCritical = used != null && used >= 100;
+  const usedStatusClass = usedCritical ? "is-critical" : usedWarn ? "is-warning" : "is-normal";
+
+  return `
+    <section class="nvme-card">
+      <div class="nvme-card-head">
+        <div class="nvme-card-title">
+          <strong>${escapeHtml(device.model || device.name)}</strong>
+          <span>${escapeHtml(device.path || device.name)}</span>
+        </div>
+        <div class="nvme-card-badges">
+          <span class="nvme-badge ${badgeClass}">${escapeHtml(healthLabel)}</span>
+        </div>
+      </div>
+
+      <div class="nvme-specs-grid">
+        <div class="nvme-spec-item">
+          <i>${escapeHtml(t("nvme.capacity"))}</i>
+          <b>${byteUnit(device.totalBytes)}</b>
+        </div>
+        <div class="nvme-spec-item">
+          <i>${escapeHtml(t("nvme.serial"))}</i>
+          <b>${escapeHtml(device.serial || "—")}</b>
+        </div>
+        <div class="nvme-spec-item">
+          <i>${escapeHtml(t("nvme.firmware"))}</i>
+          <b>${escapeHtml(device.firmware || "—")}</b>
+        </div>
+        <div class="nvme-spec-item">
+          <i>${escapeHtml(t("nvme.temperature"))}</i>
+          <b>${tempText}</b>
+        </div>
+      </div>
+
+      <div class="nvme-metrics-grid">
+        <div class="nvme-metric-block">
+          <div class="nvme-metric-header">
+            <span>${escapeHtml(t("nvme.spare"))}</span>
+            <b>${spare != null ? `${spare}%` : "—"}</b>
+          </div>
+          <div class="nvme-metric-bar">
+            <div class="nvme-metric-bar-fill ${spareStatusClass}" data-metric-percent="${Math.min(100, Math.max(0, spare || 0))}"></div>
+          </div>
+        </div>
+
+        <div class="nvme-metric-block">
+          <div class="nvme-metric-header">
+            <span>${escapeHtml(t("nvme.used"))}</span>
+            <b>${used != null ? `${used}%` : "—"}</b>
+          </div>
+          <div class="nvme-metric-bar">
+            <div class="nvme-metric-bar-fill ${usedStatusClass}" data-metric-percent="${Math.min(100, Math.max(0, used || 0))}"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="nvme-stats-grid">
+        <div class="nvme-stat-item">
+          <i>${escapeHtml(t("nvme.dataRead"))}</i>
+          <b>${byteUnit(smart.dataReadBytes)}</b>
+        </div>
+        <div class="nvme-stat-item">
+          <i>${escapeHtml(t("nvme.dataWritten"))}</i>
+          <b>${byteUnit(smart.dataWrittenBytes)}</b>
+        </div>
+        <div class="nvme-stat-item">
+          <i>${escapeHtml(t("nvme.powerOnHours"))}</i>
+          <b>${formatNumber(smart.powerOnHours || 0, 0)} h</b>
+        </div>
+        <div class="nvme-stat-item">
+          <i>${escapeHtml(t("nvme.unsafeShutdowns"))}</i>
+          <b>${formatNumber(smart.unsafeShutdowns || 0, 0)}</b>
+        </div>
+        <div class="nvme-stat-item">
+          <i>${escapeHtml(t("nvme.mediaErrors"))}</i>
+          <b>${formatNumber(smart.mediaErrors || 0, 0)}</b>
+        </div>
+        <div class="nvme-stat-item">
+          <i>${escapeHtml(t("nvme.errorLogs"))}</i>
+          <b>${formatNumber(smart.numErrLogEntries || 0, 0)}</b>
+        </div>
+      </div>
+    </section>
+  `;
 }
 
 function renderActions() {

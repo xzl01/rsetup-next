@@ -9,6 +9,7 @@ mod sources;
 mod spi_flash;
 mod transaction;
 mod video;
+pub mod nvme;
 
 pub use actions::{ActionError, Controller, ExecutionPolicy};
 pub use fan_curve::{
@@ -23,9 +24,10 @@ pub use hardware::{
 };
 pub use model::{
     ActionRun, ActionSpec, ActionStatus, ActivityEvent, Alert, AlertLevel, Capability,
-    DeviceIdentity, DeviceSnapshot, MetricSet, NetworkInterface, ProbeMode, RiskLevel,
-    ServiceState, ServiceSummary, StorageMetric,
+    DeviceIdentity, DeviceSnapshot, MetricSet, NetworkInterface, NvmeDevice, NvmeSmartLog,
+    NvmeStatus, ProbeMode, RiskLevel, ServiceState, ServiceSummary, StorageMetric,
 };
+pub use nvme::{NvmeError, NvmeManager};
 pub use probe::collect_snapshot;
 pub use sources::{
     MirrorBenchmark, MirrorProbe, MirrorProbeStatus, MirrorProvider, SourceApplyResult,

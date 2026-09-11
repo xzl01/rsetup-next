@@ -390,6 +390,32 @@
       "spiFlash.applied.install": "SPI boot image installed",
       "spiFlash.applied.erase": "SPI boot flash erased",
       "spiFlash.backupPath": "Backup: {path}",
+      "nvme.title": "NVMe Storage",
+      "nvme.description": "Monitor NVMe solid-state storage health and SMART metrics.",
+      "nvme.uninitialized": "No NVMe storage devices detected. NVMe hardware module is disabled.",
+      "nvme.refresh": "Refresh NVMe",
+      "nvme.refreshing": "Reading NVMe metrics…",
+      "nvme.healthy": "Healthy",
+      "nvme.warning": "Warning",
+      "nvme.critical": "Critical",
+      "nvme.device": "Device",
+      "nvme.model": "Model",
+      "nvme.serial": "Serial",
+      "nvme.firmware": "Firmware",
+      "nvme.capacity": "Capacity",
+      "nvme.temperature": "Temperature",
+      "nvme.temperatureNormal": "Normal",
+      "nvme.temperatureWarning": "High",
+      "nvme.spare": "Available spare",
+      "nvme.used": "Percentage used",
+      "nvme.dataRead": "Total data read",
+      "nvme.dataWritten": "Total data written",
+      "nvme.powerOnHours": "Power-on hours",
+      "nvme.unsafeShutdowns": "Unsafe shutdowns",
+      "nvme.mediaErrors": "Media errors",
+      "nvme.errorLogs": "Error log entries",
+      "nvme.warningFlags": "Warning flags",
+      "nvme.noDevices": "No NVMe devices detected.",
       "workflows.title": "System operations",
       "workflows.group.system": "System & power",
       "workflows.group.network": "Network access",
@@ -880,6 +906,32 @@
       "spiFlash.applied.install": "SPI 引导镜像已写入",
       "spiFlash.applied.erase": "SPI 启动闪存已擦除",
       "spiFlash.backupPath": "备份：{path}",
+      "nvme.title": "NVMe 存储",
+      "nvme.description": "监测 NVMe 固态硬盘健康状态与 SMART 遥测指标。",
+      "nvme.uninitialized": "未检测到 NVMe 存储设备，模块未激活。",
+      "nvme.refresh": "刷新 NVMe",
+      "nvme.refreshing": "正在读取 NVMe 指标…",
+      "nvme.healthy": "健康",
+      "nvme.warning": "告警",
+      "nvme.critical": "故障",
+      "nvme.device": "设备节点",
+      "nvme.model": "设备型号",
+      "nvme.serial": "序列号",
+      "nvme.firmware": "固件版本",
+      "nvme.capacity": "格式化容量",
+      "nvme.temperature": "综合温度",
+      "nvme.temperatureNormal": "正常",
+      "nvme.temperatureWarning": "偏高",
+      "nvme.spare": "可用备用空间",
+      "nvme.used": "已用寿命消耗",
+      "nvme.dataRead": "累计读取量",
+      "nvme.dataWritten": "累计写入量",
+      "nvme.powerOnHours": "通电时间",
+      "nvme.unsafeShutdowns": "不安全关机",
+      "nvme.mediaErrors": "介质与完整性错误",
+      "nvme.errorLogs": "错误日志项",
+      "nvme.warningFlags": "告警标志",
+      "nvme.noDevices": "未检测到 NVMe 设备。",
       "workflows.title": "系统管理",
       "workflows.group.system": "系统与电源",
       "workflows.group.network": "网络访问",
@@ -1009,6 +1061,7 @@
     thermal: ["温控能力", "内核温控子系统"],
     led: ["LED 控制", "Linux LED 设备"],
     "spi-flash": ["SPI 启动闪存", "MTD 闪存设备"],
+    nvme: ["NVMe 存储", "NVMe 固态存储设备"],
   };
 
   const serviceCopy = {
@@ -1087,7 +1140,8 @@
     else if (value.id === "thermal" && /^\d+ zones/.test(detail)) detail = detail.replace(" zones", " 个温区");
     else if (value.id === "led" && /^\d+ status LEDs/.test(detail)) detail = detail.replace(" status LEDs", " 个状态灯").replace(" RGB group", " 组 RGB 灯");
     else if (value.id === "spi-flash" && /MTD device$/.test(detail)) detail = detail.replace("MTD device", "MTD 设备");
-    else if (["Overlay storage detected", "Video4Linux device", "Kernel thermal subsystem", "Linux LED class devices", "MTD flash device"].includes(detail)) detail = copy[1];
+    else if (value.id === "nvme" && /^\d+ NVMe SSD/.test(detail)) detail = detail.replace(" NVMe SSD", " 块 NVMe 固态硬盘");
+    else if (["Overlay storage detected", "Video4Linux device", "Kernel thermal subsystem", "Linux LED class devices", "MTD flash device", "NVMe controllers detected"].includes(detail)) detail = copy[1];
     return { ...value, label: copy[0], detail };
   }
 

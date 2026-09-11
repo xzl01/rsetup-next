@@ -127,6 +127,12 @@ fn live_snapshot() -> Result<DeviceSnapshot> {
             spi_nor_detected(),
             "SPI NOR MTD device",
         ),
+        capability(
+            "nvme",
+            "NVMe storage",
+            !crate::NvmeManager::probe_sysfs(Path::new("/")).is_empty(),
+            "NVMe controllers detected",
+        ),
     ];
     let mut alerts = Vec::new();
     if temperature_c.is_some_and(|value| value >= 80.0) {
@@ -237,6 +243,7 @@ fn demo_snapshot() -> DeviceSnapshot {
             capability("thermal", "Thermal controls", true, "3 zones · step_wise"),
             capability("led", "LED control", true, "2 status LEDs · 1 RGB group"),
             capability("spi-flash", "SPI boot flash", true, "16 MiB MTD device"),
+            capability("nvme", "NVMe storage", true, "1 NVMe SSD · 512 GB"),
         ],
         alerts: vec![Alert {
             id: "demo-state".into(),

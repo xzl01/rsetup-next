@@ -173,3 +173,42 @@ pub struct ActivityEvent {
     pub detail: String,
     pub synthetic: bool,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NvmeStatus {
+    pub initialized: bool,
+    pub devices: Vec<NvmeDevice>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NvmeDevice {
+    pub name: String,
+    pub path: String,
+    pub model: String,
+    pub serial: String,
+    pub firmware: String,
+    pub total_bytes: u64,
+    pub smart: NvmeSmartLog,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NvmeSmartLog {
+    pub critical_warning: u8,
+    pub warning_flags: Vec<String>,
+    pub temperature_c: f32,
+    pub available_spare_percent: u8,
+    pub spare_threshold_percent: u8,
+    pub percentage_used: u8,
+    pub data_read_bytes: u64,
+    pub data_written_bytes: u64,
+    pub host_read_commands: u64,
+    pub host_write_commands: u64,
+    pub power_on_hours: u64,
+    pub unsafe_shutdowns: u64,
+    pub media_errors: u64,
+    pub num_err_log_entries: u64,
+}

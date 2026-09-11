@@ -9,10 +9,10 @@ use axum::{
 };
 use rsetup_core::{
     ActionRun, ActionSpec, ActivityEvent, Controller, DeviceSnapshot, FanCurveApplyResult,
-    FanCurvePlan, FanCurveRequest, FanCurveStatus, GpioStatus, LedStatus, OverlayApplyResult,
-    OverlayPlan, OverlayStatus, RgbLedConfig, SourceApplyResult, SourcePlan, SourceStatus,
-    SpiFlashApplyResult, SpiFlashPlan, SpiFlashRequest, SpiFlashStatus, ThermalStatus, VideoFrame,
-    VideoStatus,
+    FanCurvePlan, FanCurveRequest, FanCurveStatus, GpioStatus, LedStatus, NvmeStatus,
+    OverlayApplyResult, OverlayPlan, OverlayStatus, RgbLedConfig, SourceApplyResult, SourcePlan,
+    SourceStatus, SpiFlashApplyResult, SpiFlashPlan, SpiFlashRequest, SpiFlashStatus,
+    ThermalStatus, VideoFrame, VideoStatus,
 };
 use serde::Deserialize;
 use std::{net::SocketAddr, sync::Arc};
@@ -191,6 +191,7 @@ pub fn router(controller: Controller) -> Router {
             "/api/v1/hardware/thermal/fan-curve/apply",
             post(apply_fan_curve),
         )
+        .route("/api/v1/hardware/nvme", get(nvme_status))
         .route("/api/v1/activity", get(activity))
         .layer(middleware::from_fn(local_boundary))
         .layer(TraceLayer::new_for_http())
@@ -710,6 +711,18 @@ async fn apply_fan_curve(
     .await
 }
 
+async fn nvme_status(
+    State(controller): State<Arc<Controller>>,
+) -> Result<Json<NvmeStatus>, ApiError> {
+    blocking(move || {
+        controller
+            .nvme_status()
+            .map(Json)
+            .map_err(ApiError::from_hardware)
+    })
+    .await
+}
+
 struct ApiError {
     status: StatusCode,
     code: &'static str,
@@ -855,6 +868,31 @@ mod tests {
     fn community_qr_assets_are_embedded() {
         assert!(COMMUNITY_QQ.starts_with(b"RIFF"));
         assert!(COMMUNITY_WECHAT.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    #[tokio::test]
+    async fn get_nvme_status_returns_ok_with_demo_device() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+        use rsetup_core::NvmeStatus;
+
+        let app = router(Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun));
+        let request = Request::builder()
+            .uri("/api/v1/hardware/nvme")
+            .header("host", "127.0.0.1:8788")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status: NvmeStatus = serde_json::from_slice(&bytes).unwrap();
+        assert!(status.initialized);
+        assert_eq!(status.devices.len(), 1);
+        assert_eq!(status.devices[0].model, "Radxa M.2 NVMe SSD 512GB");
     }
 }
 

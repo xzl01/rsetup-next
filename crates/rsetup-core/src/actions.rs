@@ -1,6 +1,7 @@
 use crate::{
-    ActionRun, ActionSpec, ActionStatus, ActivityEvent, ProbeMode, RiskLevel, SourceApplyResult,
-    SourceError, SourcePlan, SourceStatus, collect_snapshot,
+    ActionRun, ActionSpec, ActionStatus, ActivityEvent, NvmeDevice, NvmeManager, NvmeSmartLog,
+    NvmeStatus, ProbeMode, RiskLevel, SourceApplyResult, SourceError, SourcePlan, SourceStatus,
+    collect_snapshot,
     fan_curve::{
         FanCurveApplyResult, FanCurveManager, FanCurvePlan, FanCurveRequest, FanCurveStatus,
         FanCurveTick,
@@ -76,6 +77,7 @@ pub struct Controller {
     hardware: Arc<HardwareManager>,
     spi_flash: Arc<SpiFlashManager>,
     fan_curve: Arc<FanCurveManager>,
+    nvme: Arc<NvmeManager>,
     overlay_cache: Arc<RwLock<Option<OverlayStatus>>>,
 }
 
@@ -110,6 +112,7 @@ impl Controller {
             hardware: Arc::new(HardwareManager::new(synthetic)),
             spi_flash: Arc::new(SpiFlashManager::new(synthetic)),
             fan_curve: Arc::new(FanCurveManager::new(synthetic)),
+            nvme: Arc::new(NvmeManager::new()),
             overlay_cache: Arc::new(RwLock::new(None)),
         }
     }
@@ -505,6 +508,13 @@ impl Controller {
 
     pub fn fan_curve_status(&self) -> Result<FanCurveStatus, HardwareError> {
         self.fan_curve.status()
+    }
+
+    pub fn nvme_status(&self) -> Result<NvmeStatus, HardwareError> {
+        if self.synthetic {
+            return Ok(demo_nvme_status());
+        }
+        Ok(self.nvme.status())
     }
 
     pub fn plan_fan_curve(&self, request: &FanCurveRequest) -> Result<FanCurvePlan, HardwareError> {
@@ -1797,6 +1807,37 @@ fn source_plan_output(plan: &SourcePlan) -> String {
         .join("\n")
 }
 
+fn demo_nvme_status() -> NvmeStatus {
+    NvmeStatus {
+        initialized: true,
+        devices: vec![NvmeDevice {
+            name: "nvme0".into(),
+            path: "/dev/nvme0n1".into(),
+            model: "Radxa M.2 NVMe SSD 512GB".into(),
+            serial: "RADXA2026NVME01".into(),
+            firmware: "1.0.0".into(),
+            total_bytes: 512_110_190_592, // ~512 GB
+            smart: NvmeSmartLog {
+                critical_warning: 0,
+                warning_flags: Vec::new(),
+                temperature_c: 38.5,
+                available_spare_percent: 100,
+                spare_threshold_percent: 10,
+                percentage_used: 2,
+                data_read_bytes: 1_250_000_000_000,
+                data_written_bytes: 850_000_000_000,
+                host_read_commands: 25_000_000,
+                host_write_commands: 18_000_000,
+                power_on_hours: 120,
+                unsafe_shutdowns: 1,
+                media_errors: 0,
+                num_err_log_entries: 0,
+            },
+        }],
+        message: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1944,6 +1985,33 @@ mod tests {
                     .map(String::as_str),
                 Some("rsetup")
             );
+        }
+    }
+
+    #[test]
+    fn test_controller_nvme_status_demo() {
+        let controller = Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun);
+        let status = controller.nvme_status().expect("nvme status in demo mode");
+        assert!(status.initialized);
+        assert_eq!(status.devices.len(), 1);
+        let dev = &status.devices[0];
+        assert_eq!(dev.name, "nvme0");
+        assert_eq!(dev.model, "Radxa M.2 NVMe SSD 512GB");
+        assert!(dev.total_bytes > 0);
+        assert_eq!(dev.smart.critical_warning, 0);
+        assert!(dev.smart.warning_flags.is_empty());
+        assert!((dev.smart.temperature_c - 38.5).abs() < 0.1);
+        assert_eq!(dev.smart.available_spare_percent, 100);
+        assert_eq!(dev.smart.percentage_used, 2);
+    }
+
+    #[test]
+    fn test_controller_nvme_status_live() {
+        let controller = Controller::new(ProbeMode::Auto, ExecutionPolicy::DryRun);
+        let status = controller.nvme_status().expect("nvme status in live/auto mode");
+        // Whether initialized is true or false depends on host, but it must not panic and must return Ok.
+        if !status.initialized {
+            assert!(status.message.is_some());
         }
     }
 

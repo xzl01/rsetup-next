@@ -154,6 +154,11 @@ enum HardwareCommands {
         #[command(subcommand)]
         command: ThermalCommands,
     },
+    /// Inspect NVMe storage devices and SMART health / 查看 NVMe 存储设备与 SMART 健康状态
+    Nvme {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -659,6 +664,14 @@ async fn main() -> Result<()> {
                     }
                 },
             },
+            HardwareCommands::Nvme { json } => {
+                let status = controller.nvme_status()?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&status)?);
+                } else {
+                    println!("{}", format_nvme_status(&status, locale));
+                }
+            }
         },
         Commands::Tui => tui::run(controller, locale)?,
         Commands::Serve { listen } => server::serve(controller, listen).await?,
@@ -1011,6 +1024,128 @@ fn print_doctor(controller: &Controller, locale: Locale, json: bool) -> Result<(
     Ok(())
 }
 
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    const TIB: u64 = 1024 * GIB;
+
+    if bytes >= TIB {
+        format!("{:.2} TiB", bytes as f64 / TIB as f64)
+    } else if bytes >= GIB {
+        format!("{:.2} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.2} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.2} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+fn format_nvme_status(status: &rsetup_core::NvmeStatus, locale: Locale) -> String {
+    let is_zh = locale == Locale::ZhCn;
+    if !status.initialized {
+        if let Some(msg) = &status.message {
+            if is_zh {
+                return format!("未检测到 NVMe 存储设备，模块未激活。（{}）", msg);
+            } else {
+                return format!("No NVMe storage devices detected; module is uninitialized. ({})", msg);
+            }
+        } else if is_zh {
+            return "未检测到 NVMe 存储设备，模块未激活。".into();
+        } else {
+            return "No NVMe storage devices detected; module is uninitialized.".into();
+        }
+    }
+
+    if status.devices.is_empty() {
+        return if is_zh {
+            "已检测到 NVMe 控制器，但未发现可用命名空间/设备。".into()
+        } else {
+            "NVMe controller detected, but no storage devices/namespaces found.".into()
+        };
+    }
+
+    let mut out = Vec::new();
+    for (idx, dev) in status.devices.iter().enumerate() {
+        if idx > 0 {
+            out.push("".to_string());
+        }
+        let header = if is_zh {
+            format!("=== NVMe 设备: {} ({}) ===", dev.name, dev.path)
+        } else {
+            format!("=== NVMe Device: {} ({}) ===", dev.name, dev.path)
+        };
+        out.push(header);
+
+        let size_str = format_bytes(dev.total_bytes);
+        if is_zh {
+            out.push(format!("  型号:             {}", dev.model));
+            out.push(format!("  序列号:           {}", dev.serial));
+            out.push(format!("  固件版本:         {}", dev.firmware));
+            out.push(format!("  总容量:           {} ({} 字节)", size_str, dev.total_bytes));
+            out.push(format!("  当前温度:         {:.1} °C", dev.smart.temperature_c));
+            out.push(format!(
+                "  备用空间/阈值:    {}% / {}%",
+                dev.smart.available_spare_percent, dev.smart.spare_threshold_percent
+            ));
+            out.push(format!("  已使用寿命:       {}%", dev.smart.percentage_used));
+            out.push(format!(
+                "  数据读写量:       读取 {} / 写入 {}",
+                format_bytes(dev.smart.data_read_bytes),
+                format_bytes(dev.smart.data_written_bytes)
+            ));
+            out.push(format!(
+                "  通电时间/不安全关机: {} 小时 / {} 次",
+                dev.smart.power_on_hours, dev.smart.unsafe_shutdowns
+            ));
+            out.push(format!(
+                "  错误计数:         介质错误 {} / 错误日志项 {}",
+                dev.smart.media_errors, dev.smart.num_err_log_entries
+            ));
+            let warning_str = if dev.smart.warning_flags.is_empty() {
+                "无".to_string()
+            } else {
+                dev.smart.warning_flags.join(", ")
+            };
+            out.push(format!("  告警状态:         {}", warning_str));
+        } else {
+            out.push(format!("  Model:            {}", dev.model));
+            out.push(format!("  Serial Number:    {}", dev.serial));
+            out.push(format!("  Firmware:         {}", dev.firmware));
+            out.push(format!("  Total Capacity:   {} ({} bytes)", size_str, dev.total_bytes));
+            out.push(format!("  Temperature:      {:.1} °C", dev.smart.temperature_c));
+            out.push(format!(
+                "  Available Spare:  {}% (threshold: {}%)",
+                dev.smart.available_spare_percent, dev.smart.spare_threshold_percent
+            ));
+            out.push(format!("  Percentage Used:  {}%", dev.smart.percentage_used));
+            out.push(format!(
+                "  Data Read/Write:  Read {} / Written {}",
+                format_bytes(dev.smart.data_read_bytes),
+                format_bytes(dev.smart.data_written_bytes)
+            ));
+            out.push(format!(
+                "  Power-on/Shutdown: {} hrs / {} unsafe shutdowns",
+                dev.smart.power_on_hours, dev.smart.unsafe_shutdowns
+            ));
+            out.push(format!(
+                "  Error Counts:     Media errors: {} / Error entries: {}",
+                dev.smart.media_errors, dev.smart.num_err_log_entries
+            ));
+            let warning_str = if dev.smart.warning_flags.is_empty() {
+                "None".to_string()
+            } else {
+                dev.smart.warning_flags.join(", ")
+            };
+            out.push(format!("  Critical Warning: {}", warning_str));
+        }
+    }
+
+    out.join("\n")
+}
+
 fn percent(value: u64, total: u64) -> f32 {
     if total == 0 {
         0.0
@@ -1079,6 +1214,102 @@ fn decode_base64(value: &str) -> Option<Vec<u8>> {
         }
     }
     Some(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use rsetup_core::{NvmeDevice, NvmeSmartLog, NvmeStatus};
+
+    #[test]
+    fn hardware_cli_parses_nvme_subcommand_and_flags() {
+        let cli = Cli::try_parse_from(["rsetup-next", "hardware", "nvme"]).expect("parse nvme");
+        match cli.command {
+            Some(Commands::Hardware {
+                command: HardwareCommands::Nvme { json },
+            }) => {
+                assert!(!json);
+            }
+            other => panic!("unexpected command parsed: {:?}", other),
+        }
+
+        let cli_json =
+            Cli::try_parse_from(["rsetup-next", "hardware", "nvme", "--json"]).expect("parse nvme json");
+        match cli_json.command {
+            Some(Commands::Hardware {
+                command: HardwareCommands::Nvme { json },
+            }) => {
+                assert!(json);
+            }
+            other => panic!("unexpected command parsed: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn format_nvme_status_uninitialized_en_and_zh() {
+        let uninit = NvmeStatus {
+            initialized: false,
+            devices: Vec::new(),
+            message: Some("No NVMe controller detected in system".into()),
+        };
+
+        let formatted_zh = format_nvme_status(&uninit, Locale::ZhCn);
+        assert!(
+            formatted_zh.contains("未检测到 NVMe 存储设备") || formatted_zh.contains("未激活"),
+            "ZH output: {formatted_zh}"
+        );
+
+        let formatted_en = format_nvme_status(&uninit, Locale::En);
+        assert!(
+            formatted_en.contains("No NVMe") || formatted_en.contains("uninitialized"),
+            "EN output: {formatted_en}"
+        );
+    }
+
+    #[test]
+    fn format_nvme_status_initialized_with_device() {
+        let status = NvmeStatus {
+            initialized: true,
+            devices: vec![NvmeDevice {
+                name: "nvme0".into(),
+                path: "/dev/nvme0".into(),
+                model: "Radxa NVMe SSD 256GB".into(),
+                serial: "RADXA2026NVME01".into(),
+                firmware: "1.0.0".into(),
+                total_bytes: 256_060_514_304,
+                smart: NvmeSmartLog {
+                    critical_warning: 0,
+                    warning_flags: Vec::new(),
+                    temperature_c: 42.0,
+                    available_spare_percent: 100,
+                    spare_threshold_percent: 10,
+                    percentage_used: 3,
+                    data_read_bytes: 1024 * 1024 * 1024 * 50, // 50 GiB
+                    data_written_bytes: 1024 * 1024 * 1024 * 30, // 30 GiB
+                    host_read_commands: 1000,
+                    host_write_commands: 500,
+                    power_on_hours: 120,
+                    unsafe_shutdowns: 1,
+                    media_errors: 0,
+                    num_err_log_entries: 0,
+                },
+            }],
+            message: None,
+        };
+
+        let out_zh = format_nvme_status(&status, Locale::ZhCn);
+        assert!(out_zh.contains("nvme0"), "zh should contain nvme0");
+        assert!(out_zh.contains("Radxa NVMe SSD 256GB"), "zh should contain model");
+        assert!(out_zh.contains("42"), "zh should contain temperature 42");
+        assert!(out_zh.contains("RADXA2026NVME01"), "zh should contain serial");
+
+        let out_en = format_nvme_status(&status, Locale::En);
+        assert!(out_en.contains("nvme0"), "en should contain nvme0");
+        assert!(out_en.contains("Radxa NVMe SSD 256GB"), "en should contain model");
+        assert!(out_en.contains("42"), "en should contain temperature 42");
+        assert!(out_en.contains("Temperature"), "en should contain label Temperature");
+    }
 }
 
 #[cfg(test)]
