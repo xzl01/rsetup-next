@@ -212,3 +212,95 @@ pub struct NvmeSmartLog {
     pub media_errors: u64,
     pub num_err_log_entries: u64,
 }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MmcHealth {
+    pub pre_eol_info: u8,
+    pub life_time_est_a_percent: Option<u8>,
+    pub life_time_est_b_percent: Option<u8>,
+    pub warning_flags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MmcDevice {
+    pub name: String,
+    pub block_path: String,
+    pub card_type: String,
+    pub model: String,
+    pub manufacturer: String,
+    pub serial: String,
+    pub firmware: String,
+    pub total_bytes: u64,
+    pub health: MmcHealth,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MmcStatus {
+    pub initialized: bool,
+    pub devices: Vec<MmcDevice>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageStatus {
+    pub nvme: NvmeStatus,
+    pub mmc: MmcStatus,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mmc_and_storage_models_serialize_and_deserialize() {
+        let health = MmcHealth {
+            pre_eol_info: 1,
+            life_time_est_a_percent: Some(10),
+            life_time_est_b_percent: Some(20),
+            warning_flags: vec!["urgent".to_string()],
+        };
+
+        let device = MmcDevice {
+            name: "mmcblk0".to_string(),
+            block_path: "/dev/mmcblk0".to_string(),
+            card_type: "eMMC".to_string(),
+            model: "DG4064".to_string(),
+            manufacturer: "0x45".to_string(),
+            serial: "0x12345678".to_string(),
+            firmware: "0x00".to_string(),
+            total_bytes: 64000000000,
+            health: health.clone(),
+        };
+
+        let mmc_status = MmcStatus {
+            initialized: true,
+            devices: vec![device.clone()],
+            message: None,
+        };
+
+        let nvme_status = NvmeStatus {
+            initialized: true,
+            devices: vec![],
+            message: None,
+        };
+
+        let storage_status = StorageStatus {
+            nvme: nvme_status.clone(),
+            mmc: mmc_status.clone(),
+        };
+
+        let json = serde_json::to_string(&storage_status).expect("serialize storage_status");
+        assert!(json.contains("\"lifeTimeEstAPercent\":10"));
+        assert!(json.contains("\"blockPath\":\"/dev/mmcblk0\""));
+        assert!(json.contains("\"mmc\":{"));
+        assert!(json.contains("\"nvme\":{"));
+
+        let deserialized: StorageStatus = serde_json::from_str(&json).expect("deserialize storage_status");
+        assert_eq!(deserialized, storage_status);
+    }
+}
+

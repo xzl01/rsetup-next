@@ -24,8 +24,9 @@ pub use hardware::{
 };
 pub use model::{
     ActionRun, ActionSpec, ActionStatus, ActivityEvent, Alert, AlertLevel, Capability,
-    DeviceIdentity, DeviceSnapshot, MetricSet, NetworkInterface, NvmeDevice, NvmeSmartLog,
-    NvmeStatus, ProbeMode, RiskLevel, ServiceState, ServiceSummary, StorageMetric,
+    DeviceIdentity, DeviceSnapshot, MetricSet, MmcDevice, MmcHealth, MmcStatus, NetworkInterface,
+    NvmeDevice, NvmeSmartLog, NvmeStatus, ProbeMode, RiskLevel, ServiceState, ServiceSummary,
+    StorageMetric, StorageStatus,
 };
 pub use nvme::{NvmeError, NvmeManager};
 pub use probe::collect_snapshot;
