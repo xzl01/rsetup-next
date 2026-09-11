@@ -3,11 +3,11 @@
 ## 1. 概述与背景
 
 `rsetup-next` 作为 Linux 单板计算机 (SBC) 的统一控制平面，需要提供对挂载 NVMe 固态硬盘（如 M.2 NVMe SSD）的健康与状态观测能力。
-为确保极低的运行时开销与自包含性，本功能通过 `libnvme` 静态链接读取 NVMe 设备的底层健康与运行指标（包含基础设备识别与 SMART/Health 遥测）。
+为确保极低的运行时开销与自包含性，本功能**不依赖任何外部 NVMe 库**：通过 Linux 内核的 NVMe Admin Passthru `ioctl` 直接读取设备的只读识别信息与 SMART/Health 日志页，指标解析在进程内完成（详见 2.2）。
 
 ### 核心约束
 1. **启动时按需侦测与条件初始化**：在应用启动加载硬件模块时，首先执行底层侦测；仅当系统存在至少一个物理 NVMe 控制器/设备时，才正式初始化并激活 NVMe 管理子模块。若未侦测到 NVMe 硬件，该模块保持未初始化（Uninitialized/Disabled）状态。
-2. **支持静态编译链接**：底层优先静态链接 `libnvme`（`libnvme.a`），使构建生成的独立二进制文件在目标 SBC 上运行时无需额外安装 `libnvme.so.1` 动态库。
+2. **零外部依赖的采集路径**：不链接 `libnvme`（既非静态也非动态），不调用任何 `libnvme` 符号。SMART/Health 数据经 `ioctl(NVME_IOCTL_ADMIN_CMD)` 从 `/dev/nvmeX` 读取，因此构建产物在目标 SBC 上运行时无需安装 `libnvme.so.1`，交叉编译时也无需目标架构的 `libnvme` 开发包。设计决策与依据见 2.2。
 3. **只读安全性**：本模块为纯观察型硬件监控，仅发送 NVMe Identify 与 Log Page（SMART / Health）只读查询指令，不包含格式化、固件写入或任何破坏性写操作。
 
 ---
@@ -20,7 +20,7 @@
 应用启动 (Controller::new / from_environment)
       │
       ▼
-侦测系统环境 (Linux sysfs /sys/class/nvme 或 libnvme 拓扑扫描)
+侦测系统环境 (Linux sysfs /sys/class/nvme)
       │
       ├─► [无 NVMe 设备] ──► NVMe 模块标记为 Uninitialized (supported: false)
       │                     ├── API/CLI: 返回 nvme.available = false, devices = []
@@ -37,11 +37,25 @@
       └── 轮询或按需读取 SMART Log (温度, 备用空间, 寿命消耗, 读写字节, 警告标志)
 ```
 
-### 2.2 静态编译策略 (Static Linking)
-- 在 `crates/rsetup-core/build.rs` 中：
-  - 通过 `pkg-config` 尝试静态查找 `libnvme` (`pkg_config::Config::new().statik(true).probe("libnvme")`)。
-  - 或配置回退搜索路径 `/usr/lib/*/libnvme.a`，配置 `cargo:rustc-link-lib=static=nvme`。
-  - 对于缺少 `libnvme` 开发库的环境（如纯粹的跨平台单元测试、macOS 或无静态库的开发机），提供 mock / dummy 实现，确保 `cargo test --workspace` 在任何平台都能编译和测试通过。
+### 2.2 采集路径与依赖策略（无外部库）
+
+采集实现位于 `crates/rsetup-core/src/nvme/sys.rs`：
+
+- **设备拓扑与静态属性**：读取 `/sys/class/nvme/nvmeX/` 下的 `model`、`serial`、`firmware_rev`，并由关联命名空间（如 `nvme0n1/size`）换算容量，不触发任何设备命令。
+- **SMART / Health 日志**：对 `/dev/nvmeX` 发起 Linux Admin Passthru `ioctl`（`NVME_IOCTL_ADMIN_CMD = 0xc0484e41`，`opcode 0x02` Get Log Page，`LID 0x02` SMART/Health），读取 512 字节日志缓冲区，再由 `parse_smart_log` 在进程内解析为 `NvmeSmartLog`。
+- **失败降级**：设备节点不存在或权限不足时返回 `NvmeError::Io`，不 panic、不阻断其他硬件模块。
+
+#### 为什么不用 libnvme
+
+早期设计曾要求静态链接 `libnvme`。实现阶段改为直接使用内核 `ioctl` 接口，理由：
+
+1. **自包含性更强**：`ioctl` 路径不引入任何库依赖，产物天然不依赖 `libnvme.so.1`。
+2. **交叉编译更简单**：静态链接 `libnvme` 需要目标架构的 `libnvme.a` 及其传递依赖（如 `json-c`、`libuuid`）；实测本机 `/usr/lib/aarch64-linux-gnu` 下并无 `libnvme`，交叉编译无法满足该前提。
+3. **接口面更小**：仅需一个 Log Page 读取，`libnvme` 的拓扑扫描与命令封装属于用不到的能力，符合 YAGNI。
+
+因此 `crates/rsetup-core/build.rs` 及其 `libnvme` 探测/链接逻辑已被**整体移除**；仓库中不存在对 `libnvme` 的任何构建期或运行期引用。
+
+> 变更记录：该决定与移除动作见 `docs/testing/nvme-2026-09-12/report.md`；对应的历史计划文档 `docs/superpowers/plans/2026-09-10-nvme-monitoring-tdd-plan.md` 保留原始阶段 3 描述并附有偏离说明。
 
 ---
 
