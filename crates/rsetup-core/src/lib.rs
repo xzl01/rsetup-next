@@ -23,6 +23,7 @@ pub use hardware::{
     OverlayChange, OverlayEntry, OverlayPlan, OverlayStatus, RgbLedConfig, RgbLedGroup,
     ThermalStatus, ThermalZone, VideoDevice, VideoFrame, VideoStatus,
 };
+pub use mmc::{MmcError, MmcManager};
 pub use model::{
     ActionRun, ActionSpec, ActionStatus, ActivityEvent, Alert, AlertLevel, Capability,
     DeviceIdentity, DeviceSnapshot, MetricSet, MmcDevice, MmcHealth, MmcStatus, NetworkInterface,

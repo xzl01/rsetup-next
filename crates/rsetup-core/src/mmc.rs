@@ -1,4 +1,8 @@
+use crate::model::MmcStatus;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
+
+pub mod sys;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum MmcError {
@@ -8,6 +12,96 @@ pub enum MmcError {
     NotSupported(String),
     #[error("I/O error: {0}")]
     Io(String),
+}
+
+/// MMC/SD device manager.
+#[derive(Debug, Clone)]
+pub struct MmcManager {
+    status: MmcStatus,
+    sysfs_root: PathBuf,
+}
+
+impl Default for MmcManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MmcManager {
+    /// Probe the system for MMC/SD devices and initialize manager status.
+    pub fn probe_and_init(sysfs_root: Option<&Path>) -> Self {
+        let root = sysfs_root
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("/"));
+        let devices = Self::probe_sysfs(&root);
+
+        let status = if devices.is_empty() {
+            MmcStatus {
+                initialized: false,
+                devices: Vec::new(),
+                message: Some("No MMC/SD devices detected in system".into()),
+            }
+        } else {
+            let mmc_devices = devices
+                .into_iter()
+                .filter_map(|name| sys::read_device_sysfs(&root, &name).ok())
+                .collect();
+            MmcStatus {
+                initialized: true,
+                devices: mmc_devices,
+                message: None,
+            }
+        };
+
+        Self {
+            status,
+            sysfs_root: root,
+        }
+    }
+
+    /// Create default instance probing `/`.
+    pub fn new() -> Self {
+        Self::probe_and_init(None)
+    }
+
+    /// Return sysfs root path.
+    pub fn sysfs_root(&self) -> &Path {
+        &self.sysfs_root
+    }
+
+    pub fn status(&self) -> MmcStatus {
+        self.status.clone()
+    }
+
+    pub fn is_initialized(&self) -> bool {
+        self.status.initialized
+    }
+
+    /// Probe `sys/bus/mmc/devices` under the given root.
+    pub fn probe_sysfs(root: &Path) -> Vec<String> {
+        let mmc_bus_dir = if root == Path::new("/") {
+            PathBuf::from("/sys/bus/mmc/devices")
+        } else {
+            root.join("sys/bus/mmc/devices")
+        };
+
+        let mut devices = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&mmc_bus_dir) {
+            for entry in entries.flatten() {
+                let file_name = entry.file_name();
+                let name = file_name.to_string_lossy().to_string();
+                let dev_dir = entry.path();
+                let type_file = dev_dir.join("type");
+                if let Some(card_type) = sys::read_trimmed_attr(&type_file) {
+                    if card_type == "MMC" || card_type == "SD" {
+                        devices.push(name);
+                    }
+                }
+            }
+        }
+        devices.sort();
+        devices
+    }
 }
 
 fn parse_hex_or_dec_u8(s: &str) -> Option<u8> {
@@ -206,5 +300,91 @@ mod tests {
                 "life_time_typ_b_exceeded".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn test_mmc_probing_no_devices() {
+        let root = std::env::temp_dir().join(format!("rsetup-mmc-none-{}", uuid::Uuid::new_v4()));
+        let manager = MmcManager::probe_and_init(Some(&root));
+        assert!(!manager.is_initialized());
+        let status = manager.status();
+        assert!(!status.initialized);
+        assert_eq!(status.devices.len(), 0);
+        assert_eq!(
+            status.message,
+            Some("No MMC/SD devices detected in system".into())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_mmc_probing_multi_devices() {
+        let root = std::env::temp_dir().join(format!("rsetup-mmc-multi-{}", uuid::Uuid::new_v4()));
+
+        // mmc0:0001: MMC
+        let dev0_dir = root.join("sys/bus/mmc/devices/mmc0:0001");
+        std::fs::create_dir_all(&dev0_dir).expect("create dev0_dir");
+        std::fs::write(dev0_dir.join("type"), "MMC\n").unwrap();
+        std::fs::write(dev0_dir.join("name"), "FE4MB4\n").unwrap();
+        std::fs::write(dev0_dir.join("manfid"), "0x000015\n").unwrap();
+        std::fs::write(dev0_dir.join("serial"), "0x12345678\n").unwrap();
+        std::fs::write(dev0_dir.join("life_time"), "0x01 0x01\n").unwrap();
+        std::fs::write(dev0_dir.join("pre_eol_info"), "0x01\n").unwrap();
+        let blk0_dir = dev0_dir.join("block/mmcblk0");
+        std::fs::create_dir_all(&blk0_dir).expect("create blk0_dir");
+        let class_blk0 = root.join("sys/class/block/mmcblk0");
+        std::fs::create_dir_all(&class_blk0).expect("create class_blk0");
+        std::fs::write(class_blk0.join("size"), "122142720\n").unwrap();
+
+        // mmc1:59b4: SD
+        let dev1_dir = root.join("sys/bus/mmc/devices/mmc1:59b4");
+        std::fs::create_dir_all(&dev1_dir).expect("create dev1_dir");
+        std::fs::write(dev1_dir.join("type"), "SD\n").unwrap();
+        std::fs::write(dev1_dir.join("name"), "SC64G\n").unwrap();
+        std::fs::write(dev1_dir.join("manfid"), "0x000045\n").unwrap();
+        std::fs::write(dev1_dir.join("serial"), "0x87654321\n").unwrap();
+        let blk1_dir = dev1_dir.join("block/mmcblk1");
+        std::fs::create_dir_all(&blk1_dir).expect("create blk1_dir");
+        let class_blk1 = root.join("sys/class/block/mmcblk1");
+        std::fs::create_dir_all(&class_blk1).expect("create class_blk1");
+        std::fs::write(class_blk1.join("size"), "124735488\n").unwrap();
+
+        // mmc2:0001: SDIO (should be ignored)
+        let dev2_dir = root.join("sys/bus/mmc/devices/mmc2:0001");
+        std::fs::create_dir_all(&dev2_dir).expect("create dev2_dir");
+        std::fs::write(dev2_dir.join("type"), "SDIO\n").unwrap();
+        std::fs::write(dev2_dir.join("name"), "WIFI\n").unwrap();
+
+        let manager = MmcManager::probe_and_init(Some(&root));
+        assert!(manager.is_initialized());
+        assert_eq!(manager.sysfs_root(), root.as_path());
+        let status = manager.status();
+        assert!(status.initialized);
+        assert_eq!(status.message, None);
+        assert_eq!(status.devices.len(), 2);
+
+        let d0 = &status.devices[0];
+        assert_eq!(d0.name, "mmc0:0001");
+        assert_eq!(d0.card_type, "MMC");
+        assert_eq!(d0.model, "FE4MB4");
+        assert_eq!(d0.manufacturer, "Samsung (0x000015)");
+        assert_eq!(d0.serial, "0x12345678");
+        assert_eq!(d0.block_path, "/dev/mmcblk0");
+        assert_eq!(d0.total_bytes, 62537072640);
+        assert_eq!(d0.health.pre_eol_info, 1);
+        assert_eq!(d0.health.life_time_est_a_percent, Some(10));
+        assert_eq!(d0.health.life_time_est_b_percent, Some(10));
+        assert!(d0.health.warning_flags.is_empty());
+
+        let d1 = &status.devices[1];
+        assert_eq!(d1.name, "mmc1:59b4");
+        assert_eq!(d1.card_type, "SD");
+        assert_eq!(d1.model, "SC64G");
+        assert_eq!(d1.manufacturer, "SanDisk (0x000045)");
+        assert_eq!(d1.serial, "0x87654321");
+        assert_eq!(d1.block_path, "/dev/mmcblk1");
+        assert_eq!(d1.total_bytes, 124735488 * 512);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
