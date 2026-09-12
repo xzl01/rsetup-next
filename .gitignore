@@ -26,5 +26,10 @@
 .env.*
 !.env.example
 
-# SDD subagent-driven-development scratch workspace (briefs, reports, ledger)
-.superpowers/
+# SDD subagent-driven-development scratch workspace (briefs, reports, ledger).
+# One task's ledger is tracked on purpose: the MMC storage TUI run is the audit
+# trail behind the TUI commits and is cited by the test report.
+.superpowers/*
+!.superpowers/sdd/
+.superpowers/sdd/*
+!.superpowers/sdd/2026-09-12-mmc-storage-tui-tdd-plan/
