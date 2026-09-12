@@ -25,3 +25,6 @@
 .env
 .env.*
 !.env.example
+
+# SDD subagent-driven-development scratch workspace (briefs, reports, ledger)
+.superpowers/
