@@ -48,10 +48,10 @@ const capabilityVisuals = {
   thermal: { icon: "thermal", tone: "amber" },
   led: { icon: "led", tone: "coral" },
   "spi-flash": { icon: "spi-flash", tone: "signal" },
-  nvme: { icon: "nvme", tone: "cyan" },
+  storage: { icon: "storage", tone: "cyan" },
 };
 
-const hardwareToolIds = new Set(["device-tree", "gpio", "video", "thermal", "led", "spi-flash", "nvme"]);
+const hardwareToolIds = new Set(["device-tree", "gpio", "video", "thermal", "led", "spi-flash", "storage"]);
 
 const debugDeviceProfiles = [
   { id: "rockchip-rk3588", label: "ROCK 5B · RK3588", product: "Radxa ROCK 5B Demo", hostname: "debug-rock-5b", socVendor: "Rockchip", soc: "RK3588", architecture: "aarch64", pinoutProfile: "rock5b" },
@@ -333,9 +333,9 @@ const transport = {
       body: JSON.stringify({ config, confirm }),
     });
   },
-  async nvmeStatus() {
-    if (tauriInvoke) return tauriInvoke("nvme_status");
-    return request("/api/v1/hardware/nvme");
+  async storageStatus() {
+    if (tauriInvoke) return tauriInvoke("storage_status");
+    return request("/api/v1/hardware/storage");
   },
 };
 
@@ -1018,7 +1018,7 @@ function hardwareToolCopy(id) {
     thermal: "thermal",
     led: "led",
     "spi-flash": "spiFlash",
-    nvme: "nvme",
+    storage: "storageTool",
   }[id] || "hardware";
   return { title: t(`${prefix}.title`), description: t(`${prefix}.description`) };
 }
@@ -1086,7 +1086,7 @@ async function openHardwareTool(id) {
       },
       led: () => transport.ledStatus(),
       "spi-flash": () => transport.spiFlashStatus(),
-      nvme: () => transport.nvmeStatus(),
+      storage: () => transport.storageStatus(),
     };
     const data = await loaders[id]();
     if (state.selectedHardware !== id || state.hardwareLoadVersion !== loadVersion) return;
@@ -1137,7 +1137,7 @@ function renderHardwareTool() {
   else if (state.selectedHardware === "thermal") renderThermalTool();
   else if (state.selectedHardware === "led") renderLedTool();
   else if (state.selectedHardware === "spi-flash") renderSpiFlashTool();
-  else if (state.selectedHardware === "nvme") renderNvmeTool();
+  else if (state.selectedHardware === "storage") renderStorageTool();
 }
 
 function preserveToolFocus(host) {
@@ -2306,38 +2306,133 @@ async function applyLedConfiguration(event) {
   }
 }
 
-function renderNvmeTool() {
+function applyStorageMetricStyles(host) {
+  $$("[data-metric-percent]", host).forEach((bar) => {
+    bar.style.setProperty("--metric-percent", `${Number(bar.dataset.metricPercent || 0)}%`);
+  });
+}
+
+function renderStorageMmcCard(device) {
+  const health = device.health || {};
+  const typeLabel = device.cardType === "SD" ? t("storageTool.sd") : t("storageTool.emmc");
+  const isCritical = (health.warningFlags && health.warningFlags.length > 0) || health.preEolInfo === 3;
+  const isWarning = !isCritical && health.preEolInfo === 2;
+  const badgeClass = isCritical ? "nvme-badge-critical" : isWarning ? "nvme-badge-warning" : "nvme-badge-healthy";
+  const healthLabel = isCritical ? t("storageTool.critical") : isWarning ? t("storageTool.warning") : t("storageTool.healthy");
+  const preEolLabel =
+    health.preEolInfo === 1
+      ? t("storageTool.preEolNormal")
+      : health.preEolInfo === 2
+        ? t("storageTool.preEolWarning")
+        : health.preEolInfo === 3
+          ? t("storageTool.preEolUrgent")
+          : t("storageTool.preEolUndefined");
+
+  function lifeBlock(labelKey, percent) {
+    if (percent == null) {
+      return `
+        <div class="nvme-metric-block">
+          <div class="nvme-metric-header">
+            <span>${escapeHtml(t(labelKey))}</span>
+            <b>${escapeHtml(t("storageTool.na"))}</b>
+          </div>
+          <div class="nvme-metric-bar">
+            <div class="nvme-metric-bar-fill is-na" data-metric-percent="0"></div>
+          </div>
+        </div>`;
+    }
+    const clamped = Math.min(100, Math.max(0, percent));
+    const statusClass = percent >= 100 ? "is-critical" : percent >= 80 ? "is-warning" : "is-normal";
+    return `
+      <div class="nvme-metric-block">
+        <div class="nvme-metric-header">
+          <span>${escapeHtml(t(labelKey))}</span>
+          <b>${clamped}%</b>
+        </div>
+        <div class="nvme-metric-bar">
+          <div class="nvme-metric-bar-fill ${statusClass}" data-metric-percent="${clamped}"></div>
+        </div>
+      </div>`;
+  }
+
+  return `
+    <section class="storage-mmc-card">
+      <div class="nvme-card-head">
+        <div class="nvme-card-title">
+          <strong>${escapeHtml(device.model || device.name)}<span class="storage-card-type-badge">${escapeHtml(typeLabel)}</span></strong>
+          <span>${escapeHtml(device.blockPath || device.name)}</span>
+        </div>
+        <div class="nvme-card-badges">
+          <span class="nvme-badge ${badgeClass}">${escapeHtml(healthLabel)}</span>
+        </div>
+      </div>
+
+      <div class="nvme-specs-grid">
+        <div class="nvme-spec-item">
+          <i>${escapeHtml(t("storageTool.capacity"))}</i>
+          <b>${byteUnit(device.totalBytes)}</b>
+        </div>
+        <div class="nvme-spec-item">
+          <i>${escapeHtml(t("storageTool.serial"))}</i>
+          <b>${escapeHtml(device.serial || "—")}</b>
+        </div>
+        <div class="nvme-spec-item">
+          <i>${escapeHtml(t("storageTool.firmware"))}</i>
+          <b>${escapeHtml(device.firmware || "—")}</b>
+        </div>
+        <div class="nvme-spec-item">
+          <i>${escapeHtml(t("storageTool.manufacturer"))}</i>
+          <b>${escapeHtml(device.manufacturer || "—")}</b>
+        </div>
+      </div>
+
+      <div class="nvme-metrics-grid">
+        ${lifeBlock("storageTool.lifeA", health.lifeTimeEstAPercent)}
+        ${lifeBlock("storageTool.lifeB", health.lifeTimeEstBPercent)}
+      </div>
+
+      <div class="storage-pre-eol-line">
+        <span>${escapeHtml(t("storageTool.preEol"))}</span>
+        <b>${escapeHtml(preEolLabel)}</b>
+      </div>
+    </section>
+  `;
+}
+
+function renderStorageTool() {
   const data = state.hardwareData;
   const host = $("[data-hardware-body]");
   preserveToolFocus(host);
 
-  if (!data || !data.initialized) {
-    host.innerHTML = `<div class="hardware-tool-empty">${escapeHtml(data?.message || t("nvme.uninitialized"))}</div>`;
+  const nvme = data?.nvme;
+  const mmc = data?.mmc;
+  const nvmeDevices = nvme?.initialized ? nvme.devices || [] : [];
+  const mmcDevices = mmc?.initialized ? mmc.devices || [] : [];
+
+  if (nvmeDevices.length === 0 && mmcDevices.length === 0) {
+    const message =
+      !(nvme?.initialized) && !(mmc?.initialized)
+        ? t("storageTool.uninitialized")
+        : t("storageTool.noDevices");
+    host.innerHTML = `<div class="hardware-tool-empty">${escapeHtml(message)}</div>`;
     return;
   }
 
-  const devices = data.devices || [];
-  if (!devices.length) {
-    host.innerHTML = `<div class="hardware-tool-empty">${escapeHtml(t("nvme.noDevices"))}</div>`;
-    return;
-  }
+  const parts = [];
+  if (nvmeDevices.length > 0) parts.push(t("storageTool.countNvme", { count: nvmeDevices.length }));
+  if (mmcDevices.length > 0) parts.push(t("storageTool.countMmc", { count: mmcDevices.length }));
 
   host.innerHTML = `
     <div class="tool-fact-line">
-      <span>${escapeHtml(t("nvme.description"))}</span>
-      <b>${devices.length} NVMe</b>
+      <span>${escapeHtml(t("storageTool.description"))}</span>
+      <b>${escapeHtml(parts.join(" · "))}</b>
     </div>
     <div class="nvme-tool-container">
-      ${devices.map((dev) => renderNvmeDeviceCard(dev)).join("")}
+      ${nvmeDevices.map((dev) => renderNvmeDeviceCard(dev)).join("")}
+      ${mmcDevices.map((dev) => renderStorageMmcCard(dev)).join("")}
     </div>
   `;
-  applyNvmeMetricStyles(host);
-}
-
-function applyNvmeMetricStyles(host) {
-  $$("[data-metric-percent]", host).forEach((bar) => {
-    bar.style.setProperty("--metric-percent", `${Number(bar.dataset.metricPercent || 0)}%`);
-  });
+  applyStorageMetricStyles(host);
 }
 
 function renderNvmeDeviceCard(device) {

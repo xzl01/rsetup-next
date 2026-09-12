@@ -1980,6 +1980,51 @@ body.is-resolving .core-node { animation: core-resolve 820ms var(--ease-soft) bo
 .nvme-metric-bar-fill.is-warning { background: var(--amber); }
 .nvme-metric-bar-fill.is-critical { background: var(--coral); }
 .nvme-metric-bar-fill.is-cyan { background: var(--cyan); }
+.nvme-metric-bar-fill.is-na {
+  background: repeating-linear-gradient(
+    45deg,
+    var(--line),
+    var(--line) 6px,
+    var(--field) 6px,
+    var(--field) 12px
+  );
+}
+
+/* Unified storage tool: MMC/eMMC cards mirror the NVMe card visual language. */
+.storage-mmc-card {
+  padding: 22px 24px;
+  border-radius: 24px;
+  background: var(--field);
+  display: grid;
+  gap: 18px;
+}
+.storage-card-type-badge {
+  display: inline-block;
+  margin-left: 10px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--bone-muted);
+  background: var(--ground-2);
+  border: 1px solid var(--line);
+  vertical-align: 2px;
+}
+.storage-pre-eol-line {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 12px 14px;
+  border-radius: 16px;
+  background: var(--ground-2);
+  font-size: 12px;
+  color: var(--bone-muted);
+}
+.storage-pre-eol-line b {
+  font-size: 12px;
+  color: var(--bone);
+  font-family: "Rsetup Mono", monospace;
+}
 
 .nvme-stats-grid {
   display: grid;

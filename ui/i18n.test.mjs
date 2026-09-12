@@ -222,3 +222,83 @@ test("unknown dynamic keys and missing parameters do not leak template syntax", 
   assert.equal(i18n.t("sources.warning.future"), "暂无详细信息");
   assert.doesNotMatch(i18n.t("gpio.overlays"), /\{count\}/);
 });
+
+const EXPECTED = {
+  "en-US": {
+    "storageTool.title": "Storage",
+    "storageTool.description": "Monitor NVMe and MMC/eMMC storage health.",
+    "storageTool.uninitialized": "No storage devices detected. Storage module is disabled.",
+    "storageTool.noDevices": "No storage devices detected.",
+    "storageTool.countNvme": "{count} NVMe",
+    "storageTool.countMmc": "{count} MMC/eMMC",
+    "storageTool.emmc": "eMMC",
+    "storageTool.sd": "SD",
+    "storageTool.model": "Model",
+    "storageTool.serial": "Serial",
+    "storageTool.firmware": "Firmware",
+    "storageTool.capacity": "Capacity",
+    "storageTool.manufacturer": "Manufacturer",
+    "storageTool.lifeA": "SLC life",
+    "storageTool.lifeB": "MLC life",
+    "storageTool.preEol": "Pre-EOL state",
+    "storageTool.preEolNormal": "Normal",
+    "storageTool.preEolWarning": "Warning (80% wear threshold)",
+    "storageTool.preEolUrgent": "Urgent (replace soon)",
+    "storageTool.preEolUndefined": "Undefined",
+    "storageTool.na": "N/A",
+    "storageTool.healthy": "Healthy",
+    "storageTool.warning": "Warning",
+    "storageTool.critical": "Critical",
+  },
+  "zh-CN": {
+    "storageTool.title": "存储",
+    "storageTool.description": "监测 NVMe 与 MMC/eMMC 存储健康状态。",
+    "storageTool.uninitialized": "未检测到存储设备，存储模块未激活。",
+    "storageTool.noDevices": "未检测到存储设备。",
+    "storageTool.countNvme": "{count} NVMe",
+    "storageTool.countMmc": "{count} MMC/eMMC",
+    "storageTool.emmc": "eMMC",
+    "storageTool.sd": "SD",
+    "storageTool.model": "型号",
+    "storageTool.serial": "序列号",
+    "storageTool.firmware": "固件",
+    "storageTool.capacity": "容量",
+    "storageTool.manufacturer": "厂商",
+    "storageTool.lifeA": "SLC 寿命",
+    "storageTool.lifeB": "MLC 寿命",
+    "storageTool.preEol": "预 EOL 状态",
+    "storageTool.preEolNormal": "正常",
+    "storageTool.preEolWarning": "预警（80% 寿命阈值）",
+    "storageTool.preEolUrgent": "紧急（建议尽快更换）",
+    "storageTool.preEolUndefined": "未定义",
+    "storageTool.na": "不支持",
+    "storageTool.healthy": "健康",
+    "storageTool.warning": "预警",
+    "storageTool.critical": "严重",
+  },
+};
+
+test("storage tool keys exist in both languages with exact copy", () => {
+  for (const [language, table] of Object.entries(EXPECTED)) {
+    const { i18n } = loadI18n(language);
+    for (const [key, expected] of Object.entries(table)) {
+      if (expected.includes("{count}")) {
+        assert.equal(i18n.t(key, { count: 3 }), expected.replace("{count}", "3"), `${language} ${key}`);
+      } else {
+        assert.equal(i18n.t(key), expected, `${language} ${key}`);
+      }
+    }
+    // parameter substitution works through the real t()
+    assert.equal(i18n.t("storageTool.countMmc", { count: 2 }), "2 MMC/eMMC");
+  }
+});
+
+test("storage capability card is localized under its renamed id", () => {
+  const detected = { id: "storage", label: "Storage", available: true, detail: "1 NVMe · 1 eMMC · 1 SD" };
+  assert.equal(loadI18n("en-US").i18n.capability(detected).label, "Storage");
+  assert.equal(loadI18n("zh-CN").i18n.capability(detected).label, "存储");
+
+  const missing = { id: "storage", label: "Storage", available: false, detail: "No storage devices detected" };
+  assert.equal(loadI18n("en-US").i18n.capability(missing).detail, "No storage devices detected");
+  assert.equal(loadI18n("zh-CN").i18n.capability(missing).detail, "未检测到存储设备");
+});

@@ -416,6 +416,30 @@
       "nvme.errorLogs": "Error log entries",
       "nvme.warningFlags": "Warning flags",
       "nvme.noDevices": "No NVMe devices detected.",
+      "storageTool.title": "Storage",
+      "storageTool.description": "Monitor NVMe and MMC/eMMC storage health.",
+      "storageTool.uninitialized": "No storage devices detected. Storage module is disabled.",
+      "storageTool.noDevices": "No storage devices detected.",
+      "storageTool.countNvme": "{count} NVMe",
+      "storageTool.countMmc": "{count} MMC/eMMC",
+      "storageTool.emmc": "eMMC",
+      "storageTool.sd": "SD",
+      "storageTool.model": "Model",
+      "storageTool.serial": "Serial",
+      "storageTool.firmware": "Firmware",
+      "storageTool.capacity": "Capacity",
+      "storageTool.manufacturer": "Manufacturer",
+      "storageTool.lifeA": "SLC life",
+      "storageTool.lifeB": "MLC life",
+      "storageTool.preEol": "Pre-EOL state",
+      "storageTool.preEolNormal": "Normal",
+      "storageTool.preEolWarning": "Warning (80% wear threshold)",
+      "storageTool.preEolUrgent": "Urgent (replace soon)",
+      "storageTool.preEolUndefined": "Undefined",
+      "storageTool.na": "N/A",
+      "storageTool.healthy": "Healthy",
+      "storageTool.warning": "Warning",
+      "storageTool.critical": "Critical",
       "workflows.title": "System operations",
       "workflows.group.system": "System & power",
       "workflows.group.network": "Network access",
@@ -932,6 +956,30 @@
       "nvme.errorLogs": "错误日志项",
       "nvme.warningFlags": "告警标志",
       "nvme.noDevices": "未检测到 NVMe 设备。",
+      "storageTool.title": "存储",
+      "storageTool.description": "监测 NVMe 与 MMC/eMMC 存储健康状态。",
+      "storageTool.uninitialized": "未检测到存储设备，存储模块未激活。",
+      "storageTool.noDevices": "未检测到存储设备。",
+      "storageTool.countNvme": "{count} NVMe",
+      "storageTool.countMmc": "{count} MMC/eMMC",
+      "storageTool.emmc": "eMMC",
+      "storageTool.sd": "SD",
+      "storageTool.model": "型号",
+      "storageTool.serial": "序列号",
+      "storageTool.firmware": "固件",
+      "storageTool.capacity": "容量",
+      "storageTool.manufacturer": "厂商",
+      "storageTool.lifeA": "SLC 寿命",
+      "storageTool.lifeB": "MLC 寿命",
+      "storageTool.preEol": "预 EOL 状态",
+      "storageTool.preEolNormal": "正常",
+      "storageTool.preEolWarning": "预警（80% 寿命阈值）",
+      "storageTool.preEolUrgent": "紧急（建议尽快更换）",
+      "storageTool.preEolUndefined": "未定义",
+      "storageTool.na": "不支持",
+      "storageTool.healthy": "健康",
+      "storageTool.warning": "预警",
+      "storageTool.critical": "严重",
       "workflows.title": "系统管理",
       "workflows.group.system": "系统与电源",
       "workflows.group.network": "网络访问",
@@ -1061,7 +1109,7 @@
     thermal: ["温控能力", "内核温控子系统"],
     led: ["LED 控制", "Linux LED 设备"],
     "spi-flash": ["SPI 启动闪存", "MTD 闪存设备"],
-    nvme: ["NVMe 存储", "NVMe 固态存储设备"],
+    storage: ["存储", "存储设备"],
   };
 
   const serviceCopy = {
@@ -1140,8 +1188,7 @@
     else if (value.id === "thermal" && /^\d+ zones/.test(detail)) detail = detail.replace(" zones", " 个温区");
     else if (value.id === "led" && /^\d+ status LEDs/.test(detail)) detail = detail.replace(" status LEDs", " 个状态灯").replace(" RGB group", " 组 RGB 灯");
     else if (value.id === "spi-flash" && /MTD device$/.test(detail)) detail = detail.replace("MTD device", "MTD 设备");
-    else if (value.id === "nvme" && /^\d+ NVMe SSD/.test(detail)) detail = detail.replace(" NVMe SSD", " 块 NVMe 固态硬盘");
-    else if (["Overlay storage detected", "Video4Linux device", "Kernel thermal subsystem", "Linux LED class devices", "MTD flash device", "NVMe controllers detected"].includes(detail)) detail = copy[1];
+    else if (["Overlay storage detected", "Video4Linux device", "Kernel thermal subsystem", "Linux LED class devices", "MTD flash device"].includes(detail)) detail = copy[1];
     return { ...value, label: copy[0], detail };
   }
 
@@ -1219,6 +1266,7 @@
     if (locale !== "zh-CN") return reason;
     const translations = {
       "Not detected on this device": "此设备未检测到",
+      "No storage devices detected": "未检测到存储设备",
       "EFI boot files require administrator authorization to read.": "读取 EFI 配置需要管理员授权。",
       "UEFI detected. No supported overlay configuration backend is available.": "UEFI：当前没有可用的 Overlay 配置后端。",
       "No managed overlay directory was detected.": "未检测到受管的 Overlay 目录。",
