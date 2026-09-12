@@ -82,6 +82,7 @@ struct App {
     source_selected: usize,
     notice: Option<String>,
     pub(crate) nvme_status: rsetup_core::NvmeStatus,
+    pub(crate) mmc_status: rsetup_core::MmcStatus,
     benchmark_rx: Option<
         std::sync::mpsc::Receiver<Result<rsetup_core::MirrorBenchmark, rsetup_core::SourceError>>,
     >,
@@ -107,6 +108,11 @@ impl App {
             devices: vec![],
             message: Some("Failed to query NVMe status".into()),
         });
+        let mmc_status = controller.mmc_status().unwrap_or_else(|_| rsetup_core::MmcStatus {
+            initialized: false,
+            devices: vec![],
+            message: Some("Failed to query MMC status".into()),
+        });
         Ok(Self {
             controller,
             locale,
@@ -121,6 +127,7 @@ impl App {
             source_selected,
             notice: None,
             nvme_status,
+            mmc_status,
             benchmark_rx: None,
             benchmarks: Default::default(),
         })
@@ -202,6 +209,14 @@ impl App {
                 initialized: false,
                 devices: vec![],
                 message: Some("Failed to query NVMe status".into()),
+            });
+        self.mmc_status = self
+            .controller
+            .mmc_status()
+            .unwrap_or_else(|_| rsetup_core::MmcStatus {
+                initialized: false,
+                devices: vec![],
+                message: Some("Failed to query MMC status".into()),
             });
         if self.source_picker {
             self.update_source_plan();
@@ -853,6 +868,18 @@ mod tests {
         assert_eq!(app.nvme_status.devices.len(), 1);
         app.refresh().expect("refresh app");
         assert!(app.nvme_status.initialized);
+    }
+
+    #[test]
+    fn test_tui_app_loads_and_refreshes_mmc_status() {
+        let controller = Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun);
+        let mut app = App::new(controller, Locale::En).expect("init app");
+        // Demo mode returns 2 MMC devices (eMMC + SD).
+        assert!(app.mmc_status.initialized);
+        assert_eq!(app.mmc_status.devices.len(), 2);
+        app.refresh().expect("refresh app");
+        assert!(app.mmc_status.initialized);
+        assert_eq!(app.mmc_status.devices.len(), 2);
     }
 
     #[test]
