@@ -55,7 +55,7 @@ const EXT_CSD_PRE_EOL_INFO: usize = 267;
 const EXT_CSD_DEVICE_LIFE_TIME_EST_TYP_A: usize = 268;
 const EXT_CSD_DEVICE_LIFE_TIME_EST_TYP_B: usize = 269;
 
-/// Parsed subset of the 512-byte EXT_CSD register (CMD6).
+/// Parsed subset of the 512-byte EXT_CSD register (CMD8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MmcExtCsd {
     pub rev: u8,
