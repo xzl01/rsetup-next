@@ -299,8 +299,8 @@ mod tests {
         assert!(json.contains("\"mmc\":{"));
         assert!(json.contains("\"nvme\":{"));
 
-        let deserialized: StorageStatus = serde_json::from_str(&json).expect("deserialize storage_status");
+        let deserialized: StorageStatus =
+            serde_json::from_str(&json).expect("deserialize storage_status");
         assert_eq!(deserialized, storage_status);
     }
 }
-

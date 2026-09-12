@@ -1076,7 +1076,10 @@ fn format_nvme_status(status: &rsetup_core::NvmeStatus, locale: Locale) -> Strin
             if is_zh {
                 return format!("未检测到 NVMe 存储设备，模块未激活。（{}）", msg);
             } else {
-                return format!("No NVMe storage devices detected; module is uninitialized. ({})", msg);
+                return format!(
+                    "No NVMe storage devices detected; module is uninitialized. ({})",
+                    msg
+                );
             }
         } else if is_zh {
             return "未检测到 NVMe 存储设备，模块未激活。".into();
@@ -1110,13 +1113,22 @@ fn format_nvme_status(status: &rsetup_core::NvmeStatus, locale: Locale) -> Strin
             out.push(format!("  型号:             {}", dev.model));
             out.push(format!("  序列号:           {}", dev.serial));
             out.push(format!("  固件版本:         {}", dev.firmware));
-            out.push(format!("  总容量:           {} ({} 字节)", size_str, dev.total_bytes));
-            out.push(format!("  当前温度:         {:.1} °C", dev.smart.temperature_c));
+            out.push(format!(
+                "  总容量:           {} ({} 字节)",
+                size_str, dev.total_bytes
+            ));
+            out.push(format!(
+                "  当前温度:         {:.1} °C",
+                dev.smart.temperature_c
+            ));
             out.push(format!(
                 "  备用空间/阈值:    {}% / {}%",
                 dev.smart.available_spare_percent, dev.smart.spare_threshold_percent
             ));
-            out.push(format!("  已使用寿命:       {}%", dev.smart.percentage_used));
+            out.push(format!(
+                "  已使用寿命:       {}%",
+                dev.smart.percentage_used
+            ));
             out.push(format!(
                 "  数据读写量:       读取 {} / 写入 {}",
                 format_bytes(dev.smart.data_read_bytes),
@@ -1140,13 +1152,22 @@ fn format_nvme_status(status: &rsetup_core::NvmeStatus, locale: Locale) -> Strin
             out.push(format!("  Model:            {}", dev.model));
             out.push(format!("  Serial Number:    {}", dev.serial));
             out.push(format!("  Firmware:         {}", dev.firmware));
-            out.push(format!("  Total Capacity:   {} ({} bytes)", size_str, dev.total_bytes));
-            out.push(format!("  Temperature:      {:.1} °C", dev.smart.temperature_c));
+            out.push(format!(
+                "  Total Capacity:   {} ({} bytes)",
+                size_str, dev.total_bytes
+            ));
+            out.push(format!(
+                "  Temperature:      {:.1} °C",
+                dev.smart.temperature_c
+            ));
             out.push(format!(
                 "  Available Spare:  {}% (threshold: {}%)",
                 dev.smart.available_spare_percent, dev.smart.spare_threshold_percent
             ));
-            out.push(format!("  Percentage Used:  {}%", dev.smart.percentage_used));
+            out.push(format!(
+                "  Percentage Used:  {}%",
+                dev.smart.percentage_used
+            ));
             out.push(format!(
                 "  Data Read/Write:  Read {} / Written {}",
                 format_bytes(dev.smart.data_read_bytes),
@@ -1205,7 +1226,10 @@ fn format_mmc_status(status: &rsetup_core::MmcStatus, locale: Locale) -> String 
             out.push("".to_string());
         }
         let header = if is_zh {
-            format!("=== 存储设备: {} ({}) [{}] ===", dev.name, dev.block_path, dev.card_type)
+            format!(
+                "=== 存储设备: {} ({}) [{}] ===",
+                dev.name, dev.block_path, dev.card_type
+            )
         } else {
             format!(
                 "=== Storage Device: {} ({}) [{}] ===",
@@ -1274,7 +1298,9 @@ fn format_mmc_status(status: &rsetup_core::MmcStatus, locale: Locale) -> String 
             let life_a_str = life_str(dev.health.life_time_est_a_percent);
             let life_b_str = life_str(dev.health.life_time_est_b_percent);
             out.push(format!("  Pre-EOL:            {pre_eol_str}"));
-            out.push(format!("  Life Time Est (A/B): {life_a_str} / {life_b_str}"));
+            out.push(format!(
+                "  Life Time Est (A/B): {life_a_str} / {life_b_str}"
+            ));
             let warning_str = if dev.health.warning_flags.is_empty() {
                 "None".to_string()
             } else {
@@ -1383,8 +1409,8 @@ mod tests {
             other => panic!("unexpected command parsed: {:?}", other),
         }
 
-        let cli_json =
-            Cli::try_parse_from(["rsetup-next", "hardware", "nvme", "--json"]).expect("parse nvme json");
+        let cli_json = Cli::try_parse_from(["rsetup-next", "hardware", "nvme", "--json"])
+            .expect("parse nvme json");
         match cli_json.command {
             Some(Commands::Hardware {
                 command: HardwareCommands::Nvme { json },
@@ -1449,15 +1475,27 @@ mod tests {
 
         let out_zh = format_nvme_status(&status, Locale::ZhCn);
         assert!(out_zh.contains("nvme0"), "zh should contain nvme0");
-        assert!(out_zh.contains("Radxa NVMe SSD 256GB"), "zh should contain model");
+        assert!(
+            out_zh.contains("Radxa NVMe SSD 256GB"),
+            "zh should contain model"
+        );
         assert!(out_zh.contains("42"), "zh should contain temperature 42");
-        assert!(out_zh.contains("RADXA2026NVME01"), "zh should contain serial");
+        assert!(
+            out_zh.contains("RADXA2026NVME01"),
+            "zh should contain serial"
+        );
 
         let out_en = format_nvme_status(&status, Locale::En);
         assert!(out_en.contains("nvme0"), "en should contain nvme0");
-        assert!(out_en.contains("Radxa NVMe SSD 256GB"), "en should contain model");
+        assert!(
+            out_en.contains("Radxa NVMe SSD 256GB"),
+            "en should contain model"
+        );
         assert!(out_en.contains("42"), "en should contain temperature 42");
-        assert!(out_en.contains("Temperature"), "en should contain label Temperature");
+        assert!(
+            out_en.contains("Temperature"),
+            "en should contain label Temperature"
+        );
     }
 
     #[test]
@@ -1472,8 +1510,8 @@ mod tests {
             other => panic!("unexpected command parsed: {:?}", other),
         }
 
-        let cli_json =
-            Cli::try_parse_from(["rsetup-next", "hardware", "mmc", "--json"]).expect("parse mmc json");
+        let cli_json = Cli::try_parse_from(["rsetup-next", "hardware", "mmc", "--json"])
+            .expect("parse mmc json");
         match cli_json.command {
             Some(Commands::Hardware {
                 command: HardwareCommands::Mmc { json },
@@ -1486,7 +1524,8 @@ mod tests {
 
     #[test]
     fn hardware_cli_parses_storage_subcommand_and_flags() {
-        let cli = Cli::try_parse_from(["rsetup-next", "hardware", "storage"]).expect("parse storage");
+        let cli =
+            Cli::try_parse_from(["rsetup-next", "hardware", "storage"]).expect("parse storage");
         match cli.command {
             Some(Commands::Hardware {
                 command: HardwareCommands::Storage { json },
@@ -1496,13 +1535,8 @@ mod tests {
             other => panic!("unexpected command parsed: {:?}", other),
         }
 
-        let cli_json = Cli::try_parse_from([
-            "rsetup-next",
-            "hardware",
-            "storage",
-            "--json",
-        ])
-        .expect("parse storage json");
+        let cli_json = Cli::try_parse_from(["rsetup-next", "hardware", "storage", "--json"])
+            .expect("parse storage json");
         match cli_json.command {
             Some(Commands::Hardware {
                 command: HardwareCommands::Storage { json },
@@ -1576,16 +1610,25 @@ mod tests {
 
         let out_zh = format_mmc_status(&status, Locale::ZhCn);
         assert!(out_zh.contains("mmc0:0001"), "zh should contain mmc0:0001");
-        assert!(out_zh.contains("/dev/mmcblk0"), "zh should contain block path");
+        assert!(
+            out_zh.contains("/dev/mmcblk0"),
+            "zh should contain block path"
+        );
         assert!(out_zh.contains("MMC"), "zh should contain card type MMC");
         assert!(out_zh.contains("SD"), "zh should contain card type SD");
-        assert!(out_zh.contains("10%"), "zh should contain life estimate 10%");
+        assert!(
+            out_zh.contains("10%"),
+            "zh should contain life estimate 10%"
+        );
         assert!(out_zh.contains("不支持"), "zh should contain N/A marker");
 
         let out_en = format_mmc_status(&status, Locale::En);
         assert!(out_en.contains("mmc0:0001"), "en should contain mmc0:0001");
         assert!(out_en.contains("N/A"), "en should contain N/A marker");
-        assert!(out_en.contains("Normal"), "en should contain Normal pre-EOL");
+        assert!(
+            out_en.contains("Normal"),
+            "en should contain Normal pre-EOL"
+        );
     }
 
     #[test]

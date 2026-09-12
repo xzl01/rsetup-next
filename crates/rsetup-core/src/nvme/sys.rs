@@ -1,4 +1,4 @@
-use super::{parse_smart_log, NvmeError};
+use super::{NvmeError, parse_smart_log};
 use crate::model::{NvmeDevice, NvmeSmartLog};
 use std::fs;
 use std::path::{Path, PathBuf};

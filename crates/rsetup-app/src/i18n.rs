@@ -290,9 +290,7 @@ impl Locale {
                 "No NVMe storage devices detected; module is uninitialized."
             }
             (_, "storage_telemetry") => "Storage Devices",
-            (_, "storage_not_detected") => {
-                "No NVMe or MMC storage devices detected."
-            }
+            (_, "storage_not_detected") => "No NVMe or MMC storage devices detected.",
             (_, "storage_nvme") => "NVMe",
             (_, "storage_emmc") => "eMMC",
             (_, "storage_sd") => "SD Card",

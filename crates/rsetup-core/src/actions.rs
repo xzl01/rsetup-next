@@ -2066,7 +2066,9 @@ mod tests {
     #[test]
     fn test_controller_nvme_status_live() {
         let controller = Controller::new(ProbeMode::Auto, ExecutionPolicy::DryRun);
-        let status = controller.nvme_status().expect("nvme status in live/auto mode");
+        let status = controller
+            .nvme_status()
+            .expect("nvme status in live/auto mode");
         // Whether initialized is true or false depends on host, but it must not panic and must return Ok.
         if !status.initialized {
             assert!(status.message.is_some());
@@ -2104,7 +2106,9 @@ mod tests {
     #[test]
     fn test_controller_storage_status_demo() {
         let controller = Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun);
-        let storage = controller.storage_status().expect("storage status in demo mode");
+        let storage = controller
+            .storage_status()
+            .expect("storage status in demo mode");
         assert!(storage.nvme.initialized);
         assert_eq!(storage.nvme.devices.len(), 1);
         assert!(storage.mmc.initialized);

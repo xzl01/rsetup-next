@@ -1,6 +1,6 @@
 use super::{
-    format_manufacturer, generate_warning_flags, map_life_time_byte_to_percent,
-    parse_life_time_str, parse_pre_eol_info_str, MmcError,
+    MmcError, format_manufacturer, generate_warning_flags, map_life_time_byte_to_percent,
+    parse_life_time_str, parse_pre_eol_info_str,
 };
 use crate::model::{MmcDevice, MmcHealth};
 use std::fs;
@@ -35,8 +35,7 @@ const MMC_BLOCK_MAJOR: u8 = 179;
 // _IOWR(MMC_BLOCK_MAJOR, 0, struct mmc_ioc_cmd)
 // dir = _IOC_READ | _IOC_WRITE = 3, size = 72 (0x48), type = 179 (0xB3), nr = 0
 // 3 << 30 | 72 << 16 | 0xB3 << 8 | 0x00 = 0xc048b300
-const MMC_IOC_CMD: libc::c_ulong =
-    3u64 << 30 | 72u64 << 16 | (MMC_BLOCK_MAJOR as u64) << 8;
+const MMC_IOC_CMD: libc::c_ulong = 3u64 << 30 | 72u64 << 16 | (MMC_BLOCK_MAJOR as u64) << 8;
 
 /// CMD8 — SEND EXT_CSD (include/linux/mmc/core.h).
 const MMC_OPCODE_SEND_EXT_CSD: u32 = 8;
@@ -102,7 +101,10 @@ pub fn read_ext_csd_raw(dev_path: &str) -> Result<[u8; 512], MmcError> {
     let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY) };
     if fd < 0 {
         let err = std::io::Error::last_os_error();
-        return Err(MmcError::Io(format!("Failed to open {}: {}", dev_path, err)));
+        return Err(MmcError::Io(format!(
+            "Failed to open {}: {}",
+            dev_path, err
+        )));
     }
 
     let mut buf = [0u8; 512];
@@ -264,8 +266,7 @@ pub fn read_device_sysfs(sysfs_root: &Path, dev_name: &str) -> Result<MmcDevice,
                     .iter()
                     .position(|&b| b == 0)
                     .unwrap_or(ext.firmware_version.len());
-                firmware = String::from_utf8_lossy(&ext.firmware_version[..end])
-                    .into_owned();
+                firmware = String::from_utf8_lossy(&ext.firmware_version[..end]).into_owned();
             }
         }
     }

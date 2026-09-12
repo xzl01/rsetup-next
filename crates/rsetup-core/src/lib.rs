@@ -2,15 +2,15 @@ mod actions;
 mod efi_overlay;
 mod fan_curve;
 mod hardware;
+pub mod mmc;
 mod model;
+pub mod nvme;
 mod pinout;
 mod probe;
 mod sources;
 mod spi_flash;
 mod transaction;
 mod video;
-pub mod mmc;
-pub mod nvme;
 
 pub use actions::{ActionError, Controller, ExecutionPolicy};
 pub use fan_curve::{

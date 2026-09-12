@@ -103,16 +103,20 @@ impl App {
                 Some(provider.id.as_str()) == source_status.current_system_provider.as_deref()
             })
             .unwrap_or(0);
-        let nvme_status = controller.nvme_status().unwrap_or_else(|_| rsetup_core::NvmeStatus {
-            initialized: false,
-            devices: vec![],
-            message: Some("Failed to query NVMe status".into()),
-        });
-        let mmc_status = controller.mmc_status().unwrap_or_else(|_| rsetup_core::MmcStatus {
-            initialized: false,
-            devices: vec![],
-            message: Some("Failed to query MMC status".into()),
-        });
+        let nvme_status = controller
+            .nvme_status()
+            .unwrap_or_else(|_| rsetup_core::NvmeStatus {
+                initialized: false,
+                devices: vec![],
+                message: Some("Failed to query NVMe status".into()),
+            });
+        let mmc_status = controller
+            .mmc_status()
+            .unwrap_or_else(|_| rsetup_core::MmcStatus {
+                initialized: false,
+                devices: vec![],
+                message: Some("Failed to query MMC status".into()),
+            });
         Ok(Self {
             controller,
             locale,
@@ -202,14 +206,14 @@ impl App {
             .controller
             .source_status()
             .map_err(|error| anyhow!(self.locale.source_error(&error)))?;
-        self.nvme_status = self
-            .controller
-            .nvme_status()
-            .unwrap_or_else(|_| rsetup_core::NvmeStatus {
-                initialized: false,
-                devices: vec![],
-                message: Some("Failed to query NVMe status".into()),
-            });
+        self.nvme_status =
+            self.controller
+                .nvme_status()
+                .unwrap_or_else(|_| rsetup_core::NvmeStatus {
+                    initialized: false,
+                    devices: vec![],
+                    message: Some("Failed to query NVMe status".into()),
+                });
         self.mmc_status = self
             .controller
             .mmc_status()
@@ -390,8 +394,16 @@ fn render_mission(frame: &mut Frame, app: &App, area: Rect) {
     // width to size the card for what will actually render.
     let has_nvme_devices = app.nvme_status.initialized && !app.nvme_status.devices.is_empty();
     let has_mmc_devices = app.mmc_status.initialized && !app.mmc_status.devices.is_empty();
-    let nvme_count = if has_nvme_devices { app.nvme_status.devices.len() } else { 0 };
-    let mmc_count = if has_mmc_devices { app.mmc_status.devices.len() } else { 0 };
+    let nvme_count = if has_nvme_devices {
+        app.nvme_status.devices.len()
+    } else {
+        0
+    };
+    let mmc_count = if has_mmc_devices {
+        app.mmc_status.devices.len()
+    } else {
+        0
+    };
     let inner_width = (area.width.saturating_sub(2)) as usize;
     let nvme_rows = if has_nvme_devices {
         app.nvme_status
@@ -417,7 +429,11 @@ fn render_mission(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         nvme_rows + mmc_rows + (device_count - 1)
     };
-    let desired_height = if device_count == 0 { 3 } else { 2 + content_rows };
+    let desired_height = if device_count == 0 {
+        3
+    } else {
+        2 + content_rows
+    };
     // On short viewports keep the two cards above and the service list below
     // intact rather than growing the storage card past the available room.
     let headroom = area.height.saturating_sub(6 + 6 + 4) as usize;
@@ -585,9 +601,7 @@ fn render_storage_summary(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: true }),
+        Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
         area,
     );
 }
@@ -619,7 +633,10 @@ fn nvme_device_lines(
     let size_str = crate::format_bytes(dev.total_bytes);
     // Line 1: dev.name, dev.path, model, capacity
     let line1 = Line::from(vec![
-        Span::styled(format!("{} ", dev.name), Style::default().fg(BONE).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{} ", dev.name),
+            Style::default().fg(BONE).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(format!("({}) · ", dev.path), Style::default().fg(MUTED)),
         Span::styled(format!("{} · ", dev.model), Style::default().fg(BONE)),
         Span::styled(size_str, Style::default().fg(AMBER)),
@@ -632,20 +649,45 @@ fn nvme_device_lines(
     } else {
         (app.locale.text("nvme_warning"), CORAL)
     };
-    let status_label = if app.locale.is_zh() { "状态: " } else { "Health: " };
-    let temp_label = if app.locale.is_zh() { "温度: " } else { "Temp: " };
-    let spare_label = if app.locale.is_zh() { "备用: " } else { "Spare: " };
-    let endurance_label = if app.locale.is_zh() { "已用寿命: " } else { "Used Endurance: " };
+    let status_label = if app.locale.is_zh() {
+        "状态: "
+    } else {
+        "Health: "
+    };
+    let temp_label = if app.locale.is_zh() {
+        "温度: "
+    } else {
+        "Temp: "
+    };
+    let spare_label = if app.locale.is_zh() {
+        "备用: "
+    } else {
+        "Spare: "
+    };
+    let endurance_label = if app.locale.is_zh() {
+        "已用寿命: "
+    } else {
+        "Used Endurance: "
+    };
     // "Used Endurance:" is long enough to push the mandatory available-spare
     // value past the 59 columns the mission panel gets on a 100-column
     // terminal, so fall back to the short spelling when the full one does
     // not fit next to the warning flags.
-    let short_endurance_label = if app.locale.is_zh() { endurance_label } else { "Used: " };
+    let short_endurance_label = if app.locale.is_zh() {
+        endurance_label
+    } else {
+        "Used: "
+    };
 
     let build_telemetry_line = |endurance_label: &'static str| -> Line<'static> {
         let mut spans = vec![
             Span::styled(status_label, Style::default().fg(MUTED)),
-            Span::styled(status_text, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                status_text,
+                Style::default()
+                    .fg(status_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ];
         if !is_healthy && !dev.smart.warning_flags.is_empty() {
             spans.push(Span::styled(
@@ -656,13 +698,22 @@ fn nvme_device_lines(
         spans.extend(vec![
             Span::styled(" · ", Style::default().fg(MUTED)),
             Span::styled(temp_label, Style::default().fg(MUTED)),
-            Span::styled(format!("{:.1} °C", dev.smart.temperature_c), Style::default().fg(BONE)),
+            Span::styled(
+                format!("{:.1} °C", dev.smart.temperature_c),
+                Style::default().fg(BONE),
+            ),
             Span::styled(" · ", Style::default().fg(MUTED)),
             Span::styled(endurance_label, Style::default().fg(MUTED)),
-            Span::styled(format!("{}%", dev.smart.percentage_used), Style::default().fg(BONE)),
+            Span::styled(
+                format!("{}%", dev.smart.percentage_used),
+                Style::default().fg(BONE),
+            ),
             Span::styled(" · ", Style::default().fg(MUTED)),
             Span::styled(spare_label, Style::default().fg(MUTED)),
-            Span::styled(format!("{}%", dev.smart.available_spare_percent), Style::default().fg(BONE)),
+            Span::styled(
+                format!("{}%", dev.smart.available_spare_percent),
+                Style::default().fg(BONE),
+            ),
         ]);
         Line::from(spans)
     };
@@ -674,14 +725,25 @@ fn nvme_device_lines(
     };
 
     // Line 3: Data read & written plus the available-spare threshold
-    let io_label = if app.locale.is_zh() { "读写: " } else { "I/O: " };
-    let threshold_label = if app.locale.is_zh() { "阈值" } else { "threshold" };
+    let io_label = if app.locale.is_zh() {
+        "读写: "
+    } else {
+        "I/O: "
+    };
+    let threshold_label = if app.locale.is_zh() {
+        "阈值"
+    } else {
+        "threshold"
+    };
     let read_str = crate::format_bytes(dev.smart.data_read_bytes);
     let write_str = crate::format_bytes(dev.smart.data_written_bytes);
 
     let line3 = Line::from(vec![
         Span::styled(io_label, Style::default().fg(MUTED)),
-        Span::styled(format!("Read {read_str} / Written {write_str}"), Style::default().fg(BONE)),
+        Span::styled(
+            format!("Read {read_str} / Written {write_str}"),
+            Style::default().fg(BONE),
+        ),
         Span::styled(" · ", Style::default().fg(MUTED)),
         Span::styled(
             format!("{threshold_label} {}%", dev.smart.spare_threshold_percent),
@@ -700,11 +762,20 @@ fn mmc_device_lines(app: &App, dev: &rsetup_core::MmcDevice) -> Vec<Line<'static
         app.locale.text("storage_sd")
     };
     let line1 = Line::from(vec![
-        Span::styled(format!("[{}] ", type_label), Style::default().fg(BONE).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("[{}] ", type_label),
+            Style::default().fg(BONE).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(format!("{} · ", dev.block_path), Style::default().fg(BONE)),
         Span::styled(format!("{} · ", dev.model), Style::default().fg(BONE)),
-        Span::styled(format!("{} · ", dev.manufacturer), Style::default().fg(MUTED)),
-        Span::styled(crate::format_bytes(dev.total_bytes), Style::default().fg(AMBER)),
+        Span::styled(
+            format!("{} · ", dev.manufacturer),
+            Style::default().fg(MUTED),
+        ),
+        Span::styled(
+            crate::format_bytes(dev.total_bytes),
+            Style::default().fg(AMBER),
+        ),
     ]);
 
     // Line 2: Health state, SLC/MLC life estimates, pre-EOL warning
@@ -739,7 +810,12 @@ fn mmc_device_lines(app: &App, dev: &rsetup_core::MmcDevice) -> Vec<Line<'static
     };
     let line2 = Line::from(vec![
         Span::styled(health_label, Style::default().fg(MUTED)),
-        Span::styled(health_text, Style::default().fg(health_color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            health_text,
+            Style::default()
+                .fg(health_color)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" · ", Style::default().fg(MUTED)),
         Span::styled(life_a_label, Style::default().fg(MUTED)),
         Span::styled(life_a, Style::default().fg(BONE)),
@@ -1065,7 +1141,11 @@ mod tests {
             })
             .expect("draw");
         let buffer = terminal.backend().buffer();
-        let text = buffer.content().iter().map(|c| c.symbol()).collect::<String>();
+        let text = buffer
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
         let norm_text = text.split_whitespace().collect::<Vec<_>>().join("");
         assert!(text.contains("Radxa M.2 NVMe SSD 512GB") || text.contains("nvme0"));
         assert!(text.contains("38.5") || text.contains("温度"));
@@ -1084,9 +1164,10 @@ mod tests {
     fn test_render_storage_summary_fits_available_spare() {
         // Real device geometry: left panel is 61% of a 100-column terminal,
         // so the storage box has 61 display columns (59 inner columns).
-        for (locale, spare_label, threshold_label) in
-            [(Locale::ZhCn, "备用", "阈值"), (Locale::En, "Spare", "threshold")]
-        {
+        for (locale, spare_label, threshold_label) in [
+            (Locale::ZhCn, "备用", "阈值"),
+            (Locale::En, "Spare", "threshold"),
+        ] {
             let controller = Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun);
             let mut app = App::new(controller, locale).expect("init app");
             let mut dev = app.nvme_status.devices[0].clone();
@@ -1103,7 +1184,11 @@ mod tests {
                 })
                 .expect("draw");
             let buffer = terminal.backend().buffer();
-            let raw_text = buffer.content().iter().map(|c| c.symbol()).collect::<String>();
+            let raw_text = buffer
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
             let norm_text = raw_text.split_whitespace().collect::<Vec<_>>().join("");
 
             assert!(
@@ -1148,8 +1233,14 @@ mod tests {
         // 59 inner columns cannot hold "Used Endurance:" next to the mandatory
         // available-spare value, so the short spelling is used there.
         let narrow = render_norm(Locale::En, 61);
-        assert!(narrow.contains("Used:2%"), "Expected compact endurance label at 59 columns, got: {narrow}");
-        assert!(narrow.contains("Spare:100%"), "Expected available spare at 59 columns, got: {narrow}");
+        assert!(
+            narrow.contains("Used:2%"),
+            "Expected compact endurance label at 59 columns, got: {narrow}"
+        );
+        assert!(
+            narrow.contains("Spare:100%"),
+            "Expected available spare at 59 columns, got: {narrow}"
+        );
 
         // With room to spare the full label is kept.
         let wide = render_norm(Locale::En, 90);
@@ -1158,7 +1249,6 @@ mod tests {
             "Expected full 'Used Endurance' label on a wide panel, got: {wide}"
         );
     }
-
 
     #[test]
     fn test_render_full_tui_with_nvme_zh() {
@@ -1172,10 +1262,20 @@ mod tests {
             })
             .expect("draw");
         let buffer = terminal.backend().buffer();
-        let raw_text = buffer.content().iter().map(|c| c.symbol()).collect::<String>();
+        let raw_text = buffer
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
         let norm_text = raw_text.split_whitespace().collect::<Vec<_>>().join("");
-        assert!(norm_text.contains("存储状态"), "Expected '存储状态' in buffer, got: {raw_text}");
-        assert!(raw_text.contains("Radxa M.2 NVMe SSD 512GB"), "Expected 'Radxa M.2 NVMe SSD 512GB' in buffer");
+        assert!(
+            norm_text.contains("存储状态"),
+            "Expected '存储状态' in buffer, got: {raw_text}"
+        );
+        assert!(
+            raw_text.contains("Radxa M.2 NVMe SSD 512GB"),
+            "Expected 'Radxa M.2 NVMe SSD 512GB' in buffer"
+        );
         assert!(norm_text.contains("正常"), "Expected '正常' in buffer");
         assert!(raw_text.contains("38.5 °C"), "Expected '38.5 °C' in buffer");
         // Regression for the live Rock 5B screenshot: on a 100x30 terminal the
@@ -1216,7 +1316,11 @@ mod tests {
                 })
                 .expect("draw");
             let buffer = terminal.backend().buffer();
-            let raw_text = buffer.content().iter().map(|c| c.symbol()).collect::<String>();
+            let raw_text = buffer
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
             let norm_text = raw_text.split_whitespace().collect::<Vec<_>>().join("");
             assert!(
                 norm_text.contains("未检测到NVMe或MMC存储设备"),
@@ -1246,7 +1350,11 @@ mod tests {
                 })
                 .expect("draw");
             let buffer = terminal.backend().buffer();
-            let raw_text = buffer.content().iter().map(|c| c.symbol()).collect::<String>();
+            let raw_text = buffer
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
             assert!(
                 raw_text.contains("No NVMe or MMC storage devices detected."),
                 "Expected English no-storage message in buffer, got: {raw_text}"
@@ -1275,7 +1383,10 @@ mod tests {
         let mut app = App::new(controller, Locale::ZhCn).expect("init app");
         let mut dev = app.nvme_status.devices[0].clone();
         dev.smart.critical_warning = 0x03;
-        dev.smart.warning_flags = vec!["spare_below_threshold".into(), "temperature_exceeded".into()];
+        dev.smart.warning_flags = vec![
+            "spare_below_threshold".into(),
+            "temperature_exceeded".into(),
+        ];
         app.nvme_status.devices = vec![dev];
 
         let backend = ratatui::backend::TestBackend::new(100, 10);
@@ -1287,11 +1398,24 @@ mod tests {
             })
             .expect("draw");
         let buffer = terminal.backend().buffer();
-        let raw_text = buffer.content().iter().map(|c| c.symbol()).collect::<String>();
+        let raw_text = buffer
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
         let norm_text = raw_text.split_whitespace().collect::<Vec<_>>().join("");
-        assert!(norm_text.contains("告警"), "Expected '告警' in buffer, got: {raw_text}");
-        assert!(raw_text.contains("spare_below_threshold"), "Expected 'spare_below_threshold' in buffer");
-        assert!(raw_text.contains("temperature_exceeded"), "Expected 'temperature_exceeded' in buffer");
+        assert!(
+            norm_text.contains("告警"),
+            "Expected '告警' in buffer, got: {raw_text}"
+        );
+        assert!(
+            raw_text.contains("spare_below_threshold"),
+            "Expected 'spare_below_threshold' in buffer"
+        );
+        assert!(
+            raw_text.contains("temperature_exceeded"),
+            "Expected 'temperature_exceeded' in buffer"
+        );
 
         // Also test English locale
         app.locale = Locale::En;
@@ -1302,9 +1426,19 @@ mod tests {
             })
             .expect("draw");
         let buffer = terminal.backend().buffer();
-        let text_en = buffer.content().iter().map(|c| c.symbol()).collect::<String>();
-        assert!(text_en.contains("Warning"), "Expected 'Warning' in buffer, got: {text_en}");
-        assert!(text_en.contains("spare_below_threshold"), "Expected 'spare_below_threshold' in buffer");
+        let text_en = buffer
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(
+            text_en.contains("Warning"),
+            "Expected 'Warning' in buffer, got: {text_en}"
+        );
+        assert!(
+            text_en.contains("spare_below_threshold"),
+            "Expected 'spare_below_threshold' in buffer"
+        );
     }
 
     #[test]
@@ -1327,14 +1461,36 @@ mod tests {
             })
             .expect("draw");
         let buffer = terminal.backend().buffer();
-        let raw_text = buffer.content().iter().map(|c| c.symbol()).collect::<String>();
+        let raw_text = buffer
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
         let norm_text = raw_text.split_whitespace().collect::<Vec<_>>().join("");
-        assert!(raw_text.contains("FE4MB4"), "Expected eMMC model in buffer, got: {raw_text}");
-        assert!(raw_text.contains("/dev/mmcblk0"), "Expected eMMC path in buffer, got: {raw_text}");
-        assert!(raw_text.contains("SC64G"), "Expected SD model in buffer, got: {raw_text}");
-        assert!(raw_text.contains("/dev/mmcblk1"), "Expected SD path in buffer, got: {raw_text}");
-        assert!(raw_text.contains("10%"), "Expected eMMC life value in buffer, got: {raw_text}");
-        assert!(norm_text.contains("存储状态"), "Expected card title in buffer, got: {raw_text}");
+        assert!(
+            raw_text.contains("FE4MB4"),
+            "Expected eMMC model in buffer, got: {raw_text}"
+        );
+        assert!(
+            raw_text.contains("/dev/mmcblk0"),
+            "Expected eMMC path in buffer, got: {raw_text}"
+        );
+        assert!(
+            raw_text.contains("SC64G"),
+            "Expected SD model in buffer, got: {raw_text}"
+        );
+        assert!(
+            raw_text.contains("/dev/mmcblk1"),
+            "Expected SD path in buffer, got: {raw_text}"
+        );
+        assert!(
+            raw_text.contains("10%"),
+            "Expected eMMC life value in buffer, got: {raw_text}"
+        );
+        assert!(
+            norm_text.contains("存储状态"),
+            "Expected card title in buffer, got: {raw_text}"
+        );
 
         // English locale: type labels and the N/A life values for the SD card.
         app.locale = Locale::En;
@@ -1344,10 +1500,23 @@ mod tests {
             })
             .expect("draw");
         let buffer = terminal.backend().buffer();
-        let raw_en = buffer.content().iter().map(|c| c.symbol()).collect::<String>();
-        assert!(raw_en.contains("eMMC"), "Expected 'eMMC' label in buffer, got: {raw_en}");
-        assert!(raw_en.contains("SD Card"), "Expected 'SD Card' label in buffer, got: {raw_en}");
-        assert!(raw_en.contains("N/A"), "Expected 'N/A' life for SD card, got: {raw_en}");
+        let raw_en = buffer
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(
+            raw_en.contains("eMMC"),
+            "Expected 'eMMC' label in buffer, got: {raw_en}"
+        );
+        assert!(
+            raw_en.contains("SD Card"),
+            "Expected 'SD Card' label in buffer, got: {raw_en}"
+        );
+        assert!(
+            raw_en.contains("N/A"),
+            "Expected 'N/A' life for SD card, got: {raw_en}"
+        );
     }
 
     #[test]
@@ -1364,10 +1533,23 @@ mod tests {
             })
             .expect("draw");
         let buffer = terminal.backend().buffer();
-        let raw_text = buffer.content().iter().map(|c| c.symbol()).collect::<String>();
-        assert!(raw_text.contains("nvme0"), "Expected NVMe device in buffer, got: {raw_text}");
-        assert!(raw_text.contains("/dev/mmcblk0"), "Expected eMMC device in buffer, got: {raw_text}");
-        assert!(raw_text.contains("/dev/mmcblk1"), "Expected SD device in buffer, got: {raw_text}");
+        let raw_text = buffer
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(
+            raw_text.contains("nvme0"),
+            "Expected NVMe device in buffer, got: {raw_text}"
+        );
+        assert!(
+            raw_text.contains("/dev/mmcblk0"),
+            "Expected eMMC device in buffer, got: {raw_text}"
+        );
+        assert!(
+            raw_text.contains("/dev/mmcblk1"),
+            "Expected SD device in buffer, got: {raw_text}"
+        );
     }
 
     #[test]
@@ -1393,7 +1575,11 @@ mod tests {
                 })
                 .expect("draw");
             let buffer = terminal.backend().buffer();
-            let raw_text = buffer.content().iter().map(|c| c.symbol()).collect::<String>();
+            let raw_text = buffer
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
             let norm_text = raw_text.split_whitespace().collect::<Vec<_>>().join("");
             if locale == Locale::ZhCn {
                 assert!(
@@ -1409,4 +1595,3 @@ mod tests {
         }
     }
 }
-

@@ -134,10 +134,8 @@ pub fn parse_life_time_str(s: &str) -> (Option<u8>, Option<u8>) {
         return (None, None);
     }
 
-    let val_a = parse_hex_or_dec_u8(tokens[0])
-        .and_then(map_life_time_byte_to_percent);
-    let val_b = parse_hex_or_dec_u8(tokens[1])
-        .and_then(map_life_time_byte_to_percent);
+    let val_a = parse_hex_or_dec_u8(tokens[0]).and_then(map_life_time_byte_to_percent);
+    let val_b = parse_hex_or_dec_u8(tokens[1]).and_then(map_life_time_byte_to_percent);
 
     (val_a, val_b)
 }
@@ -185,11 +183,7 @@ pub fn format_manufacturer(manfid_str: &str) -> String {
     }
 }
 
-pub fn generate_warning_flags(
-    pre_eol: u8,
-    life_a: Option<u8>,
-    life_b: Option<u8>,
-) -> Vec<String> {
+pub fn generate_warning_flags(pre_eol: u8, life_a: Option<u8>, life_b: Option<u8>) -> Vec<String> {
     let mut flags = Vec::new();
     if pre_eol == 2 {
         flags.push("pre_eol_warning".to_string());
@@ -408,7 +402,8 @@ mod tests {
 
     #[test]
     fn test_sysfs_fallback_to_ioctl_when_attributes_missing() {
-        let root = std::env::temp_dir().join(format!("rsetup-mmc-fallback-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("rsetup-mmc-fallback-{}", uuid::Uuid::new_v4()));
         let dev_dir = root.join("sys/bus/mmc/devices/mmc0:0001");
         std::fs::create_dir_all(&dev_dir).expect("create dev_dir");
         std::fs::write(dev_dir.join("type"), "MMC\n").unwrap();
@@ -440,7 +435,8 @@ mod tests {
 
     #[test]
     fn test_mmc_primary_block_device_selection() {
-        let root = std::env::temp_dir().join(format!("rsetup-mmc-blk-filter-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("rsetup-mmc-blk-filter-{}", uuid::Uuid::new_v4()));
         let dev_dir = root.join("sys/bus/mmc/devices/mmc0:0001");
         std::fs::create_dir_all(&dev_dir).expect("create dev_dir");
         std::fs::write(dev_dir.join("type"), "MMC\n").unwrap();
