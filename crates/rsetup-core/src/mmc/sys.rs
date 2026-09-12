@@ -38,7 +38,7 @@ const MMC_BLOCK_MAJOR: u8 = 179;
 const MMC_IOC_CMD: libc::c_ulong =
     3u64 << 30 | 72u64 << 16 | (MMC_BLOCK_MAJOR as u64) << 8;
 
-/// CMD6 — SEND EXT_CSD (include/linux/mmc/core.h).
+/// CMD8 — SEND EXT_CSD (include/linux/mmc/core.h).
 const MMC_OPCODE_SEND_EXT_CSD: u32 = 8;
 
 /// R1 response type: (1<<0) | (1<<2) | (1<<4).
