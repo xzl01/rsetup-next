@@ -1109,7 +1109,7 @@
     thermal: ["温控能力", "内核温控子系统"],
     led: ["LED 控制", "Linux LED 设备"],
     "spi-flash": ["SPI 启动闪存", "MTD 闪存设备"],
-    storage: ["存储", "存储设备"],
+    storage: ["存储", "NVMe 与 MMC/eMMC 存储设备"],
   };
 
   const serviceCopy = {

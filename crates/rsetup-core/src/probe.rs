@@ -130,20 +130,8 @@ fn live_snapshot() -> Result<DeviceSnapshot> {
         {
             let nvme_devices = crate::NvmeManager::probe_sysfs(Path::new("/"));
             let mmc_names = crate::MmcManager::probe_sysfs(Path::new("/"));
-            let (emmc_count, sd_count) = mmc_names.iter().fold((0u32, 0u32), |(emmc, sd), name| {
-                let type_path = Path::new("/sys/bus/mmc/devices").join(name).join("type");
-                match crate::mmc::sys::read_trimmed_attr(&type_path).as_deref() {
-                    Some("MMC") => (emmc + 1, sd),
-                    Some("SD") => (emmc, sd + 1),
-                    _ => (emmc, sd),
-                }
-            });
-            Capability {
-                id: "storage".into(),
-                label: "Storage".into(),
-                available: !nvme_devices.is_empty() || !mmc_names.is_empty(),
-                detail: storage_detail(nvme_devices.len() as u32, emmc_count, sd_count),
-            }
+            let (emmc_count, sd_count) = mmc_type_counts(&mmc_names);
+            storage_capability(nvme_devices.len() as u32, emmc_count, sd_count)
         },
     ];
     let mut alerts = Vec::new();
@@ -306,6 +294,35 @@ pub(crate) fn storage_detail(nvme_count: u32, emmc_count: u32, sd_count: u32) ->
         "No storage devices detected".to_string()
     } else {
         parts.join(" · ")
+    }
+}
+
+/// Split probed MMC bus device names into eMMC and SD card counts.
+///
+/// `MmcManager::probe_sysfs` already drops every card whose `type` is neither
+/// `MMC` nor `SD`, so the two counts add up to the number of probed devices.
+fn mmc_type_counts(mmc_names: &[String]) -> (u32, u32) {
+    mmc_names.iter().fold((0u32, 0u32), |(emmc, sd), name| {
+        let type_path = Path::new("/sys/bus/mmc/devices").join(name).join("type");
+        match crate::mmc::sys::read_trimmed_attr(&type_path).as_deref() {
+            Some("MMC") => (emmc + 1, sd),
+            Some("SD") => (emmc, sd + 1),
+            _ => (emmc, sd),
+        }
+    })
+}
+
+/// Unified `storage` capability for the hardware matrix.
+///
+/// Available as soon as one of the three counts is non-zero, so an MMC-only
+/// board (eMMC or SD) reports storage exactly like an NVMe-only one; the
+/// per-type counts land in [`storage_detail`].
+fn storage_capability(nvme_count: u32, emmc_count: u32, sd_count: u32) -> Capability {
+    Capability {
+        id: "storage".into(),
+        label: "Storage".into(),
+        available: nvme_count > 0 || emmc_count > 0 || sd_count > 0,
+        detail: storage_detail(nvme_count, emmc_count, sd_count),
     }
 }
 
@@ -737,21 +754,57 @@ mod tests {
     }
 
     #[test]
-    fn live_storage_capability_is_available_with_mmc_only() {
-        // The probe machine decides the hardware; assert the invariant that
-        // the `nvme` capability no longer exists and `storage` mirrors the
-        // union of both sysfs probes, whatever the host actually has.
+    fn storage_capability_is_available_from_counts_alone() {
+        let nvme_only = storage_capability(1, 0, 0);
+        assert!(nvme_only.available);
+        assert_eq!(nvme_only.id, "storage");
+        assert_eq!(nvme_only.label, "Storage");
+        assert_eq!(nvme_only.detail, "1 NVMe");
+
+        let emmc_only = storage_capability(0, 1, 0);
+        assert!(emmc_only.available, "an eMMC-only host must report storage");
+        assert_eq!(emmc_only.detail, "1 eMMC");
+
+        let sd_only = storage_capability(0, 0, 1);
+        assert!(sd_only.available, "an SD-only host must report storage");
+        assert_eq!(sd_only.detail, "1 SD");
+
+        let both_mmc = storage_capability(0, 1, 1);
+        assert!(both_mmc.available);
+        assert_eq!(both_mmc.detail, "1 eMMC · 1 SD");
+
+        let mixed = storage_capability(1, 1, 0);
+        assert!(mixed.available);
+        assert_eq!(mixed.detail, "1 NVMe · 1 eMMC");
+    }
+
+    #[test]
+    fn storage_capability_is_unavailable_without_any_device() {
+        let empty = storage_capability(0, 0, 0);
+        assert!(
+            !empty.available,
+            "a host with neither NVMe nor MMC has no storage"
+        );
+        assert_eq!(empty.id, "storage");
+        assert_eq!(empty.detail, "No storage devices detected");
+    }
+
+    #[test]
+    fn live_storage_capability_mirrors_probe_results() {
+        // The probe machine decides the hardware, so this test covers the
+        // wiring: both sysfs probes must feed the single `storage` capability
+        // and the legacy `nvme` capability must be gone. The MMC-only and
+        // empty-host cases are asserted deterministically by the two tests
+        // above, which do not depend on what this host happens to have.
         let snapshot = live_snapshot().expect("live snapshot on a Linux host");
-        let has_nvme = !crate::NvmeManager::probe_sysfs(Path::new("/")).is_empty();
+        let nvme_devices = crate::NvmeManager::probe_sysfs(Path::new("/"));
         let mmc_devices = crate::MmcManager::probe_sysfs(Path::new("/"));
-        let (emmc, sd) = mmc_devices.iter().fold((0u32, 0u32), |(e, s), name| {
-            let dir = Path::new("/sys/bus/mmc/devices").join(name);
-            match crate::mmc::sys::read_trimmed_attr(&dir.join("type")).as_deref() {
-                Some("MMC") => (e + 1, s),
-                Some("SD") => (e, s + 1),
-                _ => (e, s),
-            }
-        });
+        let (emmc, sd) = mmc_type_counts(&mmc_devices);
+        assert_eq!(
+            mmc_devices.len() as u32,
+            emmc + sd,
+            "probe_sysfs only reports MMC and SD cards, so the type counts must add up"
+        );
         let storage = snapshot
             .capabilities
             .iter()
@@ -763,23 +816,15 @@ mod tests {
                 .iter()
                 .any(|capability| capability.id == "nvme")
         );
+        let expected = storage_capability(nvme_devices.len() as u32, emmc, sd);
+        assert_eq!(storage.id, expected.id);
+        assert_eq!(storage.label, expected.label);
         assert_eq!(
-            storage.available,
-            has_nvme || !mmc_devices.is_empty(),
+            storage.available, expected.available,
             "storage availability must mirror NVMe-or-MMC probe results"
         );
-        let expected_detail = if has_nvme || !mmc_devices.is_empty() {
-            storage_detail(
-                crate::NvmeManager::probe_sysfs(Path::new("/")).len() as u32,
-                emmc,
-                sd,
-            )
-        } else {
-            "No storage devices detected".to_string()
-        };
         assert_eq!(
-            storage.detail,
-            expected_detail.as_str(),
+            storage.detail, expected.detail,
             "storage detail must reflect live probe counts"
         );
     }
