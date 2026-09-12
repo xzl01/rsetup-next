@@ -202,12 +202,14 @@ node scripts/capture-web-screenshot.mjs --url "http://127.0.0.1:19088/#hardware"
    - `storageTool.model`、`nvme.description`/`uninitialized`/`noDevices` 已无引用，`ui/index.html` 的 `icon-nvme` 成为孤立 symbol → 可清理；
    - `crates/rsetup-core/src/probe.rs` 在探测 MMC 计数时以硬编码绝对路径重读 `type`，而 `MmcManager::probe_sysfs` 已按注入的 root 读取同一文件；
    - `ui/storage.test.mjs` 中 NVMe 卡片渲染现仅经由 stub 覆盖，保留的 NVMe 卡片断言较此前减少。
+   - `ui/styles.css` 的 `.nvme-metric-bar-fill.is-na` 目前是死 CSS：基础规则的 `width: var(--metric-percent, 0%)` 与 NA 分支的 `data-metric-percent="0"`（`ui/app.js`）叠加后，填充在 `overflow: hidden` 的 `.nvme-metric-bar` 轨道内宽度恒为 0%，因此「N/A」寿命条渲染为空轨道而非灰色斜纹填充；需决定给它一个可见宽度，或删除该规则、该 class 及 `ui/storage.test.mjs` 中对应的计数断言（`nvme-metric-bar-fill is-na` 计数为 2）。
+   - 历史文档 `docs/testing/nvme-2026-09-12/report.md` 与 `docs/superpowers/specs/2026-09-10-nvme-monitoring-design.md` 仍将 `GET /api/v1/hardware/nvme` 描述为在线端点；它们现已早于该端点被 `/api/v1/hardware/storage` 取代这一变更。
 3. 规范回写：第 6 节的三项等价差异建议直接在 TUI 规范 §5.1/§5.2 中改成实现现状，避免后续核验再次产生假阳性。
 4. 保留（非序列号、且是核验所需的设备上下文）：第 2.2 节的型号 `A3A562` / `064G02`、厂商 `0x0000d6` / `0x000011`、固件与容量。如需连型号/固件一并脱敏，可再处理。
 
 ## 11. 核验记录
 
-- **代码基线**：恢复提交 `6465543`（后端 storage capability + REST 端点）与 `54a755c`（前端 storage 工具 + MMC 卡片 + W1/W2 修复），其后一次仅涉及测试收紧与不可达中文回退文案的提交（不改变任何渲染结果）。截图即在该二进制（SHA-256 `1c57f599…`）上采集。
-- **自动化**：`cargo test --workspace --locked` 全绿（core 120 / app 39 / helper 1，2 ignored）、`node --test ui/*.test.mjs` 全绿（含 `ui/storage.test.mjs` 6 项与 `ui/i18n.test.mjs` 16 项）、`cargo clippy --workspace --all-targets -- -D warnings` 无告警。`cargo fmt --all -- --check` 在本仓库基线上即为红（未改动树实测 61 处 `Diff in`，全在未触碰文件；本次改动的两个 Rust 文件为 0 处），属既有 rustfmt 版本漂移，未纳入本次范围。
+- **代码基线**：恢复提交 `6465543`（后端 storage capability + REST 端点）与 `54a755c`（前端 storage 工具 + MMC 卡片 + W1/W2 修复）。11 张截图是针对由 commit `54a755c` 构建的二进制（SHA-256 `1c57f5991733b01c9abee6e327229f1f216f590126746acc38c4dc3f3859fd51`）采集的；其后的修复提交 `38751fe` 仅收紧一处测试接缝（test seam）与一处不可达的中文回退文案、不改变任何渲染结果，该提交重新构建（SHA-256 `262775fad71c55cb…`）、重新部署到两台机器并实机复检，渲染输出完全一致，故这 11 张截图对最终代码仍然有效。
+- **自动化**：`cargo test --workspace --locked` 全绿（core 122 passed（124 run，其中 2 ignored）/ app 39 / helper 1）、`node --test ui/*.test.mjs` 全绿（含 `ui/storage.test.mjs` 6 项与 `ui/i18n.test.mjs` 16 项）、`cargo clippy --workspace --all-targets -- -D warnings` 无告警。`cargo fmt --all -- --check` 在本仓库基线上即为红（未改动树实测 61 处 `Diff in`，全在未触碰文件；本次改动的两个 Rust 文件为 0 处），属既有 rustfmt 版本漂移，未纳入本次范围。
 - **W1/W2 的失败态已独立复现**：在一次性 worktree 中分别把两处修复还原后，对应用例失败（`storage drawer copy …` 1/6 失败、`storage capability card …` 1/16 失败），确认两个用例真正锁定了缺陷，而非事后补写。
 - **实机证据**：两机 REST（200/404 + capability detail）、W1/W2 文案（中英）、MMC 卡片字段、`consoleErrors: []`、11 张已打码截图，均见第 3、4、8 节。

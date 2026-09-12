@@ -11,7 +11,7 @@
  *     --url "http://127.0.0.1:19088/#hardware" \
  *     --out docs/testing/screenshots/web-nvme-rock5b-desktop.png \
  *     --width 1440 --height 900 \
- *     [--tool nvme] [--settle 1500] [--mobile] [--devtools-port 9333]
+ *     [--tool storage] [--settle 1500] [--mobile] [--devtools-port 9333]
  *     [--no-click] [--scroll-drawer-bottom] [--eval "<js>"] [--rect-selector "<css>"]
  *
  * Each capture writes only the PNG. Pass --meta to additionally write a .json
@@ -328,12 +328,12 @@ async function main() {
   const url = args.url;
   const out = args.out;
   if (!url || !out) {
-    console.error("usage: capture-web-screenshot.mjs --url <url> --out <png> [--width N --height N --tool nvme]");
+    console.error("usage: capture-web-screenshot.mjs --url <url> --out <png> [--width N --height N --tool storage]");
     process.exit(2);
   }
   const width = Number(args.width ?? 1440);
   const height = Number(args.height ?? 900);
-  const tool = typeof args.tool === "string" ? args.tool : "nvme";
+  const tool = typeof args.tool === "string" ? args.tool : "storage";
   const settleMs = Number(args.settle ?? 1500);
   const devtoolsPort = Number(args["devtools-port"] ?? 9333);
   const mobile = Boolean(args.mobile);
