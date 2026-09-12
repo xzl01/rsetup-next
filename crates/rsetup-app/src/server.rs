@@ -9,9 +9,9 @@ use axum::{
 };
 use rsetup_core::{
     ActionRun, ActionSpec, ActivityEvent, Controller, DeviceSnapshot, FanCurveApplyResult,
-    FanCurvePlan, FanCurveRequest, FanCurveStatus, GpioStatus, LedStatus, NvmeStatus,
-    OverlayApplyResult, OverlayPlan, OverlayStatus, RgbLedConfig, SourceApplyResult, SourcePlan,
-    SourceStatus, SpiFlashApplyResult, SpiFlashPlan, SpiFlashRequest, SpiFlashStatus,
+    FanCurvePlan, FanCurveRequest, FanCurveStatus, GpioStatus, LedStatus, OverlayApplyResult,
+    OverlayPlan, OverlayStatus, RgbLedConfig, SourceApplyResult, SourcePlan, SourceStatus,
+    SpiFlashApplyResult, SpiFlashPlan, SpiFlashRequest, SpiFlashStatus, StorageStatus,
     ThermalStatus, VideoFrame, VideoStatus,
 };
 use serde::Deserialize;
@@ -191,7 +191,7 @@ pub fn router(controller: Controller) -> Router {
             "/api/v1/hardware/thermal/fan-curve/apply",
             post(apply_fan_curve),
         )
-        .route("/api/v1/hardware/nvme", get(nvme_status))
+        .route("/api/v1/hardware/storage", get(storage_status))
         .route("/api/v1/activity", get(activity))
         .layer(middleware::from_fn(local_boundary))
         .layer(TraceLayer::new_for_http())
@@ -711,12 +711,12 @@ async fn apply_fan_curve(
     .await
 }
 
-async fn nvme_status(
+async fn storage_status(
     State(controller): State<Arc<Controller>>,
-) -> Result<Json<NvmeStatus>, ApiError> {
+) -> Result<Json<StorageStatus>, ApiError> {
     blocking(move || {
         controller
-            .nvme_status()
+            .storage_status()
             .map(Json)
             .map_err(ApiError::from_hardware)
     })
@@ -871,14 +871,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_nvme_status_returns_ok_with_demo_device() {
+    async fn get_storage_status_returns_ok_with_demo_devices() {
         use axum::body::Body;
+        use rsetup_core::StorageStatus;
         use tower::ServiceExt;
-        use rsetup_core::NvmeStatus;
 
         let app = router(Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun));
         let request = Request::builder()
-            .uri("/api/v1/hardware/nvme")
+            .uri("/api/v1/hardware/storage")
             .header("host", "127.0.0.1:8788")
             .body(Body::empty())
             .unwrap();
@@ -889,10 +889,46 @@ mod tests {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        let status: NvmeStatus = serde_json::from_slice(&bytes).unwrap();
-        assert!(status.initialized);
-        assert_eq!(status.devices.len(), 1);
-        assert_eq!(status.devices[0].model, "Radxa M.2 NVMe SSD 512GB");
+        let status: StorageStatus = serde_json::from_slice(&bytes).unwrap();
+        // NVMe side
+        assert!(status.nvme.initialized);
+        assert_eq!(status.nvme.devices.len(), 1);
+        assert_eq!(status.nvme.devices[0].model, "Radxa M.2 NVMe SSD 512GB");
+        // MMC side
+        assert!(status.mmc.initialized);
+        assert_eq!(status.mmc.devices.len(), 2);
+        let emmc = &status.mmc.devices[0];
+        assert_eq!(emmc.name, "mmc0:0001");
+        assert_eq!(emmc.block_path, "/dev/mmcblk0");
+        assert_eq!(emmc.card_type, "MMC");
+        assert_eq!(emmc.model, "FE4MB4");
+        assert_eq!(emmc.total_bytes, 62_537_072_640);
+        assert_eq!(emmc.health.pre_eol_info, 1);
+        assert_eq!(emmc.health.life_time_est_a_percent, Some(10));
+        assert_eq!(emmc.health.life_time_est_b_percent, Some(10));
+        assert!(emmc.health.warning_flags.is_empty());
+        let sd = &status.mmc.devices[1];
+        assert_eq!(sd.name, "mmc1:59b4");
+        assert_eq!(sd.card_type, "SD");
+        assert_eq!(sd.health.pre_eol_info, 0);
+        assert_eq!(sd.health.life_time_est_a_percent, None);
+        assert_eq!(sd.health.life_time_est_b_percent, None);
+    }
+
+    #[tokio::test]
+    async fn legacy_nvme_route_is_removed() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let app = router(Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun));
+        let request = Request::builder()
+            .uri("/api/v1/hardware/nvme")
+            .header("host", "127.0.0.1:8788")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
 

@@ -127,12 +127,24 @@ fn live_snapshot() -> Result<DeviceSnapshot> {
             spi_nor_detected(),
             "SPI NOR MTD device",
         ),
-        capability(
-            "nvme",
-            "NVMe storage",
-            !crate::NvmeManager::probe_sysfs(Path::new("/")).is_empty(),
-            "NVMe controllers detected",
-        ),
+        {
+            let nvme_devices = crate::NvmeManager::probe_sysfs(Path::new("/"));
+            let mmc_names = crate::MmcManager::probe_sysfs(Path::new("/"));
+            let (emmc_count, sd_count) = mmc_names.iter().fold((0u32, 0u32), |(emmc, sd), name| {
+                let type_path = Path::new("/sys/bus/mmc/devices").join(name).join("type");
+                match crate::mmc::sys::read_trimmed_attr(&type_path).as_deref() {
+                    Some("MMC") => (emmc + 1, sd),
+                    Some("SD") => (emmc, sd + 1),
+                    _ => (emmc, sd),
+                }
+            });
+            Capability {
+                id: "storage".into(),
+                label: "Storage".into(),
+                available: !nvme_devices.is_empty() || !mmc_names.is_empty(),
+                detail: storage_detail(nvme_devices.len() as u32, emmc_count, sd_count),
+            }
+        },
     ];
     let mut alerts = Vec::new();
     if temperature_c.is_some_and(|value| value >= 80.0) {
@@ -243,7 +255,12 @@ fn demo_snapshot() -> DeviceSnapshot {
             capability("thermal", "Thermal controls", true, "3 zones · step_wise"),
             capability("led", "LED control", true, "2 status LEDs · 1 RGB group"),
             capability("spi-flash", "SPI boot flash", true, "16 MiB MTD device"),
-            capability("nvme", "NVMe storage", true, "1 NVMe SSD · 512 GB"),
+            capability(
+                "storage",
+                "Storage",
+                true,
+                &storage_detail(1, 1, 1),
+            ),
         ],
         alerts: vec![Alert {
             id: "demo-state".into(),
@@ -264,6 +281,31 @@ fn capability(id: &str, label: &str, available: bool, available_detail: &str) ->
         } else {
             "Not detected on this device".into()
         },
+    }
+}
+
+/// Human-readable detail line for the unified `storage` capability.
+///
+/// Counts are grouped by type so the hardware matrix card can answer
+/// "what storage is on this board" in one glance:
+/// `1 NVMe · 1 eMMC · 1 SD`. SD cards are grouped as `MMC/SD` when more
+/// than one is present; zero devices yields the not-detected copy.
+pub(crate) fn storage_detail(nvme_count: u32, emmc_count: u32, sd_count: u32) -> String {
+    let mut parts = Vec::new();
+    if nvme_count > 0 {
+        parts.push(format!("{nvme_count} NVMe"));
+    }
+    if emmc_count > 0 {
+        parts.push(format!("{emmc_count} eMMC"));
+    }
+    if sd_count > 0 {
+        let label = if sd_count > 1 { "MMC/SD" } else { "SD" };
+        parts.push(format!("{sd_count} {label}"));
+    }
+    if parts.is_empty() {
+        "No storage devices detected".to_string()
+    } else {
+        parts.join(" · ")
     }
 }
 
@@ -664,6 +706,82 @@ mod tests {
         );
         assert!(!capability.available);
         assert!(capability.detail.contains("UEFI + DT"));
+    }
+
+    #[test]
+    fn storage_detail_formats_counts_by_type() {
+        assert_eq!(storage_detail(0, 0, 0), "No storage devices detected");
+        assert_eq!(storage_detail(1, 0, 0), "1 NVMe");
+        assert_eq!(storage_detail(1, 1, 1), "1 NVMe · 1 eMMC · 1 SD");
+        assert_eq!(storage_detail(1, 0, 2), "1 NVMe · 2 MMC/SD");
+        assert_eq!(storage_detail(0, 2, 0), "2 eMMC");
+        assert_eq!(storage_detail(0, 1, 1), "1 eMMC · 1 SD");
+    }
+
+    #[test]
+    fn demo_snapshot_exposes_storage_capability() {
+        let snapshot = demo_snapshot();
+        let storage = snapshot
+            .capabilities
+            .iter()
+            .find(|capability| capability.id == "storage")
+            .expect("storage capability present");
+        assert!(storage.available);
+        assert_eq!(storage.detail, "1 NVMe · 1 eMMC · 1 SD");
+        assert!(
+            !snapshot
+                .capabilities
+                .iter()
+                .any(|capability| capability.id == "nvme")
+        );
+    }
+
+    #[test]
+    fn live_storage_capability_is_available_with_mmc_only() {
+        // The probe machine decides the hardware; assert the invariant that
+        // the `nvme` capability no longer exists and `storage` mirrors the
+        // union of both sysfs probes, whatever the host actually has.
+        let snapshot = live_snapshot().expect("live snapshot on a Linux host");
+        let has_nvme = !crate::NvmeManager::probe_sysfs(Path::new("/")).is_empty();
+        let mmc_devices = crate::MmcManager::probe_sysfs(Path::new("/"));
+        let (emmc, sd) = mmc_devices.iter().fold((0u32, 0u32), |(e, s), name| {
+            let dir = Path::new("/sys/bus/mmc/devices").join(name);
+            match crate::mmc::sys::read_trimmed_attr(&dir.join("type")).as_deref() {
+                Some("MMC") => (e + 1, s),
+                Some("SD") => (e, s + 1),
+                _ => (e, s),
+            }
+        });
+        let storage = snapshot
+            .capabilities
+            .iter()
+            .find(|capability| capability.id == "storage")
+            .expect("storage capability present in live snapshot");
+        assert!(
+            !snapshot
+                .capabilities
+                .iter()
+                .any(|capability| capability.id == "nvme")
+        );
+        assert_eq!(
+            storage.available,
+            has_nvme || !mmc_devices.is_empty(),
+            "storage availability must mirror NVMe-or-MMC probe results"
+        );
+        let expected_detail = if has_nvme || !mmc_devices.is_empty() {
+            storage_detail(
+                crate::NvmeManager::probe_sysfs(Path::new("/")).len() as u32,
+                emmc,
+                sd,
+            )
+        } else {
+            "No storage devices detected".to_string()
+        };
+        assert_eq!(
+            storage.detail,
+            expected_detail.as_str(),
+            "storage detail must reflect live probe counts"
+        );
     }
 
     #[test]
