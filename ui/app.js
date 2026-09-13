@@ -607,23 +607,31 @@ function dismissDialog(dialog) {
   else dialog.removeAttribute("open");
 }
 
-async function refreshAll({ quiet = false } = {}) {
+async function refreshAll({ quiet = false, invalidate = false } = {}) {
   if (typeof refreshStorageTool === "function") void refreshStorageTool();
-  state.refreshRequested = true;
+  state.refreshEpoch ??= 0;
+  if (invalidate) {
+    state.refreshEpoch += 1;
+    state.refreshRequested = true;
+  }
   if (!quiet) state.refreshLoud = true;
   if (state.refreshPromise) return state.refreshPromise;
+  state.refreshRequested = true;
   state.refreshPromise = (async () => {
     while (state.refreshRequested) {
       state.refreshRequested = false;
       const nextQuiet = !state.refreshLoud;
       state.refreshLoud = false;
-      await refreshOnce({ quiet: nextQuiet });
+      await refreshOnce({ quiet: nextQuiet, epoch: state.refreshEpoch });
     }
-  })().finally(() => { state.refreshPromise = null; });
+  })().finally(() => {
+    state.refreshPromise = null;
+    state.refreshLoud = false;
+  });
   return state.refreshPromise;
 }
 
-async function refreshOnce({ quiet = false } = {}) {
+async function refreshOnce({ quiet = false, epoch = 0 } = {}) {
   const shouldResolve = !state.snapshot || !quiet;
   state.refreshing = true;
   document.body.dataset.state = "loading";
@@ -634,7 +642,7 @@ async function refreshOnce({ quiet = false } = {}) {
     const [snapshot, actions, activity, sources] = await Promise.all([
       transport.snapshot(), transport.actions(), transport.activity(), transport.sourceStatus(),
     ]);
-    if (state.refreshRequested) return; // A queued read must supersede this older snapshot.
+    if (epoch !== state.refreshEpoch) return;
     state.providerSnapshot = snapshot;
     state.snapshot = applyDebugDevice(snapshot);
     state.actions = actions;
@@ -649,13 +657,16 @@ async function refreshOnce({ quiet = false } = {}) {
     if (shouldResolve) resolveSignals();
     if (!quiet) toast(t("toast.probeComplete"), snapshot.synthetic ? t("toast.demoLoaded") : t("toast.localCurrent"));
   } catch (error) {
+    if (epoch !== state.refreshEpoch) return;
     const detail = displayError(error);
     document.body.dataset.state = "error";
     setText("[data-footer-status]", t("status.unavailable"));
     setText("[data-footer-detail]", detail);
     toast(t("toast.refreshFailed"), detail, true);
   } finally {
-    state.refreshing = false;
+    if (epoch === state.refreshEpoch) {
+      state.refreshing = false;
+    }
   }
 }
 
@@ -901,7 +912,7 @@ async function applySourcePlan() {
     const rawOutput = applied.run.output && !applied.run.synthetic ? `\n\n${applied.run.output}` : "";
     result.textContent = `${heading}\n${applied.run.status === "failed" ? applied.run.summary : i18n.runSummary(applied.run)}${applied.backups.length ? `\n${t("sources.backups", { count: applied.backups.length })}\n${applied.backups.join("\n")}` : ""}${rawOutput}`;
     toast(heading, i18n.runSummary(applied.run), applied.run.status === "failed");
-    await refreshAll({ quiet: true });
+    await refreshAll({ quiet: true, invalidate: true });
   } catch (error) {
     const detail = displayError(error);
     if (error?.code === "stale_plan" || error?.code === "plan_required") {
@@ -1364,7 +1375,7 @@ async function applyOverlays() {
       state.overlayPlan = null;
       renderOverlayTool();
     }
-    await refreshAll({ quiet: true });
+    await refreshAll({ quiet: true, invalidate: true });
   } catch (error) {
     if (state.selectedHardware !== "device-tree" || loadVersion !== state.hardwareLoadVersion) return;
     const detail = displayError(error);
@@ -1534,7 +1545,7 @@ async function applySpiFlash() {
       initializeSpiFlashState(state.hardwareData);
       renderSpiFlashTool();
     }
-    await refreshAll({ quiet: true });
+    await refreshAll({ quiet: true, invalidate: true });
   } catch (error) {
     const detail = displayError(error);
     const confirmation = $("[data-spi-confirm]");
@@ -2043,7 +2054,7 @@ async function applyFanCurve() {
       initializeFanCurveState(fanCurve);
       renderThermalTool();
     }
-    await refreshAll({ quiet: true });
+    await refreshAll({ quiet: true, invalidate: true });
   } catch (error) {
     showApplyError(result, error);
     $("span", button).textContent = t(plan.request.enabled ? "fanCurve.apply" : "fanCurve.disable");
@@ -2075,7 +2086,7 @@ async function applyThermalPolicy() {
       initializeFanCurveState(fanCurve);
       renderThermalTool();
     }
-    await refreshAll({ quiet: true });
+    await refreshAll({ quiet: true, invalidate: true });
   } catch (error) {
     const detail = displayError(error);
     showApplyError(result, error);
@@ -2315,7 +2326,7 @@ async function applyLedConfiguration(event) {
       state.ledPanel = panel;
       renderLedTool();
     }
-    await refreshAll({ quiet: true });
+    await refreshAll({ quiet: true, invalidate: true });
   } catch (error) {
     const detail = displayError(error);
     showApplyError(result, error);
@@ -2344,6 +2355,26 @@ function renderStorageMmcCard(device) {
         : healthState === "healthy"
           ? "nvme-badge-healthy"
           : "nvme-badge-unknown";
+
+  const telemetryState = device.telemetry?.state;
+  let telemetryReason = "";
+  if (telemetryState === "unavailable") {
+    const err = device.telemetry?.error;
+    if (err) {
+      const errKey =
+        err.kind === "permission_denied"
+          ? "storageTool.permissionDenied"
+          : err.kind === "io"
+            ? "storageTool.readFailed"
+            : err.kind === "nvme_status"
+              ? "storageTool.protocolError"
+              : "storageTool.unavailable";
+      telemetryReason = err.code != null ? `${t(errKey)} (${err.code})` : t(errKey);
+    } else {
+      telemetryReason = t("storageTool.unavailable");
+    }
+  }
+
   const healthLabel =
     state.storageStale
       ? t("storageTool.staleData")
@@ -2353,9 +2384,12 @@ function renderStorageMmcCard(device) {
           ? t("storageTool.warning")
           : healthState === "healthy"
             ? t("storageTool.healthy")
-            : device.telemetry?.state === "unsupported"
-              ? t("storageTool.unsupported")
-              : t("storageTool.unknown");
+            : telemetryState === "unavailable"
+              ? telemetryReason
+              : telemetryState === "unsupported"
+                ? t("storageTool.unsupported")
+                : t("storageTool.unknown");
+
   const preEolLabel =
     health.preEolInfo === 1
       ? t("storageTool.preEolNormal")
@@ -2364,6 +2398,34 @@ function renderStorageMmcCard(device) {
         : health.preEolInfo === 3
           ? t("storageTool.preEolUrgent")
           : t("storageTool.preEolUndefined");
+
+  let bottomContent = "";
+  if (telemetryState === "unavailable") {
+    bottomContent = `
+      <div class="storage-telemetry-banner">
+        <span>${escapeHtml(t("storageTool.unavailable"))}</span>:
+        <b>${escapeHtml(telemetryReason)}</b>
+      </div>
+    `;
+  } else if (telemetryState === "unsupported") {
+    bottomContent = `
+      <div class="storage-telemetry-banner">
+        <b>${escapeHtml(t("storageTool.unsupported"))}</b>
+      </div>
+    `;
+  } else {
+    bottomContent = `
+      <div class="nvme-metrics-grid">
+        ${lifeBlock("storageTool.lifeA", health.lifeTimeEstAPercent)}
+        ${lifeBlock("storageTool.lifeB", health.lifeTimeEstBPercent)}
+      </div>
+
+      <div class="storage-pre-eol-line">
+        <span>${escapeHtml(t("storageTool.preEol"))}</span>
+        <b>${escapeHtml(preEolLabel)}</b>
+      </div>
+    `;
+  }
 
   function lifeBlock(labelKey, percent) {
     if (percent == null) {
@@ -2424,15 +2486,7 @@ function renderStorageMmcCard(device) {
         </div>
       </div>
 
-      <div class="nvme-metrics-grid">
-        ${lifeBlock("storageTool.lifeA", health.lifeTimeEstAPercent)}
-        ${lifeBlock("storageTool.lifeB", health.lifeTimeEstBPercent)}
-      </div>
-
-      <div class="storage-pre-eol-line">
-        <span>${escapeHtml(t("storageTool.preEol"))}</span>
-        <b>${escapeHtml(preEolLabel)}</b>
-      </div>
+      ${bottomContent}
     </section>
   `;
 }
@@ -2947,7 +3001,7 @@ async function executeSelectedAction() {
       : run.output;
     result.textContent = `${run.synthetic ? t("drawer.dryRun") : t("drawer.result")} / ${t(`run.status.${run.status}`)}\n${i18n.runSummary(run)}${output ? `\n\n${output}` : ""}`;
     toast(run.synthetic ? t("toast.dryRun") : t("toast.complete"), i18n.runSummary(run));
-    await refreshAll({ quiet: true });
+    await refreshAll({ quiet: true, invalidate: true });
   } catch (error) {
     const detail = displayError(error);
     showApplyError(result, error);

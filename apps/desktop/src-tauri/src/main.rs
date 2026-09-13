@@ -315,6 +315,50 @@ fn apply_thermal_policy(
         .map_err(CommandError::from)
 }
 
+#[tauri::command]
+async fn storage_status(
+    controller: tauri::State<'_, Controller>,
+) -> Result<rsetup_core::StorageStatus, CommandError> {
+    let controller = controller.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || controller.storage_status())
+        .await
+        .map_err(CommandError::internal)?
+        .map_err(CommandError::from)
+}
+
+pub fn command_handler<R: tauri::Runtime>()
+-> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static {
+    tauri::generate_handler![
+        system_snapshot,
+        list_actions,
+        list_activity,
+        run_action,
+        source_status,
+        benchmark_source,
+        plan_sources,
+        apply_sources,
+        overlay_status,
+        authorize_overlay_read,
+        plan_overlays,
+        apply_overlays,
+        gpio_status,
+        spi_flash_status,
+        plan_spi_flash,
+        apply_spi_flash,
+        fan_curve_status,
+        plan_fan_curve,
+        apply_fan_curve,
+        led_status,
+        apply_led_trigger,
+        apply_rgb_led,
+        video_status,
+        capture_video_frame,
+        thermal_status,
+        apply_thermal_policy,
+        storage_status
+    ]
+}
+
 fn main() {
     // Opt in explicitly; never infer permission to mutate from launching the GUI.
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -348,34 +392,7 @@ fn main() {
     };
     tauri::Builder::default()
         .manage(controller)
-        .invoke_handler(tauri::generate_handler![
-            system_snapshot,
-            list_actions,
-            list_activity,
-            run_action,
-            source_status,
-            benchmark_source,
-            plan_sources,
-            apply_sources,
-            overlay_status,
-            authorize_overlay_read,
-            plan_overlays,
-            apply_overlays,
-            gpio_status,
-            spi_flash_status,
-            plan_spi_flash,
-            apply_spi_flash,
-            fan_curve_status,
-            plan_fan_curve,
-            apply_fan_curve,
-            led_status,
-            apply_led_trigger,
-            apply_rgb_led,
-            video_status,
-            capture_video_frame,
-            thermal_status,
-            apply_thermal_policy
-        ])
+        .invoke_handler(command_handler())
         .run(tauri::generate_context!())
         .expect("failed to run rsetup desktop");
 }

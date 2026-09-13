@@ -83,6 +83,8 @@ struct App {
     notice: Option<String>,
     pub(crate) nvme_status: rsetup_core::NvmeStatus,
     pub(crate) mmc_status: rsetup_core::MmcStatus,
+    pub nvme_error: Option<rsetup_core::HardwareError>,
+    pub mmc_error: Option<rsetup_core::HardwareError>,
     benchmark_rx: Option<
         std::sync::mpsc::Receiver<Result<rsetup_core::MirrorBenchmark, rsetup_core::SourceError>>,
     >,
@@ -103,21 +105,7 @@ impl App {
                 Some(provider.id.as_str()) == source_status.current_system_provider.as_deref()
             })
             .unwrap_or(0);
-        let nvme_status = controller
-            .nvme_status()
-            .unwrap_or_else(|_| rsetup_core::NvmeStatus {
-                initialized: false,
-                devices: vec![],
-                message: Some("Failed to query NVMe status".into()),
-            });
-        let mmc_status = controller
-            .mmc_status()
-            .unwrap_or_else(|_| rsetup_core::MmcStatus {
-                initialized: false,
-                devices: vec![],
-                message: Some("Failed to query MMC status".into()),
-            });
-        Ok(Self {
+        let mut app = Self {
             controller,
             locale,
             snapshot,
@@ -130,11 +118,23 @@ impl App {
             source_picker: false,
             source_selected,
             notice: None,
-            nvme_status,
-            mmc_status,
+            nvme_status: rsetup_core::NvmeStatus {
+                initialized: false,
+                devices: vec![],
+                message: None,
+            },
+            mmc_status: rsetup_core::MmcStatus {
+                initialized: false,
+                devices: vec![],
+                message: None,
+            },
+            nvme_error: None,
+            mmc_error: None,
             benchmark_rx: None,
             benchmarks: Default::default(),
-        })
+        };
+        app.refresh_storage();
+        Ok(app)
     }
 
     fn next(&mut self) {
@@ -198,6 +198,37 @@ impl App {
         self.confirm_pending = false;
     }
 
+    fn refresh_storage(&mut self) {
+        match self.controller.nvme_status() {
+            Ok(status) => {
+                self.nvme_status = status;
+                self.nvme_error = None;
+            }
+            Err(error) => {
+                self.nvme_status = rsetup_core::NvmeStatus {
+                    initialized: false,
+                    devices: vec![],
+                    message: None,
+                };
+                self.nvme_error = Some(error);
+            }
+        }
+        match self.controller.mmc_status() {
+            Ok(status) => {
+                self.mmc_status = status;
+                self.mmc_error = None;
+            }
+            Err(error) => {
+                self.mmc_status = rsetup_core::MmcStatus {
+                    initialized: false,
+                    devices: vec![],
+                    message: None,
+                };
+                self.mmc_error = Some(error);
+            }
+        }
+    }
+
     fn refresh(&mut self) -> Result<()> {
         self.snapshot = self.controller.snapshot()?;
         self.actions = self.controller.actions();
@@ -206,22 +237,7 @@ impl App {
             .controller
             .source_status()
             .map_err(|error| anyhow!(self.locale.source_error(&error)))?;
-        self.nvme_status =
-            self.controller
-                .nvme_status()
-                .unwrap_or_else(|_| rsetup_core::NvmeStatus {
-                    initialized: false,
-                    devices: vec![],
-                    message: Some("Failed to query NVMe status".into()),
-                });
-        self.mmc_status = self
-            .controller
-            .mmc_status()
-            .unwrap_or_else(|_| rsetup_core::MmcStatus {
-                initialized: false,
-                devices: vec![],
-                message: Some("Failed to query MMC status".into()),
-            });
+        self.refresh_storage();
         if self.source_picker {
             self.update_source_plan();
         }
@@ -423,13 +439,23 @@ fn render_mission(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         0
     };
+    let error_lines = storage_error_lines(app);
+    let error_rows = wrapped_rows(&error_lines, inner_width);
     let device_count = nvme_count + mmc_count;
-    let content_rows = if device_count == 0 {
+    let content_rows = if device_count == 0 && error_rows == 0 {
         0
     } else {
-        nvme_rows + mmc_rows + (device_count - 1)
+        error_rows
+            + nvme_rows
+            + mmc_rows
+            + (device_count.saturating_sub(1))
+            + if error_rows > 0 && device_count > 0 {
+                1
+            } else {
+                0
+            }
     };
-    let desired_height = if device_count == 0 {
+    let desired_height = if content_rows == 0 {
         3
     } else {
         2 + content_rows
@@ -544,13 +570,27 @@ fn render_storage_summary(frame: &mut Frame, app: &App, area: Rect) {
         &[]
     };
 
-    if nvme.is_empty() && mmc.is_empty() {
+    if app.nvme_error.is_none() && app.mmc_error.is_none() && nvme.is_empty() && mmc.is_empty() {
         let msg = Paragraph::new(app.locale.text("storage_not_detected"))
             .style(Style::default().fg(MUTED))
             .block(block)
             .wrap(Wrap { trim: true });
         frame.render_widget(msg, area);
         return;
+    }
+
+    let budget = area.height.saturating_sub(2) as usize;
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut used_rows = 0usize;
+
+    let error_lines = storage_error_lines(app);
+    for err_line in error_lines {
+        let rows = wrapped_rows(std::slice::from_ref(&err_line), inner_width);
+        if used_rows + rows <= budget {
+            lines.push(err_line);
+            used_rows += rows;
+        }
     }
 
     // NVMe devices all come first, then the MMC/SD devices. When the card is
@@ -566,23 +606,20 @@ fn render_storage_summary(frame: &mut Frame, app: &App, area: Rect) {
         .map(Device::Nvme)
         .chain(mmc.iter().map(Device::Mmc))
         .collect();
-    let budget = area.height.saturating_sub(2) as usize;
-    let inner_width = area.width.saturating_sub(2) as usize;
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut used_rows = 0usize;
     let mut more = 0usize;
     for (idx, dev) in devices.iter().enumerate() {
         let dev_lines = match dev {
             Device::Nvme(d) => nvme_device_lines(app, d, inner_width),
             Device::Mmc(d) => mmc_device_lines(app, d),
         };
-        // A blank row separates consecutive devices; charge it to the second one.
-        let rows = wrapped_rows(&dev_lines, inner_width) + if idx > 0 { 1 } else { 0 };
+        // A blank row separates consecutive devices, or devices from errors; charge it to the device.
+        let needs_sep = idx > 0 || !lines.is_empty();
+        let rows = wrapped_rows(&dev_lines, inner_width) + if needs_sep { 1 } else { 0 };
         if used_rows + rows > budget {
             more = devices.len() - idx;
             break;
         }
-        if idx > 0 {
+        if needs_sep {
             lines.push(Line::from(""));
         }
         lines.extend(dev_lines);
@@ -604,6 +641,29 @@ fn render_storage_summary(frame: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
         area,
     );
+}
+
+fn storage_error_lines(app: &App) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(err) = &app.nvme_error {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{}: ", app.locale.text("storage_nvme_enum_failed")),
+                Style::default().fg(CORAL).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(err.to_string(), Style::default().fg(MUTED)),
+        ]));
+    }
+    if let Some(err) = &app.mmc_error {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{}: ", app.locale.text("storage_mmc_enum_failed")),
+                Style::default().fg(CORAL).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(err.to_string(), Style::default().fg(MUTED)),
+        ]));
+    }
+    lines
 }
 
 fn wrapped_rows(lines: &[Line<'static>], inner_width: usize) -> usize {
@@ -835,52 +895,94 @@ fn mmc_device_lines(app: &App, dev: &rsetup_core::MmcDevice) -> Vec<Line<'static
         ),
     ]);
 
-    // Line 2: Health state, SLC/MLC life estimates, pre-EOL warning
+    // Line 2: Health state or telemetry error/unsupported banner
     let health_label = format!("{}: ", app.locale.text("storage_health"));
-    let life_a_label = format!("{}: ", app.locale.text("storage_life_a"));
-    let life_b_label = format!("{}: ", app.locale.text("storage_life_b"));
-    let pre_eol_label = format!("{}: ", app.locale.text("storage_pre_eol"));
     let (health_text, health_color) = match dev.health_state {
         rsetup_core::HealthState::Healthy => (app.locale.text("storage_healthy"), SIGNAL),
         rsetup_core::HealthState::Warning => (app.locale.text("storage_warning"), AMBER),
         rsetup_core::HealthState::Critical => (app.locale.text("storage_critical"), CORAL),
         rsetup_core::HealthState::Unknown => (app.locale.text("storage_unknown"), MUTED),
     };
-    let format_life = |value: Option<u8>| -> String {
-        match value {
-            Some(100) => "90–100%".to_string(),
-            Some(101) => ">100%".to_string(),
-            Some(p) => format!("{p}%"),
-            None => app.locale.text("storage_na").to_string(),
+
+    let line2 = match dev.telemetry.state {
+        rsetup_core::TelemetryReadState::Unavailable => {
+            let err_reason = app
+                .locale
+                .storage_telemetry_error(dev.telemetry.error.as_ref());
+            Line::from(vec![
+                Span::styled(health_label, Style::default().fg(MUTED)),
+                Span::styled(
+                    health_text,
+                    Style::default()
+                        .fg(health_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" · ", Style::default().fg(MUTED)),
+                Span::styled(
+                    format!(
+                        "{}: {}",
+                        app.locale.text("storage_telemetry_unavailable"),
+                        err_reason
+                    ),
+                    Style::default().fg(MUTED),
+                ),
+            ])
+        }
+        rsetup_core::TelemetryReadState::Unsupported => Line::from(vec![
+            Span::styled(health_label, Style::default().fg(MUTED)),
+            Span::styled(
+                health_text,
+                Style::default()
+                    .fg(health_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" · ", Style::default().fg(MUTED)),
+            Span::styled(
+                app.locale.text("storage_telemetry_unsupported"),
+                Style::default().fg(MUTED),
+            ),
+        ]),
+        rsetup_core::TelemetryReadState::Available => {
+            let life_a_label = format!("{}: ", app.locale.text("storage_life_a"));
+            let life_b_label = format!("{}: ", app.locale.text("storage_life_b"));
+            let pre_eol_label = format!("{}: ", app.locale.text("storage_pre_eol"));
+            let format_life = |value: Option<u8>| -> String {
+                match value {
+                    Some(100) => "90–100%".to_string(),
+                    Some(101) => ">100%".to_string(),
+                    Some(p) => format!("{p}%"),
+                    None => app.locale.text("storage_na").to_string(),
+                }
+            };
+            let life_a = format_life(dev.health.life_time_est_a_percent);
+            let life_b = format_life(dev.health.life_time_est_b_percent);
+            let eol = match dev.health.pre_eol_info {
+                0 => app.locale.text("storage_eol_undefined"),
+                1 => app.locale.text("storage_eol_normal"),
+                2 => app.locale.text("storage_eol_warning"),
+                3 => app.locale.text("storage_eol_urgent"),
+                _ => app.locale.text("storage_eol_undefined"),
+            };
+            Line::from(vec![
+                Span::styled(health_label, Style::default().fg(MUTED)),
+                Span::styled(
+                    health_text,
+                    Style::default()
+                        .fg(health_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" · ", Style::default().fg(MUTED)),
+                Span::styled(life_a_label, Style::default().fg(MUTED)),
+                Span::styled(life_a, Style::default().fg(BONE)),
+                Span::styled(" · ", Style::default().fg(MUTED)),
+                Span::styled(life_b_label, Style::default().fg(MUTED)),
+                Span::styled(life_b, Style::default().fg(BONE)),
+                Span::styled(" · ", Style::default().fg(MUTED)),
+                Span::styled(pre_eol_label, Style::default().fg(MUTED)),
+                Span::styled(eol, Style::default().fg(BONE)),
+            ])
         }
     };
-    let life_a = format_life(dev.health.life_time_est_a_percent);
-    let life_b = format_life(dev.health.life_time_est_b_percent);
-    let eol = match dev.health.pre_eol_info {
-        0 => app.locale.text("storage_eol_undefined"),
-        1 => app.locale.text("storage_eol_normal"),
-        2 => app.locale.text("storage_eol_warning"),
-        3 => app.locale.text("storage_eol_urgent"),
-        _ => app.locale.text("storage_eol_undefined"),
-    };
-    let line2 = Line::from(vec![
-        Span::styled(health_label, Style::default().fg(MUTED)),
-        Span::styled(
-            health_text,
-            Style::default()
-                .fg(health_color)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" · ", Style::default().fg(MUTED)),
-        Span::styled(life_a_label, Style::default().fg(MUTED)),
-        Span::styled(life_a, Style::default().fg(BONE)),
-        Span::styled(" · ", Style::default().fg(MUTED)),
-        Span::styled(life_b_label, Style::default().fg(MUTED)),
-        Span::styled(life_b, Style::default().fg(BONE)),
-        Span::styled(" · ", Style::default().fg(MUTED)),
-        Span::styled(pre_eol_label, Style::default().fg(MUTED)),
-        Span::styled(eol, Style::default().fg(BONE)),
-    ]);
 
     vec![line1, line2]
 }
@@ -1574,8 +1676,8 @@ mod tests {
             "Expected 'SD Card' label in buffer, got: {raw_en}"
         );
         assert!(
-            raw_en.contains("N/A"),
-            "Expected 'N/A' life for SD card, got: {raw_en}"
+            raw_en.contains("Health telemetry unsupported"),
+            "Expected 'Health telemetry unsupported' for SD card, got: {raw_en}"
         );
     }
 
@@ -1806,6 +1908,392 @@ mod tests {
                 raw_text.contains("78.0 °C") || raw_text.contains("78°C"),
                 "Expected 78.0 °C in rendered buffer, got: {raw_text}"
             );
+        }
+    }
+
+    #[test]
+    fn mmc_unavailable_in_tui_lines_and_render() {
+        use rsetup_core::{
+            HealthState, MmcHealth, TelemetryError, TelemetryErrorKind, TelemetryReadState,
+            TelemetryStatus,
+        };
+
+        for (locale, reason) in [
+            (Locale::En, "Permission denied (13)"),
+            (Locale::ZhCn, "权限不足 (13)"),
+        ] {
+            let mut app = App::new(
+                Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun),
+                locale,
+            )
+            .expect("init app");
+            assert!(!app.mmc_status.devices.is_empty());
+            {
+                let dev = &mut app.mmc_status.devices[0];
+                dev.health = MmcHealth::default();
+                dev.health_state = HealthState::Unknown;
+                dev.telemetry = TelemetryStatus {
+                    state: TelemetryReadState::Unavailable,
+                    error: Some(TelemetryError {
+                        kind: TelemetryErrorKind::PermissionDenied,
+                        code: Some(13),
+                    }),
+                };
+            }
+
+            // Test lines directly
+            let dev = &app.mmc_status.devices[0];
+            let lines = mmc_device_lines(&app, dev);
+            let combined_lines_text = lines
+                .iter()
+                .flat_map(|line| line.spans.iter().map(|s| s.content.as_ref()))
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            assert!(
+                combined_lines_text.contains(reason),
+                "Expected '{reason}' in lines, got: {combined_lines_text}"
+            );
+            assert!(!combined_lines_text.contains("SLC"));
+            assert!(!combined_lines_text.contains("MLC"));
+
+            // Test render_storage_summary TestBackend
+            let backend = ratatui::backend::TestBackend::new(120, 30);
+            let mut terminal = Terminal::new(backend).expect("init test terminal");
+            terminal
+                .draw(|frame| {
+                    render_storage_summary(frame, &app, Rect::new(0, 0, 120, 30));
+                })
+                .expect("draw");
+            let buffer = terminal.backend().buffer();
+            let raw_text = buffer
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            let norm_text = raw_text.split_whitespace().collect::<Vec<_>>().join("");
+            let norm_reason = reason.split_whitespace().collect::<Vec<_>>().join("");
+            assert!(
+                norm_text.contains(&norm_reason),
+                "Expected '{reason}' (norm '{norm_reason}') in rendered buffer, got:\n{raw_text}"
+            );
+        }
+    }
+
+    #[derive(Clone)]
+    struct EnumerationFixture(
+        std::sync::Arc<std::sync::Mutex<(rsetup_core::StorageStatus, bool, bool)>>,
+    );
+
+    impl rsetup_core::StorageReader for EnumerationFixture {
+        fn nvme_status(&self) -> Result<rsetup_core::NvmeStatus, rsetup_core::HardwareError> {
+            let state = self.0.lock().unwrap();
+            if state.1 {
+                Err(rsetup_core::HardwareError::Io(
+                    "nvme-enumeration-eio".into(),
+                ))
+            } else {
+                Ok(state.0.nvme.clone())
+            }
+        }
+        fn mmc_status(&self) -> Result<rsetup_core::MmcStatus, rsetup_core::HardwareError> {
+            let state = self.0.lock().unwrap();
+            if state.2 {
+                Err(rsetup_core::HardwareError::Io("mmc-enumeration-eio".into()))
+            } else {
+                Ok(state.0.mmc.clone())
+            }
+        }
+    }
+
+    fn storage_card_text(app: &App) -> String {
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_storage_summary(frame, app, Rect::new(0, 0, 120, 40));
+            })
+            .unwrap();
+        let raw = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        raw.split_whitespace().collect::<Vec<_>>().join("")
+    }
+
+    fn norm(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join("")
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn storage_enumeration_errors_are_not_no_devices() {
+        use std::sync::{Arc, Mutex};
+        let demo = Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun)
+            .storage_status()
+            .unwrap();
+        let shared = Arc::new(Mutex::new((demo, true, true)));
+        let controller = Controller::with_storage_reader(
+            ProbeMode::Live,
+            ExecutionPolicy::DryRun,
+            Arc::new(EnumerationFixture(shared)),
+        );
+        let app = App::new(controller, Locale::En).unwrap();
+        let text = storage_card_text(&app);
+        assert!(
+            text.contains(&norm("NVMe device enumeration failed")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&norm("MMC device enumeration failed")),
+            "{text}"
+        );
+        assert!(
+            !text.contains(&norm(app.locale.text("storage_not_detected"))),
+            "{text}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn storage_enumeration_state_transitions_and_screens() {
+        use std::sync::{Arc, Mutex};
+        for locale in [Locale::En, Locale::ZhCn] {
+            let demo = Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun)
+                .storage_status()
+                .unwrap();
+            let nvme_model = demo.nvme.devices[0].model.clone();
+            let mmc_model = demo.mmc.devices[0].model.clone();
+
+            // 1. Double empty success -> shows storage_not_detected
+            let mut empty_demo = demo.clone();
+            empty_demo.nvme.devices.clear();
+            empty_demo.mmc.devices.clear();
+            let shared = Arc::new(Mutex::new((empty_demo, false, false)));
+            let controller = Controller::with_storage_reader(
+                ProbeMode::Live,
+                ExecutionPolicy::DryRun,
+                Arc::new(EnumerationFixture(shared.clone())),
+            );
+            let mut app = App::new(controller, locale).unwrap();
+            let text = storage_card_text(&app);
+            assert!(
+                text.contains(&norm(app.locale.text("storage_not_detected"))),
+                "Expected empty message in: {text}"
+            );
+            assert!(app.nvme_error.is_none());
+            assert!(app.mmc_error.is_none());
+
+            // 2. NVMe failure / MMC empty -> error line, no storage_not_detected
+            {
+                let mut guard = shared.lock().unwrap();
+                guard.1 = true; // nvme fail
+                guard.2 = false; // mmc ok
+            }
+            app.refresh().unwrap();
+            assert!(app.nvme_error.is_some());
+            assert!(app.mmc_error.is_none());
+            let text = storage_card_text(&app);
+            assert!(
+                text.contains(&norm(app.locale.text("storage_nvme_enum_failed"))),
+                "{text}"
+            );
+            assert!(
+                !text.contains(&norm(app.locale.text("storage_mmc_enum_failed"))),
+                "{text}"
+            );
+            assert!(
+                !text.contains(&norm(app.locale.text("storage_not_detected"))),
+                "{text}"
+            );
+
+            // 3. MMC failure / NVMe has devices -> MMC error line, NVMe model visible
+            {
+                let mut guard = shared.lock().unwrap();
+                guard.0 = demo.clone();
+                guard.1 = false; // nvme ok
+                guard.2 = true; // mmc fail
+            }
+            app.refresh().unwrap();
+            assert!(app.nvme_error.is_none());
+            assert!(app.mmc_error.is_some());
+            let text = storage_card_text(&app);
+            assert!(
+                !text.contains(&norm(app.locale.text("storage_nvme_enum_failed"))),
+                "{text}"
+            );
+            assert!(
+                text.contains(&norm(app.locale.text("storage_mmc_enum_failed"))),
+                "{text}"
+            );
+            assert!(text.contains(&norm(&nvme_model)), "{text}");
+            assert!(
+                !text.contains(&norm(app.locale.text("storage_not_detected"))),
+                "{text}"
+            );
+
+            // 4. NVMe failure / MMC has devices -> NVMe error line, MMC model visible
+            {
+                let mut guard = shared.lock().unwrap();
+                guard.1 = true; // nvme fail
+                guard.2 = false; // mmc ok
+            }
+            app.refresh().unwrap();
+            assert!(app.nvme_error.is_some());
+            assert!(app.mmc_error.is_none());
+            let text = storage_card_text(&app);
+            assert!(
+                text.contains(&norm(app.locale.text("storage_nvme_enum_failed"))),
+                "{text}"
+            );
+            assert!(
+                !text.contains(&norm(app.locale.text("storage_mmc_enum_failed"))),
+                "{text}"
+            );
+            assert!(text.contains(&norm(&mmc_model)), "{text}");
+            assert!(!text.contains(&norm(&nvme_model)), "{text}");
+            assert!(
+                !text.contains(&norm(app.locale.text("storage_not_detected"))),
+                "{text}"
+            );
+
+            // 5. Both fail -> both errors visible, neither model visible
+            {
+                let mut guard = shared.lock().unwrap();
+                guard.1 = true; // nvme fail
+                guard.2 = true; // mmc fail
+            }
+            app.refresh().unwrap();
+            assert!(app.nvme_error.is_some());
+            assert!(app.mmc_error.is_some());
+            let text = storage_card_text(&app);
+            assert!(
+                text.contains(&norm(app.locale.text("storage_nvme_enum_failed"))),
+                "{text}"
+            );
+            assert!(
+                text.contains(&norm(app.locale.text("storage_mmc_enum_failed"))),
+                "{text}"
+            );
+            assert!(!text.contains(&norm(&nvme_model)), "{text}");
+            assert!(!text.contains(&norm(&mmc_model)), "{text}");
+            assert!(
+                !text.contains(&norm(app.locale.text("storage_not_detected"))),
+                "{text}"
+            );
+
+            // 6. Fail -> Refresh success (clears error, restores devices)
+            {
+                let mut guard = shared.lock().unwrap();
+                guard.1 = false;
+                guard.2 = false;
+            }
+            app.refresh().unwrap();
+            assert!(app.nvme_error.is_none());
+            assert!(app.mmc_error.is_none());
+            let text = storage_card_text(&app);
+            assert!(
+                !text.contains(&norm(app.locale.text("storage_nvme_enum_failed"))),
+                "{text}"
+            );
+            assert!(
+                !text.contains(&norm(app.locale.text("storage_mmc_enum_failed"))),
+                "{text}"
+            );
+            assert!(text.contains(&norm(&nvme_model)), "{text}");
+            assert!(text.contains(&norm(&mmc_model)), "{text}");
+
+            // 7. Success -> Refresh fail (clears old devices, shows error)
+            {
+                let mut guard = shared.lock().unwrap();
+                guard.1 = true;
+                guard.2 = true;
+            }
+            app.refresh().unwrap();
+            assert!(app.nvme_error.is_some());
+            assert!(app.mmc_error.is_some());
+            let text = storage_card_text(&app);
+            assert!(
+                text.contains(&norm(app.locale.text("storage_nvme_enum_failed"))),
+                "{text}"
+            );
+            assert!(
+                text.contains(&norm(app.locale.text("storage_mmc_enum_failed"))),
+                "{text}"
+            );
+            assert!(!text.contains(&norm(&nvme_model)), "{text}");
+            assert!(!text.contains(&norm(&mmc_model)), "{text}");
+
+            // 8. Single disk telemetry unavailable but query Ok -> shows telemetry error, NOT enumeration error
+            {
+                let mut guard = shared.lock().unwrap();
+                guard.1 = false;
+                guard.2 = false;
+                guard.0 = demo.clone();
+                guard.0.nvme.devices[0].smart = None;
+                guard.0.nvme.devices[0].telemetry = rsetup_core::TelemetryStatus {
+                    state: rsetup_core::TelemetryReadState::Unavailable,
+                    error: Some(rsetup_core::TelemetryError {
+                        kind: rsetup_core::TelemetryErrorKind::PermissionDenied,
+                        code: Some(13),
+                    }),
+                };
+            }
+            app.refresh().unwrap();
+            assert!(app.nvme_error.is_none());
+            assert!(app.mmc_error.is_none());
+            let text = storage_card_text(&app);
+            assert!(
+                !text.contains(&norm(app.locale.text("storage_nvme_enum_failed"))),
+                "{text}"
+            );
+            assert!(
+                !text.contains(&norm(app.locale.text("storage_mmc_enum_failed"))),
+                "{text}"
+            );
+            assert!(text.contains(&norm(&nvme_model)), "{text}");
+            assert!(
+                text.contains(&norm(app.locale.text("storage_permission_denied"))),
+                "{text}"
+            );
+
+            // 9. Full screen render test on 120x40 and 100x28 TestBackend
+            {
+                let mut guard = shared.lock().unwrap();
+                guard.1 = true;
+                guard.2 = true;
+            }
+            app.refresh().unwrap();
+
+            for (w, h) in [(120, 40), (100, 28)] {
+                let backend = ratatui::backend::TestBackend::new(w, h);
+                let mut terminal = ratatui::Terminal::new(backend).unwrap();
+                terminal
+                    .draw(|frame| {
+                        render(frame, &mut app);
+                    })
+                    .unwrap();
+                let full_text = norm(
+                    &terminal
+                        .backend()
+                        .buffer()
+                        .content()
+                        .iter()
+                        .map(|cell| cell.symbol())
+                        .collect::<String>(),
+                );
+                assert!(
+                    full_text.contains(&norm(app.locale.text("storage_nvme_enum_failed"))),
+                    "Expected NVMe enum error on {w}x{h}, got:\n{full_text}"
+                );
+                assert!(
+                    full_text.contains(&norm(app.locale.text("storage_mmc_enum_failed"))),
+                    "Expected MMC enum error on {w}x{h}, got:\n{full_text}"
+                );
+            }
         }
     }
 }

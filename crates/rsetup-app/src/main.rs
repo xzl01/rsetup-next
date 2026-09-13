@@ -1286,31 +1286,42 @@ fn format_mmc_status(status: &rsetup_core::MmcStatus, locale: Locale) -> String 
                 "  总容量:           {} ({} 字节)",
                 size_str, dev.total_bytes
             ));
-            let pre_eol_str = match dev.health.pre_eol_info {
-                0 => "未定义".to_string(),
-                1 => "正常".to_string(),
-                2 => "预警 (80% 寿命)".to_string(),
-                3 => "紧急 (建议更换)".to_string(),
-                other => format!("未知 ({other})"),
-            };
-            let life_str_zh = |value: Option<u8>| -> String {
-                match value {
-                    Some(100) => "90–100%".to_string(),
-                    Some(101) => ">100%".to_string(),
-                    Some(p) => format!("{p}%"),
-                    None => "不支持".to_string(),
+            match dev.telemetry.state {
+                rsetup_core::TelemetryReadState::Unavailable => {
+                    let err_reason = locale.storage_telemetry_error(dev.telemetry.error.as_ref());
+                    out.push(format!("  健康状态:         不可读取 ({err_reason})"));
                 }
-            };
-            let life_a_str = life_str_zh(dev.health.life_time_est_a_percent);
-            let life_b_str = life_str_zh(dev.health.life_time_est_b_percent);
-            out.push(format!("  预 EOL 状态:       {pre_eol_str}"));
-            out.push(format!("  寿命估计 (A/B):   {life_a_str} / {life_b_str}"));
-            let warning_str = if dev.health.warning_flags.is_empty() {
-                "无".to_string()
-            } else {
-                dev.health.warning_flags.join(", ")
-            };
-            out.push(format!("  告警标志:         {warning_str}"));
+                rsetup_core::TelemetryReadState::Unsupported => {
+                    out.push("  健康状态:         不支持健康指标".to_string());
+                }
+                rsetup_core::TelemetryReadState::Available => {
+                    let pre_eol_str = match dev.health.pre_eol_info {
+                        0 => "未定义".to_string(),
+                        1 => "正常".to_string(),
+                        2 => "预警 (80% 寿命)".to_string(),
+                        3 => "紧急 (建议更换)".to_string(),
+                        other => format!("未知 ({other})"),
+                    };
+                    let life_str_zh = |value: Option<u8>| -> String {
+                        match value {
+                            Some(100) => "90–100%".to_string(),
+                            Some(101) => ">100%".to_string(),
+                            Some(p) => format!("{p}%"),
+                            None => "不支持".to_string(),
+                        }
+                    };
+                    let life_a_str = life_str_zh(dev.health.life_time_est_a_percent);
+                    let life_b_str = life_str_zh(dev.health.life_time_est_b_percent);
+                    out.push(format!("  预 EOL 状态:       {pre_eol_str}"));
+                    out.push(format!("  寿命估计 (A/B):   {life_a_str} / {life_b_str}"));
+                    let warning_str = if dev.health.warning_flags.is_empty() {
+                        "无".to_string()
+                    } else {
+                        dev.health.warning_flags.join(", ")
+                    };
+                    out.push(format!("  告警标志:         {warning_str}"));
+                }
+            }
         } else {
             out.push(format!("  Type:             {}", dev.card_type));
             out.push(format!("  Model:            {}", dev.model));
@@ -1321,33 +1332,44 @@ fn format_mmc_status(status: &rsetup_core::MmcStatus, locale: Locale) -> String 
                 "  Total Capacity:   {} ({} bytes)",
                 size_str, dev.total_bytes
             ));
-            let pre_eol_str = match dev.health.pre_eol_info {
-                0 => "Undefined".to_string(),
-                1 => "Normal".to_string(),
-                2 => "Warning (80% endurance)".to_string(),
-                3 => "Urgent (replace soon)".to_string(),
-                other => format!("Unknown ({other})"),
-            };
-            let life_str_en = |value: Option<u8>| -> String {
-                match value {
-                    Some(100) => "90–100%".to_string(),
-                    Some(101) => ">100%".to_string(),
-                    Some(p) => format!("{p}%"),
-                    None => "N/A".to_string(),
+            match dev.telemetry.state {
+                rsetup_core::TelemetryReadState::Unavailable => {
+                    let err_reason = locale.storage_telemetry_error(dev.telemetry.error.as_ref());
+                    out.push(format!("  Health:           Unavailable ({err_reason})"));
                 }
-            };
-            let life_a_str = life_str_en(dev.health.life_time_est_a_percent);
-            let life_b_str = life_str_en(dev.health.life_time_est_b_percent);
-            out.push(format!("  Pre-EOL:            {pre_eol_str}"));
-            out.push(format!(
-                "  Life Time Est (A/B): {life_a_str} / {life_b_str}"
-            ));
-            let warning_str = if dev.health.warning_flags.is_empty() {
-                "None".to_string()
-            } else {
-                dev.health.warning_flags.join(", ")
-            };
-            out.push(format!("  Warning Flags:    {warning_str}"));
+                rsetup_core::TelemetryReadState::Unsupported => {
+                    out.push("  Health:           Health telemetry unsupported".to_string());
+                }
+                rsetup_core::TelemetryReadState::Available => {
+                    let pre_eol_str = match dev.health.pre_eol_info {
+                        0 => "Undefined".to_string(),
+                        1 => "Normal".to_string(),
+                        2 => "Warning (80% endurance)".to_string(),
+                        3 => "Urgent (replace soon)".to_string(),
+                        other => format!("Unknown ({other})"),
+                    };
+                    let life_str_en = |value: Option<u8>| -> String {
+                        match value {
+                            Some(100) => "90–100%".to_string(),
+                            Some(101) => ">100%".to_string(),
+                            Some(p) => format!("{p}%"),
+                            None => "N/A".to_string(),
+                        }
+                    };
+                    let life_a_str = life_str_en(dev.health.life_time_est_a_percent);
+                    let life_b_str = life_str_en(dev.health.life_time_est_b_percent);
+                    out.push(format!("  Pre-EOL:            {pre_eol_str}"));
+                    out.push(format!(
+                        "  Life Time Est (A/B): {life_a_str} / {life_b_str}"
+                    ));
+                    let warning_str = if dev.health.warning_flags.is_empty() {
+                        "None".to_string()
+                    } else {
+                        dev.health.warning_flags.join(", ")
+                    };
+                    out.push(format!("  Warning Flags:    {warning_str}"));
+                }
+            }
         }
     }
 
@@ -1824,6 +1846,40 @@ mod tests {
         let mmc_en = format_mmc_status(&special_mmc, Locale::En);
         assert!(mmc_en.contains("90–100%"));
         assert!(mmc_en.contains(">100%"));
+    }
+
+    #[test]
+    fn mmc_unavailable_preserves_reason_in_both_cli_commands() {
+        use rsetup_core::{
+            HealthState, MmcHealth, TelemetryError, TelemetryErrorKind, TelemetryReadState,
+            TelemetryStatus,
+        };
+        let controller = Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun);
+        let mut storage = controller.storage_status().unwrap();
+        storage.mmc.devices.truncate(1);
+        let dev = &mut storage.mmc.devices[0];
+        dev.health = MmcHealth::default();
+        dev.health_state = HealthState::Unknown;
+        dev.telemetry = TelemetryStatus {
+            state: TelemetryReadState::Unavailable,
+            error: Some(TelemetryError {
+                kind: TelemetryErrorKind::PermissionDenied,
+                code: Some(13),
+            }),
+        };
+        for (locale, reason) in [
+            (Locale::En, "Permission denied (13)"),
+            (Locale::ZhCn, "权限不足 (13)"),
+        ] {
+            let mmc = format_mmc_status(&storage.mmc, locale);
+            let combined = format_storage_status(&storage, locale);
+            assert!(mmc.contains(reason), "{mmc}");
+            assert!(combined.contains(reason), "{combined}");
+            assert!(!mmc.lines().any(|line| {
+                (line.contains("Warning Flags:") && line.trim_end().ends_with("None"))
+                    || (line.contains("告警标志:") && line.trim_end().ends_with('无'))
+            }));
+        }
     }
 }
 

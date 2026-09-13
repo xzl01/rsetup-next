@@ -208,10 +208,7 @@ test("renderStorageTool renders MMC card with life bars and N/A", () => {
   assert.ok(host.innerHTML.includes("/dev/mmcblk0"));
   assert.ok(host.innerHTML.includes("storageTool.emmc"));
   assert.ok(host.innerHTML.includes("storageTool.sd"));
-  assert.ok(host.innerHTML.includes("storageTool.na")); // SD life is null
-  // The SD card reports no life estimates, so both of its bars take the N/A
-  // state; the eMMC keeps a real percentage.
-  assert.equal((host.innerHTML.match(/nvme-metric-bar-fill is-na/g) || []).length, 2);
+  assert.ok(host.innerHTML.includes("storageTool.unsupported"));
   assert.ok(host.innerHTML.includes('data-metric-percent="10"'));
   assert.ok(!host.innerHTML.includes("nvme-metric-bar-fill is-critical"));
   assert.ok(!host.innerHTML.includes('class="nvme-card"'));
@@ -251,6 +248,141 @@ test("renderStorageMmcCard maps healthState to badge classes", () => {
   assert.ok(createTestContext().context.renderStorageMmcCard(flagged).includes("nvme-badge-critical"));
   assert.ok(createTestContext().context.renderStorageMmcCard(emmcDevice).includes("nvme-badge-healthy"));
   assert.ok(createTestContext().context.renderStorageMmcCard(undefinedDev).includes("storageTool.preEolUndefined"));
+});
+
+test("MMC unavailable explains permission failure in both locales", () => {
+  for (const [language, reason] of [
+    ["en", "Permission denied (13)"],
+    ["zh-CN", "权限不足 (13)"],
+  ]) {
+    const i18n = loadI18n(language);
+    const { context } = createTestContext({ t: (key, params) => i18n.t(key, params) });
+    const device = structuredClone(emmcDevice);
+    device.health = {
+      preEolInfo: 0,
+      lifeTimeEstAPercent: null,
+      lifeTimeEstBPercent: null,
+      warningFlags: [],
+    };
+    device.healthState = "unknown";
+    device.telemetry = {
+      state: "unavailable",
+      error: { kind: "permission_denied", code: 13 },
+    };
+    const html = context.renderStorageMmcCard(device);
+    assert.ok(html.includes(reason), `Expected HTML to include "${reason}":\n${html}`);
+    assert.doesNotMatch(html, /data-metric-percent/);
+  }
+});
+
+test("MMC truth table tests for telemetry states across unavailable, unsupported, and available", () => {
+  const i18nEn = loadI18n("en");
+  const i18nZh = loadI18n("zh-CN");
+
+  // 1. PermissionDenied with code 13 and code 1
+  for (const code of [13, 1]) {
+    const dev = structuredClone(emmcDevice);
+    dev.telemetry = { state: "unavailable", error: { kind: "permission_denied", code } };
+    dev.healthState = "unknown";
+    const ctxEn = createTestContext({ t: (k, p) => i18nEn.t(k, p) });
+    const htmlEn = ctxEn.context.renderStorageMmcCard(dev);
+    assert.ok(htmlEn.includes(`Permission denied (${code})`));
+    assert.ok(!htmlEn.includes("Health telemetry unsupported"));
+    assert.ok(!htmlEn.includes("Healthy"));
+    assert.doesNotMatch(htmlEn, /data-metric-percent/);
+  }
+
+  // 2. Io with code 5
+  {
+    const dev = structuredClone(emmcDevice);
+    dev.telemetry = { state: "unavailable", error: { kind: "io", code: 5 } };
+    dev.healthState = "unknown";
+    const ctxEn = createTestContext({ t: (k, p) => i18nEn.t(k, p) });
+    const htmlEn = ctxEn.context.renderStorageMmcCard(dev);
+    assert.ok(htmlEn.includes("Read failed (5)"));
+    assert.ok(!htmlEn.includes("Health telemetry unsupported"));
+
+    const ctxZh = createTestContext({ t: (k, p) => i18nZh.t(k, p) });
+    const htmlZh = ctxZh.context.renderStorageMmcCard(dev);
+    assert.ok(htmlZh.includes("读取失败 (5)"));
+  }
+
+  // 3. Io, None; Unavailable, None
+  {
+    const devIoNone = structuredClone(emmcDevice);
+    devIoNone.telemetry = { state: "unavailable", error: { kind: "io", code: null } };
+    devIoNone.healthState = "unknown";
+    const htmlIoNone = createTestContext({ t: (k, p) => i18nEn.t(k, p) }).context.renderStorageMmcCard(devIoNone);
+    assert.ok(htmlIoNone.includes("Read failed"));
+    assert.ok(!htmlIoNone.includes("(0)"));
+
+    const devUnavailNone = structuredClone(emmcDevice);
+    devUnavailNone.telemetry = { state: "unavailable", error: null };
+    devUnavailNone.healthState = "unknown";
+    const htmlUnavailNone = createTestContext({ t: (k, p) => i18nEn.t(k, p) }).context.renderStorageMmcCard(devUnavailNone);
+    assert.ok(htmlUnavailNone.includes("Unavailable"));
+    assert.ok(!htmlUnavailNone.includes("(0)"));
+  }
+
+  // 4. Unsupported
+  {
+    const devUnsupported = structuredClone(emmcDevice);
+    devUnsupported.telemetry = { state: "unsupported", error: null };
+    devUnsupported.healthState = "unknown";
+    const html = createTestContext({ t: (k, p) => i18nEn.t(k, p) }).context.renderStorageMmcCard(devUnsupported);
+    assert.ok(html.includes("Health telemetry unsupported"));
+    assert.ok(!html.includes("Read failed"));
+    assert.doesNotMatch(html, /data-metric-percent/);
+  }
+
+  // 5. Available, partial fields undefined
+  {
+    const devPartial = structuredClone(emmcDevice);
+    devPartial.telemetry = { state: "available", error: null };
+    devPartial.health = { preEolInfo: 0, lifeTimeEstAPercent: 20, lifeTimeEstBPercent: null, warningFlags: [] };
+    devPartial.healthState = "healthy";
+    const html = createTestContext({ t: (k, p) => i18nEn.t(k, p) }).context.renderStorageMmcCard(devPartial);
+    assert.ok(html.includes('data-metric-percent="20"'));
+    assert.ok(html.includes("N/A"));
+    assert.ok(html.includes("Undefined"));
+    assert.ok(!html.includes("Health telemetry unsupported"));
+  }
+
+  // 6. Available, all undefined
+  {
+    const devAllUndef = structuredClone(emmcDevice);
+    devAllUndef.telemetry = { state: "available", error: null };
+    devAllUndef.health = { preEolInfo: 0, lifeTimeEstAPercent: null, lifeTimeEstBPercent: null, warningFlags: [] };
+    devAllUndef.healthState = "unknown";
+    const html = createTestContext({ t: (k, p) => i18nEn.t(k, p) }).context.renderStorageMmcCard(devAllUndef);
+    assert.ok(html.includes("Undefined"));
+    assert.ok(!html.includes("nvme-badge-healthy"));
+  }
+
+  // 7. Missing telemetry legacy JSON (defaults to unknown)
+  {
+    const devLegacy = structuredClone(emmcDevice);
+    delete devLegacy.telemetry;
+    devLegacy.healthState = "unknown";
+    const html = createTestContext({ t: (k, p) => i18nEn.t(k, p) }).context.renderStorageMmcCard(devLegacy);
+    assert.ok(html.includes("nvme-badge-unknown"));
+    assert.ok(!html.includes("nvme-badge-healthy"));
+  }
+
+  // 8. Stale + unavailable
+  {
+    const devStale = structuredClone(emmcDevice);
+    devStale.telemetry = { state: "unavailable", error: { kind: "permission_denied", code: 13 } };
+    devStale.healthState = "unknown";
+    const ctx = createTestContext({
+      state: { storageStale: true },
+      t: (k, p) => i18nEn.t(k, p),
+    });
+    const html = ctx.context.renderStorageMmcCard(devStale);
+    assert.ok(html.includes("Stale data"));
+    assert.ok(html.includes("nvme-badge-unknown"));
+    assert.ok(!html.includes("nvme-badge-healthy"));
+  }
 });
 
 test("renderNvmeDeviceCard and renderStorageMmcCard handle missing telemetry and contract requirements", () => {

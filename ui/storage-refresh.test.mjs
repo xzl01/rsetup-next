@@ -810,3 +810,107 @@ test("scenario 12: synchronous transport throw => current handle clears and retr
   assert.equal(state.storageRefreshPromise, null);
   assert.equal(state.storageRefreshError, null);
 });
+
+// 13. Routine setInterval ticks coalesce without starving or breaking
+test("scenario 13: setInterval routine ticks coalesce during pending refresh without starving or breaking", async () => {
+  const intervals = [];
+  const mockWindow = {
+    setInterval: (cb, ms) => {
+      intervals.push({ cb, ms });
+      return intervals.length;
+    },
+  };
+
+  const rendered = [];
+  const requests = [];
+  const state = {
+    selectedHardware: null,
+    hardwareLoadVersion: 1,
+    hardwareData: null,
+    refreshRequested: false,
+    refreshPromise: null,
+    refreshLoud: false,
+    refreshing: false,
+    refreshEpoch: 0,
+    snapshot: null,
+    sources: null,
+  };
+
+  const context = {
+    state,
+    window: mockWindow,
+    document: { body: { dataset: {}, classList: { remove() {}, add() {} } } },
+    transport: {
+      storageStatus: async () => ({ nvme: { initialized: false, devices: [] }, mmc: { initialized: false, devices: [] } }),
+      snapshot: () => new Promise((resolve) => requests.push(resolve)),
+      actions: async () => [],
+      activity: async () => [],
+      sourceStatus: async () => ({ sourceRevision: "1" }),
+    },
+    renderHardwareTool: () => {},
+    renderAll: () => { rendered.push(state.snapshot?.id); },
+    setText: () => {},
+    t: (key) => key,
+    toast: () => {},
+    displayError: (e) => String(e?.message || e),
+    applyDebugDevice: (s) => s,
+    resolveSignals: () => {},
+    clearSourcePlan: () => {},
+    resetSourceBenchmark: () => {},
+    loadDebugState: () => {},
+    applyStaticTranslations: () => {},
+    setTheme: () => {},
+    bindEvents: () => {},
+    startClock: () => {},
+    routes: [],
+    location: { hash: "" },
+    navigate: () => {},
+    Date,
+  };
+
+  vm.createContext(context);
+  vm.runInContext(
+    [
+      handler("refreshOnce"),
+      handler("refreshAll"),
+      handler("init").replace(/init\(\);?\s*$/, ""),
+    ].join("\n"),
+    context
+  );
+
+  // Run init(); it triggers the initial refreshAll and registers setInterval
+  // Notice init() has `await refreshAll({ quiet: true });` BEFORE `window.setInterval(...)`!
+  // So we run init(), resolve the first snapshot request, and then window.setInterval is registered.
+  const initPromise = context.init();
+  await Promise.resolve();
+
+  assert.equal(requests.length, 1, "initial snapshot request sent");
+  requests[0]({ id: "first-init-snapshot", synthetic: false });
+  await initPromise;
+
+  const intervalItem = intervals.find((i) => i.ms === 10_000);
+  assert.ok(intervalItem, "10-second routine refresh setInterval registered");
+
+  // Now trigger another refreshAll that stays pending
+  const ongoing = context.refreshAll({ quiet: true });
+  await Promise.resolve();
+  assert.equal(requests.length, 2, "pending refresh request sent");
+
+  // Fire interval tick 4 times while transport snapshot is still pending
+  intervalItem.cb();
+  intervalItem.cb();
+  intervalItem.cb();
+  intervalItem.cb();
+
+  // Resolve pending snapshot
+  requests[1]({ id: "tick-resolved", synthetic: false });
+
+  await ongoing;
+  await Promise.all([context.state.refreshPromise].filter(Boolean));
+
+  assert.equal(requests.length, 2, "routine ticks must coalesce and not trigger extra round trips");
+  assert.deepEqual(rendered, ["first-init-snapshot", "tick-resolved"], "rendered snapshot in order");
+  assert.equal(context.state.refreshing, false);
+  assert.equal(context.state.refreshPromise, null);
+  assert.equal(context.document.body.dataset.state, "live");
+});

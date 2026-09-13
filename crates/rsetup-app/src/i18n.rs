@@ -219,8 +219,11 @@ impl Locale {
             (Self::ZhCn, "storage_written") => "写",
             (Self::ZhCn, "storage_telemetry_unavailable") => "不可读取",
             (Self::ZhCn, "storage_telemetry_unsupported") => "不支持健康指标",
-            (Self::ZhCn, "storage_permission_denied") => "权限不足 (EACCES/EPERM)",
-            (Self::ZhCn, "storage_protocol_error") => "协议状态码",
+            (Self::ZhCn, "storage_permission_denied") => "权限不足",
+            (Self::ZhCn, "storage_read_failed") => "读取失败",
+            (Self::ZhCn, "storage_protocol_error") => "设备协议错误",
+            (Self::ZhCn, "storage_nvme_enum_failed") => "NVMe 设备枚举失败",
+            (Self::ZhCn, "storage_mmc_enum_failed") => "MMC 设备枚举失败",
             (Self::ZhCn, "storage_unknown") => "未知",
             (_, "live_linux_only") => "live execution is only supported on Linux SBC hosts",
             (_, "not_available") => "n/a",
@@ -325,10 +328,29 @@ impl Locale {
             (_, "storage_written") => "Written",
             (_, "storage_telemetry_unavailable") => "Unavailable",
             (_, "storage_telemetry_unsupported") => "Health telemetry unsupported",
-            (_, "storage_permission_denied") => "Permission denied (EACCES/EPERM)",
-            (_, "storage_protocol_error") => "Protocol status",
+            (_, "storage_permission_denied") => "Permission denied",
+            (_, "storage_read_failed") => "Read failed",
+            (_, "storage_protocol_error") => "Device protocol error",
+            (_, "storage_nvme_enum_failed") => "NVMe device enumeration failed",
+            (_, "storage_mmc_enum_failed") => "MMC device enumeration failed",
             (_, "storage_unknown") => "Unknown",
             _ => "",
+        }
+    }
+
+    pub fn storage_telemetry_error(&self, error: Option<&rsetup_core::TelemetryError>) -> String {
+        use rsetup_core::TelemetryErrorKind;
+        let Some(error) = error else {
+            return self.text("storage_telemetry_unavailable").to_string();
+        };
+        let key = match error.kind {
+            TelemetryErrorKind::PermissionDenied => "storage_permission_denied",
+            TelemetryErrorKind::Io => "storage_read_failed",
+            TelemetryErrorKind::NvmeStatus => "storage_protocol_error",
+        };
+        match error.code {
+            Some(code) => format!("{} ({code})", self.text(key)),
+            None => self.text(key).to_string(),
         }
     }
 
@@ -705,11 +727,82 @@ mod tests {
             ("storage_more_devices", "更多设备", "more device(s)"),
             ("storage_read", "读", "Read"),
             ("storage_written", "写", "Written"),
+            ("storage_telemetry_unavailable", "不可读取", "Unavailable"),
+            (
+                "storage_telemetry_unsupported",
+                "不支持健康指标",
+                "Health telemetry unsupported",
+            ),
+            ("storage_permission_denied", "权限不足", "Permission denied"),
+            ("storage_read_failed", "读取失败", "Read failed"),
+            (
+                "storage_protocol_error",
+                "设备协议错误",
+                "Device protocol error",
+            ),
+            (
+                "storage_nvme_enum_failed",
+                "NVMe 设备枚举失败",
+                "NVMe device enumeration failed",
+            ),
+            (
+                "storage_mmc_enum_failed",
+                "MMC 设备枚举失败",
+                "MMC device enumeration failed",
+            ),
+            ("storage_unknown", "未知", "Unknown"),
         ];
         for (key, zh, en) in expected {
             assert_eq!(Locale::ZhCn.text(key), zh, "ZhCn translation for {key}");
             assert_eq!(Locale::En.text(key), en, "En translation for {key}");
         }
+    }
+
+    #[test]
+    fn storage_telemetry_error_formatting() {
+        use rsetup_core::{TelemetryError, TelemetryErrorKind};
+
+        assert_eq!(Locale::ZhCn.storage_telemetry_error(None), "不可读取");
+        assert_eq!(Locale::En.storage_telemetry_error(None), "Unavailable");
+
+        let perm = TelemetryError {
+            kind: TelemetryErrorKind::PermissionDenied,
+            code: Some(13),
+        };
+        assert_eq!(
+            Locale::ZhCn.storage_telemetry_error(Some(&perm)),
+            "权限不足 (13)"
+        );
+        assert_eq!(
+            Locale::En.storage_telemetry_error(Some(&perm)),
+            "Permission denied (13)"
+        );
+
+        let io_no_code = TelemetryError {
+            kind: TelemetryErrorKind::Io,
+            code: None,
+        };
+        assert_eq!(
+            Locale::ZhCn.storage_telemetry_error(Some(&io_no_code)),
+            "读取失败"
+        );
+        assert_eq!(
+            Locale::En.storage_telemetry_error(Some(&io_no_code)),
+            "Read failed"
+        );
+
+        let proto = TelemetryError {
+            kind: TelemetryErrorKind::NvmeStatus,
+            code: Some(2),
+        };
+        assert_eq!(
+            Locale::ZhCn.storage_telemetry_error(Some(&proto)),
+            "设备协议错误 (2)"
+        );
+        assert_eq!(
+            Locale::En.storage_telemetry_error(Some(&proto)),
+            "Device protocol error (2)"
+        );
     }
 
     #[test]

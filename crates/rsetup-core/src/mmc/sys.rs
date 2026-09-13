@@ -37,7 +37,26 @@ const MMC_BLOCK_MAJOR: u8 = 179;
 // _IOWR(MMC_BLOCK_MAJOR, 0, struct mmc_ioc_cmd)
 // dir = _IOC_READ | _IOC_WRITE = 3, size = 72 (0x48), type = 179 (0xB3), nr = 0
 // 3 << 30 | 72 << 16 | 0xB3 << 8 | 0x00 = 0xc048b300
+#[cfg(any(target_arch = "arm", target_arch = "x86"))]
+const MMC_IOC_CMD: libc::c_ulong = 3u32 << 30 | 72u32 << 16 | (MMC_BLOCK_MAJOR as u32) << 8;
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 const MMC_IOC_CMD: libc::c_ulong = 3u64 << 30 | 72u64 << 16 | (MMC_BLOCK_MAJOR as u64) << 8;
+
+#[cfg(any(
+    target_arch = "arm",
+    target_arch = "x86",
+    target_arch = "aarch64",
+    target_arch = "x86_64"
+))]
+const _: () = {
+    #[allow(clippy::unnecessary_cast)]
+    {
+        assert!(MMC_IOC_CMD as u64 == 0xc048_b300);
+    }
+    assert!(std::mem::size_of::<MmcIocCmd>() == 72);
+    assert!(std::mem::offset_of!(MmcIocCmd, data_ptr) == 64);
+};
 
 /// CMD8 — SEND EXT_CSD (include/linux/mmc/core.h).
 const MMC_OPCODE_SEND_EXT_CSD: u32 = 8;
@@ -120,6 +139,12 @@ impl Drop for SafeFd {
 /// Read the full 512-byte EXT_CSD register from an MMC block device node
 /// (e.g. `/dev/mmcblk0`) via the direct `MMC_IOC_CMD` ioctl. Read-only;
 /// same style as `nvme/sys.rs::read_smart_log_raw`.
+#[cfg(any(
+    target_arch = "arm",
+    target_arch = "x86",
+    target_arch = "aarch64",
+    target_arch = "x86_64"
+))]
 pub fn read_ext_csd_raw(dev_path: &str) -> Result<[u8; 512], MmcError> {
     use std::ffi::CString;
 
@@ -155,6 +180,18 @@ pub fn read_ext_csd_raw(dev_path: &str) -> Result<[u8; 512], MmcError> {
     }
 
     Ok(buf)
+}
+
+#[cfg(not(any(
+    target_arch = "arm",
+    target_arch = "x86",
+    target_arch = "aarch64",
+    target_arch = "x86_64"
+)))]
+pub fn read_ext_csd_raw(_dev_path: &str) -> Result<[u8; 512], MmcError> {
+    Err(MmcError::NotSupported(
+        "MMC ioctl ABI is not implemented for this target architecture".into(),
+    ))
 }
 
 /// Read a trimmed string from a file if it exists.
@@ -623,5 +660,13 @@ mod tests {
 
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    #[allow(clippy::unnecessary_cast)]
+    fn mmc_ioctl_abi_matches_linux_uapi() {
+        assert_eq!(MMC_IOC_CMD as u64, 0xc048_b300);
+        assert_eq!(std::mem::size_of::<MmcIocCmd>(), 72);
+        assert_eq!(std::mem::offset_of!(MmcIocCmd, data_ptr), 64);
     }
 }
