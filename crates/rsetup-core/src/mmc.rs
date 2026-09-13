@@ -19,7 +19,6 @@ pub enum MmcError {
 /// MMC/SD device manager.
 #[derive(Debug, Clone)]
 pub struct MmcManager {
-    status: MmcStatus,
     sysfs_root: PathBuf,
 }
 
@@ -30,33 +29,13 @@ impl Default for MmcManager {
 }
 
 impl MmcManager {
-    /// Probe the system for MMC/SD devices and initialize manager status.
+    /// Configure sysfs root for MMC manager without performing storage I/O.
     pub fn probe_and_init(sysfs_root: Option<&Path>) -> Self {
         let root = sysfs_root
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("/"));
-        let devices = Self::probe_sysfs(&root);
-
-        let status = if devices.is_empty() {
-            MmcStatus {
-                initialized: false,
-                devices: Vec::new(),
-                message: Some("No MMC/SD devices detected in system".into()),
-            }
-        } else {
-            let mmc_devices = devices
-                .into_iter()
-                .filter_map(|name| sys::read_device_sysfs(&root, &name).ok())
-                .collect();
-            MmcStatus {
-                initialized: true,
-                devices: mmc_devices,
-                message: None,
-            }
-        };
 
         Self {
-            status,
             sysfs_root: root,
         }
     }
@@ -71,38 +50,101 @@ impl MmcManager {
         &self.sysfs_root
     }
 
-    pub fn status(&self) -> MmcStatus {
-        self.status.clone()
-    }
-
-    pub fn is_initialized(&self) -> bool {
-        self.status.initialized
-    }
-
     /// Probe `sys/bus/mmc/devices` under the given root.
     pub fn probe_sysfs(root: &Path) -> Vec<String> {
+        Self::try_probe_sysfs(root).unwrap_or_default()
+    }
+
+    /// Try to probe `sys/bus/mmc/devices` under the given root, returning any I/O error.
+    pub fn try_probe_sysfs(root: &Path) -> Result<Vec<String>, MmcError> {
         let mmc_bus_dir = if root == Path::new("/") {
             PathBuf::from("/sys/bus/mmc/devices")
         } else {
             root.join("sys/bus/mmc/devices")
         };
 
+        if !mmc_bus_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let entries = std::fs::read_dir(&mmc_bus_dir).map_err(|e| {
+            if let Some(code) = e.raw_os_error() {
+                MmcError::IoCode(code)
+            } else {
+                MmcError::Io(e.to_string())
+            }
+        })?;
+
         let mut devices = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&mmc_bus_dir) {
-            for entry in entries.flatten() {
-                let file_name = entry.file_name();
-                let name = file_name.to_string_lossy().to_string();
-                let dev_dir = entry.path();
-                let type_file = dev_dir.join("type");
-                if let Some(card_type) = sys::read_trimmed_attr(&type_file) {
-                    if card_type == "MMC" || card_type == "SD" {
-                        devices.push(name);
-                    }
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                if let Some(code) = e.raw_os_error() {
+                    MmcError::IoCode(code)
+                } else {
+                    MmcError::Io(e.to_string())
+                }
+            })?;
+            let file_name = entry.file_name();
+            let name = file_name.to_string_lossy().to_string();
+            let dev_dir = entry.path();
+            let type_file = dev_dir.join("type");
+            if let Some(card_type) = sys::read_trimmed_attr(&type_file) {
+                if card_type == "MMC" || card_type == "SD" {
+                    devices.push(name);
                 }
             }
         }
         devices.sort();
-        devices
+        Ok(devices)
+    }
+
+    pub fn status(&self) -> Result<MmcStatus, MmcError> {
+        let devices = Self::try_probe_sysfs(&self.sysfs_root)?;
+        if devices.is_empty() {
+            return Ok(MmcStatus {
+                initialized: false,
+                devices: Vec::new(),
+                message: Some("No MMC/SD devices detected in system".into()),
+            });
+        }
+
+        let mmc_devices = devices
+            .into_iter()
+            .map(|name| {
+                sys::read_device_sysfs(&self.sysfs_root, &name).unwrap_or_else(|err| {
+                    let telemetry = sys::telemetry_from_mmc_error(&err);
+                    let card_type = if name.contains("mmc") { "MMC".to_string() } else { "SD".to_string() };
+                    crate::model::MmcDevice {
+                        name: name.clone(),
+                        card_type,
+                        model: String::new(),
+                        manufacturer: String::new(),
+                        serial: String::new(),
+                        firmware: String::new(),
+                        block_path: String::new(),
+                        total_bytes: 0,
+                        health: crate::model::MmcHealth {
+                            pre_eol_info: 0,
+                            life_time_est_a_percent: None,
+                            life_time_est_b_percent: None,
+                            warning_flags: vec![],
+                        },
+                        telemetry,
+                        health_state: crate::model::HealthState::Unknown,
+                    }
+                })
+            })
+            .collect();
+
+        Ok(MmcStatus {
+            initialized: true,
+            devices: mmc_devices,
+            message: None,
+        })
+    }
+
+    pub fn is_initialized(&self) -> bool {
+        self.status().map(|s| s.initialized).unwrap_or(false)
     }
 }
 
@@ -339,7 +381,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("rsetup-mmc-none-{}", uuid::Uuid::new_v4()));
         let manager = MmcManager::probe_and_init(Some(&root));
         assert!(!manager.is_initialized());
-        let status = manager.status();
+        let status = manager.status().expect("status");
         assert!(!status.initialized);
         assert_eq!(status.devices.len(), 0);
         assert_eq!(
@@ -390,7 +432,7 @@ mod tests {
         let manager = MmcManager::probe_and_init(Some(&root));
         assert!(manager.is_initialized());
         assert_eq!(manager.sysfs_root(), root.as_path());
-        let status = manager.status();
+        let status = manager.status().expect("status");
         assert!(status.initialized);
         assert_eq!(status.message, None);
         assert_eq!(status.devices.len(), 2);
@@ -497,6 +539,108 @@ mod tests {
         let dev2 = sys::read_device_sysfs(&root, "mmc0:0001").expect("read_device_sysfs");
         assert_eq!(dev2.block_path, "/dev/mmcblk0");
         assert_eq!(dev2.total_bytes, 1000 * 512);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn storage_freshness_mmc_rereads_attributes() {
+        let root =
+            std::env::temp_dir().join(format!("rsetup-mmc-freshness-{}", uuid::Uuid::new_v4()));
+        let dev_dir = root.join("sys/bus/mmc/devices/mmc0:0001");
+        std::fs::create_dir_all(&dev_dir).expect("create dev_dir");
+        std::fs::write(dev_dir.join("type"), "MMC\n").unwrap();
+        std::fs::write(dev_dir.join("name"), "TEST_MMC\n").unwrap();
+        std::fs::write(dev_dir.join("life_time"), "0x01 0x01\n").unwrap();
+        std::fs::write(dev_dir.join("pre_eol_info"), "01\n").unwrap();
+
+        let manager = MmcManager::probe_and_init(Some(&root));
+        let initial_status = manager.status().expect("initial status");
+        assert_eq!(
+            initial_status.devices[0].health.life_time_est_a_percent,
+            Some(10)
+        );
+
+        // Rewrite card life_time to 0x0B 0x01
+        std::fs::write(dev_dir.join("life_time"), "0x0B 0x01\n").unwrap();
+
+        let updated_status = manager.status().expect("updated status");
+        assert_eq!(
+            updated_status.devices[0].health.life_time_est_a_percent,
+            Some(101)
+        );
+        assert_eq!(
+            updated_status.devices[0].health_state,
+            crate::model::HealthState::Critical
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mmc_enumeration_distinguishes_missing_empty_and_errors() {
+        let temp = std::env::temp_dir();
+
+        // 1. Missing directory => empty success
+        let missing = temp.join(format!("rsetup-mmc-missing-{}", uuid::Uuid::new_v4()));
+        let res = MmcManager::try_probe_sysfs(&missing).expect("missing directory is empty success");
+        assert!(res.is_empty());
+
+        // 2. Empty directory => empty success
+        let empty_root = temp.join(format!("rsetup-mmc-empty-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(empty_root.join("sys/bus/mmc/devices")).unwrap();
+        let res = MmcManager::try_probe_sysfs(&empty_root).expect("empty dir is empty success");
+        assert!(res.is_empty());
+        let _ = std::fs::remove_dir_all(&empty_root);
+
+        // 3. Normal file occupying subsystem directory => ENOTDIR error
+        let file_root = temp.join(format!("rsetup-mmc-notdir-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(file_root.join("sys/bus/mmc")).unwrap();
+        std::fs::write(file_root.join("sys/bus/mmc/devices"), "not a directory").unwrap();
+        let err = MmcManager::try_probe_sysfs(&file_root).unwrap_err();
+        match err {
+            MmcError::IoCode(code) => assert_eq!(code, libc::ENOTDIR),
+            other => panic!("expected ENOTDIR IoCode, got {:?}", other),
+        }
+        let _ = std::fs::remove_dir_all(&file_root);
+    }
+
+    #[test]
+    fn mmc_same_manager_add_and_remove_cards() {
+        let root = std::env::temp_dir().join(format!("rsetup-mmc-addrem-{}", uuid::Uuid::new_v4()));
+        let mmc_bus = root.join("sys/bus/mmc/devices");
+        std::fs::create_dir_all(&mmc_bus).unwrap();
+
+        let manager = MmcManager::probe_and_init(Some(&root));
+        let s0 = manager.status().unwrap();
+        assert_eq!(s0.devices.len(), 0);
+
+        // Add mmc0:0001 (MMC)
+        let mmc0 = mmc_bus.join("mmc0:0001");
+        std::fs::create_dir_all(&mmc0).unwrap();
+        std::fs::write(mmc0.join("type"), "MMC\n").unwrap();
+        std::fs::write(mmc0.join("name"), "CARD0\n").unwrap();
+
+        let s1 = manager.status().unwrap();
+        assert_eq!(s1.devices.len(), 1);
+        assert_eq!(s1.devices[0].name, "mmc0:0001");
+        assert_eq!(s1.devices[0].model, "CARD0");
+
+        // Add mmc0:0002 (SD)
+        let mmc1 = mmc_bus.join("mmc0:0002");
+        std::fs::create_dir_all(&mmc1).unwrap();
+        std::fs::write(mmc1.join("type"), "SD\n").unwrap();
+        std::fs::write(mmc1.join("name"), "CARD1\n").unwrap();
+
+        let s2 = manager.status().unwrap();
+        assert_eq!(s2.devices.len(), 2);
+
+        // Remove mmc0:0001
+        std::fs::remove_dir_all(&mmc0).unwrap();
+        let s3 = manager.status().unwrap();
+        assert_eq!(s3.devices.len(), 1);
+        assert_eq!(s3.devices[0].name, "mmc0:0002");
+        assert_eq!(s3.devices[0].model, "CARD1");
 
         let _ = std::fs::remove_dir_all(&root);
     }

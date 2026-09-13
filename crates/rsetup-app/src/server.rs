@@ -930,6 +930,176 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
+
+    #[tokio::test]
+    async fn storage_route_same_router_injected_storage_freshness() {
+        use axum::body::Body;
+        use rsetup_core::{
+            ExecutionPolicy, HardwareError, HealthState, MmcDevice, MmcHealth, MmcStatus,
+            NvmeDevice, NvmeSmartLog, NvmeStatus, ProbeMode, StorageReader, StorageStatus,
+            TelemetryReadState, TelemetryStatus,
+        };
+        use std::sync::{Arc, Mutex};
+        use tower::ServiceExt;
+
+        #[derive(Clone)]
+        struct FakeStorage(Arc<Mutex<Result<StorageStatus, HardwareError>>>);
+
+        impl StorageReader for FakeStorage {
+            fn nvme_status(&self) -> Result<NvmeStatus, HardwareError> {
+                self.0.lock().unwrap().as_ref().map(|s| s.nvme.clone()).map_err(|e| match e {
+                    HardwareError::Io(msg) => HardwareError::Io(msg.clone()),
+                    _ => HardwareError::Io("error".into()),
+                })
+            }
+            fn mmc_status(&self) -> Result<MmcStatus, HardwareError> {
+                self.0.lock().unwrap().as_ref().map(|s| s.mmc.clone()).map_err(|e| match e {
+                    HardwareError::Io(msg) => HardwareError::Io(msg.clone()),
+                    _ => HardwareError::Io("error".into()),
+                })
+            }
+        }
+
+        let initial_storage = StorageStatus {
+            nvme: NvmeStatus {
+                initialized: true,
+                devices: vec![NvmeDevice {
+                    path: "/dev/nvme0".into(),
+                    name: "nvme0".into(),
+                    model: "SSD Initial".into(),
+                    serial: "S1".into(),
+                    firmware: "1".into(),
+                    total_bytes: 1000,
+                    smart: Some(NvmeSmartLog {
+                        critical_warning: 0,
+                        temperature_c: 35.0,
+                        available_spare_percent: 100,
+                        spare_threshold_percent: 10,
+                        percentage_used: 1,
+                        data_read_bytes: 100,
+                        data_written_bytes: 100,
+                        host_read_commands: 10,
+                        host_write_commands: 10,
+                        power_on_hours: 1,
+                        unsafe_shutdowns: 0,
+                        media_errors: 0,
+                        num_err_log_entries: 0,
+                        warning_flags: vec![],
+                    }),
+                    telemetry: TelemetryStatus {
+                        state: TelemetryReadState::Available,
+                        error: None,
+                    },
+                    health_state: HealthState::Healthy,
+                }],
+                message: None,
+            },
+            mmc: MmcStatus {
+                initialized: true,
+                devices: vec![MmcDevice {
+                    name: "mmc0:0001".into(),
+                    card_type: "MMC".into(),
+                    model: "EMMC".into(),
+                    manufacturer: "Vendor".into(),
+                    serial: "M1".into(),
+                    firmware: "1".into(),
+                    block_path: "/dev/mmcblk0".into(),
+                    total_bytes: 2000,
+                    health: MmcHealth {
+                        pre_eol_info: 1,
+                        life_time_est_a_percent: Some(10),
+                        life_time_est_b_percent: Some(10),
+                        warning_flags: vec![],
+                    },
+                    telemetry: TelemetryStatus {
+                        state: TelemetryReadState::Available,
+                        error: None,
+                    },
+                    health_state: HealthState::Healthy,
+                }],
+                message: None,
+            },
+        };
+
+        let shared = Arc::new(Mutex::new(Ok(initial_storage)));
+        let fake = FakeStorage(Arc::clone(&shared));
+
+        let controller = Controller::with_storage_reader(
+            ProbeMode::Live,
+            ExecutionPolicy::DryRun,
+            Arc::new(fake),
+        );
+        let app = router(controller);
+
+        // First request on router
+        let req1 = Request::builder()
+            .uri("/api/v1/hardware/storage")
+            .header("host", "127.0.0.1:8788")
+            .body(Body::empty())
+            .unwrap();
+        let res1 = app.clone().oneshot(req1).await.unwrap();
+        assert_eq!(res1.status(), StatusCode::OK);
+        let body1 = axum::body::to_bytes(res1.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val1: serde_json::Value = serde_json::from_slice(&body1).unwrap();
+        assert_eq!(
+            val1["nvme"]["devices"][0]["smart"]["temperatureC"],
+            35.0
+        );
+        assert_eq!(val1["mmc"]["devices"].as_array().unwrap().len(), 1);
+
+        // Mutate shared fake storage: set smart to null, telemetry to unavailable, and healthState unknown
+        {
+            let mut guard = shared.lock().unwrap();
+            let state = guard.as_mut().unwrap();
+            state.nvme.devices[0].smart = None;
+            state.nvme.devices[0].telemetry = TelemetryStatus {
+                state: TelemetryReadState::Unavailable,
+                error: Some(rsetup_core::TelemetryError {
+                    kind: rsetup_core::TelemetryErrorKind::Io,
+                    code: Some(libc::EIO),
+                }),
+            };
+            state.nvme.devices[0].health_state = HealthState::Unknown;
+        }
+
+        // Second request on SAME router clone
+        let req2 = Request::builder()
+            .uri("/api/v1/hardware/storage")
+            .header("host", "127.0.0.1:8788")
+            .body(Body::empty())
+            .unwrap();
+        let res2 = app.clone().oneshot(req2).await.unwrap();
+        assert_eq!(res2.status(), StatusCode::OK);
+        let body2 = axum::body::to_bytes(res2.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
+        assert!(val2["nvme"]["devices"][0]["smart"].is_null());
+        assert_eq!(
+            val2["nvme"]["devices"][0]["telemetry"]["state"],
+            "unavailable"
+        );
+        assert_eq!(
+            val2["nvme"]["devices"][0]["healthState"],
+            "unknown"
+        );
+
+        // Test whole reader failure returns ApiError (e.g. 500) rather than 200 with empty list
+        {
+            let mut guard = shared.lock().unwrap();
+            *guard = Err(HardwareError::Io("Disk subsystem failed".into()));
+        }
+
+        let req3 = Request::builder()
+            .uri("/api/v1/hardware/storage")
+            .header("host", "127.0.0.1:8788")
+            .body(Body::empty())
+            .unwrap();
+        let res3 = app.clone().oneshot(req3).await.unwrap();
+        assert_ne!(res3.status(), StatusCode::OK);
+    }
 }
 
 #[cfg(test)]

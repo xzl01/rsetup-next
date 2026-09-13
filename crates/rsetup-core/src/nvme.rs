@@ -24,7 +24,6 @@ pub enum NvmeError {
 /// NVMe device and controller manager.
 #[derive(Debug, Clone)]
 pub struct NvmeManager {
-    status: NvmeStatus,
     sysfs_root: PathBuf,
 }
 
@@ -35,51 +34,13 @@ impl Default for NvmeManager {
 }
 
 impl NvmeManager {
-    /// Probe the system for NVMe controllers and initialize manager status.
+    /// Configure sysfs root for NVMe manager without performing storage I/O.
     pub fn probe_and_init(sysfs_root: Option<&Path>) -> Self {
         let root = sysfs_root
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("/"));
-        let devices = Self::probe_sysfs(&root);
-
-        let status = if devices.is_empty() {
-            NvmeStatus {
-                initialized: false,
-                devices: Vec::new(),
-                message: Some("No NVMe controller detected in system".into()),
-            }
-        } else {
-            let nvme_devices = devices
-                .into_iter()
-                .map(|name| {
-                    sys::read_controller_sysfs(&root, &name).unwrap_or_else(|_| NvmeDevice {
-                        path: format!("/dev/{}", name),
-                        name,
-                        model: String::new(),
-                        serial: String::new(),
-                        firmware: String::new(),
-                        total_bytes: 0,
-                        smart: None,
-                        telemetry: TelemetryStatus {
-                            state: TelemetryReadState::Unavailable,
-                            error: Some(TelemetryError {
-                                kind: TelemetryErrorKind::Io,
-                                code: None,
-                            }),
-                        },
-                        health_state: HealthState::Unknown,
-                    })
-                })
-                .collect();
-            NvmeStatus {
-                initialized: true,
-                devices: nvme_devices,
-                message: None,
-            }
-        };
 
         Self {
-            status,
             sysfs_root: root,
         }
     }
@@ -96,36 +57,110 @@ impl NvmeManager {
 
     /// Probe `/sys/class/nvme` under the given root.
     pub fn probe_sysfs(root: &Path) -> Vec<String> {
+        Self::try_probe_sysfs(root).unwrap_or_default()
+    }
+
+    /// Try to probe `/sys/class/nvme` under the given root, returning any I/O error.
+    pub fn try_probe_sysfs(root: &Path) -> Result<Vec<String>, NvmeError> {
         let nvme_class_dir = if root == Path::new("/") {
             PathBuf::from("/sys/class/nvme")
         } else {
             root.join("sys/class/nvme")
         };
 
+        if !nvme_class_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let entries = std::fs::read_dir(&nvme_class_dir).map_err(|e| {
+            if let Some(code) = e.raw_os_error() {
+                NvmeError::IoCode(code)
+            } else {
+                NvmeError::Io(e.to_string())
+            }
+        })?;
+
         let mut devices = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&nvme_class_dir) {
-            for entry in entries.flatten() {
-                let file_name = entry.file_name();
-                let name = file_name.to_string_lossy();
-                // Match controller entries like nvme0, nvme1 (exclude namespace or other files)
-                // Controllers are typically nvmeX where X is numeric.
-                if let Some(suffix) = name.strip_prefix("nvme") {
-                    if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
-                        devices.push(name.to_string());
-                    }
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                if let Some(code) = e.raw_os_error() {
+                    NvmeError::IoCode(code)
+                } else {
+                    NvmeError::Io(e.to_string())
+                }
+            })?;
+            let file_name = entry.file_name();
+            let name = file_name.to_string_lossy();
+            if let Some(suffix) = name.strip_prefix("nvme") {
+                if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+                    devices.push(name.to_string());
                 }
             }
         }
         devices.sort();
-        devices
+        Ok(devices)
     }
 
-    pub fn status(&self) -> NvmeStatus {
-        self.status.clone()
+    pub(crate) fn status_with(
+        &self,
+        reader: &dyn Fn(&str) -> Result<[u8; 512], NvmeError>,
+    ) -> Result<NvmeStatus, NvmeError> {
+        let devices = Self::try_probe_sysfs(&self.sysfs_root)?;
+        if devices.is_empty() {
+            return Ok(NvmeStatus {
+                initialized: false,
+                devices: Vec::new(),
+                message: Some("No NVMe controller detected in system".into()),
+            });
+        }
+
+        let nvme_devices = devices
+            .into_iter()
+            .map(|name| {
+                sys::read_controller_sysfs_with(&self.sysfs_root, &name, reader).unwrap_or_else(|_| {
+                    NvmeDevice {
+                        path: format!("/dev/{}", name),
+                        name,
+                        model: String::new(),
+                        serial: String::new(),
+                        firmware: String::new(),
+                        total_bytes: 0,
+                        smart: None,
+                        telemetry: TelemetryStatus {
+                            state: TelemetryReadState::Unavailable,
+                            error: Some(TelemetryError {
+                                kind: TelemetryErrorKind::Io,
+                                code: None,
+                            }),
+                        },
+                        health_state: HealthState::Unknown,
+                    }
+                })
+            })
+            .collect();
+
+        Ok(NvmeStatus {
+            initialized: true,
+            devices: nvme_devices,
+            message: None,
+        })
+    }
+
+    pub fn status(&self) -> Result<NvmeStatus, NvmeError> {
+        if self.sysfs_root == Path::new("/") {
+            self.status_with(&sys::read_smart_log_raw)
+        } else {
+            let fixture_reader = |_dev: &str| -> Result<[u8; 512], NvmeError> {
+                Err(NvmeError::NotSupported(
+                    "fixture requires an injected reader".to_string(),
+                ))
+            };
+            self.status_with(&fixture_reader)
+        }
     }
 
     pub fn is_initialized(&self) -> bool {
-        self.status.initialized
+        self.status().map(|s| s.initialized).unwrap_or(false)
     }
 }
 
@@ -431,7 +466,7 @@ mod tests {
         let non_existent = root.join("non_existent_sys");
         let manager = NvmeManager::probe_and_init(Some(&non_existent));
         assert!(!manager.is_initialized());
-        let status = manager.status();
+        let status = manager.status().expect("status");
         assert!(!status.initialized);
         assert!(status.devices.is_empty());
         assert_eq!(
@@ -447,7 +482,7 @@ mod tests {
         std::fs::create_dir_all(&nvme_class).expect("create_dir_all");
         let manager = NvmeManager::probe_and_init(Some(&root));
         assert!(!manager.is_initialized());
-        let status = manager.status();
+        let status = manager.status().expect("status");
         assert!(!status.initialized);
         assert!(status.devices.is_empty());
         assert_eq!(
@@ -470,7 +505,7 @@ mod tests {
         let manager = NvmeManager::probe_and_init(Some(&root));
         assert!(manager.is_initialized());
         assert_eq!(manager.sysfs_root(), root.as_path());
-        let status = manager.status();
+        let status = manager.status().expect("status");
         assert!(status.initialized);
         assert_eq!(status.message, None);
         assert_eq!(status.devices.len(), 2);
@@ -577,5 +612,105 @@ mod tests {
             }
             other => panic!("expected NvmeError::IoCode, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn storage_freshness_nvme_rereads_smart() {
+        let root =
+            std::env::temp_dir().join(format!("rsetup-nvme-freshness-{}", uuid::Uuid::new_v4()));
+        let ctrl_dir = root.join("sys/class/nvme/nvme0");
+        std::fs::create_dir_all(&ctrl_dir).expect("create ctrl_dir");
+        std::fs::write(ctrl_dir.join("model"), "TEST NVME\n").unwrap();
+
+        let manager = NvmeManager::probe_and_init(Some(&root));
+
+        use std::cell::Cell;
+        let call_count = Cell::new(0usize);
+        let reader = |_dev: &str| -> Result<[u8; 512], NvmeError> {
+            let count = call_count.get();
+            call_count.set(count + 1);
+            let mut buf = [0u8; 512];
+            // Kelvin: 310 then 320 at bytes 1..3 LE
+            let kelvin: u16 = if count == 0 { 310 } else { 320 };
+            buf[1..3].copy_from_slice(&kelvin.to_le_bytes());
+            Ok(buf)
+        };
+
+        let status1 = manager.status_with(&reader).expect("status 1");
+        assert_eq!(call_count.get(), 1);
+        let temp1 = status1.devices[0].smart.as_ref().unwrap().temperature_c;
+        assert!((temp1 - (310.0 - 273.15)).abs() < 0.01);
+
+        let status2 = manager.status_with(&reader).expect("status 2");
+        assert_eq!(call_count.get(), 2);
+        let temp2 = status2.devices[0].smart.as_ref().unwrap().temperature_c;
+        assert!((temp2 - (320.0 - 273.15)).abs() < 0.01);
+        assert!((temp1 - temp2).abs() > 1.0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn nvme_enumeration_distinguishes_missing_empty_and_errors() {
+        let temp = std::env::temp_dir();
+
+        // 1. Missing directory => empty success
+        let missing = temp.join(format!("rsetup-nvme-missing-{}", uuid::Uuid::new_v4()));
+        let res = NvmeManager::try_probe_sysfs(&missing).expect("missing directory is empty success");
+        assert!(res.is_empty());
+
+        // 2. Empty directory => empty success
+        let empty_root = temp.join(format!("rsetup-nvme-empty-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(empty_root.join("sys/class/nvme")).unwrap();
+        let res = NvmeManager::try_probe_sysfs(&empty_root).expect("empty dir is empty success");
+        assert!(res.is_empty());
+        let _ = std::fs::remove_dir_all(&empty_root);
+
+        // 3. Normal file occupying subsystem directory => ENOTDIR error
+        let file_root = temp.join(format!("rsetup-nvme-notdir-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(file_root.join("sys/class")).unwrap();
+        std::fs::write(file_root.join("sys/class/nvme"), "not a directory").unwrap();
+        let err = NvmeManager::try_probe_sysfs(&file_root).unwrap_err();
+        match err {
+            NvmeError::IoCode(code) => assert_eq!(code, libc::ENOTDIR),
+            other => panic!("expected ENOTDIR IoCode, got {:?}", other),
+        }
+        let _ = std::fs::remove_dir_all(&file_root);
+    }
+
+    #[test]
+    fn nvme_same_manager_add_and_remove_controllers() {
+        let root = std::env::temp_dir().join(format!("rsetup-nvme-addrem-{}", uuid::Uuid::new_v4()));
+        let nvme_dir = root.join("sys/class/nvme");
+        std::fs::create_dir_all(&nvme_dir).unwrap();
+
+        let manager = NvmeManager::probe_and_init(Some(&root));
+        let s0 = manager.status().unwrap();
+        assert_eq!(s0.devices.len(), 0);
+
+        // Add nvme0
+        let nvme0 = nvme_dir.join("nvme0");
+        std::fs::create_dir_all(&nvme0).unwrap();
+        std::fs::write(nvme0.join("model"), "NVME 0").unwrap();
+
+        let s1 = manager.status().unwrap();
+        assert_eq!(s1.devices.len(), 1);
+        assert_eq!(s1.devices[0].name, "nvme0");
+
+        // Add nvme1
+        let nvme1 = nvme_dir.join("nvme1");
+        std::fs::create_dir_all(&nvme1).unwrap();
+        std::fs::write(nvme1.join("model"), "NVME 1").unwrap();
+
+        let s2 = manager.status().unwrap();
+        assert_eq!(s2.devices.len(), 2);
+
+        // Remove nvme0
+        std::fs::remove_dir_all(&nvme0).unwrap();
+        let s3 = manager.status().unwrap();
+        assert_eq!(s3.devices.len(), 1);
+        assert_eq!(s3.devices[0].name, "nvme1");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

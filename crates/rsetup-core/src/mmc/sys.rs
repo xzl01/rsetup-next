@@ -202,6 +202,31 @@ pub fn read_device_sysfs(sysfs_root: &Path, dev_name: &str) -> Result<MmcDevice,
     }
 }
 
+pub(crate) fn telemetry_from_mmc_error(err: &MmcError) -> TelemetryStatus {
+    let error = match err {
+        MmcError::IoCode(code) if *code == libc::EACCES || *code == libc::EPERM => {
+            Some(TelemetryError {
+                kind: TelemetryErrorKind::PermissionDenied,
+                code: Some(*code),
+            })
+        }
+        MmcError::IoCode(code) => Some(TelemetryError {
+            kind: TelemetryErrorKind::Io,
+            code: Some(*code),
+        }),
+        MmcError::Io(_) | MmcError::NotSupported(_) | MmcError::InvalidBufferLength { .. } => {
+            Some(TelemetryError {
+                kind: TelemetryErrorKind::Io,
+                code: None,
+            })
+        }
+    };
+    TelemetryStatus {
+        state: TelemetryReadState::Unavailable,
+        error,
+    }
+}
+
 pub(crate) fn read_device_sysfs_with(
     sysfs_root: &Path,
     dev_name: &str,
@@ -277,31 +302,6 @@ pub(crate) fn read_device_sysfs_with(
     } else {
         (String::new(), 0)
     };
-
-pub(crate) fn telemetry_from_mmc_error(err: &MmcError) -> TelemetryStatus {
-    let error = match err {
-        MmcError::IoCode(code) if *code == libc::EACCES || *code == libc::EPERM => {
-            Some(TelemetryError {
-                kind: TelemetryErrorKind::PermissionDenied,
-                code: Some(*code),
-            })
-        }
-        MmcError::IoCode(code) => Some(TelemetryError {
-            kind: TelemetryErrorKind::Io,
-            code: Some(*code),
-        }),
-        MmcError::Io(_) | MmcError::NotSupported(_) | MmcError::InvalidBufferLength { .. } => {
-            Some(TelemetryError {
-                kind: TelemetryErrorKind::Io,
-                code: None,
-            })
-        }
-    };
-    TelemetryStatus {
-        state: TelemetryReadState::Unavailable,
-        error,
-    }
-}
 
     let telemetry;
 

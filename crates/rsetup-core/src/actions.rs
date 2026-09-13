@@ -1,6 +1,6 @@
 use crate::{
     ActionRun, ActionSpec, ActionStatus, ActivityEvent, HealthState, MmcDevice, MmcHealth,
-    MmcManager, MmcStatus, NvmeDevice, NvmeManager, NvmeSmartLog, NvmeStatus, ProbeMode, RiskLevel,
+    MmcStatus, NvmeDevice, NvmeSmartLog, NvmeStatus, ProbeMode, RiskLevel,
     SourceApplyResult, SourceError, SourcePlan, SourceStatus, StorageStatus,
     TelemetryReadState, TelemetryStatus, collect_snapshot,
     fan_curve::{
@@ -78,13 +78,25 @@ pub struct Controller {
     hardware: Arc<HardwareManager>,
     spi_flash: Arc<SpiFlashManager>,
     fan_curve: Arc<FanCurveManager>,
-    nvme: Arc<NvmeManager>,
-    mmc: Arc<MmcManager>,
+    storage_reader: Arc<dyn crate::storage::StorageReader>,
     overlay_cache: Arc<RwLock<Option<OverlayStatus>>>,
 }
 
 impl Controller {
     pub fn new(mode: ProbeMode, policy: ExecutionPolicy) -> Self {
+        Self::with_storage_reader(
+            mode,
+            policy,
+            Arc::new(crate::storage::SystemStorageReader::new(None, None)),
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn with_storage_reader(
+        mode: ProbeMode,
+        policy: ExecutionPolicy,
+        reader: Arc<dyn crate::storage::StorageReader>,
+    ) -> Self {
         let synthetic = mode == ProbeMode::Demo || !cfg!(target_os = "linux");
         let mut activity = VecDeque::new();
         activity.push_back(ActivityEvent {
@@ -114,8 +126,7 @@ impl Controller {
             hardware: Arc::new(HardwareManager::new(synthetic)),
             spi_flash: Arc::new(SpiFlashManager::new(synthetic)),
             fan_curve: Arc::new(FanCurveManager::new(synthetic)),
-            nvme: Arc::new(NvmeManager::new()),
-            mmc: Arc::new(MmcManager::new()),
+            storage_reader: reader,
             overlay_cache: Arc::new(RwLock::new(None)),
         }
     }
@@ -517,14 +528,14 @@ impl Controller {
         if self.synthetic {
             return Ok(demo_nvme_status());
         }
-        Ok(self.nvme.status())
+        self.storage_reader.nvme_status()
     }
 
     pub fn mmc_status(&self) -> Result<MmcStatus, HardwareError> {
         if self.synthetic {
             return Ok(demo_mmc_status());
         }
-        Ok(self.mmc.status())
+        self.storage_reader.mmc_status()
     }
 
     pub fn storage_status(&self) -> Result<StorageStatus, HardwareError> {
@@ -2160,5 +2171,81 @@ mod tests {
             );
         }
         assert!(actions.iter().all(|action| action.available));
+    }
+
+    #[derive(Clone)]
+    struct FakeStorage(Arc<std::sync::Mutex<StorageStatus>>);
+
+    impl crate::storage::StorageReader for FakeStorage {
+        fn nvme_status(&self) -> Result<NvmeStatus, HardwareError> {
+            Ok(self.0.lock().unwrap().nvme.clone())
+        }
+        fn mmc_status(&self) -> Result<MmcStatus, HardwareError> {
+            Ok(self.0.lock().unwrap().mmc.clone())
+        }
+    }
+
+    struct PanickingStorageReader;
+    impl crate::storage::StorageReader for PanickingStorageReader {
+        fn nvme_status(&self) -> Result<NvmeStatus, HardwareError> {
+            panic!("unexpected call to nvme_status on injected reader in Demo mode");
+        }
+        fn mmc_status(&self) -> Result<MmcStatus, HardwareError> {
+            panic!("unexpected call to mmc_status on injected reader in Demo mode");
+        }
+    }
+
+    #[test]
+    fn controller_same_instance_injected_storage_freshness() {
+        let demo_storage = StorageStatus {
+            nvme: demo_nvme_status(),
+            mmc: demo_mmc_status(),
+        };
+        let shared = Arc::new(std::sync::Mutex::new(demo_storage));
+        let fake = FakeStorage(Arc::clone(&shared));
+
+        let controller = Controller::with_storage_reader(
+            ProbeMode::Live,
+            ExecutionPolicy::DryRun,
+            Arc::new(fake),
+        );
+
+        let s1 = controller.storage_status().expect("first storage status");
+        assert!(s1.nvme.devices[0].smart.is_some());
+        assert!(!s1.mmc.devices.is_empty());
+
+        // Mutate: first NVMe temperature_c to 71.0, clear MMC devices and initialized = false
+        {
+            let mut state = shared.lock().unwrap();
+            if let Some(smart) = &mut state.nvme.devices[0].smart {
+                smart.temperature_c = 71.0;
+            }
+            state.mmc.devices.clear();
+            state.mmc.initialized = false;
+        }
+
+        // Second call on SAME controller instance
+        let s2 = controller.storage_status().expect("second storage status");
+        assert_eq!(s2.nvme.devices[0].smart.as_ref().unwrap().temperature_c, 71.0);
+        assert!(s2.mmc.devices.is_empty());
+        assert!(!s2.mmc.initialized);
+    }
+
+    #[test]
+    fn controller_demo_mode_never_invokes_storage_reader() {
+        let panicking = Arc::new(PanickingStorageReader);
+        let controller = Controller::with_storage_reader(
+            ProbeMode::Demo,
+            ExecutionPolicy::DryRun,
+            panicking,
+        );
+
+        let nvme = controller.nvme_status().expect("demo nvme");
+        assert!(nvme.initialized);
+        let mmc = controller.mmc_status().expect("demo mmc");
+        assert!(mmc.initialized);
+        let storage = controller.storage_status().expect("demo storage");
+        assert!(storage.nvme.initialized);
+        assert!(storage.mmc.initialized);
     }
 }

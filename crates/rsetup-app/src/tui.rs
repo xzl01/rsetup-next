@@ -1650,4 +1650,158 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_tui_app_same_instance_injected_storage_freshness() {
+        use rsetup_core::{
+            ExecutionPolicy, HardwareError, HealthState, MmcDevice, MmcHealth, MmcStatus,
+            NvmeDevice, NvmeSmartLog, NvmeStatus, ProbeMode, StorageReader, StorageStatus,
+            TelemetryReadState, TelemetryStatus,
+        };
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct FakeStorage(Arc<Mutex<StorageStatus>>);
+
+        impl StorageReader for FakeStorage {
+            fn nvme_status(&self) -> Result<NvmeStatus, HardwareError> {
+                Ok(self.0.lock().unwrap().nvme.clone())
+            }
+            fn mmc_status(&self) -> Result<MmcStatus, HardwareError> {
+                Ok(self.0.lock().unwrap().mmc.clone())
+            }
+        }
+
+        let initial_storage = StorageStatus {
+            nvme: NvmeStatus {
+                initialized: true,
+                devices: vec![NvmeDevice {
+                    path: "/dev/nvme0".into(),
+                    name: "nvme0".into(),
+                    model: "Test NVMe SSD".into(),
+                    serial: "123".into(),
+                    firmware: "1".into(),
+                    total_bytes: 1000,
+                    smart: Some(NvmeSmartLog {
+                        critical_warning: 0,
+                        temperature_c: 42.0,
+                        available_spare_percent: 100,
+                        spare_threshold_percent: 10,
+                        percentage_used: 5,
+                        data_read_bytes: 1000,
+                        data_written_bytes: 1000,
+                        host_read_commands: 10,
+                        host_write_commands: 10,
+                        power_on_hours: 1,
+                        unsafe_shutdowns: 0,
+                        media_errors: 0,
+                        num_err_log_entries: 0,
+                        warning_flags: vec![],
+                    }),
+                    telemetry: TelemetryStatus {
+                        state: TelemetryReadState::Available,
+                        error: None,
+                    },
+                    health_state: HealthState::Healthy,
+                }],
+                message: None,
+            },
+            mmc: MmcStatus {
+                initialized: true,
+                devices: vec![MmcDevice {
+                    name: "mmc0:0001".into(),
+                    card_type: "MMC".into(),
+                    model: "EMMC_CARD".into(),
+                    manufacturer: "Vendor".into(),
+                    serial: "456".into(),
+                    firmware: "1".into(),
+                    block_path: "/dev/mmcblk0".into(),
+                    total_bytes: 2000,
+                    health: MmcHealth {
+                        pre_eol_info: 1,
+                        life_time_est_a_percent: Some(10),
+                        life_time_est_b_percent: Some(10),
+                        warning_flags: vec![],
+                    },
+                    telemetry: TelemetryStatus {
+                        state: TelemetryReadState::Available,
+                        error: None,
+                    },
+                    health_state: HealthState::Healthy,
+                }],
+                message: None,
+            },
+        };
+
+        let shared = Arc::new(Mutex::new(initial_storage));
+        let fake = FakeStorage(Arc::clone(&shared));
+
+        let controller = Controller::with_storage_reader(
+            ProbeMode::Live,
+            ExecutionPolicy::DryRun,
+            Arc::new(fake),
+        );
+
+        let mut app = App::new(controller, Locale::En).expect("init app");
+        // On non-Linux host App::new snapshot/controller is synthetic unless forced, but let's check app.nvme_status
+        // If non-Linux, Controller with ProbeMode::Live is synthetic if !cfg!(target_os = "linux")
+        // But in our test environment (Linux x86_64 or Linux aarch64), let's check:
+        // If it is Linux, it queried our fake!
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(
+                app.nvme_status.devices[0]
+                    .smart
+                    .as_ref()
+                    .unwrap()
+                    .temperature_c,
+                42.0
+            );
+            assert_eq!(app.mmc_status.devices.len(), 1);
+
+            // Mutate storage state
+            {
+                let mut state = shared.lock().unwrap();
+                if let Some(smart) = &mut state.nvme.devices[0].smart {
+                    smart.temperature_c = 78.0;
+                }
+                state.mmc.devices.clear();
+                state.mmc.initialized = false;
+            }
+
+            // Refresh app
+            app.refresh().expect("app refresh");
+
+            // Verify refreshed state reflects mutation on same App instance
+            assert_eq!(
+                app.nvme_status.devices[0]
+                    .smart
+                    .as_ref()
+                    .unwrap()
+                    .temperature_c,
+                78.0
+            );
+            assert_eq!(app.mmc_status.devices.len(), 0);
+            assert!(!app.mmc_status.initialized);
+
+            // Render and verify UI text has 78°C
+            let backend = ratatui::backend::TestBackend::new(120, 30);
+            let mut terminal = Terminal::new(backend).expect("init test terminal");
+            terminal
+                .draw(|frame| {
+                    render_storage_summary(frame, &app, Rect::new(0, 0, 100, 15));
+                })
+                .expect("draw");
+            let buffer = terminal.backend().buffer();
+            let raw_text = buffer
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            assert!(
+                raw_text.contains("78.0 °C") || raw_text.contains("78°C"),
+                "Expected 78.0 °C in rendered buffer, got: {raw_text}"
+            );
+        }
+    }
 }
