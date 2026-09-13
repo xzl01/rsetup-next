@@ -231,7 +231,11 @@ pub struct NvmeDevice {
     pub serial: String,
     pub firmware: String,
     pub total_bytes: u64,
-    pub smart: NvmeSmartLog,
+    pub smart: Option<NvmeSmartLog>,
+    #[serde(default)]
+    pub telemetry: TelemetryStatus,
+    #[serde(default)]
+    pub health_state: HealthState,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -274,6 +278,10 @@ pub struct MmcDevice {
     pub firmware: String,
     pub total_bytes: u64,
     pub health: MmcHealth,
+    #[serde(default)]
+    pub telemetry: TelemetryStatus,
+    #[serde(default)]
+    pub health_state: HealthState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -296,6 +304,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn storage_contract_exact_json_roundtrip_fixture() {
+        let fixture_json = r#"{"name":"nvme0","path":"/dev/nvme0","model":"FIXTURE","serial":"test-only","firmware":"1","totalBytes":4096,"smart":null,"telemetry":{"state":"unavailable","error":{"kind":"permission_denied","code":13}},"healthState":"unknown"}"#;
+
+        let dev: NvmeDevice = serde_json::from_str(fixture_json).expect("deserialize fixture JSON");
+        assert!(dev.smart.is_none());
+        assert_eq!(dev.health_state, HealthState::Unknown);
+        assert_eq!(dev.telemetry.state, TelemetryReadState::Unavailable);
+        assert_eq!(
+            dev.telemetry.error,
+            Some(TelemetryError {
+                kind: TelemetryErrorKind::PermissionDenied,
+                code: Some(13),
+            })
+        );
+
+        let serialized = serde_json::to_string(&dev).expect("serialize NvmeDevice");
+        assert!(serialized.contains(r#""smart":null"#));
+        assert!(serialized.contains(r#""code":13"#));
+        assert!(serialized.contains(r#""healthState":"unknown""#));
+    }
+
+    #[test]
     fn mmc_and_storage_models_serialize_and_deserialize() {
         let health = MmcHealth {
             pre_eol_info: 1,
@@ -314,6 +344,8 @@ mod tests {
             firmware: "0x00".to_string(),
             total_bytes: 64000000000,
             health: health.clone(),
+            telemetry: TelemetryStatus::default(),
+            health_state: HealthState::default(),
         };
 
         let mmc_status = MmcStatus {

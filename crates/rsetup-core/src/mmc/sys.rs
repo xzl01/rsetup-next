@@ -2,7 +2,10 @@ use super::{
     MmcError, format_manufacturer, generate_warning_flags, map_life_time_byte_to_percent,
     parse_life_time_str, parse_pre_eol_info_str,
 };
-use crate::model::{MmcDevice, MmcHealth};
+use crate::model::{
+    MmcDevice, MmcHealth, TelemetryError, TelemetryErrorKind,
+    TelemetryReadState, TelemetryStatus,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -275,31 +278,89 @@ pub(crate) fn read_device_sysfs_with(
         (String::new(), 0)
     };
 
-    // Fallback: only when card_type == "MMC", all health attributes in sysfs are unknown/missing,
-    // and primary block device exists. SD cards must NEVER issue EXT_CSD ioctl.
-    if card_type == "MMC" && life_a.is_none() && life_b.is_none() && pre_eol == 0 && !block_path.is_empty() {
-        if let Ok(buf) = reader(&block_path) {
-            let ext = parse_ext_csd(&buf);
-            // rev < 7 does not interpret health bytes; rev >= 7 interprets
-            if ext.rev >= 7 {
-                // pre-EOL non-1/2/3 normalized to 0
-                pre_eol = match ext.pre_eol_info {
-                    1 => 1,
-                    2 => 2,
-                    3 => 3,
-                    _ => 0,
-                };
-                life_a = map_life_time_byte_to_percent(ext.life_time_est_typ_a);
-                life_b = map_life_time_byte_to_percent(ext.life_time_est_typ_b);
-            }
+pub(crate) fn telemetry_from_mmc_error(err: &MmcError) -> TelemetryStatus {
+    let error = match err {
+        MmcError::IoCode(code) if *code == libc::EACCES || *code == libc::EPERM => {
+            Some(TelemetryError {
+                kind: TelemetryErrorKind::PermissionDenied,
+                code: Some(*code),
+            })
+        }
+        MmcError::IoCode(code) => Some(TelemetryError {
+            kind: TelemetryErrorKind::Io,
+            code: Some(*code),
+        }),
+        MmcError::Io(_) | MmcError::NotSupported(_) | MmcError::InvalidBufferLength { .. } => {
+            Some(TelemetryError {
+                kind: TelemetryErrorKind::Io,
+                code: None,
+            })
+        }
+    };
+    TelemetryStatus {
+        state: TelemetryReadState::Unavailable,
+        error,
+    }
+}
 
-            if firmware.is_empty() {
-                let end = ext
-                    .firmware_version
-                    .iter()
-                    .position(|&b| b == 0)
-                    .unwrap_or(ext.firmware_version.len());
-                firmware = String::from_utf8_lossy(&ext.firmware_version[..end]).into_owned();
+    let telemetry;
+
+    if card_type == "SD" {
+        telemetry = TelemetryStatus {
+            state: TelemetryReadState::Unsupported,
+            error: None,
+        };
+    } else if pre_eol != 0 || life_a.is_some() || life_b.is_some() {
+        telemetry = TelemetryStatus {
+            state: TelemetryReadState::Available,
+            error: None,
+        };
+    } else if block_path.is_empty() {
+        telemetry = TelemetryStatus {
+            state: TelemetryReadState::Unavailable,
+            error: Some(TelemetryError {
+                kind: TelemetryErrorKind::Io,
+                code: None,
+            }),
+        };
+    } else {
+        // Fallback: only when card_type == "MMC", all health attributes in sysfs are unknown/missing,
+        // and primary block device exists. SD cards must NEVER issue EXT_CSD ioctl.
+        match reader(&block_path) {
+            Ok(buf) => {
+                let ext = parse_ext_csd(&buf);
+                if ext.rev < 7 {
+                    telemetry = TelemetryStatus {
+                        state: TelemetryReadState::Unsupported,
+                        error: None,
+                    };
+                } else {
+                    // pre-EOL non-1/2/3 normalized to 0
+                    pre_eol = match ext.pre_eol_info {
+                        1 => 1,
+                        2 => 2,
+                        3 => 3,
+                        _ => 0,
+                    };
+                    life_a = map_life_time_byte_to_percent(ext.life_time_est_typ_a);
+                    life_b = map_life_time_byte_to_percent(ext.life_time_est_typ_b);
+                    telemetry = TelemetryStatus {
+                        state: TelemetryReadState::Available,
+                        error: None,
+                    };
+                }
+
+                if firmware.is_empty() {
+                    let end = ext
+                        .firmware_version
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(ext.firmware_version.len());
+                    firmware = String::from_utf8_lossy(&ext.firmware_version[..end]).into_owned();
+                }
+            }
+            Err(err) => {
+                telemetry = telemetry_from_mmc_error(&err);
             }
         }
     }
@@ -312,6 +373,7 @@ pub(crate) fn read_device_sysfs_with(
         life_time_est_b_percent: life_b,
         warning_flags,
     };
+    let health_state = crate::mmc_health_state(&telemetry, &health);
 
     Ok(MmcDevice {
         name: dev_name.to_string(),
@@ -323,6 +385,8 @@ pub(crate) fn read_device_sysfs_with(
         firmware,
         total_bytes,
         health,
+        telemetry,
+        health_state,
     })
 }
 

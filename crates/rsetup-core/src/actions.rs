@@ -1,7 +1,8 @@
 use crate::{
-    ActionRun, ActionSpec, ActionStatus, ActivityEvent, MmcDevice, MmcHealth, MmcManager,
-    MmcStatus, NvmeDevice, NvmeManager, NvmeSmartLog, NvmeStatus, ProbeMode, RiskLevel,
-    SourceApplyResult, SourceError, SourcePlan, SourceStatus, StorageStatus, collect_snapshot,
+    ActionRun, ActionSpec, ActionStatus, ActivityEvent, HealthState, MmcDevice, MmcHealth,
+    MmcManager, MmcStatus, NvmeDevice, NvmeManager, NvmeSmartLog, NvmeStatus, ProbeMode, RiskLevel,
+    SourceApplyResult, SourceError, SourcePlan, SourceStatus, StorageStatus,
+    TelemetryReadState, TelemetryStatus, collect_snapshot,
     fan_curve::{
         FanCurveApplyResult, FanCurveManager, FanCurvePlan, FanCurveRequest, FanCurveStatus,
         FanCurveTick,
@@ -1833,7 +1834,7 @@ fn demo_nvme_status() -> NvmeStatus {
             serial: "RADXA2026NVME01".into(),
             firmware: "1.0.0".into(),
             total_bytes: 512_110_190_592, // ~512 GB
-            smart: NvmeSmartLog {
+            smart: Some(NvmeSmartLog {
                 critical_warning: 0,
                 warning_flags: Vec::new(),
                 temperature_c: 38.5,
@@ -1848,7 +1849,12 @@ fn demo_nvme_status() -> NvmeStatus {
                 unsafe_shutdowns: 1,
                 media_errors: 0,
                 num_err_log_entries: 0,
+            }),
+            telemetry: TelemetryStatus {
+                state: TelemetryReadState::Available,
+                error: None,
             },
+            health_state: HealthState::Healthy,
         }],
         message: None,
     }
@@ -1873,6 +1879,11 @@ fn demo_mmc_status() -> MmcStatus {
                     life_time_est_b_percent: Some(10),
                     warning_flags: Vec::new(),
                 },
+                telemetry: TelemetryStatus {
+                    state: TelemetryReadState::Available,
+                    error: None,
+                },
+                health_state: HealthState::Healthy,
             },
             MmcDevice {
                 name: "mmc1:59b4".into(),
@@ -1890,6 +1901,11 @@ fn demo_mmc_status() -> MmcStatus {
                     life_time_est_b_percent: None,
                     warning_flags: Vec::new(),
                 },
+                telemetry: TelemetryStatus {
+                    state: TelemetryReadState::Unsupported,
+                    error: None,
+                },
+                health_state: HealthState::Unknown,
             },
         ],
         message: None,
@@ -2056,11 +2072,14 @@ mod tests {
         assert_eq!(dev.name, "nvme0");
         assert_eq!(dev.model, "Radxa M.2 NVMe SSD 512GB");
         assert!(dev.total_bytes > 0);
-        assert_eq!(dev.smart.critical_warning, 0);
-        assert!(dev.smart.warning_flags.is_empty());
-        assert!((dev.smart.temperature_c - 38.5).abs() < 0.1);
-        assert_eq!(dev.smart.available_spare_percent, 100);
-        assert_eq!(dev.smart.percentage_used, 2);
+        assert_eq!(dev.telemetry.state, TelemetryReadState::Available);
+        assert_eq!(dev.health_state, HealthState::Healthy);
+        let smart = dev.smart.as_ref().expect("demo smart log");
+        assert_eq!(smart.critical_warning, 0);
+        assert!(smart.warning_flags.is_empty());
+        assert!((smart.temperature_c - 38.5).abs() < 0.1);
+        assert_eq!(smart.available_spare_percent, 100);
+        assert_eq!(smart.percentage_used, 2);
     }
 
     #[test]

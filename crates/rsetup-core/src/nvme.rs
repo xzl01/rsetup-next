@@ -1,4 +1,7 @@
-use crate::model::{NvmeDevice, NvmeSmartLog, NvmeStatus};
+use crate::model::{
+    HealthState, NvmeDevice, NvmeSmartLog, NvmeStatus, TelemetryError, TelemetryErrorKind,
+    TelemetryReadState, TelemetryStatus,
+};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -56,7 +59,15 @@ impl NvmeManager {
                         serial: String::new(),
                         firmware: String::new(),
                         total_bytes: 0,
-                        smart: NvmeSmartLog::default(),
+                        smart: None,
+                        telemetry: TelemetryStatus {
+                            state: TelemetryReadState::Unavailable,
+                            error: Some(TelemetryError {
+                                kind: TelemetryErrorKind::Io,
+                                code: None,
+                            }),
+                        },
+                        health_state: HealthState::Unknown,
                     })
                 })
                 .collect();
@@ -218,6 +229,73 @@ pub fn parse_smart_log(buf: &[u8; 512]) -> Result<NvmeSmartLog, NvmeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_contract_nvme_error_injections_preserve_metadata_and_set_telemetry() {
+        let root = std::env::temp_dir().join(format!("rsetup-nvme-contract-{}", uuid::Uuid::new_v4()));
+        let ctrl_dir = root.join("sys/class/nvme/nvme0");
+        std::fs::create_dir_all(&ctrl_dir).expect("create ctrl_dir");
+        std::fs::write(ctrl_dir.join("model"), "FIXTURE SSD\n").unwrap();
+        std::fs::write(ctrl_dir.join("serial"), "SERIAL123\n").unwrap();
+        std::fs::write(ctrl_dir.join("firmware_rev"), "FW1\n").unwrap();
+        let ns_dir = ctrl_dir.join("nvme0n1");
+        std::fs::create_dir_all(&ns_dir).expect("create ns_dir");
+        std::fs::write(ns_dir.join("size"), "1000\n").unwrap();
+
+        // 1. IoCode(EACCES) -> PermissionDenied, code 13, smart None, health Unknown
+        let dev_eacces = sys::read_controller_sysfs_with(&root, "nvme0", &|_| {
+            Err(NvmeError::IoCode(libc::EACCES))
+        })
+        .expect("read_controller_sysfs_with");
+        assert_eq!(dev_eacces.model, "FIXTURE SSD");
+        assert_eq!(dev_eacces.serial, "SERIAL123");
+        assert_eq!(dev_eacces.firmware, "FW1");
+        assert_eq!(dev_eacces.total_bytes, 1000 * 512);
+        assert!(dev_eacces.smart.is_none());
+        assert_eq!(dev_eacces.telemetry.state, TelemetryReadState::Unavailable);
+        assert_eq!(
+            dev_eacces.telemetry.error,
+            Some(TelemetryError {
+                kind: TelemetryErrorKind::PermissionDenied,
+                code: Some(libc::EACCES),
+            })
+        );
+        assert_eq!(dev_eacces.health_state, HealthState::Unknown);
+
+        // 2. IoCode(EIO) -> Io, code 5, smart None, health Unknown
+        let dev_eio = sys::read_controller_sysfs_with(&root, "nvme0", &|_| {
+            Err(NvmeError::IoCode(libc::EIO))
+        })
+        .expect("read_controller_sysfs_with");
+        assert!(dev_eio.smart.is_none());
+        assert_eq!(dev_eio.telemetry.state, TelemetryReadState::Unavailable);
+        assert_eq!(
+            dev_eio.telemetry.error,
+            Some(TelemetryError {
+                kind: TelemetryErrorKind::Io,
+                code: Some(libc::EIO),
+            })
+        );
+        assert_eq!(dev_eio.health_state, HealthState::Unknown);
+
+        // 3. CommandStatus(2) -> NvmeStatus, code 2, smart None, health Unknown
+        let dev_cmd = sys::read_controller_sysfs_with(&root, "nvme0", &|_| {
+            Err(NvmeError::CommandStatus(2))
+        })
+        .expect("read_controller_sysfs_with");
+        assert!(dev_cmd.smart.is_none());
+        assert_eq!(dev_cmd.telemetry.state, TelemetryReadState::Unavailable);
+        assert_eq!(
+            dev_cmd.telemetry.error,
+            Some(TelemetryError {
+                kind: TelemetryErrorKind::NvmeStatus,
+                code: Some(2),
+            })
+        );
+        assert_eq!(dev_cmd.health_state, HealthState::Unknown);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn nvme_admin_result_requires_zero() {
@@ -444,9 +522,18 @@ mod tests {
 
         // 1. Without injected reader on non-root, read_controller_sysfs delegates to default fixture reader
         // which rejects reading with NotSupported("fixture requires an injected reader")
-        // and falls back to default SMART log (legacy struct behavior in T2).
+        // and sets smart to None and telemetry to Unavailable/Io/None.
         let dev_default = sys::read_controller_sysfs(&root, "nvme0").expect("read_controller_sysfs");
-        assert_eq!(dev_default.smart.temperature_c, 0.0);
+        assert!(dev_default.smart.is_none());
+        assert_eq!(dev_default.telemetry.state, TelemetryReadState::Unavailable);
+        assert_eq!(
+            dev_default.telemetry.error,
+            Some(TelemetryError {
+                kind: TelemetryErrorKind::Io,
+                code: None,
+            })
+        );
+        assert_eq!(dev_default.health_state, HealthState::Unknown);
 
         // 2. With injected reader and call count verification
         let call_count = std::sync::atomic::AtomicUsize::new(0);
@@ -471,7 +558,10 @@ mod tests {
         assert_eq!(device.total_bytes, 500118192 * 512);
 
         // kelvin = 310 -> 310 - 273.15 = 36.85°C
-        assert!((device.smart.temperature_c - 36.85).abs() < 0.001);
+        assert!(device.smart.is_some());
+        assert!((device.smart.as_ref().unwrap().temperature_c - 36.85).abs() < 0.001);
+        assert_eq!(device.telemetry.state, TelemetryReadState::Available);
+        assert_eq!(device.health_state, HealthState::Healthy);
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         let _ = std::fs::remove_dir_all(&root);

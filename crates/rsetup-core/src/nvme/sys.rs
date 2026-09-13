@@ -1,5 +1,8 @@
 use super::{NvmeError, parse_smart_log};
-use crate::model::{NvmeDevice, NvmeSmartLog};
+use crate::model::{
+    NvmeDevice, NvmeSmartLog, TelemetryError, TelemetryErrorKind,
+    TelemetryReadState, TelemetryStatus,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -84,6 +87,35 @@ pub fn read_controller_sysfs(sysfs_root: &Path, ctrl_name: &str) -> Result<NvmeD
     }
 }
 
+pub(crate) fn telemetry_from_nvme_error(err: &NvmeError) -> TelemetryStatus {
+    let error = match err {
+        NvmeError::IoCode(code) if *code == libc::EACCES || *code == libc::EPERM => {
+            Some(TelemetryError {
+                kind: TelemetryErrorKind::PermissionDenied,
+                code: Some(*code),
+            })
+        }
+        NvmeError::IoCode(code) => Some(TelemetryError {
+            kind: TelemetryErrorKind::Io,
+            code: Some(*code),
+        }),
+        NvmeError::CommandStatus(code) => Some(TelemetryError {
+            kind: TelemetryErrorKind::NvmeStatus,
+            code: Some(*code),
+        }),
+        NvmeError::Io(_) | NvmeError::NotSupported(_) | NvmeError::InvalidBufferLength { .. } => {
+            Some(TelemetryError {
+                kind: TelemetryErrorKind::Io,
+                code: None,
+            })
+        }
+    };
+    TelemetryStatus {
+        state: TelemetryReadState::Unavailable,
+        error,
+    }
+}
+
 pub(crate) fn read_controller_sysfs_with(
     root: &Path,
     name: &str,
@@ -108,9 +140,17 @@ pub(crate) fn read_controller_sysfs_with(
     let total_bytes = read_namespaces_total_bytes(&ctrl_dir);
 
     let dev_path = format!("/dev/{}", name);
-    let smart = reader(&dev_path)
-        .and_then(|buf| parse_smart_log(&buf))
-        .unwrap_or_default();
+    let (smart, telemetry) = match reader(&dev_path).and_then(|buf| parse_smart_log(&buf)) {
+        Ok(log) => (
+            Some(log),
+            TelemetryStatus {
+                state: TelemetryReadState::Available,
+                error: None,
+            },
+        ),
+        Err(err) => (None, telemetry_from_nvme_error(&err)),
+    };
+    let health_state = crate::nvme_health_state(&telemetry, smart.as_ref());
 
     Ok(NvmeDevice {
         name: name.to_string(),
@@ -120,6 +160,8 @@ pub(crate) fn read_controller_sysfs_with(
         firmware,
         total_bytes,
         smart,
+        telemetry,
+        health_state,
     })
 }
 

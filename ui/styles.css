@@ -1912,6 +1912,10 @@ body.is-resolving .core-node { animation: core-resolve 820ms var(--ease-soft) bo
   background: var(--coral-soft);
   color: var(--coral);
 }
+.nvme-badge-unknown {
+  background: var(--field);
+  color: var(--bone-muted);
+}
 .nvme-specs-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

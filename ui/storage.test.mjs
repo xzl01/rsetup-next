@@ -81,7 +81,6 @@ function createTestContext(overrides = {}) {
       return value;
     },
     preserveToolFocus: () => {},
-    renderNvmeDeviceCard: (device) => `<section class="nvme-card"><strong>${device.model}</strong></section>`,
     ...overrides,
   };
 
@@ -89,6 +88,7 @@ function createTestContext(overrides = {}) {
   vm.runInContext(
     [
       handler("applyStorageMetricStyles"),
+      handler("renderNvmeDeviceCard"),
       handler("renderStorageMmcCard"),
       handler("renderStorageTool"),
     ].join("\n"),
@@ -107,6 +107,8 @@ const emmcDevice = {
   firmware: "0x01",
   totalBytes: 62537072640,
   health: { preEolInfo: 1, lifeTimeEstAPercent: 10, lifeTimeEstBPercent: 10, warningFlags: [] },
+  telemetry: { state: "available", error: null },
+  healthState: "healthy",
 };
 
 const sdDevice = {
@@ -119,6 +121,8 @@ const sdDevice = {
   firmware: "0x01",
   totalBytes: 64026691584,
   health: { preEolInfo: 0, lifeTimeEstAPercent: null, lifeTimeEstBPercent: null, warningFlags: [] },
+  telemetry: { state: "unsupported", error: null },
+  healthState: "unknown",
 };
 
 const nvmeDevice = {
@@ -144,6 +148,8 @@ const nvmeDevice = {
     mediaErrors: 0,
     numErrLogEntries: 0,
   },
+  telemetry: { state: "available", error: null },
+  healthState: "healthy",
 };
 
 test("renderStorageTool renders uninitialized message when no module initialized", () => {
@@ -231,17 +237,55 @@ test("renderStorageTool renders NVMe above MMC with combined counts", () => {
   assert.ok(host.innerHTML.includes("1 MMC/eMMC"));
 });
 
-test("renderStorageMmcCard maps preEolInfo to badge classes", () => {
-  const critical = { ...emmcDevice, health: { ...emmcDevice.health, preEolInfo: 3 } };
-  const warning = { ...emmcDevice, health: { ...emmcDevice.health, preEolInfo: 2 } };
-  const flagged = { ...emmcDevice, health: { ...emmcDevice.health, warningFlags: ["life_exceeded"] } };
-  const undefined = { ...emmcDevice, health: { ...emmcDevice.health, preEolInfo: 0 } };
+test("renderStorageMmcCard maps healthState to badge classes", () => {
+  const critical = { ...emmcDevice, health: { ...emmcDevice.health, preEolInfo: 3 }, healthState: "critical" };
+  const warning = { ...emmcDevice, health: { ...emmcDevice.health, preEolInfo: 2, warningFlags: ["pre_eol_warning"] }, healthState: "warning" };
+  const flagged = { ...emmcDevice, health: { ...emmcDevice.health, warningFlags: ["life_time_typ_a_exceeded"] }, healthState: "critical" };
+  const undefinedDev = { ...emmcDevice, health: { ...emmcDevice.health, preEolInfo: 0 }, healthState: "unknown" };
 
   assert.ok(createTestContext().context.renderStorageMmcCard(critical).includes("nvme-badge-critical"));
   assert.ok(createTestContext().context.renderStorageMmcCard(warning).includes("nvme-badge-warning"));
+  assert.ok(!createTestContext().context.renderStorageMmcCard(warning).includes("nvme-badge-critical"));
   assert.ok(createTestContext().context.renderStorageMmcCard(flagged).includes("nvme-badge-critical"));
   assert.ok(createTestContext().context.renderStorageMmcCard(emmcDevice).includes("nvme-badge-healthy"));
-  assert.ok(createTestContext().context.renderStorageMmcCard(undefined).includes("storageTool.preEolUndefined"));
+  assert.ok(createTestContext().context.renderStorageMmcCard(undefinedDev).includes("storageTool.preEolUndefined"));
+});
+
+test("renderNvmeDeviceCard and renderStorageMmcCard handle missing telemetry and contract requirements", () => {
+  const missingNvme = {
+    name: "nvme0",
+    path: "/dev/nvme0",
+    model: "FIXTURE SSD",
+    serial: "test-only",
+    firmware: "1",
+    totalBytes: 4096,
+    smart: null,
+    telemetry: { state: "unavailable", error: { kind: "permission_denied", code: 13 } },
+    healthState: "unknown",
+  };
+
+  const cardHtml = createTestContext().context.renderNvmeDeviceCard(missingNvme);
+  assert.ok(!cardHtml.includes("nvme-badge-healthy"));
+  assert.ok(!cardHtml.includes("0.0 °C"));
+  assert.ok(cardHtml.includes("nvme-badge-unknown"));
+  assert.ok(cardHtml.includes("storageTool.permissionDenied"));
+  assert.ok(cardHtml.includes("FIXTURE SSD"));
+
+  const sdHtml = createTestContext().context.renderStorageMmcCard(sdDevice);
+  assert.ok(!sdHtml.includes("nvme-badge-healthy"));
+  assert.ok(sdHtml.includes("nvme-badge-unknown"));
+  assert.ok(sdHtml.includes("storageTool.unsupported"));
+
+  const warnEmmc = {
+    ...emmcDevice,
+    health: { preEolInfo: 2, lifeTimeEstAPercent: 10, lifeTimeEstBPercent: 10, warningFlags: ["pre_eol_warning"] },
+    telemetry: { state: "available", error: null },
+    healthState: "warning",
+  };
+  const warnHtml = createTestContext().context.renderStorageMmcCard(warnEmmc);
+  assert.ok(warnHtml.includes("nvme-badge-warning"));
+  assert.ok(!warnHtml.includes("nvme-badge-critical"));
+  assert.ok(!warnHtml.includes("nvme-badge-healthy"));
 });
 
 

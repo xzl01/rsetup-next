@@ -217,6 +217,11 @@ impl Locale {
             (Self::ZhCn, "storage_more_devices") => "更多设备",
             (Self::ZhCn, "storage_read") => "读",
             (Self::ZhCn, "storage_written") => "写",
+            (Self::ZhCn, "storage_telemetry_unavailable") => "不可读取",
+            (Self::ZhCn, "storage_telemetry_unsupported") => "不支持健康指标",
+            (Self::ZhCn, "storage_permission_denied") => "权限不足 (EACCES/EPERM)",
+            (Self::ZhCn, "storage_protocol_error") => "协议状态码",
+            (Self::ZhCn, "storage_unknown") => "未知",
             (_, "live_linux_only") => "live execution is only supported on Linux SBC hosts",
             (_, "not_available") => "n/a",
             (_, "synthetic_data") => "SYNTHETIC DATA",
@@ -318,6 +323,11 @@ impl Locale {
             (_, "storage_more_devices") => "more device(s)",
             (_, "storage_read") => "Read",
             (_, "storage_written") => "Written",
+            (_, "storage_telemetry_unavailable") => "Unavailable",
+            (_, "storage_telemetry_unsupported") => "Health telemetry unsupported",
+            (_, "storage_permission_denied") => "Permission denied (EACCES/EPERM)",
+            (_, "storage_protocol_error") => "Protocol status",
+            (_, "storage_unknown") => "Unknown",
             _ => "",
         }
     }

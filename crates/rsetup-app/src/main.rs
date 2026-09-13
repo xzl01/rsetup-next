@@ -1117,37 +1117,60 @@ fn format_nvme_status(status: &rsetup_core::NvmeStatus, locale: Locale) -> Strin
                 "  总容量:           {} ({} 字节)",
                 size_str, dev.total_bytes
             ));
-            out.push(format!(
-                "  当前温度:         {:.1} °C",
-                dev.smart.temperature_c
-            ));
-            out.push(format!(
-                "  备用空间/阈值:    {}% / {}%",
-                dev.smart.available_spare_percent, dev.smart.spare_threshold_percent
-            ));
-            out.push(format!(
-                "  已使用寿命:       {}%",
-                dev.smart.percentage_used
-            ));
-            out.push(format!(
-                "  数据读写量:       读取 {} / 写入 {}",
-                format_bytes(dev.smart.data_read_bytes),
-                format_bytes(dev.smart.data_written_bytes)
-            ));
-            out.push(format!(
-                "  通电时间/不安全关机: {} 小时 / {} 次",
-                dev.smart.power_on_hours, dev.smart.unsafe_shutdowns
-            ));
-            out.push(format!(
-                "  错误计数:         介质错误 {} / 错误日志项 {}",
-                dev.smart.media_errors, dev.smart.num_err_log_entries
-            ));
-            let warning_str = if dev.smart.warning_flags.is_empty() {
-                "无".to_string()
+
+            if let Some(smart) = &dev.smart {
+                out.push(format!(
+                    "  当前温度:         {:.1} °C",
+                    smart.temperature_c
+                ));
+                out.push(format!(
+                    "  备用空间/阈值:    {}% / {}%",
+                    smart.available_spare_percent, smart.spare_threshold_percent
+                ));
+                out.push(format!(
+                    "  已使用寿命:       {}%",
+                    smart.percentage_used
+                ));
+                out.push(format!(
+                    "  数据读写量:       读取 {} / 写入 {}",
+                    format_bytes(smart.data_read_bytes),
+                    format_bytes(smart.data_written_bytes)
+                ));
+                out.push(format!(
+                    "  通电时间/不安全关机: {} 小时 / {} 次",
+                    smart.power_on_hours, smart.unsafe_shutdowns
+                ));
+                out.push(format!(
+                    "  错误计数:         介质错误 {} / 错误日志项 {}",
+                    smart.media_errors, smart.num_err_log_entries
+                ));
+                let warning_str = if smart.warning_flags.is_empty() {
+                    "无".to_string()
+                } else {
+                    smart.warning_flags.join(", ")
+                };
+                out.push(format!("  告警状态:         {}", warning_str));
             } else {
-                dev.smart.warning_flags.join(", ")
-            };
-            out.push(format!("  告警状态:         {}", warning_str));
+                let reason = match &dev.telemetry.error {
+                    Some(err) => match err.kind {
+                        rsetup_core::TelemetryErrorKind::PermissionDenied => {
+                            format!("不可读取 (权限不足, code {})", err.code.unwrap_or(13))
+                        }
+                        rsetup_core::TelemetryErrorKind::NvmeStatus => {
+                            format!("不可读取 (协议状态码 {})", err.code.unwrap_or(0))
+                        }
+                        rsetup_core::TelemetryErrorKind::Io => {
+                            if let Some(code) = err.code {
+                                format!("不可读取 (I/O 错误, code {})", code)
+                            } else {
+                                "不可读取 (I/O 错误)".to_string()
+                            }
+                        }
+                    },
+                    None => "不可读取".to_string(),
+                };
+                out.push(format!("  健康状态:         {}", reason));
+            }
         } else {
             out.push(format!("  Model:            {}", dev.model));
             out.push(format!("  Serial Number:    {}", dev.serial));
@@ -1156,37 +1179,60 @@ fn format_nvme_status(status: &rsetup_core::NvmeStatus, locale: Locale) -> Strin
                 "  Total Capacity:   {} ({} bytes)",
                 size_str, dev.total_bytes
             ));
-            out.push(format!(
-                "  Temperature:      {:.1} °C",
-                dev.smart.temperature_c
-            ));
-            out.push(format!(
-                "  Available Spare:  {}% (threshold: {}%)",
-                dev.smart.available_spare_percent, dev.smart.spare_threshold_percent
-            ));
-            out.push(format!(
-                "  Percentage Used:  {}%",
-                dev.smart.percentage_used
-            ));
-            out.push(format!(
-                "  Data Read/Write:  Read {} / Written {}",
-                format_bytes(dev.smart.data_read_bytes),
-                format_bytes(dev.smart.data_written_bytes)
-            ));
-            out.push(format!(
-                "  Power-on/Shutdown: {} hrs / {} unsafe shutdowns",
-                dev.smart.power_on_hours, dev.smart.unsafe_shutdowns
-            ));
-            out.push(format!(
-                "  Error Counts:     Media errors: {} / Error entries: {}",
-                dev.smart.media_errors, dev.smart.num_err_log_entries
-            ));
-            let warning_str = if dev.smart.warning_flags.is_empty() {
-                "None".to_string()
+
+            if let Some(smart) = &dev.smart {
+                out.push(format!(
+                    "  Temperature:      {:.1} °C",
+                    smart.temperature_c
+                ));
+                out.push(format!(
+                    "  Available Spare:  {}% (threshold: {}%)",
+                    smart.available_spare_percent, smart.spare_threshold_percent
+                ));
+                out.push(format!(
+                    "  Percentage Used:  {}%",
+                    smart.percentage_used
+                ));
+                out.push(format!(
+                    "  Data Read/Write:  Read {} / Written {}",
+                    format_bytes(smart.data_read_bytes),
+                    format_bytes(smart.data_written_bytes)
+                ));
+                out.push(format!(
+                    "  Power-on/Shutdown: {} hrs / {} unsafe shutdowns",
+                    smart.power_on_hours, smart.unsafe_shutdowns
+                ));
+                out.push(format!(
+                    "  Error Counts:     Media errors: {} / Error entries: {}",
+                    smart.media_errors, smart.num_err_log_entries
+                ));
+                let warning_str = if smart.warning_flags.is_empty() {
+                    "None".to_string()
+                } else {
+                    smart.warning_flags.join(", ")
+                };
+                out.push(format!("  Critical Warning: {}", warning_str));
             } else {
-                dev.smart.warning_flags.join(", ")
-            };
-            out.push(format!("  Critical Warning: {}", warning_str));
+                let reason = match &dev.telemetry.error {
+                    Some(err) => match err.kind {
+                        rsetup_core::TelemetryErrorKind::PermissionDenied => {
+                            format!("Unavailable (Permission denied, code {})", err.code.unwrap_or(13))
+                        }
+                        rsetup_core::TelemetryErrorKind::NvmeStatus => {
+                            format!("Unavailable (Protocol status {})", err.code.unwrap_or(0))
+                        }
+                        rsetup_core::TelemetryErrorKind::Io => {
+                            if let Some(code) = err.code {
+                                format!("Unavailable (I/O error, code {})", code)
+                            } else {
+                                "Unavailable (I/O error)".to_string()
+                            }
+                        }
+                    },
+                    None => "Unavailable".to_string(),
+                };
+                out.push(format!("  Health:           {}", reason));
+            }
         }
     }
 
@@ -1256,14 +1302,16 @@ fn format_mmc_status(status: &rsetup_core::MmcStatus, locale: Locale) -> String 
                 3 => "紧急 (建议更换)".to_string(),
                 other => format!("未知 ({other})"),
             };
-            let life_str = |value: Option<u8>| -> String {
+            let life_str_zh = |value: Option<u8>| -> String {
                 match value {
+                    Some(100) => "90–100%".to_string(),
+                    Some(101) => ">100%".to_string(),
                     Some(p) => format!("{p}%"),
                     None => "不支持".to_string(),
                 }
             };
-            let life_a_str = life_str(dev.health.life_time_est_a_percent);
-            let life_b_str = life_str(dev.health.life_time_est_b_percent);
+            let life_a_str = life_str_zh(dev.health.life_time_est_a_percent);
+            let life_b_str = life_str_zh(dev.health.life_time_est_b_percent);
             out.push(format!("  预 EOL 状态:       {pre_eol_str}"));
             out.push(format!("  寿命估计 (A/B):   {life_a_str} / {life_b_str}"));
             let warning_str = if dev.health.warning_flags.is_empty() {
@@ -1289,14 +1337,16 @@ fn format_mmc_status(status: &rsetup_core::MmcStatus, locale: Locale) -> String 
                 3 => "Urgent (replace soon)".to_string(),
                 other => format!("Unknown ({other})"),
             };
-            let life_str = |value: Option<u8>| -> String {
+            let life_str_en = |value: Option<u8>| -> String {
                 match value {
+                    Some(100) => "90–100%".to_string(),
+                    Some(101) => ">100%".to_string(),
                     Some(p) => format!("{p}%"),
                     None => "N/A".to_string(),
                 }
             };
-            let life_a_str = life_str(dev.health.life_time_est_a_percent);
-            let life_b_str = life_str(dev.health.life_time_est_b_percent);
+            let life_a_str = life_str_en(dev.health.life_time_est_a_percent);
+            let life_b_str = life_str_en(dev.health.life_time_est_b_percent);
             out.push(format!("  Pre-EOL:            {pre_eol_str}"));
             out.push(format!(
                 "  Life Time Est (A/B): {life_a_str} / {life_b_str}"
@@ -1453,7 +1503,7 @@ mod tests {
                 serial: "RADXA2026NVME01".into(),
                 firmware: "1.0.0".into(),
                 total_bytes: 256_060_514_304,
-                smart: NvmeSmartLog {
+                smart: Some(NvmeSmartLog {
                     critical_warning: 0,
                     warning_flags: Vec::new(),
                     temperature_c: 42.0,
@@ -1468,7 +1518,12 @@ mod tests {
                     unsafe_shutdowns: 1,
                     media_errors: 0,
                     num_err_log_entries: 0,
+                }),
+                telemetry: rsetup_core::TelemetryStatus {
+                    state: rsetup_core::TelemetryReadState::Available,
+                    error: None,
                 },
+                health_state: rsetup_core::HealthState::Healthy,
             }],
             message: None,
         };
@@ -1585,6 +1640,11 @@ mod tests {
                 life_time_est_b_percent: None,
                 warning_flags: Vec::new(),
             },
+            telemetry: rsetup_core::TelemetryStatus {
+                state: rsetup_core::TelemetryReadState::Available,
+                error: None,
+            },
+            health_state: rsetup_core::HealthState::Healthy,
         };
         let sd = MmcDevice {
             name: "mmc1:0001".into(),
@@ -1596,11 +1656,16 @@ mod tests {
             firmware: "1.0".into(),
             total_bytes: 8_000_000_000,
             health: MmcHealth {
-                pre_eol_info: 1,
+                pre_eol_info: 0,
                 life_time_est_a_percent: None,
                 life_time_est_b_percent: None,
                 warning_flags: Vec::new(),
             },
+            telemetry: rsetup_core::TelemetryStatus {
+                state: rsetup_core::TelemetryReadState::Unsupported,
+                error: None,
+            },
+            health_state: rsetup_core::HealthState::Unknown,
         };
         let status = MmcStatus {
             initialized: true,
@@ -1642,7 +1707,7 @@ mod tests {
                 serial: "RADXA2026NVME01".into(),
                 firmware: "1.0.0".into(),
                 total_bytes: 256_060_514_304,
-                smart: NvmeSmartLog {
+                smart: Some(NvmeSmartLog {
                     critical_warning: 0,
                     warning_flags: Vec::new(),
                     temperature_c: 42.0,
@@ -1657,7 +1722,12 @@ mod tests {
                     unsafe_shutdowns: 1,
                     media_errors: 0,
                     num_err_log_entries: 0,
+                }),
+                telemetry: rsetup_core::TelemetryStatus {
+                    state: rsetup_core::TelemetryReadState::Available,
+                    error: None,
                 },
+                health_state: rsetup_core::HealthState::Healthy,
             }],
             message: None,
         };
@@ -1678,6 +1748,11 @@ mod tests {
                     life_time_est_b_percent: None,
                     warning_flags: Vec::new(),
                 },
+                telemetry: rsetup_core::TelemetryStatus {
+                    state: rsetup_core::TelemetryReadState::Available,
+                    error: None,
+                },
+                health_state: rsetup_core::HealthState::Healthy,
             }],
             message: None,
         };
@@ -1689,6 +1764,75 @@ mod tests {
             out.contains("mmc0:0001"),
             "storage output should contain mmc0:0001"
         );
+    }
+
+    #[test]
+    fn format_nvme_and_mmc_status_handles_unavailable_and_special_percentages() {
+        let unavail_nvme = NvmeStatus {
+            initialized: true,
+            devices: vec![NvmeDevice {
+                name: "nvme0".into(),
+                path: "/dev/nvme0".into(),
+                model: "SAMSUNG 980".into(),
+                serial: "S123".into(),
+                firmware: "1.0".into(),
+                total_bytes: 500_000_000_000,
+                smart: None,
+                telemetry: rsetup_core::TelemetryStatus {
+                    state: rsetup_core::TelemetryReadState::Unavailable,
+                    error: Some(rsetup_core::TelemetryError {
+                        kind: rsetup_core::TelemetryErrorKind::PermissionDenied,
+                        code: Some(13),
+                    }),
+                },
+                health_state: rsetup_core::HealthState::Unknown,
+            }],
+            message: None,
+        };
+        let out_zh = format_nvme_status(&unavail_nvme, Locale::ZhCn);
+        assert!(out_zh.contains("SAMSUNG 980"));
+        assert!(out_zh.contains("不可读取"));
+        assert!(out_zh.contains("权限不足"));
+        assert!(!out_zh.contains("0.0 °C"));
+
+        let out_en = format_nvme_status(&unavail_nvme, Locale::En);
+        assert!(out_en.contains("SAMSUNG 980"));
+        assert!(out_en.contains("Unavailable"));
+        assert!(out_en.contains("Permission denied"));
+        assert!(!out_en.contains("0.0 °C"));
+
+        let special_mmc = MmcStatus {
+            initialized: true,
+            devices: vec![MmcDevice {
+                name: "mmc0:0001".into(),
+                block_path: "/dev/mmcblk0".into(),
+                card_type: "MMC".into(),
+                model: "EMMC".into(),
+                manufacturer: "0x15".into(),
+                serial: "123".into(),
+                firmware: "1".into(),
+                total_bytes: 32_000_000_000,
+                health: MmcHealth {
+                    pre_eol_info: 2,
+                    life_time_est_a_percent: Some(100),
+                    life_time_est_b_percent: Some(101),
+                    warning_flags: vec!["pre_eol_warning".into()],
+                },
+                telemetry: rsetup_core::TelemetryStatus {
+                    state: rsetup_core::TelemetryReadState::Available,
+                    error: None,
+                },
+                health_state: rsetup_core::HealthState::Warning,
+            }],
+            message: None,
+        };
+        let mmc_zh = format_mmc_status(&special_mmc, Locale::ZhCn);
+        assert!(mmc_zh.contains("90–100%"));
+        assert!(mmc_zh.contains(">100%"));
+
+        let mmc_en = format_mmc_status(&special_mmc, Locale::En);
+        assert!(mmc_en.contains("90–100%"));
+        assert!(mmc_en.contains(">100%"));
     }
 }
 

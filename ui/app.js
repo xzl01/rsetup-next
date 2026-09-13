@@ -2315,10 +2315,25 @@ function applyStorageMetricStyles(host) {
 function renderStorageMmcCard(device) {
   const health = device.health || {};
   const typeLabel = device.cardType === "SD" ? t("storageTool.sd") : t("storageTool.emmc");
-  const isCritical = (health.warningFlags && health.warningFlags.length > 0) || health.preEolInfo === 3;
-  const isWarning = !isCritical && health.preEolInfo === 2;
-  const badgeClass = isCritical ? "nvme-badge-critical" : isWarning ? "nvme-badge-warning" : "nvme-badge-healthy";
-  const healthLabel = isCritical ? t("storageTool.critical") : isWarning ? t("storageTool.warning") : t("storageTool.healthy");
+  const healthState = device.healthState || "unknown";
+  const badgeClass =
+    healthState === "critical"
+      ? "nvme-badge-critical"
+      : healthState === "warning"
+        ? "nvme-badge-warning"
+        : healthState === "healthy"
+          ? "nvme-badge-healthy"
+          : "nvme-badge-unknown";
+  const healthLabel =
+    healthState === "critical"
+      ? t("storageTool.critical")
+      : healthState === "warning"
+        ? t("storageTool.warning")
+        : healthState === "healthy"
+          ? t("storageTool.healthy")
+          : device.telemetry?.state === "unsupported"
+            ? t("storageTool.unsupported")
+            : t("storageTool.unknown");
   const preEolLabel =
     health.preEolInfo === 1
       ? t("storageTool.preEolNormal")
@@ -2342,12 +2357,13 @@ function renderStorageMmcCard(device) {
         </div>`;
     }
     const clamped = Math.min(100, Math.max(0, percent));
-    const statusClass = percent >= 100 ? "is-critical" : percent >= 80 ? "is-warning" : "is-normal";
+    const statusClass = percent > 100 ? "is-critical" : percent >= 100 ? "is-warning" : percent >= 80 ? "is-warning" : "is-normal";
+    const text = percent === 100 ? "90–100%" : percent === 101 ? ">100%" : `${percent}%`;
     return `
       <div class="nvme-metric-block">
         <div class="nvme-metric-header">
           <span>${escapeHtml(t(labelKey))}</span>
-          <b>${clamped}%</b>
+          <b>${escapeHtml(text)}</b>
         </div>
         <div class="nvme-metric-bar">
           <div class="nvme-metric-bar-fill ${statusClass}" data-metric-percent="${clamped}"></div>
@@ -2436,10 +2452,66 @@ function renderStorageTool() {
 }
 
 function renderNvmeDeviceCard(device) {
-  const smart = device.smart || {};
-  const isHealthy = smart.criticalWarning === 0;
-  const badgeClass = isHealthy ? "nvme-badge-healthy" : "nvme-badge-critical";
-  const healthLabel = isHealthy ? t("nvme.healthy") : (smart.warningFlags?.join(", ") || t("nvme.warning"));
+  const smart = device.smart;
+  const healthState = device.healthState || "unknown";
+  const badgeClass =
+    healthState === "critical"
+      ? "nvme-badge-critical"
+      : healthState === "warning"
+        ? "nvme-badge-warning"
+        : healthState === "healthy"
+          ? "nvme-badge-healthy"
+          : "nvme-badge-unknown";
+
+  const healthLabel =
+    healthState === "critical"
+      ? t("nvme.critical")
+      : healthState === "warning"
+        ? (smart?.warningFlags?.join(", ") || t("nvme.warning"))
+        : healthState === "healthy"
+          ? t("nvme.healthy")
+          : device.telemetry?.error?.kind === "permission_denied"
+            ? t("storageTool.permissionDenied")
+            : device.telemetry?.error?.kind === "nvme_status"
+              ? `${t("storageTool.protocolError")} (${device.telemetry.error.code ?? 0})`
+              : device.telemetry?.state === "unavailable"
+                ? t("storageTool.unavailable")
+                : t("storageTool.unknown");
+
+  if (!smart) {
+    return `
+      <section class="nvme-card">
+        <div class="nvme-card-head">
+          <div class="nvme-card-title">
+            <strong>${escapeHtml(device.model || device.name)}</strong>
+            <span>${escapeHtml(device.path || device.name)}</span>
+          </div>
+          <div class="nvme-card-badges">
+            <span class="nvme-badge ${badgeClass}">${escapeHtml(healthLabel)}</span>
+          </div>
+        </div>
+
+        <div class="nvme-specs-grid">
+          <div class="nvme-spec-item">
+            <i>${escapeHtml(t("nvme.capacity"))}</i>
+            <b>${byteUnit(device.totalBytes)}</b>
+          </div>
+          <div class="nvme-spec-item">
+            <i>${escapeHtml(t("nvme.serial"))}</i>
+            <b>${escapeHtml(device.serial || "—")}</b>
+          </div>
+          <div class="nvme-spec-item">
+            <i>${escapeHtml(t("nvme.firmware"))}</i>
+            <b>${escapeHtml(device.firmware || "—")}</b>
+          </div>
+          <div class="nvme-spec-item">
+            <i>${escapeHtml(t("nvme.temperature"))}</i>
+            <b>—</b>
+          </div>
+        </div>
+      </section>
+    `;
+  }
 
   const temp = smart.temperatureC != null ? smart.temperatureC : null;
   const tempWarn = temp != null && temp >= 70;

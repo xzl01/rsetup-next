@@ -643,11 +643,11 @@ fn nvme_device_lines(
     ]);
 
     // Line 2: Health state, temperature, used endurance, available spare
-    let is_healthy = dev.smart.critical_warning == 0 && dev.smart.warning_flags.is_empty();
-    let (status_text, status_color) = if is_healthy {
-        (app.locale.text("nvme_healthy"), SIGNAL)
-    } else {
-        (app.locale.text("nvme_warning"), CORAL)
+    let (status_text, status_color) = match dev.health_state {
+        rsetup_core::HealthState::Healthy => (app.locale.text("storage_healthy"), SIGNAL),
+        rsetup_core::HealthState::Warning => (app.locale.text("storage_warning"), AMBER),
+        rsetup_core::HealthState::Critical => (app.locale.text("storage_critical"), CORAL),
+        rsetup_core::HealthState::Unknown => (app.locale.text("storage_unknown"), MUTED),
     };
     let status_label = if app.locale.is_zh() {
         "状态: "
@@ -679,8 +679,116 @@ fn nvme_device_lines(
         "Used: "
     };
 
-    let build_telemetry_line = |endurance_label: &'static str| -> Line<'static> {
-        let mut spans = vec![
+    if let Some(smart) = &dev.smart {
+        let is_healthy = dev.health_state == rsetup_core::HealthState::Healthy;
+        let build_telemetry_line = |endurance_label: &'static str| -> Line<'static> {
+            let mut spans = vec![
+                Span::styled(status_label, Style::default().fg(MUTED)),
+                Span::styled(
+                    status_text,
+                    Style::default()
+                        .fg(status_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ];
+            if !is_healthy && !smart.warning_flags.is_empty() {
+                spans.push(Span::styled(
+                    format!(" ({})", smart.warning_flags.join(", ")),
+                    Style::default().fg(CORAL),
+                ));
+            }
+            spans.extend(vec![
+                Span::styled(" · ", Style::default().fg(MUTED)),
+                Span::styled(temp_label, Style::default().fg(MUTED)),
+                Span::styled(
+                    format!("{:.1} °C", smart.temperature_c),
+                    Style::default().fg(BONE),
+                ),
+                Span::styled(" · ", Style::default().fg(MUTED)),
+                Span::styled(endurance_label, Style::default().fg(MUTED)),
+                Span::styled(
+                    format!("{}%", smart.percentage_used),
+                    Style::default().fg(BONE),
+                ),
+                Span::styled(" · ", Style::default().fg(MUTED)),
+                Span::styled(spare_label, Style::default().fg(MUTED)),
+                Span::styled(
+                    format!("{}%", smart.available_spare_percent),
+                    Style::default().fg(BONE),
+                ),
+            ]);
+            Line::from(spans)
+        };
+        let full_line = build_telemetry_line(endurance_label);
+        let line2 = if full_line.width() > inner_width {
+            build_telemetry_line(short_endurance_label)
+        } else {
+            full_line
+        };
+
+        // Line 3: Data read & written plus the available-spare threshold
+        let io_label = if app.locale.is_zh() {
+            "读写: "
+        } else {
+            "I/O: "
+        };
+        let threshold_label = if app.locale.is_zh() {
+            "阈值"
+        } else {
+            "threshold"
+        };
+        let read_str = crate::format_bytes(smart.data_read_bytes);
+        let write_str = crate::format_bytes(smart.data_written_bytes);
+
+        let line3 = Line::from(vec![
+            Span::styled(io_label, Style::default().fg(MUTED)),
+            Span::styled(
+                format!("Read {read_str} / Written {write_str}"),
+                Style::default().fg(BONE),
+            ),
+            Span::styled(" · ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!("{threshold_label} {}%", smart.spare_threshold_percent),
+                Style::default().fg(BONE),
+            ),
+        ]);
+
+        vec![line1, line2, line3]
+    } else {
+        let reason = match &dev.telemetry.error {
+            Some(err) => match err.kind {
+                rsetup_core::TelemetryErrorKind::PermissionDenied => {
+                    if app.locale.is_zh() {
+                        format!("权限不足 (code {})", err.code.unwrap_or(13))
+                    } else {
+                        format!("Permission denied (code {})", err.code.unwrap_or(13))
+                    }
+                }
+                rsetup_core::TelemetryErrorKind::NvmeStatus => {
+                    if app.locale.is_zh() {
+                        format!("协议状态码 {}", err.code.unwrap_or(0))
+                    } else {
+                        format!("Protocol status {}", err.code.unwrap_or(0))
+                    }
+                }
+                rsetup_core::TelemetryErrorKind::Io => {
+                    if let Some(code) = err.code {
+                        if app.locale.is_zh() {
+                            format!("I/O 错误 (code {})", code)
+                        } else {
+                            format!("I/O error (code {})", code)
+                        }
+                    } else if app.locale.is_zh() {
+                        "I/O 错误".to_string()
+                    } else {
+                        "I/O error".to_string()
+                    }
+                }
+            },
+            None => app.locale.text("storage_telemetry_unavailable").to_string(),
+        };
+
+        let line2 = Line::from(vec![
             Span::styled(status_label, Style::default().fg(MUTED)),
             Span::styled(
                 status_text,
@@ -688,70 +796,15 @@ fn nvme_device_lines(
                     .fg(status_color)
                     .add_modifier(Modifier::BOLD),
             ),
-        ];
-        if !is_healthy && !dev.smart.warning_flags.is_empty() {
-            spans.push(Span::styled(
-                format!(" ({})", dev.smart.warning_flags.join(", ")),
-                Style::default().fg(CORAL),
-            ));
-        }
-        spans.extend(vec![
             Span::styled(" · ", Style::default().fg(MUTED)),
-            Span::styled(temp_label, Style::default().fg(MUTED)),
             Span::styled(
-                format!("{:.1} °C", dev.smart.temperature_c),
-                Style::default().fg(BONE),
-            ),
-            Span::styled(" · ", Style::default().fg(MUTED)),
-            Span::styled(endurance_label, Style::default().fg(MUTED)),
-            Span::styled(
-                format!("{}%", dev.smart.percentage_used),
-                Style::default().fg(BONE),
-            ),
-            Span::styled(" · ", Style::default().fg(MUTED)),
-            Span::styled(spare_label, Style::default().fg(MUTED)),
-            Span::styled(
-                format!("{}%", dev.smart.available_spare_percent),
-                Style::default().fg(BONE),
+                format!("{}: {}", app.locale.text("storage_telemetry_unavailable"), reason),
+                Style::default().fg(MUTED),
             ),
         ]);
-        Line::from(spans)
-    };
-    let full_line = build_telemetry_line(endurance_label);
-    let line2 = if full_line.width() > inner_width {
-        build_telemetry_line(short_endurance_label)
-    } else {
-        full_line
-    };
 
-    // Line 3: Data read & written plus the available-spare threshold
-    let io_label = if app.locale.is_zh() {
-        "读写: "
-    } else {
-        "I/O: "
-    };
-    let threshold_label = if app.locale.is_zh() {
-        "阈值"
-    } else {
-        "threshold"
-    };
-    let read_str = crate::format_bytes(dev.smart.data_read_bytes);
-    let write_str = crate::format_bytes(dev.smart.data_written_bytes);
-
-    let line3 = Line::from(vec![
-        Span::styled(io_label, Style::default().fg(MUTED)),
-        Span::styled(
-            format!("Read {read_str} / Written {write_str}"),
-            Style::default().fg(BONE),
-        ),
-        Span::styled(" · ", Style::default().fg(MUTED)),
-        Span::styled(
-            format!("{threshold_label} {}%", dev.smart.spare_threshold_percent),
-            Style::default().fg(BONE),
-        ),
-    ]);
-
-    vec![line1, line2, line3]
+        vec![line1, line2]
+    }
 }
 
 fn mmc_device_lines(app: &App, dev: &rsetup_core::MmcDevice) -> Vec<Line<'static>> {
@@ -783,24 +836,22 @@ fn mmc_device_lines(app: &App, dev: &rsetup_core::MmcDevice) -> Vec<Line<'static
     let life_a_label = format!("{}: ", app.locale.text("storage_life_a"));
     let life_b_label = format!("{}: ", app.locale.text("storage_life_b"));
     let pre_eol_label = format!("{}: ", app.locale.text("storage_pre_eol"));
-    let (health_text, health_color) =
-        if !dev.health.warning_flags.is_empty() || dev.health.pre_eol_info == 3 {
-            (app.locale.text("storage_critical"), CORAL)
-        } else if dev.health.pre_eol_info == 2 {
-            (app.locale.text("storage_warning"), AMBER)
-        } else {
-            (app.locale.text("storage_healthy"), SIGNAL)
-        };
-    let life_a = dev
-        .health
-        .life_time_est_a_percent
-        .map(|p| format!("{p}%"))
-        .unwrap_or_else(|| app.locale.text("storage_na").to_string());
-    let life_b = dev
-        .health
-        .life_time_est_b_percent
-        .map(|p| format!("{p}%"))
-        .unwrap_or_else(|| app.locale.text("storage_na").to_string());
+    let (health_text, health_color) = match dev.health_state {
+        rsetup_core::HealthState::Healthy => (app.locale.text("storage_healthy"), SIGNAL),
+        rsetup_core::HealthState::Warning => (app.locale.text("storage_warning"), AMBER),
+        rsetup_core::HealthState::Critical => (app.locale.text("storage_critical"), CORAL),
+        rsetup_core::HealthState::Unknown => (app.locale.text("storage_unknown"), MUTED),
+    };
+    let format_life = |value: Option<u8>| -> String {
+        match value {
+            Some(100) => "90–100%".to_string(),
+            Some(101) => ">100%".to_string(),
+            Some(p) => format!("{p}%"),
+            None => app.locale.text("storage_na").to_string(),
+        }
+    };
+    let life_a = format_life(dev.health.life_time_est_a_percent);
+    let life_b = format_life(dev.health.life_time_est_b_percent);
     let eol = match dev.health.pre_eol_info {
         0 => app.locale.text("storage_eol_undefined"),
         1 => app.locale.text("storage_eol_normal"),
@@ -1172,8 +1223,10 @@ mod tests {
             let mut app = App::new(controller, locale).expect("init app");
             let mut dev = app.nvme_status.devices[0].clone();
             // Mirror the real Rock 5B device: 100% spare against a 1% threshold.
-            dev.smart.available_spare_percent = 100;
-            dev.smart.spare_threshold_percent = 1;
+            if let Some(smart) = &mut dev.smart {
+                smart.available_spare_percent = 100;
+                smart.spare_threshold_percent = 1;
+            }
             app.nvme_status.devices = vec![dev];
 
             let backend = ratatui::backend::TestBackend::new(61, 6);
@@ -1382,11 +1435,14 @@ mod tests {
         let controller = Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun);
         let mut app = App::new(controller, Locale::ZhCn).expect("init app");
         let mut dev = app.nvme_status.devices[0].clone();
-        dev.smart.critical_warning = 0x03;
-        dev.smart.warning_flags = vec![
-            "spare_below_threshold".into(),
-            "temperature_exceeded".into(),
-        ];
+        if let Some(smart) = &mut dev.smart {
+            smart.critical_warning = 0;
+            smart.warning_flags = vec![
+                "spare_below_threshold".into(),
+                "temperature_exceeded".into(),
+            ];
+        }
+        dev.health_state = rsetup_core::HealthState::Warning;
         app.nvme_status.devices = vec![dev];
 
         let backend = ratatui::backend::TestBackend::new(100, 10);
