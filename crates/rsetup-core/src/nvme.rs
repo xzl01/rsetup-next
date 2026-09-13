@@ -10,6 +10,10 @@ pub enum NvmeError {
     InvalidBufferLength { expected: usize, actual: usize },
     #[error("Device not supported: {0}")]
     NotSupported(String),
+    #[error("NVMe command status error: {0:#x}")]
+    CommandStatus(i32),
+    #[error("NVMe I/O errno: {0}")]
+    IoCode(i32),
     #[error("I/O error: {0}")]
     Io(String),
 }
@@ -216,6 +220,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nvme_admin_result_requires_zero() {
+        assert_eq!(sys::check_admin_result(0, libc::EIO), Ok(()));
+        assert_eq!(sys::check_admin_result(2, libc::EACCES), Err(NvmeError::CommandStatus(2)));
+        assert_eq!(sys::check_admin_result(0x4002, 0), Err(NvmeError::CommandStatus(0x4002)));
+        assert_eq!(sys::check_admin_result(-1, libc::EIO), Err(NvmeError::IoCode(libc::EIO)));
+    }
+
+    #[test]
     fn test_smart_log_parsing_standard() {
         let mut buf = [0u8; 512];
 
@@ -417,14 +429,63 @@ mod tests {
     }
 
     #[test]
+    fn test_sysfs_controller_reading_with_injected_reader() {
+        let root = std::env::temp_dir().join(format!("rsetup-nvme-sys-{}", uuid::Uuid::new_v4()));
+        let ctrl_dir = root.join("sys/class/nvme/nvme0");
+        std::fs::create_dir_all(&ctrl_dir).expect("create ctrl_dir");
+
+        std::fs::write(ctrl_dir.join("model"), "Radxa NVMe SSD 256GB\n").unwrap();
+        std::fs::write(ctrl_dir.join("serial"), "RADXA2026NVME01\n").unwrap();
+        std::fs::write(ctrl_dir.join("firmware_rev"), "V1.00\n").unwrap();
+
+        let ns_dir = ctrl_dir.join("nvme0n1");
+        std::fs::create_dir_all(&ns_dir).expect("create ns_dir");
+        std::fs::write(ns_dir.join("size"), "500118192\n").unwrap();
+
+        // 1. Without injected reader on non-root, read_controller_sysfs delegates to default fixture reader
+        // which rejects reading with NotSupported("fixture requires an injected reader")
+        // and falls back to default SMART log (legacy struct behavior in T2).
+        let dev_default = sys::read_controller_sysfs(&root, "nvme0").expect("read_controller_sysfs");
+        assert_eq!(dev_default.smart.temperature_c, 0.0);
+
+        // 2. With injected reader and call count verification
+        let call_count = std::sync::atomic::AtomicUsize::new(0);
+        let mut fake_buf = [0u8; 512];
+        let temp_k: u16 = 310;
+        fake_buf[1..=2].copy_from_slice(&temp_k.to_le_bytes());
+
+        let reader = |dev_path: &str| {
+            assert_eq!(dev_path, "/dev/nvme0");
+            call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(fake_buf)
+        };
+
+        let device = sys::read_controller_sysfs_with(&root, "nvme0", &reader)
+            .expect("read_controller_sysfs_with");
+
+        assert_eq!(device.name, "nvme0");
+        assert_eq!(device.path, "/dev/nvme0");
+        assert_eq!(device.model, "Radxa NVMe SSD 256GB");
+        assert_eq!(device.serial, "RADXA2026NVME01");
+        assert_eq!(device.firmware, "V1.00");
+        assert_eq!(device.total_bytes, 500118192 * 512);
+
+        // kelvin = 310 -> 310 - 273.15 = 36.85°C
+        assert!((device.smart.temperature_c - 36.85).abs() < 0.001);
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn test_sys_smart_log_graceful_error_on_nonexistent_device() {
         let res = sys::read_smart_log_raw("/dev/nonexistent_nvme_device_xyz");
         assert!(res.is_err());
         match res.unwrap_err() {
-            NvmeError::Io(msg) => {
-                assert!(!msg.is_empty());
+            NvmeError::IoCode(code) => {
+                assert_eq!(code, libc::ENOENT);
             }
-            other => panic!("expected NvmeError::Io, got {:?}", other),
+            other => panic!("expected NvmeError::IoCode, got {:?}", other),
         }
     }
 }

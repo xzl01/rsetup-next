@@ -32,6 +32,18 @@ const NVME_IOCTL_ADMIN_CMD: libc::c_ulong = 0xc0484e41;
 const NVME_ADMIN_OPCODE_GET_LOG_PAGE: u8 = 0x02;
 const NVME_LOG_LID_SMART: u32 = 0x02;
 
+/// Check result of NVMe admin command.
+/// ret == 0: success
+/// ret > 0: NVMe completion status (command error)
+/// ret < 0: errno from ioctl failure
+pub(crate) fn check_admin_result(ret: i32, errno: i32) -> Result<(), NvmeError> {
+    match ret {
+        0 => Ok(()),
+        n if n > 0 => Err(NvmeError::CommandStatus(n)),
+        _ => Err(NvmeError::IoCode(errno)),
+    }
+}
+
 /// Read a trimmed string from a file if it exists.
 fn read_trimmed_attr(path: &Path) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_string())
@@ -61,10 +73,26 @@ fn read_namespaces_total_bytes(ctrl_dir: &Path) -> u64 {
 
 /// Read sysfs controller info and construct an NvmeDevice.
 pub fn read_controller_sysfs(sysfs_root: &Path, ctrl_name: &str) -> Result<NvmeDevice, NvmeError> {
-    let ctrl_dir = if sysfs_root == Path::new("/") {
-        PathBuf::from(format!("/sys/class/nvme/{}", ctrl_name))
+    if sysfs_root == Path::new("/") {
+        read_controller_sysfs_with(sysfs_root, ctrl_name, &read_smart_log_raw)
     } else {
-        sysfs_root.join(format!("sys/class/nvme/{}", ctrl_name))
+        read_controller_sysfs_with(sysfs_root, ctrl_name, &|_| {
+            Err(NvmeError::NotSupported(
+                "fixture requires an injected reader".into(),
+            ))
+        })
+    }
+}
+
+pub(crate) fn read_controller_sysfs_with(
+    root: &Path,
+    name: &str,
+    reader: &dyn Fn(&str) -> Result<[u8; 512], NvmeError>,
+) -> Result<NvmeDevice, NvmeError> {
+    let ctrl_dir = if root == Path::new("/") {
+        PathBuf::from(format!("/sys/class/nvme/{}", name))
+    } else {
+        root.join(format!("sys/class/nvme/{}", name))
     };
 
     if !ctrl_dir.exists() {
@@ -79,11 +107,13 @@ pub fn read_controller_sysfs(sysfs_root: &Path, ctrl_name: &str) -> Result<NvmeD
     let firmware = read_trimmed_attr(&ctrl_dir.join("firmware_rev")).unwrap_or_default();
     let total_bytes = read_namespaces_total_bytes(&ctrl_dir);
 
-    let dev_path = format!("/dev/{}", ctrl_name);
-    let smart = read_smart_log(&dev_path).unwrap_or_default();
+    let dev_path = format!("/dev/{}", name);
+    let smart = reader(&dev_path)
+        .and_then(|buf| parse_smart_log(&buf))
+        .unwrap_or_default();
 
     Ok(NvmeDevice {
-        name: ctrl_name.to_string(),
+        name: name.to_string(),
         path: dev_path,
         model,
         serial,
@@ -93,6 +123,33 @@ pub fn read_controller_sysfs(sysfs_root: &Path, ctrl_name: &str) -> Result<NvmeD
     })
 }
 
+/// Helper struct for RAII file descriptor management.
+struct SafeFd(libc::c_int);
+
+impl SafeFd {
+    fn open_read_only(path: &std::ffi::CStr) -> Result<Self, i32> {
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            let errno = unsafe { *libc::__errno_location() };
+            Err(errno)
+        } else {
+            Ok(Self(fd))
+        }
+    }
+
+    fn as_raw_fd(&self) -> libc::c_int {
+        self.0
+    }
+}
+
+impl Drop for SafeFd {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            unsafe { libc::close(self.0) };
+        }
+    }
+}
+
 /// Read 512-byte SMART/Health log buffer from an NVMe device node via direct Admin passthru ioctl.
 pub fn read_smart_log_raw(dev_path: &str) -> Result<[u8; 512], NvmeError> {
     use std::ffi::CString;
@@ -100,15 +157,9 @@ pub fn read_smart_log_raw(dev_path: &str) -> Result<[u8; 512], NvmeError> {
     let c_path = CString::new(dev_path)
         .map_err(|e| NvmeError::Io(format!("Invalid device path {}: {}", dev_path, e)))?;
 
-    // Open read-only
-    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY) };
-    if fd < 0 {
-        let err = std::io::Error::last_os_error();
-        return Err(NvmeError::Io(format!(
-            "Failed to open {}: {}",
-            dev_path, err
-        )));
-    }
+    // Open read-only with O_CLOEXEC, managed by RAII
+    let fd = SafeFd::open_read_only(&c_path)
+        .map_err(|errno| NvmeError::IoCode(errno))?;
 
     let mut buf = [0u8; 512];
     let num_dwords = (512 / 4) - 1; // 0-based number of Dwords: 127
@@ -135,21 +186,14 @@ pub fn read_smart_log_raw(dev_path: &str) -> Result<[u8; 512], NvmeError> {
         result: 0,
     };
 
-    let ret = unsafe { libc::ioctl(fd, NVME_IOCTL_ADMIN_CMD, &mut cmd) };
-    let ioctl_err = if ret < 0 {
-        Some(std::io::Error::last_os_error())
+    let ret = unsafe { libc::ioctl(fd.as_raw_fd(), NVME_IOCTL_ADMIN_CMD, &mut cmd) };
+    let captured_errno = if ret < 0 {
+        unsafe { *libc::__errno_location() }
     } else {
-        None
+        0
     };
 
-    unsafe { libc::close(fd) };
-
-    if let Some(err) = ioctl_err {
-        return Err(NvmeError::Io(format!(
-            "NVME_IOCTL_ADMIN_CMD failed on {}: {}",
-            dev_path, err
-        )));
-    }
+    check_admin_result(ret, captured_errno)?;
 
     Ok(buf)
 }
