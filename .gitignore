@@ -1,3 +1,6 @@
+# Isolated implementation worktrees
+/.worktrees/
+
 # Rust and desktop build output
 /target
 /apps/desktop/node_modules
