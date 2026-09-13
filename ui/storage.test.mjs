@@ -73,6 +73,8 @@ function createTestContext(overrides = {}) {
     escapeHtml: (str) => String(str || "").replace(/[&<>"']/g, ""),
     formatNumber: (n, d) => Number(n).toFixed(d),
     byteUnit: (b) => `${Math.round(Number(b) / 1024)} KiB`,
+    icon: (name) => `<svg class="icon-${name}"></svg>`,
+    relativeTime: () => "just now",
     t: (key, params) => {
       let value = TEMPLATES[key] || key;
       for (const [name, param] of Object.entries(params || {})) {
@@ -301,4 +303,78 @@ test("storage drawer copy resolves through the storageTool namespace", () => {
   assert.equal(loadI18n("zh-CN").t(copy.title), "存储");
   assert.equal(loadI18n("en-US").t(copy.description), "Monitor NVMe and MMC/eMMC storage health.");
   assert.equal(loadI18n("zh-CN").t(copy.description), "监测 NVMe 与 MMC/eMMC 存储健康状态。");
+});
+
+test("stale cards downgrade health badges to unknown and error objects re-translate on locale render", () => {
+  const i18nEn = loadI18n("en-US");
+  const i18nZh = loadI18n("zh-CN");
+
+  const staleContextEn = createTestContext({
+    state: {
+      hardwareData: {
+        nvme: { initialized: true, devices: [nvmeDevice] },
+        mmc: { initialized: true, devices: [emmcDevice] },
+      },
+      selectedHardware: "storage",
+      storageStale: true,
+      storageRefreshError: { code: "permission_denied", message: "Forbidden" },
+    },
+    t: (key, params) => i18nEn.t(key, params),
+    relativeTime: () => "just now",
+  });
+
+  staleContextEn.context.renderStorageTool();
+  const hostEn = staleContextEn.getElement("[data-hardware-body]");
+  assert.ok(hostEn.innerHTML.includes("Stale data"));
+  assert.ok(!hostEn.innerHTML.includes("nvme-badge-healthy"));
+  assert.ok(hostEn.innerHTML.includes("nvme-badge-unknown"));
+
+  const staleContextZh = createTestContext({
+    state: {
+      hardwareData: {
+        nvme: { initialized: true, devices: [nvmeDevice] },
+        mmc: { initialized: true, devices: [emmcDevice] },
+      },
+      selectedHardware: "storage",
+      storageStale: true,
+      storageRefreshError: { code: "permission_denied", message: "Forbidden" },
+    },
+    t: (key, params) => i18nZh.t(key, params),
+    relativeTime: () => "刚刚",
+  });
+
+  staleContextZh.context.renderStorageTool();
+  const hostZh = staleContextZh.getElement("[data-hardware-body]");
+  assert.ok(hostZh.innerHTML.includes("数据已过期"));
+  assert.ok(!hostZh.innerHTML.includes("nvme-badge-healthy"));
+  assert.ok(hostZh.innerHTML.includes("nvme-badge-unknown"));
+
+  // Initial failure without data re-translates error dynamically per locale
+  const errContextEn = createTestContext({
+    state: {
+      hardwareData: null,
+      selectedHardware: "storage",
+      storageStale: false,
+      storageRefreshError: { code: "request_forbidden", message: "Forbidden" },
+    },
+    t: (key, params) => i18nEn.t(key, params),
+    displayError: (err) => i18nEn.apiError(err.code, err.message),
+    relativeTime: () => "just now",
+  });
+  errContextEn.context.renderStorageTool();
+  assert.ok(errContextEn.getElement("[data-hardware-body]").innerHTML.includes("Open the console"));
+
+  const errContextZh = createTestContext({
+    state: {
+      hardwareData: null,
+      selectedHardware: "storage",
+      storageStale: false,
+      storageRefreshError: { code: "request_forbidden", message: "Forbidden" },
+    },
+    t: (key, params) => i18nZh.t(key, params),
+    displayError: (err) => i18nZh.apiError(err.code, err.message),
+    relativeTime: () => "刚刚",
+  });
+  errContextZh.context.renderStorageTool();
+  assert.ok(errContextZh.getElement("[data-hardware-body]").innerHTML.includes("请通过本机地址"));
 });

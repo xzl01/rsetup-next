@@ -158,6 +158,11 @@ const state = {
   spiFlashImage: null,
   spiFlashPlan: null,
   spiFlashPreviewVersion: 0,
+  storageRefreshPromise: null,
+  storageRefreshing: false,
+  storageRefreshError: null,
+  storageStale: false,
+  storageRefreshedAt: null,
   lastInvoker: null,
   contactInvoker: null,
   route: "overview",
@@ -603,6 +608,7 @@ function dismissDialog(dialog) {
 }
 
 async function refreshAll({ quiet = false } = {}) {
+  if (typeof refreshStorageTool === "function") void refreshStorageTool();
   state.refreshRequested = true;
   if (!quiet) state.refreshLoud = true;
   if (state.refreshPromise) return state.refreshPromise;
@@ -1064,6 +1070,11 @@ async function openHardwareTool(id) {
   state.spiFlashTarget = null;
   state.spiFlashImage = null;
   resetSpiFlashPlan();
+  state.storageRefreshPromise = null;
+  state.storageRefreshing = false;
+  state.storageRefreshError = null;
+  state.storageStale = false;
+  state.storageRefreshedAt = null;
   state.lastInvoker = document.activeElement;
   const copy = hardwareToolCopy(id);
   setText("[data-hardware-tool-title]", copy.title);
@@ -1075,6 +1086,10 @@ async function openHardwareTool(id) {
     drawer.classList.add("is-open");
     $("[data-hardware-close]").focus();
   });
+  if (id === "storage") {
+    void refreshStorageTool();
+    return;
+  }
   try {
     const loaders = {
       "device-tree": () => transport.overlayStatus(),
@@ -1086,7 +1101,6 @@ async function openHardwareTool(id) {
       },
       led: () => transport.ledStatus(),
       "spi-flash": () => transport.spiFlashStatus(),
-      storage: () => transport.storageStatus(),
     };
     const data = await loaders[id]();
     if (state.selectedHardware !== id || state.hardwareLoadVersion !== loadVersion) return;
@@ -1120,6 +1134,11 @@ function closeHardwareTool() {
   state.overlayPlan = null;
   resetSpiFlashPlan();
   resetFanCurvePlan();
+  state.storageRefreshPromise = null;
+  state.storageRefreshing = false;
+  state.storageRefreshError = null;
+  state.storageStale = false;
+  state.storageRefreshedAt = null;
 }
 
 function renderHardwareError(message) {
@@ -1127,7 +1146,8 @@ function renderHardwareError(message) {
 }
 
 function renderHardwareTool() {
-  if (!state.selectedHardware || !state.hardwareData) return;
+  if (!state.selectedHardware) return;
+  if (state.selectedHardware !== "storage" && !state.hardwareData) return;
   const copy = hardwareToolCopy(state.selectedHardware);
   setText("[data-hardware-tool-title]", copy.title);
   setText("[data-hardware-tool-description]", copy.description);
@@ -2315,7 +2335,7 @@ function applyStorageMetricStyles(host) {
 function renderStorageMmcCard(device) {
   const health = device.health || {};
   const typeLabel = device.cardType === "SD" ? t("storageTool.sd") : t("storageTool.emmc");
-  const healthState = device.healthState || "unknown";
+  const healthState = state.storageStale ? "unknown" : (device.healthState || "unknown");
   const badgeClass =
     healthState === "critical"
       ? "nvme-badge-critical"
@@ -2325,15 +2345,17 @@ function renderStorageMmcCard(device) {
           ? "nvme-badge-healthy"
           : "nvme-badge-unknown";
   const healthLabel =
-    healthState === "critical"
-      ? t("storageTool.critical")
-      : healthState === "warning"
-        ? t("storageTool.warning")
-        : healthState === "healthy"
-          ? t("storageTool.healthy")
-          : device.telemetry?.state === "unsupported"
-            ? t("storageTool.unsupported")
-            : t("storageTool.unknown");
+    state.storageStale
+      ? t("storageTool.staleData")
+      : healthState === "critical"
+        ? t("storageTool.critical")
+        : healthState === "warning"
+          ? t("storageTool.warning")
+          : healthState === "healthy"
+            ? t("storageTool.healthy")
+            : device.telemetry?.state === "unsupported"
+              ? t("storageTool.unsupported")
+              : t("storageTool.unknown");
   const preEolLabel =
     health.preEolInfo === 1
       ? t("storageTool.preEolNormal")
@@ -2415,6 +2437,35 @@ function renderStorageMmcCard(device) {
   `;
 }
 
+async function refreshStorageTool() {
+  if (state.selectedHardware !== "storage") return;
+  if (state.storageRefreshPromise) return state.storageRefreshPromise;
+  const version = state.hardwareLoadVersion;
+  state.storageRefreshing = true;
+  let task;
+  const current = () => state.selectedHardware === "storage"
+    && state.hardwareLoadVersion === version && state.storageRefreshPromise === task;
+  task = Promise.resolve().then(() => transport.storageStatus()).then((data) => {
+    if (!current()) return;
+    state.hardwareData = data;
+    state.storageRefreshError = null;
+    state.storageStale = false;
+    state.storageRefreshedAt = Date.now();
+  }).catch((error) => {
+    if (!current()) return;
+    state.storageRefreshError = error;
+    state.storageStale = state.hardwareData !== null;
+  }).finally(() => {
+    if (!current()) return;
+    state.storageRefreshing = false;
+    state.storageRefreshPromise = null;
+    renderHardwareTool();
+  });
+  state.storageRefreshPromise = task;
+  renderHardwareTool();
+  return task;
+}
+
 function renderStorageTool() {
   const data = state.hardwareData;
   const host = $("[data-hardware-body]");
@@ -2425,12 +2476,74 @@ function renderStorageTool() {
   const nvmeDevices = nvme?.initialized ? nvme.devices || [] : [];
   const mmcDevices = mmc?.initialized ? mmc.devices || [] : [];
 
+  const refreshBtn = `
+    <button class="secondary-button storage-refresh-button" type="button" data-storage-refresh ${state.storageRefreshing ? "disabled" : ""}>
+      <svg aria-hidden="true"><use href="#icon-refresh"></use></svg>
+      <span>${escapeHtml(state.storageRefreshing ? t("storageTool.refreshing") : t("storageTool.refresh"))}</span>
+    </button>
+  `;
+
+  const refreshInfo = state.storageRefreshedAt
+    ? t("storageTool.refreshedAt", { time: relativeTime(state.storageRefreshedAt) })
+    : "";
+
+  const toolbar = `
+    <div class="storage-toolbar">
+      <div class="storage-toolbar-info">
+        <span>${escapeHtml(t("storageTool.title"))}</span>
+        ${refreshInfo ? `<b>${escapeHtml(refreshInfo)}</b>` : ""}
+      </div>
+      ${refreshBtn}
+    </div>
+  `;
+
+  const staleBanner = state.storageStale ? `
+    <div class="storage-stale-banner" role="alert">
+      ${icon("pulse")}
+      <span>${escapeHtml(t("storageTool.staleData"))}</span>
+    </div>
+  ` : "";
+
+  const wireEvents = () => {
+    const btn = $("[data-storage-refresh]", host);
+    if (btn) btn.onclick = () => void refreshStorageTool();
+    const retryBtn = $("[data-storage-retry]", host);
+    if (retryBtn) retryBtn.onclick = () => void refreshStorageTool();
+  };
+
+  if (!data) {
+    if (state.storageRefreshError) {
+      host.innerHTML = `
+        ${toolbar}
+        <div class="storage-retry-box">
+          ${icon("pulse")}
+          <strong>${escapeHtml(t("toast.failed"))}</strong>
+          <span>${escapeHtml(displayError(state.storageRefreshError))}</span>
+          <button class="secondary-button" type="button" data-storage-retry>${escapeHtml(t("storageTool.retry"))}</button>
+        </div>
+      `;
+      wireEvents();
+      return;
+    }
+    host.innerHTML = `
+      ${toolbar}
+      <div class="hardware-tool-loading"><span></span><span>${escapeHtml(t("hardware.loading"))}</span></div>
+    `;
+    wireEvents();
+    return;
+  }
+
   if (nvmeDevices.length === 0 && mmcDevices.length === 0) {
     const message =
       !(nvme?.initialized) && !(mmc?.initialized)
         ? t("storageTool.uninitialized")
         : t("storageTool.noDevices");
-    host.innerHTML = `<div class="hardware-tool-empty">${escapeHtml(message)}</div>`;
+    host.innerHTML = `
+      ${toolbar}
+      ${staleBanner}
+      <div class="hardware-tool-empty">${escapeHtml(message)}</div>
+    `;
+    wireEvents();
     return;
   }
 
@@ -2439,6 +2552,8 @@ function renderStorageTool() {
   if (mmcDevices.length > 0) parts.push(t("storageTool.countMmc", { count: mmcDevices.length }));
 
   host.innerHTML = `
+    ${toolbar}
+    ${staleBanner}
     <div class="tool-fact-line">
       <span>${escapeHtml(t("storageTool.description"))}</span>
       <b>${escapeHtml(parts.join(" · "))}</b>
@@ -2448,12 +2563,13 @@ function renderStorageTool() {
       ${mmcDevices.map((dev) => renderStorageMmcCard(dev)).join("")}
     </div>
   `;
+  wireEvents();
   applyStorageMetricStyles(host);
 }
 
 function renderNvmeDeviceCard(device) {
   const smart = device.smart;
-  const healthState = device.healthState || "unknown";
+  const healthState = state.storageStale ? "unknown" : (device.healthState || "unknown");
   const badgeClass =
     healthState === "critical"
       ? "nvme-badge-critical"
@@ -2464,19 +2580,21 @@ function renderNvmeDeviceCard(device) {
           : "nvme-badge-unknown";
 
   const healthLabel =
-    healthState === "critical"
-      ? t("nvme.critical")
-      : healthState === "warning"
-        ? (smart?.warningFlags?.join(", ") || t("nvme.warning"))
-        : healthState === "healthy"
-          ? t("nvme.healthy")
-          : device.telemetry?.error?.kind === "permission_denied"
-            ? t("storageTool.permissionDenied")
-            : device.telemetry?.error?.kind === "nvme_status"
-              ? `${t("storageTool.protocolError")} (${device.telemetry.error.code ?? 0})`
-              : device.telemetry?.state === "unavailable"
-                ? t("storageTool.unavailable")
-                : t("storageTool.unknown");
+    state.storageStale
+      ? t("storageTool.staleData")
+      : healthState === "critical"
+        ? t("nvme.critical")
+        : healthState === "warning"
+          ? (smart?.warningFlags?.join(", ") || t("nvme.warning"))
+          : healthState === "healthy"
+            ? t("nvme.healthy")
+            : device.telemetry?.error?.kind === "permission_denied"
+              ? t("storageTool.permissionDenied")
+              : device.telemetry?.error?.kind === "nvme_status"
+                ? `${t("storageTool.protocolError")} (${device.telemetry.error.code ?? 0})`
+                : device.telemetry?.state === "unavailable"
+                  ? t("storageTool.unavailable")
+                  : t("storageTool.unknown");
 
   if (!smart) {
     return `

@@ -249,6 +249,16 @@ const EXPECTED = {
     "storageTool.healthy": "Healthy",
     "storageTool.warning": "Warning",
     "storageTool.critical": "Critical",
+    "storageTool.unknown": "Unknown",
+    "storageTool.unavailable": "Unavailable",
+    "storageTool.unsupported": "Health telemetry unsupported",
+    "storageTool.permissionDenied": "Permission denied (EACCES/EPERM)",
+    "storageTool.protocolError": "Protocol status error",
+    "storageTool.refresh": "Refresh",
+    "storageTool.refreshing": "Refreshing…",
+    "storageTool.refreshedAt": "Refreshed {time}",
+    "storageTool.staleData": "Stale data",
+    "storageTool.retry": "Retry",
   },
   "zh-CN": {
     "storageTool.title": "存储",
@@ -275,6 +285,16 @@ const EXPECTED = {
     "storageTool.healthy": "健康",
     "storageTool.warning": "预警",
     "storageTool.critical": "严重",
+    "storageTool.unknown": "未知",
+    "storageTool.unavailable": "不可读取",
+    "storageTool.unsupported": "不支持健康指标",
+    "storageTool.permissionDenied": "权限不足 (EACCES/EPERM)",
+    "storageTool.protocolError": "协议状态错误",
+    "storageTool.refresh": "刷新",
+    "storageTool.refreshing": "正在刷新…",
+    "storageTool.refreshedAt": "刷新时间 {time}",
+    "storageTool.staleData": "数据已过期",
+    "storageTool.retry": "重试",
   },
 };
 
@@ -284,6 +304,8 @@ test("storage tool keys exist in both languages with exact copy", () => {
     for (const [key, expected] of Object.entries(table)) {
       if (expected.includes("{count}")) {
         assert.equal(i18n.t(key, { count: 3 }), expected.replace("{count}", "3"), `${language} ${key}`);
+      } else if (expected.includes("{time}")) {
+        assert.equal(i18n.t(key, { time: "just now" }), expected.replace("{time}", "just now"), `${language} ${key}`);
       } else {
         assert.equal(i18n.t(key), expected, `${language} ${key}`);
       }
