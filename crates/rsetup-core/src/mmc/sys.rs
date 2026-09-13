@@ -88,6 +88,33 @@ pub fn parse_ext_csd(buf: &[u8; 512]) -> MmcExtCsd {
     }
 }
 
+/// Helper struct for RAII file descriptor management.
+struct SafeFd(libc::c_int);
+
+impl SafeFd {
+    fn open_read_only(path: &std::ffi::CStr) -> Result<Self, i32> {
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            let errno = unsafe { *libc::__errno_location() };
+            Err(errno)
+        } else {
+            Ok(Self(fd))
+        }
+    }
+
+    fn as_raw_fd(&self) -> libc::c_int {
+        self.0
+    }
+}
+
+impl Drop for SafeFd {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            unsafe { libc::close(self.0) };
+        }
+    }
+}
+
 /// Read the full 512-byte EXT_CSD register from an MMC block device node
 /// (e.g. `/dev/mmcblk0`) via the direct `MMC_IOC_CMD` ioctl. Read-only;
 /// same style as `nvme/sys.rs::read_smart_log_raw`.
@@ -97,15 +124,8 @@ pub fn read_ext_csd_raw(dev_path: &str) -> Result<[u8; 512], MmcError> {
     let c_path = CString::new(dev_path)
         .map_err(|e| MmcError::Io(format!("Invalid device path {}: {}", dev_path, e)))?;
 
-    // Open read-only
-    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY) };
-    if fd < 0 {
-        let err = std::io::Error::last_os_error();
-        return Err(MmcError::Io(format!(
-            "Failed to open {}: {}",
-            dev_path, err
-        )));
-    }
+    // Open read-only with O_CLOEXEC, managed by RAII
+    let fd = SafeFd::open_read_only(&c_path).map_err(MmcError::IoCode)?;
 
     let mut buf = [0u8; 512];
 
@@ -126,20 +146,10 @@ pub fn read_ext_csd_raw(dev_path: &str) -> Result<[u8; 512], MmcError> {
         data_ptr: buf.as_mut_ptr() as u64,
     };
 
-    let ret = unsafe { libc::ioctl(fd, MMC_IOC_CMD, &mut cmd) };
-    let ioctl_err = if ret < 0 {
-        Some(std::io::Error::last_os_error())
-    } else {
-        None
-    };
-
-    unsafe { libc::close(fd) };
-
-    if let Some(err) = ioctl_err {
-        return Err(MmcError::Io(format!(
-            "MMC_IOC_CMD failed on {}: {}",
-            dev_path, err
-        )));
+    let ret = unsafe { libc::ioctl(fd.as_raw_fd(), MMC_IOC_CMD, &mut cmd) };
+    if ret < 0 {
+        let errno = unsafe { *libc::__errno_location() };
+        return Err(MmcError::IoCode(errno));
     }
 
     Ok(buf)
@@ -178,6 +188,22 @@ pub fn is_primary_mmcblk(name: &str) -> bool {
 
 /// Read sysfs MMC/SD device info and construct an MmcDevice.
 pub fn read_device_sysfs(sysfs_root: &Path, dev_name: &str) -> Result<MmcDevice, MmcError> {
+    if sysfs_root == Path::new("/") {
+        read_device_sysfs_with(sysfs_root, dev_name, &read_ext_csd_raw)
+    } else {
+        read_device_sysfs_with(sysfs_root, dev_name, &|_| {
+            Err(MmcError::NotSupported(
+                "fixture requires an injected reader".into(),
+            ))
+        })
+    }
+}
+
+pub(crate) fn read_device_sysfs_with(
+    sysfs_root: &Path,
+    dev_name: &str,
+    reader: &dyn Fn(&str) -> Result<[u8; 512], MmcError>,
+) -> Result<MmcDevice, MmcError> {
     let dev_dir = if sysfs_root == Path::new("/") {
         PathBuf::from(format!("/sys/bus/mmc/devices/{}", dev_name))
     } else {
@@ -249,16 +275,23 @@ pub fn read_device_sysfs(sysfs_root: &Path, dev_name: &str) -> Result<MmcDevice,
         (String::new(), 0)
     };
 
-    // Fallback: when sysfs exposes no life time / pre-EOL info at all, try
-    // reading EXT_CSD directly from the block device via MMC_IOC_CMD. On
-    // failure, silently keep the sysfs results (unwrap_or_default semantics)
-    // — no error logging, device probing is unaffected.
-    if life_a.is_none() && life_b.is_none() && pre_eol == 0 && !block_path.is_empty() {
-        if let Ok(buf) = read_ext_csd_raw(&block_path) {
+    // Fallback: only when card_type == "MMC", all health attributes in sysfs are unknown/missing,
+    // and primary block device exists. SD cards must NEVER issue EXT_CSD ioctl.
+    if card_type == "MMC" && life_a.is_none() && life_b.is_none() && pre_eol == 0 && !block_path.is_empty() {
+        if let Ok(buf) = reader(&block_path) {
             let ext = parse_ext_csd(&buf);
-            pre_eol = ext.pre_eol_info;
-            life_a = map_life_time_byte_to_percent(ext.life_time_est_typ_a);
-            life_b = map_life_time_byte_to_percent(ext.life_time_est_typ_b);
+            // rev < 7 does not interpret health bytes; rev >= 7 interprets
+            if ext.rev >= 7 {
+                // pre-EOL non-1/2/3 normalized to 0
+                pre_eol = match ext.pre_eol_info {
+                    1 => 1,
+                    2 => 2,
+                    3 => 3,
+                    _ => 0,
+                };
+                life_a = map_life_time_byte_to_percent(ext.life_time_est_typ_a);
+                life_b = map_life_time_byte_to_percent(ext.life_time_est_typ_b);
+            }
 
             if firmware.is_empty() {
                 let end = ext
@@ -332,6 +365,191 @@ mod tests {
     #[test]
     fn test_read_ext_csd_raw_nonexistent_device() {
         let res = read_ext_csd_raw("/dev/nonexistent_mmc_device_xyz");
-        assert!(matches!(res, Err(MmcError::Io(_))));
+        assert!(matches!(res, Err(MmcError::Io(_)) | Err(MmcError::IoCode(_))));
+    }
+
+    fn card_fixture(card_type: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("rsetup-storage-{}", uuid::Uuid::new_v4()));
+        let card = root.join("sys/bus/mmc/devices/mmc0:0001");
+        std::fs::create_dir_all(card.join("block/mmcblk0")).unwrap();
+        std::fs::write(card.join("type"), card_type).unwrap();
+        std::fs::write(card.join("name"), "FIXTURE").unwrap();
+        let block = root.join("sys/class/block/mmcblk0");
+        std::fs::create_dir_all(&block).unwrap();
+        std::fs::write(block.join("size"), "4096").unwrap();
+        root
+    }
+
+    #[test]
+    fn sd_never_calls_ext_csd_reader() {
+        let root = card_fixture("SD");
+        let forbidden = |_: &str| -> Result<[u8; 512], MmcError> {
+            panic!("SD must not issue eMMC CMD8");
+        };
+        let device = read_device_sysfs_with(&root, "mmc0:0001", &forbidden).unwrap();
+        assert_eq!(device.card_type, "SD");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ext_csd_invocation_counts_and_parser_matrix() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // 1. MMC missing health attributes -> calls reader exactly 1 time, parses successfully
+        {
+            let root = card_fixture("MMC");
+            let count = AtomicUsize::new(0);
+            let fake_reader = |path: &str| -> Result<[u8; 512], MmcError> {
+                assert_eq!(path, "/dev/mmcblk0");
+                count.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 512];
+                buf[192] = 7;    // rev = 7
+                buf[267] = 2;    // pre_eol_info = 2
+                buf[268] = 0x0A; // life_a = 0x0A -> 100%
+                buf[269] = 0x0B; // life_b = 0x0B -> 101%
+                Ok(buf)
+            };
+            let dev = read_device_sysfs_with(&root, "mmc0:0001", &fake_reader).unwrap();
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+            assert_eq!(dev.health.pre_eol_info, 2);
+            assert_eq!(dev.health.life_time_est_a_percent, Some(100));
+            assert_eq!(dev.health.life_time_est_b_percent, Some(101));
+            assert_eq!(
+                dev.health.warning_flags,
+                vec!["pre_eol_warning".to_string(), "life_time_typ_b_exceeded".to_string()]
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        // 2. MMC with valid life_time in sysfs -> 0 calls to reader
+        {
+            let root = card_fixture("MMC");
+            let card = root.join("sys/bus/mmc/devices/mmc0:0001");
+            std::fs::write(card.join("life_time"), "0x01 0x01\n").unwrap();
+            let count = AtomicUsize::new(0);
+            let reader = |_: &str| -> Result<[u8; 512], MmcError> {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok([0u8; 512])
+            };
+            let dev = read_device_sysfs_with(&root, "mmc0:0001", &reader).unwrap();
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+            assert_eq!(dev.health.life_time_est_a_percent, Some(10));
+            assert_eq!(dev.health.life_time_est_b_percent, Some(10));
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        // 3. MMC with valid pre_eol_info in sysfs -> 0 calls to reader
+        {
+            let root = card_fixture("MMC");
+            let card = root.join("sys/bus/mmc/devices/mmc0:0001");
+            std::fs::write(card.join("pre_eol_info"), "1\n").unwrap();
+            let count = AtomicUsize::new(0);
+            let reader = |_: &str| -> Result<[u8; 512], MmcError> {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok([0u8; 512])
+            };
+            let dev = read_device_sysfs_with(&root, "mmc0:0001", &reader).unwrap();
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+            assert_eq!(dev.health.pre_eol_info, 1);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        // 4. SD -> 0 calls to reader
+        {
+            let root = card_fixture("SD");
+            let count = AtomicUsize::new(0);
+            let reader = |_: &str| -> Result<[u8; 512], MmcError> {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok([0u8; 512])
+            };
+            let dev = read_device_sysfs_with(&root, "mmc0:0001", &reader).unwrap();
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+            assert_eq!(dev.card_type, "SD");
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        // 5. SDIO -> filtered out before fallback (Err NotSupported), 0 calls
+        {
+            let root = card_fixture("SDIO");
+            let count = AtomicUsize::new(0);
+            let reader = |_: &str| -> Result<[u8; 512], MmcError> {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok([0u8; 512])
+            };
+            let res = read_device_sysfs_with(&root, "mmc0:0001", &reader);
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+            assert!(matches!(res, Err(MmcError::NotSupported(_))));
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        // 6. MMC with no block device -> 0 calls to reader
+        {
+            let root = std::env::temp_dir().join(format!("rsetup-storage-{}", uuid::Uuid::new_v4()));
+            let card = root.join("sys/bus/mmc/devices/mmc0:0001");
+            std::fs::create_dir_all(&card).unwrap();
+            std::fs::write(card.join("type"), "MMC").unwrap();
+            std::fs::write(card.join("name"), "NO_BLOCK").unwrap();
+            let count = AtomicUsize::new(0);
+            let reader = |_: &str| -> Result<[u8; 512], MmcError> {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok([0u8; 512])
+            };
+            let dev = read_device_sysfs_with(&root, "mmc0:0001", &reader).unwrap();
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+            assert_eq!(dev.block_path, "");
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        // 7. MMC with only boot / rpmb / partition -> does not select as primary block, 0 calls
+        {
+            let root = std::env::temp_dir().join(format!("rsetup-storage-{}", uuid::Uuid::new_v4()));
+            let card = root.join("sys/bus/mmc/devices/mmc0:0001");
+            std::fs::create_dir_all(card.join("block/mmcblk0boot0")).unwrap();
+            std::fs::create_dir_all(card.join("block/mmcblk0rpmb")).unwrap();
+            std::fs::create_dir_all(card.join("block/mmcblk0p1")).unwrap();
+            std::fs::write(card.join("type"), "MMC").unwrap();
+            let count = AtomicUsize::new(0);
+            let reader = |_: &str| -> Result<[u8; 512], MmcError> {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok([0u8; 512])
+            };
+            let dev = read_device_sysfs_with(&root, "mmc0:0001", &reader).unwrap();
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+            assert_eq!(dev.block_path, "");
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        // 8. rev < 7 does not interpret health bytes; rev >= 7 interprets; pre-EOL non-1/2/3 normalized to 0; reserved lifetime is None
+        {
+            let root = card_fixture("MMC");
+            let reader_rev6 = |_: &str| -> Result<[u8; 512], MmcError> {
+                let mut buf = [0u8; 512];
+                buf[192] = 6;    // rev < 7
+                buf[267] = 2;
+                buf[268] = 0x05;
+                buf[269] = 0x06;
+                Ok(buf)
+            };
+            let dev_rev6 = read_device_sysfs_with(&root, "mmc0:0001", &reader_rev6).unwrap();
+            assert_eq!(dev_rev6.health.pre_eol_info, 0);
+            assert_eq!(dev_rev6.health.life_time_est_a_percent, None);
+            assert_eq!(dev_rev6.health.life_time_est_b_percent, None);
+
+            // rev 7 with invalid pre_eol (e.g. 4) and reserved lifetime (0x0C)
+            let reader_rev7_reserved = |_: &str| -> Result<[u8; 512], MmcError> {
+                let mut buf = [0u8; 512];
+                buf[192] = 7;
+                buf[267] = 4;    // invalid pre-EOL -> normalized to 0
+                buf[268] = 0x0C; // reserved -> None
+                buf[269] = 0x00; // not defined -> None
+                Ok(buf)
+            };
+            let dev_rev7 = read_device_sysfs_with(&root, "mmc0:0001", &reader_rev7_reserved).unwrap();
+            assert_eq!(dev_rev7.health.pre_eol_info, 0);
+            assert_eq!(dev_rev7.health.life_time_est_a_percent, None);
+            assert_eq!(dev_rev7.health.life_time_est_b_percent, None);
+
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 }

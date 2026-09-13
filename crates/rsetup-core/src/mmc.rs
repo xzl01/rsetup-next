@@ -10,6 +10,8 @@ pub enum MmcError {
     InvalidBufferLength { expected: usize, actual: usize },
     #[error("Device not supported: {0}")]
     NotSupported(String),
+    #[error("MMC I/O errno: {0}")]
+    IoCode(i32),
     #[error("I/O error: {0}")]
     Io(String),
 }
@@ -191,10 +193,10 @@ pub fn generate_warning_flags(pre_eol: u8, life_a: Option<u8>, life_b: Option<u8
         flags.push("pre_eol_urgent".to_string());
     }
 
-    if life_a.map(|v| v >= 100).unwrap_or(false) {
+    if life_a.map(|v| v > 100).unwrap_or(false) {
         flags.push("life_time_typ_a_exceeded".to_string());
     }
-    if life_b.map(|v| v >= 100).unwrap_or(false) {
+    if life_b.map(|v| v > 100).unwrap_or(false) {
         flags.push("life_time_typ_b_exceeded".to_string());
     }
 
@@ -280,7 +282,7 @@ mod tests {
         // Typ A exceeded
         assert_eq!(
             generate_warning_flags(1, Some(100), Some(60)),
-            vec!["life_time_typ_a_exceeded".to_string()]
+            Vec::<String>::new()
         );
         assert_eq!(
             generate_warning_flags(1, Some(101), Some(60)),
@@ -290,18 +292,46 @@ mod tests {
         // Typ B exceeded
         assert_eq!(
             generate_warning_flags(1, Some(50), Some(100)),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            generate_warning_flags(1, Some(50), Some(101)),
             vec!["life_time_typ_b_exceeded".to_string()]
         );
 
         // All flags
         assert_eq!(
-            generate_warning_flags(3, Some(100), Some(101)),
+            generate_warning_flags(3, Some(101), Some(101)),
             vec![
                 "pre_eol_urgent".to_string(),
                 "life_time_typ_a_exceeded".to_string(),
                 "life_time_typ_b_exceeded".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn mmc_life_0a_is_not_exceeded_but_0b_is() {
+        use crate::model::{HealthState, MmcHealth, TelemetryReadState, TelemetryStatus};
+        let ready = TelemetryStatus {
+            state: TelemetryReadState::Available,
+            error: None,
+        };
+        for (raw, expected) in [(0x0A, HealthState::Warning), (0x0B, HealthState::Critical)] {
+            let a = map_life_time_byte_to_percent(raw);
+            let flags = generate_warning_flags(1, a, None);
+            assert_eq!(
+                flags.iter().any(|f| f == "life_time_typ_a_exceeded"),
+                raw == 0x0B
+            );
+            let h = MmcHealth {
+                pre_eol_info: 1,
+                life_time_est_a_percent: a,
+                life_time_est_b_percent: None,
+                warning_flags: flags,
+            };
+            assert_eq!(crate::mmc_health_state(&ready, &h), expected);
+        }
     }
 
     #[test]
