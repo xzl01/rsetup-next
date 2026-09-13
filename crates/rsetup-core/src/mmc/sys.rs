@@ -3,8 +3,7 @@ use super::{
     parse_life_time_str, parse_pre_eol_info_str,
 };
 use crate::model::{
-    MmcDevice, MmcHealth, TelemetryError, TelemetryErrorKind,
-    TelemetryReadState, TelemetryStatus,
+    MmcDevice, MmcHealth, TelemetryError, TelemetryErrorKind, TelemetryReadState, TelemetryStatus,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -429,7 +428,10 @@ mod tests {
     #[test]
     fn test_read_ext_csd_raw_nonexistent_device() {
         let res = read_ext_csd_raw("/dev/nonexistent_mmc_device_xyz");
-        assert!(matches!(res, Err(MmcError::Io(_)) | Err(MmcError::IoCode(_))));
+        assert!(matches!(
+            res,
+            Err(MmcError::Io(_)) | Err(MmcError::IoCode(_))
+        ));
     }
 
     fn card_fixture(card_type: &str) -> std::path::PathBuf {
@@ -467,8 +469,8 @@ mod tests {
                 assert_eq!(path, "/dev/mmcblk0");
                 count.fetch_add(1, Ordering::SeqCst);
                 let mut buf = [0u8; 512];
-                buf[192] = 7;    // rev = 7
-                buf[267] = 2;    // pre_eol_info = 2
+                buf[192] = 7; // rev = 7
+                buf[267] = 2; // pre_eol_info = 2
                 buf[268] = 0x0A; // life_a = 0x0A -> 100%
                 buf[269] = 0x0B; // life_b = 0x0B -> 101%
                 Ok(buf)
@@ -480,7 +482,10 @@ mod tests {
             assert_eq!(dev.health.life_time_est_b_percent, Some(101));
             assert_eq!(
                 dev.health.warning_flags,
-                vec!["pre_eol_warning".to_string(), "life_time_typ_b_exceeded".to_string()]
+                vec![
+                    "pre_eol_warning".to_string(),
+                    "life_time_typ_b_exceeded".to_string()
+                ]
             );
             std::fs::remove_dir_all(root).unwrap();
         }
@@ -548,7 +553,8 @@ mod tests {
 
         // 6. MMC with no block device -> 0 calls to reader
         {
-            let root = std::env::temp_dir().join(format!("rsetup-storage-{}", uuid::Uuid::new_v4()));
+            let root =
+                std::env::temp_dir().join(format!("rsetup-storage-{}", uuid::Uuid::new_v4()));
             let card = root.join("sys/bus/mmc/devices/mmc0:0001");
             std::fs::create_dir_all(&card).unwrap();
             std::fs::write(card.join("type"), "MMC").unwrap();
@@ -566,7 +572,8 @@ mod tests {
 
         // 7. MMC with only boot / rpmb / partition -> does not select as primary block, 0 calls
         {
-            let root = std::env::temp_dir().join(format!("rsetup-storage-{}", uuid::Uuid::new_v4()));
+            let root =
+                std::env::temp_dir().join(format!("rsetup-storage-{}", uuid::Uuid::new_v4()));
             let card = root.join("sys/bus/mmc/devices/mmc0:0001");
             std::fs::create_dir_all(card.join("block/mmcblk0boot0")).unwrap();
             std::fs::create_dir_all(card.join("block/mmcblk0rpmb")).unwrap();
@@ -588,7 +595,7 @@ mod tests {
             let root = card_fixture("MMC");
             let reader_rev6 = |_: &str| -> Result<[u8; 512], MmcError> {
                 let mut buf = [0u8; 512];
-                buf[192] = 6;    // rev < 7
+                buf[192] = 6; // rev < 7
                 buf[267] = 2;
                 buf[268] = 0x05;
                 buf[269] = 0x06;
@@ -603,12 +610,13 @@ mod tests {
             let reader_rev7_reserved = |_: &str| -> Result<[u8; 512], MmcError> {
                 let mut buf = [0u8; 512];
                 buf[192] = 7;
-                buf[267] = 4;    // invalid pre-EOL -> normalized to 0
+                buf[267] = 4; // invalid pre-EOL -> normalized to 0
                 buf[268] = 0x0C; // reserved -> None
                 buf[269] = 0x00; // not defined -> None
                 Ok(buf)
             };
-            let dev_rev7 = read_device_sysfs_with(&root, "mmc0:0001", &reader_rev7_reserved).unwrap();
+            let dev_rev7 =
+                read_device_sysfs_with(&root, "mmc0:0001", &reader_rev7_reserved).unwrap();
             assert_eq!(dev_rev7.health.pre_eol_info, 0);
             assert_eq!(dev_rev7.health.life_time_est_a_percent, None);
             assert_eq!(dev_rev7.health.life_time_est_b_percent, None);

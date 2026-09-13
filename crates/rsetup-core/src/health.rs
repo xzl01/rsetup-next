@@ -293,4 +293,75 @@ mod tests {
             r#"{"kind":"nvme_status","code":7}"#
         );
     }
+
+    #[test]
+    fn real_generate_warning_flags_produces_consistent_health_state_and_serialization() {
+        use crate::mmc::generate_warning_flags;
+        use crate::model::MmcDevice;
+
+        let ready = TelemetryStatus {
+            state: TelemetryReadState::Available,
+            error: None,
+        };
+
+        // 1. pre_eol=2 (warning), 0x0A (100% endurance, not exceeded)
+        let flags_0a = generate_warning_flags(2, Some(100), Some(50));
+        assert_eq!(flags_0a, vec!["pre_eol_warning".to_string()]);
+        let health_0a = MmcHealth {
+            pre_eol_info: 2,
+            life_time_est_a_percent: Some(100),
+            life_time_est_b_percent: Some(50),
+            warning_flags: flags_0a.clone(),
+        };
+        let state_0a = mmc_health_state(&ready, &health_0a);
+        assert_eq!(state_0a, HealthState::Warning);
+
+        let dev_0a = MmcDevice {
+            name: "mmcblk0".into(),
+            block_path: "/dev/mmcblk0".into(),
+            card_type: "MMC".into(),
+            model: "EMMC_TEST".into(),
+            manufacturer: "Test".into(),
+            serial: "123".into(),
+            firmware: "1".into(),
+            total_bytes: 64_000_000_000,
+            health: health_0a,
+            telemetry: ready.clone(),
+            health_state: state_0a,
+        };
+        let json_0a = serde_json::to_string(&dev_0a).unwrap();
+        assert!(json_0a.contains(r#""healthState":"warning""#));
+        assert!(json_0a.contains(r#""warningFlags":["pre_eol_warning"]"#));
+        assert!(json_0a.contains(r#""lifeTimeEstAPercent":100"#));
+
+        // 2. 0x0B (101% endurance -> life_time_typ_a_exceeded -> Critical)
+        let flags_0b = generate_warning_flags(1, Some(101), Some(50));
+        assert_eq!(flags_0b, vec!["life_time_typ_a_exceeded".to_string()]);
+        let health_0b = MmcHealth {
+            pre_eol_info: 1,
+            life_time_est_a_percent: Some(101),
+            life_time_est_b_percent: Some(50),
+            warning_flags: flags_0b.clone(),
+        };
+        let state_0b = mmc_health_state(&ready, &health_0b);
+        assert_eq!(state_0b, HealthState::Critical);
+
+        let dev_0b = MmcDevice {
+            name: "mmcblk0".into(),
+            block_path: "/dev/mmcblk0".into(),
+            card_type: "MMC".into(),
+            model: "EMMC_TEST".into(),
+            manufacturer: "Test".into(),
+            serial: "123".into(),
+            firmware: "1".into(),
+            total_bytes: 64_000_000_000,
+            health: health_0b,
+            telemetry: ready,
+            health_state: state_0b,
+        };
+        let json_0b = serde_json::to_string(&dev_0b).unwrap();
+        assert!(json_0b.contains(r#""healthState":"critical""#));
+        assert!(json_0b.contains(r#""warningFlags":["life_time_typ_a_exceeded"]"#));
+        assert!(json_0b.contains(r#""lifeTimeEstAPercent":101"#));
+    }
 }

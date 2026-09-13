@@ -1,7 +1,7 @@
 use super::{NvmeError, parse_smart_log};
 use crate::model::{
-    NvmeDevice, NvmeSmartLog, TelemetryError, TelemetryErrorKind,
-    TelemetryReadState, TelemetryStatus,
+    NvmeDevice, NvmeSmartLog, TelemetryError, TelemetryErrorKind, TelemetryReadState,
+    TelemetryStatus,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -200,8 +200,7 @@ pub fn read_smart_log_raw(dev_path: &str) -> Result<[u8; 512], NvmeError> {
         .map_err(|e| NvmeError::Io(format!("Invalid device path {}: {}", dev_path, e)))?;
 
     // Open read-only with O_CLOEXEC, managed by RAII
-    let fd = SafeFd::open_read_only(&c_path)
-        .map_err(|errno| NvmeError::IoCode(errno))?;
+    let fd = SafeFd::open_read_only(&c_path).map_err(NvmeError::IoCode)?;
 
     let mut buf = [0u8; 512];
     let num_dwords = (512 / 4) - 1; // 0-based number of Dwords: 127

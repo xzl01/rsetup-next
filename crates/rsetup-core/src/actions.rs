@@ -1,8 +1,8 @@
 use crate::{
     ActionRun, ActionSpec, ActionStatus, ActivityEvent, HealthState, MmcDevice, MmcHealth,
-    MmcStatus, NvmeDevice, NvmeSmartLog, NvmeStatus, ProbeMode, RiskLevel,
-    SourceApplyResult, SourceError, SourcePlan, SourceStatus, StorageStatus,
-    TelemetryReadState, TelemetryStatus, collect_snapshot,
+    MmcStatus, NvmeDevice, NvmeSmartLog, NvmeStatus, ProbeMode, RiskLevel, SourceApplyResult,
+    SourceError, SourcePlan, SourceStatus, StorageStatus, TelemetryReadState, TelemetryStatus,
+    collect_snapshot,
     fan_curve::{
         FanCurveApplyResult, FanCurveManager, FanCurvePlan, FanCurveRequest, FanCurveStatus,
         FanCurveTick,
@@ -2226,7 +2226,10 @@ mod tests {
 
         // Second call on SAME controller instance
         let s2 = controller.storage_status().expect("second storage status");
-        assert_eq!(s2.nvme.devices[0].smart.as_ref().unwrap().temperature_c, 71.0);
+        assert_eq!(
+            s2.nvme.devices[0].smart.as_ref().unwrap().temperature_c,
+            71.0
+        );
         assert!(s2.mmc.devices.is_empty());
         assert!(!s2.mmc.initialized);
     }
@@ -2234,11 +2237,8 @@ mod tests {
     #[test]
     fn controller_demo_mode_never_invokes_storage_reader() {
         let panicking = Arc::new(PanickingStorageReader);
-        let controller = Controller::with_storage_reader(
-            ProbeMode::Demo,
-            ExecutionPolicy::DryRun,
-            panicking,
-        );
+        let controller =
+            Controller::with_storage_reader(ProbeMode::Demo, ExecutionPolicy::DryRun, panicking);
 
         let nvme = controller.nvme_status().expect("demo nvme");
         assert!(nvme.initialized);

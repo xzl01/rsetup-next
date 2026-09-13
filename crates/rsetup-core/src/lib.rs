@@ -37,12 +37,12 @@ pub use model::{
 pub use nvme::{NvmeError, NvmeManager};
 pub use probe::collect_snapshot;
 pub use sources::{
-    provider_catalog, MirrorBenchmark, MirrorProbe, MirrorProbeStatus, MirrorProvider,
-    SourceApplyResult, SourceError, SourceFileChange, SourceFileSummary, SourceKind, SourcePlan,
-    SourceStatus,
+    MirrorBenchmark, MirrorProbe, MirrorProbeStatus, MirrorProvider, SourceApplyResult,
+    SourceError, SourceFileChange, SourceFileSummary, SourceKind, SourcePlan, SourceStatus,
+    provider_catalog,
 };
-pub use storage::{StorageReader, SystemStorageReader};
 pub use spi_flash::{
     SpiBootComponent, SpiBootImage, SpiFlashApplyResult, SpiFlashDevice, SpiFlashPlan,
     SpiFlashRequest, SpiFlashStatus,
 };
+pub use storage::{StorageReader, SystemStorageReader};

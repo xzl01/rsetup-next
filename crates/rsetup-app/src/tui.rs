@@ -798,7 +798,11 @@ fn nvme_device_lines(
             ),
             Span::styled(" · ", Style::default().fg(MUTED)),
             Span::styled(
-                format!("{}: {}", app.locale.text("storage_telemetry_unavailable"), reason),
+                format!(
+                    "{}: {}",
+                    app.locale.text("storage_telemetry_unavailable"),
+                    reason
+                ),
                 Style::default().fg(MUTED),
             ),
         ]);

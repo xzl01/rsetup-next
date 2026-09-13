@@ -35,9 +35,7 @@ impl MmcManager {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("/"));
 
-        Self {
-            sysfs_root: root,
-        }
+        Self { sysfs_root: root }
     }
 
     /// Create default instance probing `/`.
@@ -113,7 +111,11 @@ impl MmcManager {
             .map(|name| {
                 sys::read_device_sysfs(&self.sysfs_root, &name).unwrap_or_else(|err| {
                     let telemetry = sys::telemetry_from_mmc_error(&err);
-                    let card_type = if name.contains("mmc") { "MMC".to_string() } else { "SD".to_string() };
+                    let card_type = if name.contains("mmc") {
+                        "MMC".to_string()
+                    } else {
+                        "SD".to_string()
+                    };
                     crate::model::MmcDevice {
                         name: name.clone(),
                         card_type,
@@ -583,7 +585,8 @@ mod tests {
 
         // 1. Missing directory => empty success
         let missing = temp.join(format!("rsetup-mmc-missing-{}", uuid::Uuid::new_v4()));
-        let res = MmcManager::try_probe_sysfs(&missing).expect("missing directory is empty success");
+        let res =
+            MmcManager::try_probe_sysfs(&missing).expect("missing directory is empty success");
         assert!(res.is_empty());
 
         // 2. Empty directory => empty success

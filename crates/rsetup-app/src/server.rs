@@ -947,16 +947,26 @@ mod tests {
 
         impl StorageReader for FakeStorage {
             fn nvme_status(&self) -> Result<NvmeStatus, HardwareError> {
-                self.0.lock().unwrap().as_ref().map(|s| s.nvme.clone()).map_err(|e| match e {
-                    HardwareError::Io(msg) => HardwareError::Io(msg.clone()),
-                    _ => HardwareError::Io("error".into()),
-                })
+                self.0
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|s| s.nvme.clone())
+                    .map_err(|e| match e {
+                        HardwareError::Io(msg) => HardwareError::Io(msg.clone()),
+                        _ => HardwareError::Io("error".into()),
+                    })
             }
             fn mmc_status(&self) -> Result<MmcStatus, HardwareError> {
-                self.0.lock().unwrap().as_ref().map(|s| s.mmc.clone()).map_err(|e| match e {
-                    HardwareError::Io(msg) => HardwareError::Io(msg.clone()),
-                    _ => HardwareError::Io("error".into()),
-                })
+                self.0
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|s| s.mmc.clone())
+                    .map_err(|e| match e {
+                        HardwareError::Io(msg) => HardwareError::Io(msg.clone()),
+                        _ => HardwareError::Io("error".into()),
+                    })
             }
         }
 
@@ -1043,10 +1053,7 @@ mod tests {
             .await
             .unwrap();
         let val1: serde_json::Value = serde_json::from_slice(&body1).unwrap();
-        assert_eq!(
-            val1["nvme"]["devices"][0]["smart"]["temperatureC"],
-            35.0
-        );
+        assert_eq!(val1["nvme"]["devices"][0]["smart"]["temperatureC"], 35.0);
         assert_eq!(val1["mmc"]["devices"].as_array().unwrap().len(), 1);
 
         // Mutate shared fake storage: set smart to null, telemetry to unavailable, and healthState unknown
@@ -1081,10 +1088,7 @@ mod tests {
             val2["nvme"]["devices"][0]["telemetry"]["state"],
             "unavailable"
         );
-        assert_eq!(
-            val2["nvme"]["devices"][0]["healthState"],
-            "unknown"
-        );
+        assert_eq!(val2["nvme"]["devices"][0]["healthState"], "unknown");
 
         // Test whole reader failure returns ApiError (e.g. 500) rather than 200 with empty list
         {

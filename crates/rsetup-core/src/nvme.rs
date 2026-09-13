@@ -40,9 +40,7 @@ impl NvmeManager {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("/"));
 
-        Self {
-            sysfs_root: root,
-        }
+        Self { sysfs_root: root }
     }
 
     /// Create default instance probing `/`.
@@ -117,8 +115,8 @@ impl NvmeManager {
         let nvme_devices = devices
             .into_iter()
             .map(|name| {
-                sys::read_controller_sysfs_with(&self.sysfs_root, &name, reader).unwrap_or_else(|_| {
-                    NvmeDevice {
+                sys::read_controller_sysfs_with(&self.sysfs_root, &name, reader).unwrap_or_else(
+                    |_| NvmeDevice {
                         path: format!("/dev/{}", name),
                         name,
                         model: String::new(),
@@ -134,8 +132,8 @@ impl NvmeManager {
                             }),
                         },
                         health_state: HealthState::Unknown,
-                    }
-                })
+                    },
+                )
             })
             .collect();
 
@@ -267,7 +265,8 @@ mod tests {
 
     #[test]
     fn storage_contract_nvme_error_injections_preserve_metadata_and_set_telemetry() {
-        let root = std::env::temp_dir().join(format!("rsetup-nvme-contract-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("rsetup-nvme-contract-{}", uuid::Uuid::new_v4()));
         let ctrl_dir = root.join("sys/class/nvme/nvme0");
         std::fs::create_dir_all(&ctrl_dir).expect("create ctrl_dir");
         std::fs::write(ctrl_dir.join("model"), "FIXTURE SSD\n").unwrap();
@@ -298,10 +297,9 @@ mod tests {
         assert_eq!(dev_eacces.health_state, HealthState::Unknown);
 
         // 2. IoCode(EIO) -> Io, code 5, smart None, health Unknown
-        let dev_eio = sys::read_controller_sysfs_with(&root, "nvme0", &|_| {
-            Err(NvmeError::IoCode(libc::EIO))
-        })
-        .expect("read_controller_sysfs_with");
+        let dev_eio =
+            sys::read_controller_sysfs_with(&root, "nvme0", &|_| Err(NvmeError::IoCode(libc::EIO)))
+                .expect("read_controller_sysfs_with");
         assert!(dev_eio.smart.is_none());
         assert_eq!(dev_eio.telemetry.state, TelemetryReadState::Unavailable);
         assert_eq!(
@@ -314,10 +312,9 @@ mod tests {
         assert_eq!(dev_eio.health_state, HealthState::Unknown);
 
         // 3. CommandStatus(2) -> NvmeStatus, code 2, smart None, health Unknown
-        let dev_cmd = sys::read_controller_sysfs_with(&root, "nvme0", &|_| {
-            Err(NvmeError::CommandStatus(2))
-        })
-        .expect("read_controller_sysfs_with");
+        let dev_cmd =
+            sys::read_controller_sysfs_with(&root, "nvme0", &|_| Err(NvmeError::CommandStatus(2)))
+                .expect("read_controller_sysfs_with");
         assert!(dev_cmd.smart.is_none());
         assert_eq!(dev_cmd.telemetry.state, TelemetryReadState::Unavailable);
         assert_eq!(
@@ -335,9 +332,18 @@ mod tests {
     #[test]
     fn nvme_admin_result_requires_zero() {
         assert_eq!(sys::check_admin_result(0, libc::EIO), Ok(()));
-        assert_eq!(sys::check_admin_result(2, libc::EACCES), Err(NvmeError::CommandStatus(2)));
-        assert_eq!(sys::check_admin_result(0x4002, 0), Err(NvmeError::CommandStatus(0x4002)));
-        assert_eq!(sys::check_admin_result(-1, libc::EIO), Err(NvmeError::IoCode(libc::EIO)));
+        assert_eq!(
+            sys::check_admin_result(2, libc::EACCES),
+            Err(NvmeError::CommandStatus(2))
+        );
+        assert_eq!(
+            sys::check_admin_result(0x4002, 0),
+            Err(NvmeError::CommandStatus(0x4002))
+        );
+        assert_eq!(
+            sys::check_admin_result(-1, libc::EIO),
+            Err(NvmeError::IoCode(libc::EIO))
+        );
     }
 
     #[test]
@@ -558,7 +564,8 @@ mod tests {
         // 1. Without injected reader on non-root, read_controller_sysfs delegates to default fixture reader
         // which rejects reading with NotSupported("fixture requires an injected reader")
         // and sets smart to None and telemetry to Unavailable/Io/None.
-        let dev_default = sys::read_controller_sysfs(&root, "nvme0").expect("read_controller_sysfs");
+        let dev_default =
+            sys::read_controller_sysfs(&root, "nvme0").expect("read_controller_sysfs");
         assert!(dev_default.smart.is_none());
         assert_eq!(dev_default.telemetry.state, TelemetryReadState::Unavailable);
         assert_eq!(
@@ -656,7 +663,8 @@ mod tests {
 
         // 1. Missing directory => empty success
         let missing = temp.join(format!("rsetup-nvme-missing-{}", uuid::Uuid::new_v4()));
-        let res = NvmeManager::try_probe_sysfs(&missing).expect("missing directory is empty success");
+        let res =
+            NvmeManager::try_probe_sysfs(&missing).expect("missing directory is empty success");
         assert!(res.is_empty());
 
         // 2. Empty directory => empty success
@@ -680,7 +688,8 @@ mod tests {
 
     #[test]
     fn nvme_same_manager_add_and_remove_controllers() {
-        let root = std::env::temp_dir().join(format!("rsetup-nvme-addrem-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("rsetup-nvme-addrem-{}", uuid::Uuid::new_v4()));
         let nvme_dir = root.join("sys/class/nvme");
         std::fs::create_dir_all(&nvme_dir).unwrap();
 

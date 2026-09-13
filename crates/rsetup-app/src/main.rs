@@ -1119,18 +1119,12 @@ fn format_nvme_status(status: &rsetup_core::NvmeStatus, locale: Locale) -> Strin
             ));
 
             if let Some(smart) = &dev.smart {
-                out.push(format!(
-                    "  当前温度:         {:.1} °C",
-                    smart.temperature_c
-                ));
+                out.push(format!("  当前温度:         {:.1} °C", smart.temperature_c));
                 out.push(format!(
                     "  备用空间/阈值:    {}% / {}%",
                     smart.available_spare_percent, smart.spare_threshold_percent
                 ));
-                out.push(format!(
-                    "  已使用寿命:       {}%",
-                    smart.percentage_used
-                ));
+                out.push(format!("  已使用寿命:       {}%", smart.percentage_used));
                 out.push(format!(
                     "  数据读写量:       读取 {} / 写入 {}",
                     format_bytes(smart.data_read_bytes),
@@ -1181,18 +1175,12 @@ fn format_nvme_status(status: &rsetup_core::NvmeStatus, locale: Locale) -> Strin
             ));
 
             if let Some(smart) = &dev.smart {
-                out.push(format!(
-                    "  Temperature:      {:.1} °C",
-                    smart.temperature_c
-                ));
+                out.push(format!("  Temperature:      {:.1} °C", smart.temperature_c));
                 out.push(format!(
                     "  Available Spare:  {}% (threshold: {}%)",
                     smart.available_spare_percent, smart.spare_threshold_percent
                 ));
-                out.push(format!(
-                    "  Percentage Used:  {}%",
-                    smart.percentage_used
-                ));
+                out.push(format!("  Percentage Used:  {}%", smart.percentage_used));
                 out.push(format!(
                     "  Data Read/Write:  Read {} / Written {}",
                     format_bytes(smart.data_read_bytes),
@@ -1216,7 +1204,10 @@ fn format_nvme_status(status: &rsetup_core::NvmeStatus, locale: Locale) -> Strin
                 let reason = match &dev.telemetry.error {
                     Some(err) => match err.kind {
                         rsetup_core::TelemetryErrorKind::PermissionDenied => {
-                            format!("Unavailable (Permission denied, code {})", err.code.unwrap_or(13))
+                            format!(
+                                "Unavailable (Permission denied, code {})",
+                                err.code.unwrap_or(13)
+                            )
                         }
                         rsetup_core::TelemetryErrorKind::NvmeStatus => {
                             format!("Unavailable (Protocol status {})", err.code.unwrap_or(0))

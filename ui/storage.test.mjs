@@ -288,6 +288,29 @@ test("renderNvmeDeviceCard and renderStorageMmcCard handle missing telemetry and
   assert.ok(warnHtml.includes("nvme-badge-warning"));
   assert.ok(!warnHtml.includes("nvme-badge-critical"));
   assert.ok(!warnHtml.includes("nvme-badge-healthy"));
+
+  // 0x0A (100% endurance, not exceeded) vs 0x0B (101% endurance, exceeded) without artificial flag manipulation
+  const dev0A = {
+    ...emmcDevice,
+    health: { preEolInfo: 1, lifeTimeEstAPercent: 100, lifeTimeEstBPercent: 50, warningFlags: [] },
+    telemetry: { state: "available", error: null },
+    healthState: "warning",
+  };
+  const html0A = createTestContext().context.renderStorageMmcCard(dev0A);
+  assert.ok(html0A.includes("nvme-badge-warning"));
+  assert.ok(!html0A.includes("nvme-badge-critical"));
+  assert.ok(html0A.includes("90–100%"));
+
+  const dev0B = {
+    ...emmcDevice,
+    health: { preEolInfo: 1, lifeTimeEstAPercent: 101, lifeTimeEstBPercent: 50, warningFlags: ["life_time_typ_a_exceeded"] },
+    telemetry: { state: "available", error: null },
+    healthState: "critical",
+  };
+  const html0B = createTestContext().context.renderStorageMmcCard(dev0B);
+  assert.ok(html0B.includes("nvme-badge-critical"));
+  assert.ok(!html0B.includes("nvme-badge-warning"));
+  assert.ok(html0B.includes(">100%"));
 });
 
 
