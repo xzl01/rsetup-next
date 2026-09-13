@@ -2,6 +2,7 @@ mod actions;
 mod efi_overlay;
 mod fan_curve;
 mod hardware;
+mod health;
 pub mod mmc;
 mod model;
 pub mod nvme;
@@ -23,19 +24,21 @@ pub use hardware::{
     OverlayChange, OverlayEntry, OverlayPlan, OverlayStatus, RgbLedConfig, RgbLedGroup,
     ThermalStatus, ThermalZone, VideoDevice, VideoFrame, VideoStatus,
 };
+pub use health::{mmc_health_state, nvme_health_state};
 pub use mmc::{MmcError, MmcManager};
 pub use model::{
     ActionRun, ActionSpec, ActionStatus, ActivityEvent, Alert, AlertLevel, Capability,
-    DeviceIdentity, DeviceSnapshot, MetricSet, MmcDevice, MmcHealth, MmcStatus, NetworkInterface,
-    NvmeDevice, NvmeSmartLog, NvmeStatus, ProbeMode, RiskLevel, ServiceState, ServiceSummary,
-    StorageMetric, StorageStatus,
+    DeviceIdentity, DeviceSnapshot, HealthState, MetricSet, MmcDevice, MmcHealth, MmcStatus,
+    NetworkInterface, NvmeDevice, NvmeSmartLog, NvmeStatus, ProbeMode, RiskLevel, ServiceState,
+    ServiceSummary, StorageMetric, StorageStatus, TelemetryError, TelemetryErrorKind,
+    TelemetryReadState, TelemetryStatus,
 };
 pub use nvme::{NvmeError, NvmeManager};
 pub use probe::collect_snapshot;
 pub use sources::{
-    MirrorBenchmark, MirrorProbe, MirrorProbeStatus, MirrorProvider, SourceApplyResult,
-    SourceError, SourceFileChange, SourceFileSummary, SourceKind, SourcePlan, SourceStatus,
-    provider_catalog,
+    provider_catalog, MirrorBenchmark, MirrorProbe, MirrorProbeStatus, MirrorProvider,
+    SourceApplyResult, SourceError, SourceFileChange, SourceFileSummary, SourceKind, SourcePlan,
+    SourceStatus,
 };
 pub use spi_flash::{
     SpiBootComponent, SpiBootImage, SpiFlashApplyResult, SpiFlashDevice, SpiFlashPlan,

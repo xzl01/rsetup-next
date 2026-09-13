@@ -174,6 +174,46 @@ pub struct ActivityEvent {
     pub synthetic: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetryReadState {
+    Available,
+    Unsupported,
+    #[default]
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthState {
+    #[default]
+    Unknown,
+    Healthy,
+    Warning,
+    Critical,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetryErrorKind {
+    PermissionDenied,
+    Io,
+    NvmeStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TelemetryError {
+    pub kind: TelemetryErrorKind,
+    pub code: Option<i32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TelemetryStatus {
+    pub state: TelemetryReadState,
+    pub error: Option<TelemetryError>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NvmeStatus {
