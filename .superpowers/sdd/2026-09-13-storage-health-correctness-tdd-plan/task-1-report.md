@@ -35,6 +35,25 @@ GREEN：
 - 忽略项为既有环境依赖测试（device-tree-compiler、curl/loopback）。
 - 未执行全仓无关格式化；仅对 T1 Rust 文件运行过 rustfmt，且已恢复其余文件的误格式化变更。
 
-## 疑虑
-- 任务 brief 声称基线 Rust 162 passed / JS 51 passed，但当前 checkout 实测基线为 122 passed / 2 ignored；本任务未发现或修复该差异。
-- 当前 checkout 仅发现 `apps/desktop/package.json`，没有根级 JS 测试入口；因此没有运行 JS 基线测试。
+## Fix round1：审查缺口补齐
+
+### 覆盖测试
+- `health::tests::nvme_health_state_is_table_driven_and_unknown_bits_are_critical`：覆盖 `critical_warning` 的 `0x01` 与未知位 `0x80`、仅未知 warning flag、正常值，以及 `Unsupported`/`Unavailable` 携带残留数据仍为 `Unknown`。
+- `health::tests::mmc_health_state_is_table_driven_and_symmetric`：覆盖 `Unsupported`/`Unavailable` 携带残留数据、全未知、仅 A/仅 B、pre-EOL=1、A/B 各 100 与 101、未知 flag、urgent/exceeded 指定 flags，并显式验证 A/B 对称。
+
+### TDD / mutation evidence
+- 先加入上述表驱动测试；临时将生产逻辑 `critical_warning != 0` 变异为 `== 0`。
+- RED 命令：`cargo test -p rsetup-core health --locked`；退出码 `101`。
+- 真实失败输出：`health::tests::nvme_health_state_is_table_driven_and_unknown_bits_are_critical ... FAILED`，`left: Healthy`，`right: Critical`，失败用例为 `critical warning bit 0x01`。
+- 随后恢复生产逻辑；该 RED 是 mutation evidence，不是新发现的生产 bug。
+
+### GREEN / 回归
+- `cargo test -p rsetup-core health --locked`：退出码 `0`，5 passed，0 failed。
+- `cargo test -p rsetup-core --locked`：退出码 `0`，127 passed，0 failed，2 ignored（既有环境依赖测试）。
+- `rustfmt crates/rsetup-core/src/health.rs`：仅格式化当前文件。
+
+### 自审与文件范围
+- 生产判定逻辑未为制造 RED 而永久改变，优先级保持：读取状态 → critical → warning → healthy/unknown。
+- 未修改模型、`Device` 字段、依赖或其他 scratch；仅更新 `health.rs` 测试与本报告。
+- 提交文件列表：`crates/rsetup-core/src/health.rs`、`.superpowers/sdd/2026-09-13-storage-health-correctness-tdd-plan/task-1-report.md`。
+- 更正原报告基线疑虑：workspace `162 = core 122 + app 39 + helper 1`；JS 基线命令 `node --test ui/*.test.mjs` 已由主代理执行并为 51 通过。本任务只要求并验证 core，未重复执行 JS。

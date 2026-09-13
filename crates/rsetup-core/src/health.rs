@@ -58,12 +58,14 @@ pub fn mmc_health_state(telemetry: &TelemetryStatus, health: &MmcHealth) -> Heal
 #[cfg(test)]
 mod tests {
     use super::*;
+
     fn ready() -> TelemetryStatus {
         TelemetryStatus {
             state: TelemetryReadState::Available,
             error: None,
         }
     }
+
     #[test]
     fn mmc_health_state_keeps_real_pre_eol_warning() {
         let h = MmcHealth {
@@ -84,6 +86,7 @@ mod tests {
             HealthState::Critical
         );
     }
+
     #[test]
     fn missing_data_is_not_healthy() {
         let absent = TelemetryStatus::default();
@@ -97,72 +100,180 @@ mod tests {
             mmc_health_state(&ready(), &MmcHealth::default()),
             HealthState::Unknown
         );
-        assert_eq!(
-            nvme_health_state(
-                &TelemetryStatus {
-                    state: TelemetryReadState::Unavailable,
-                    error: None,
-                },
-                Some(&NvmeSmartLog::default())
+    }
+
+    #[test]
+    fn nvme_health_state_is_table_driven_and_unknown_bits_are_critical() {
+        let cases = [
+            (
+                "critical warning bit 0x01",
+                0x01,
+                vec![],
+                HealthState::Critical,
             ),
-            HealthState::Unknown
-        );
-        assert_eq!(
-            mmc_health_state(&ready(), &MmcHealth {
-                pre_eol_info: 1,
-                ..Default::default()
-            }),
-            HealthState::Healthy
-        );
-    }
-    #[test]
-    fn nvme_health_state_applies_warning_and_critical_priority() {
-        let warning = NvmeSmartLog {
-            warning_flags: vec!["unknown".into()],
-            ..Default::default()
-        };
-        assert_eq!(
-            nvme_health_state(&ready(), Some(&warning)),
-            HealthState::Warning
-        );
-        let critical = NvmeSmartLog {
-            critical_warning: 1,
-            ..warning
-        };
-        assert_eq!(
-            nvme_health_state(&ready(), Some(&critical)),
-            HealthState::Critical
-        );
-        assert_eq!(
-            nvme_health_state(&ready(), Some(&NvmeSmartLog::default())),
-            HealthState::Healthy
-        );
-    }
-    #[test]
-    fn mmc_health_state_handles_boundaries_and_unknown_flags() {
-        for (value, expected) in [(100, HealthState::Warning), (101, HealthState::Critical)] {
-            let h = MmcHealth {
-                life_time_est_a_percent: Some(value),
+            (
+                "critical warning unknown bit 0x80",
+                0x80,
+                vec![],
+                HealthState::Critical,
+            ),
+            (
+                "known warning flag",
+                0,
+                vec!["available_spare"],
+                HealthState::Warning,
+            ),
+            (
+                "unknown warning flag",
+                0,
+                vec!["unknown"],
+                HealthState::Warning,
+            ),
+            ("normal", 0, vec![], HealthState::Healthy),
+        ];
+        for (name, critical_warning, warning_flags, expected) in cases {
+            let smart = NvmeSmartLog {
+                critical_warning,
+                warning_flags: warning_flags.into_iter().map(String::from).collect(),
                 ..Default::default()
             };
-            assert_eq!(mmc_health_state(&ready(), &h), expected);
+            assert_eq!(
+                nvme_health_state(&ready(), Some(&smart)),
+                expected,
+                "{name}"
+            );
         }
-        let h = MmcHealth {
-            warning_flags: vec!["unknown".into()],
-            ..Default::default()
-        };
-        assert_eq!(mmc_health_state(&ready(), &h), HealthState::Warning);
-        assert_eq!(
-            mmc_health_state(
-                &TelemetryStatus {
-                    state: TelemetryReadState::Unsupported,
-                    error: None
-                },
-                &h
-            ),
-            HealthState::Unknown
-        );
+        for state in [
+            TelemetryReadState::Unsupported,
+            TelemetryReadState::Unavailable,
+        ] {
+            let smart = NvmeSmartLog {
+                critical_warning: 0x80,
+                warning_flags: vec!["unknown".into()],
+                ..Default::default()
+            };
+            assert_eq!(
+                nvme_health_state(&TelemetryStatus { state, error: None }, Some(&smart)),
+                HealthState::Unknown,
+                "{state:?} with residual data"
+            );
+        }
     }
+
+    #[test]
+    fn mmc_health_state_is_table_driven_and_symmetric() {
+        let cases = [
+            ("all unknown", MmcHealth::default(), HealthState::Unknown),
+            (
+                "only A valid",
+                MmcHealth {
+                    life_time_est_a_percent: Some(10),
+                    ..Default::default()
+                },
+                HealthState::Healthy,
+            ),
+            (
+                "only B valid",
+                MmcHealth {
+                    life_time_est_b_percent: Some(10),
+                    ..Default::default()
+                },
+                HealthState::Healthy,
+            ),
+            (
+                "pre-EOL normal",
+                MmcHealth {
+                    pre_eol_info: 1,
+                    ..Default::default()
+                },
+                HealthState::Healthy,
+            ),
+            (
+                "A at limit",
+                MmcHealth {
+                    life_time_est_a_percent: Some(100),
+                    ..Default::default()
+                },
+                HealthState::Warning,
+            ),
+            (
+                "B at limit",
+                MmcHealth {
+                    life_time_est_b_percent: Some(100),
+                    ..Default::default()
+                },
+                HealthState::Warning,
+            ),
+            (
+                "A exceeded",
+                MmcHealth {
+                    life_time_est_a_percent: Some(101),
+                    ..Default::default()
+                },
+                HealthState::Critical,
+            ),
+            (
+                "B exceeded",
+                MmcHealth {
+                    life_time_est_b_percent: Some(101),
+                    ..Default::default()
+                },
+                HealthState::Critical,
+            ),
+            (
+                "unknown flag",
+                MmcHealth {
+                    warning_flags: vec!["unknown".into()],
+                    ..Default::default()
+                },
+                HealthState::Warning,
+            ),
+            (
+                "urgent flag",
+                MmcHealth {
+                    warning_flags: vec!["pre_eol_urgent".into()],
+                    ..Default::default()
+                },
+                HealthState::Critical,
+            ),
+            (
+                "A exceeded flag",
+                MmcHealth {
+                    warning_flags: vec!["life_time_typ_a_exceeded".into()],
+                    ..Default::default()
+                },
+                HealthState::Critical,
+            ),
+            (
+                "B exceeded flag",
+                MmcHealth {
+                    warning_flags: vec!["life_time_typ_b_exceeded".into()],
+                    ..Default::default()
+                },
+                HealthState::Critical,
+            ),
+        ];
+        for (name, health, expected) in cases {
+            assert_eq!(mmc_health_state(&ready(), &health), expected, "{name}");
+        }
+        for state in [
+            TelemetryReadState::Unsupported,
+            TelemetryReadState::Unavailable,
+        ] {
+            let residual = MmcHealth {
+                pre_eol_info: 3,
+                life_time_est_a_percent: Some(101),
+                life_time_est_b_percent: Some(101),
+                warning_flags: vec!["pre_eol_urgent".into()],
+            };
+            assert_eq!(
+                mmc_health_state(&TelemetryStatus { state, error: None }, &residual),
+                HealthState::Unknown,
+                "{state:?} with residual data"
+            );
+        }
+    }
+
     #[test]
     fn telemetry_and_health_models_serialize_with_contract_names() {
         assert_eq!(
