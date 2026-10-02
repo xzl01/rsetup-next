@@ -10,7 +10,7 @@ B-01：首版业务请求/响应与device.task.result事件均在OpenControl，�
 
 每个顶层业务消息schema_version必须等于1，缺失/0不作默认兼容；未知版本不执行变更，返回UNSUPPORTED_VERSION。普通请求5s期限是接收响应期限，不是重启完成期限。
 
-正常业务status_code=0；非零响应payload为空，error_message仅作安全诊断、不作程序判断，不包含凭据。未知普通action返回UNSUPPORTED_ACTION，不因一个不支持的业务动作吊销身份。对于reboot.execute，非零错误仅允许在确认没有接收执行、没有进入OS调用边界时返回；已接受后的失败必须以成功信封携带TaskRecord的failed/unknown及证据，不能用含糊INTERNAL_ERROR掩盖可能已执行的状态。
+正常业务status_code=0；非零响应payload为空，error_message仅作安全诊断、不作程序判断，不包含凭据。未知普通action返回UNSUPPORTED_ACTION，不因一个不支持的业务动作吊销身份。对于reboot.execute，非零错误仅允许在确认accepted未提交、请求未被接受且尚未进入OS调用边界时返回（例如无效票据、满日志、能证明未提交的accepted写入错误）；accepted提交结果不明时不能据写入错误推断未接收，须不发送业务结果/断流，交由device.task.get查询。已可靠接受后不得以非零错误暗示未接收：status_code=0只能携带已可靠持久的TaskRecord，且accepted仅表示已接收、并非OS调用或完成证据；结果不能可靠持久时，不得虚构failed/unknown或通过非零错误掩盖可能已执行的状态，须不发送业务结果/断流，交由查询核实。
 
 | status_code | 稳定语义 |
 | --- | --- |
@@ -172,7 +172,7 @@ TaskRecord.state取 `accepted/attempted/succeeded/failed/unknown`：
 
 TaskRecord.reason_code与04 §3的reason_code共用同一稳定词表；板端只产生OS_ERROR（OS调用明确错误）与JOURNAL_LOST（日志丢失或不可读），其余代码为中控侧原因，板端不产生。
 
-B-04：accepted落盘后才能回执行接收响应；attempted在调用OS前落盘。写日志失败必须拒绝，不调用OS。agent恢复不能仅因发现accepted/attempted就自动调用重启；只核实或记unknown。
+B-04：accepted必须可靠落盘后才能回执行接收响应；attempted必须可靠落盘后才能调用OS。accepted写入错误仅在能证明未提交、请求未接受且OS未进边界时可用非零空payload拒绝；提交结果不明则不发业务结果/断流，留待device.task.get核实，不调用OS。accepted已可靠落盘而attempted写入失败时，不调用OS，也不得返回非零或删除已接受的去重记录；若能证明attempted未提交，可用status_code=0回复最后可靠持久的accepted（不是完成证据），若attempted提交结果不明则不发送业务结果/断流待查询，不能无条件回复accepted。attempted已可靠落盘且OS明确报错时，只有failed/OS_ERROR可靠落盘才用status_code=0回复持久failed；finish写入失败或结果提交不明时不得发送未可靠持久的failed/unknown，也不得用非零暗示未执行，须不发送业务结果/断流待查询。unknown只有可靠落盘后才能作为TaskRecord回复或发送事件；上述错误及恢复均不得自动二次调用OS，agent恢复仅核实证据或可靠落盘unknown。
 
 journal_epoch在日志库重新初始化/丢失重建时更换，不随普通agent重启改变。建议容量4096条；首版不自动淘汰去重记录，满时拒绝新任务RESOURCE_EXHAUSTED。管理员维护/清理需停变更并更换epoch，旧任务仅可核实、不能重发。保留策略可后续优化，不牺牲去重换容量。
 
@@ -189,5 +189,5 @@ TASK_NOT_FOUND只证明当前日志找不到，不能证明从未执行，不能
 - WIRE-01：未知版本/action、缺字段、非法UUID、超限载荷与非有限指标不触发设备变更。
 - WIRE-02：请求/响应同流配对、旧代际拒绝，tunnel.ping仍原始16B，不误包Protobuf。
 - WIRE-03：票据过期、换连接、换boot、重复execute、不同payload同ID均不会第二次重启。
-- WIRE-04：accepted/attempted落盘和OS调用之间各处崩溃，恢复不自动重试；满日志拒绝新变更。
+- WIRE-04：accepted/attempted落盘和OS调用之间各处崩溃，恢复不自动重试；满日志拒绝新变更。故障注入核对accepted写入提交不明不得非零假拒绝、attempted写入提交不明不得无条件回复accepted、OS错误后finish失败不得伪造failed/unknown；仅可靠记录可用成功信封回复，始终不得二次调用OS。
 - WIRE-05：事件重复/乱序/丢失和journal_epoch变化，以查询恢复且不假称exactly-once。
