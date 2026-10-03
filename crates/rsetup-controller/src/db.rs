@@ -1736,6 +1736,155 @@ impl LegacyPreflightProbe for DbPool {
     }
 }
 
+// Only these five 0001 CHECKs may be removed. Each SQL spelling is fixed here,
+// not formatted from metadata returned by the database.
+const LEGACY_CHECK_DROPS: &[(&str, &str, &str)] = &[
+    (
+        "schema_meta",
+        "chk_schema_singleton",
+        "ALTER TABLE schema_meta DROP CHECK chk_schema_singleton",
+    ),
+    (
+        "devices",
+        "chk_devices_state",
+        "ALTER TABLE devices DROP CHECK chk_devices_state",
+    ),
+    (
+        "devices",
+        "chk_devices_decision",
+        "ALTER TABLE devices DROP CHECK chk_devices_decision",
+    ),
+    (
+        "grants",
+        "chk_grants_source",
+        "ALTER TABLE grants DROP CHECK chk_grants_source",
+    ),
+    (
+        "grants",
+        "chk_grants_scope",
+        "ALTER TABLE grants DROP CHECK chk_grants_scope",
+    ),
+];
+
+#[allow(dead_code)] // Task 3B2B's SQLx adapter consumes the fixed SQL spelling.
+fn legacy_check_drop_sql(table: &str, name: &str) -> Result<&'static str, ControllerError> {
+    LEGACY_CHECK_DROPS
+        .iter()
+        .find(|&&(fixed_table, fixed_name, _)| (table, name) == (fixed_table, fixed_name))
+        .map(|&(_, _, statement)| statement)
+        .ok_or_else(|| legacy_preflight_error("drop whitelist"))
+}
+
+fn same_legacy_snapshot(expected: &LegacyPreflight, actual: &LegacyPreflight) -> bool {
+    expected.old_columns == actual.old_columns
+        && expected.observed_checks.len() == actual.observed_checks.len()
+        && expected
+            .observed_checks
+            .iter()
+            .all(|check| actual.observed_checks.contains(check))
+}
+
+fn require_legacy_snapshot(
+    expected: &LegacyPreflight,
+    actual: &LegacyPreflight,
+) -> Result<(), ControllerError> {
+    if same_legacy_snapshot(expected, actual) {
+        Ok(())
+    } else {
+        Err(legacy_preflight_error("unexpected state drift"))
+    }
+}
+
+// The SQLx writer and authorized CLI route are deliberately left to Task 3B2B.
+#[allow(dead_code)]
+trait LegacyUpgradeProbe: LegacyPreflightProbe {
+    async fn preflight(&self, version: i32) -> Result<LegacyPreflight, ControllerError>
+    where
+        Self: Sized,
+    {
+        preflight_legacy_with_probe(self, version).await
+    }
+    async fn alter(&self, statement: &'static str) -> Result<(), ControllerError>;
+    async fn drop_known_check(
+        &self,
+        table: &'static str,
+        name: &'static str,
+    ) -> Result<(), ControllerError>;
+    async fn strict_v3_shape_without_meta_update(&self) -> Result<(), ControllerError>;
+    async fn cas_version(&self, from: i32, to: i32) -> Result<u64, ControllerError>;
+    async fn read_version(&self) -> Result<Option<i32>, ControllerError>;
+    async fn ready_v3(&self) -> Result<(), ControllerError>;
+}
+
+#[allow(dead_code)]
+async fn upgrade_legacy_with_probe(
+    probe: &impl LegacyUpgradeProbe,
+    version: i32,
+) -> Result<(), ControllerError> {
+    if !matches!(version, 1 | 2) {
+        return Err(legacy_preflight_error("version"));
+    }
+    // Full version/shape/CHECK/FK/data/counter/username preflight precedes
+    // *every* DDL, not just the first; independently recheck its outcome.
+    let mut trusted = probe.preflight(version).await?;
+    for (index, &(_, _, _, statement)) in IDENTITY_COLUMNS.iter().enumerate() {
+        if !trusted.old_columns[index] {
+            continue; // Nontransactional retry: this exact ALTER already landed.
+        }
+        let before = probe.preflight(version).await?;
+        require_legacy_snapshot(&trusted, &before)?;
+        if !before.old_columns[index] || version != 1 {
+            return Err(legacy_preflight_error("alter precondition"));
+        }
+        let ddl = probe.alter(statement).await;
+        // Even an Err can have applied a nontransactional ALTER. Re-read for
+        // diagnosis but never convert an uncertain result into success.
+        let after = probe.preflight(version).await;
+        ddl?;
+        let after = after?;
+        let mut expected = before;
+        expected.old_columns[index] = false;
+        require_legacy_snapshot(&expected, &after)?;
+        trusted = after;
+    }
+    for &(table, name, _) in LEGACY_CHECK_DROPS {
+        if !trusted.observed_checks.contains(&(table, name)) {
+            continue;
+        }
+        let before = probe.preflight(version).await?;
+        require_legacy_snapshot(&trusted, &before)?;
+        if !before.observed_checks.contains(&(table, name)) {
+            return Err(legacy_preflight_error("drop precondition"));
+        }
+        let ddl = probe.drop_known_check(table, name).await;
+        let after = probe.preflight(version).await;
+        ddl?;
+        let after = after?;
+        let mut expected = before;
+        expected
+            .observed_checks
+            .retain(|check| *check != (table, name));
+        require_legacy_snapshot(&expected, &after)?;
+        trusted = after;
+    }
+    let final_read = probe.preflight(version).await?;
+    require_legacy_snapshot(&trusted, &final_read)?;
+    if final_read.old_columns.iter().any(|old| *old) || !final_read.observed_checks.is_empty() {
+        return Err(legacy_preflight_error("target not ready"));
+    }
+    probe.strict_v3_shape_without_meta_update().await?;
+    let affected = probe.cas_version(version, 3).await;
+    if !matches!(affected, Ok(1)) {
+        // Read only for operator diagnosis. A successful read of 3 after a
+        // failed CAS does NOT prove this caller can claim a completed upgrade.
+        let _observed = probe.read_version().await;
+        return Err(ControllerError::Config(
+            "legacy version CAS outcome uncertain".into(),
+        ));
+    }
+    probe.ready_v3().await
+}
+
 async fn preflight_values(db: &DbPool, status: &[bool]) -> Result<(), ControllerError> {
     validate_identity_status(1, status)?;
     scan_legacy_usernames(db).await?;
@@ -2890,6 +3039,376 @@ mod tests {
         ] {
             assert!(!output.contains(sensitive));
         }
+    }
+
+    const LEGACY_CHECK_ORDER: [(&str, &str); 5] = [
+        ("schema_meta", "chk_schema_singleton"),
+        ("devices", "chk_devices_state"),
+        ("devices", "chk_devices_decision"),
+        ("grants", "chk_grants_source"),
+        ("grants", "chk_grants_scope"),
+    ];
+
+    struct LegacyUpgradeFake(std::sync::Mutex<LegacyUpgradeFakeState>);
+    struct LegacyUpgradeFakeState {
+        version: i32,
+        columns: [bool; 11],
+        checks: Vec<(&'static str, &'static str)>,
+        events: Vec<String>,
+        fault_gate: Option<&'static str>,
+        fail_ddl_at: Option<(usize, bool)>,
+        noop_drop: bool,
+        drift_on_read: Option<usize>,
+        cas_rows: u64,
+        cas_error: bool,
+    }
+    impl LegacyUpgradeFake {
+        fn new(version: i32) -> Self {
+            Self(std::sync::Mutex::new(LegacyUpgradeFakeState {
+                version,
+                columns: [version == 1; 11],
+                checks: LEGACY_CHECK_ORDER.to_vec(),
+                events: Vec::new(),
+                fault_gate: None,
+                fail_ddl_at: None,
+                noop_drop: false,
+                drift_on_read: None,
+                cas_rows: 1,
+                cas_error: false,
+            }))
+        }
+        fn gate(&self, name: &'static str) -> Result<(), ControllerError> {
+            let mut state = self.0.lock().unwrap();
+            state.events.push(name.into());
+            if state.fault_gate == Some(name) {
+                return Err(ControllerError::Config("simulated gate failure".into()));
+            }
+            Ok(())
+        }
+        fn events(&self) -> Vec<String> {
+            self.0.lock().unwrap().events.clone()
+        }
+        fn writes(&self) -> Vec<String> {
+            self.events()
+                .into_iter()
+                .filter(|event| {
+                    event.starts_with("ALTER ") || event.starts_with("DROP ") || event == "cas"
+                })
+                .collect()
+        }
+    }
+    impl LegacyPreflightProbe for LegacyUpgradeFake {
+        async fn read_legacy_meta(&self) -> Result<Vec<(i8, i32)>, ControllerError> {
+            self.gate("meta")?;
+            let mut state = self.0.lock().unwrap();
+            let count = state.events.iter().filter(|event| *event == "meta").count();
+            if state.drift_on_read == Some(count) {
+                state.checks.clear();
+            }
+            Ok(vec![(1, state.version)])
+        }
+        async fn legacy_shape(
+            &self,
+            _: i32,
+        ) -> Result<Vec<(&'static str, &'static str)>, ControllerError> {
+            self.gate("shape")?;
+            Ok(self.0.lock().unwrap().checks.clone())
+        }
+        async fn no_foreign_keys(&self) -> Result<(), ControllerError> {
+            self.gate("fk")
+        }
+        async fn identity_rows(&self, _: i32) -> Result<(), ControllerError> {
+            self.gate("data")
+        }
+        async fn column_status(&self, _: i32) -> Result<Vec<bool>, ControllerError> {
+            self.gate("status")?;
+            Ok(self.0.lock().unwrap().columns.to_vec())
+        }
+        async fn negative(&self, _: &'static str) -> Result<bool, ControllerError> {
+            self.gate("negative")?;
+            Ok(false)
+        }
+        async fn username_encoding(&self) -> Result<(), ControllerError> {
+            self.gate("encoding")
+        }
+        async fn username_collision(&self) -> Result<(), ControllerError> {
+            self.gate("collision")
+        }
+    }
+    impl LegacyUpgradeProbe for LegacyUpgradeFake {
+        async fn alter(&self, statement: &'static str) -> Result<(), ControllerError> {
+            let mut state = self.0.lock().unwrap();
+            state.events.push(format!("ALTER {statement}"));
+            let ordinal = state
+                .events
+                .iter()
+                .filter(|s| s.starts_with("ALTER ") || s.starts_with("DROP "))
+                .count();
+            if state.fail_ddl_at == Some((ordinal, false)) {
+                return Err(ControllerError::Config("simulated before ALTER".into()));
+            }
+            let index = IDENTITY_COLUMNS
+                .iter()
+                .position(|entry| entry.3 == statement)
+                .unwrap();
+            state.columns[index] = false;
+            if state.fail_ddl_at == Some((ordinal, true)) {
+                return Err(ControllerError::Config("simulated after ALTER".into()));
+            }
+            Ok(())
+        }
+        async fn drop_known_check(
+            &self,
+            table: &'static str,
+            name: &'static str,
+        ) -> Result<(), ControllerError> {
+            let mut state = self.0.lock().unwrap();
+            state.events.push(format!("DROP {table}.{name}"));
+            let ordinal = state
+                .events
+                .iter()
+                .filter(|s| s.starts_with("ALTER ") || s.starts_with("DROP "))
+                .count();
+            if state.fail_ddl_at == Some((ordinal, false)) {
+                return Err(ControllerError::Config("simulated before DROP".into()));
+            }
+            if !state.noop_drop {
+                state.checks.retain(|entry| *entry != (table, name));
+            }
+            if state.fail_ddl_at == Some((ordinal, true)) {
+                return Err(ControllerError::Config("simulated after DROP".into()));
+            }
+            Ok(())
+        }
+        async fn strict_v3_shape_without_meta_update(&self) -> Result<(), ControllerError> {
+            self.gate("strict")
+        }
+        async fn cas_version(&self, from: i32, to: i32) -> Result<u64, ControllerError> {
+            let mut state = self.0.lock().unwrap();
+            state.events.push("cas".into());
+            assert_eq!((from, to), (state.version, 3));
+            if state.cas_error {
+                state.version = 3; // Unknown result: even an applied CAS is not success.
+                return Err(ControllerError::Config("simulated uncertain CAS".into()));
+            }
+            if state.cas_rows == 1 {
+                state.version = to;
+            }
+            Ok(state.cas_rows)
+        }
+        async fn read_version(&self) -> Result<Option<i32>, ControllerError> {
+            self.gate("read_version")?;
+            Ok(Some(self.0.lock().unwrap().version))
+        }
+        async fn ready_v3(&self) -> Result<(), ControllerError> {
+            self.gate("ready")
+        }
+    }
+
+    #[test]
+    fn legacy_drop_templates_are_fixed_whitelisted_sql() {
+        assert_eq!(LEGACY_CHECK_DROPS.len(), LEGACY_CHECK_ORDER.len());
+        for (index, &(table, name, statement)) in LEGACY_CHECK_DROPS.iter().enumerate() {
+            assert_eq!((table, name), LEGACY_CHECK_ORDER[index]);
+            assert_eq!(statement, format!("ALTER TABLE {table} DROP CHECK {name}"));
+            assert_eq!(legacy_check_drop_sql(table, name).unwrap(), statement);
+            assert!(!statement.contains("DROP DATABASE"));
+            assert!(!statement.contains("GLOBAL"));
+        }
+        assert!(legacy_check_drop_sql("devices", "unknown").is_err());
+        assert!(legacy_check_drop_sql("other", "chk_devices_state").is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_upgrade_only_writes_fixed_remaining_steps_and_reads_every_boundary() {
+        for version in [1, 2] {
+            let fake = LegacyUpgradeFake::new(version);
+            {
+                let mut state = fake.0.lock().unwrap();
+                state.columns = [false; 11];
+                if version == 1 {
+                    state.columns[1] = true;
+                    state.columns[10] = true;
+                }
+                state.checks = vec![
+                    LEGACY_CHECK_ORDER[4],
+                    LEGACY_CHECK_ORDER[1],
+                    LEGACY_CHECK_ORDER[0],
+                ];
+            }
+            upgrade_legacy_with_probe(&fake, version).await.unwrap();
+            let mut expected = Vec::new();
+            if version == 1 {
+                expected.push(format!("ALTER {}", IDENTITY_COLUMNS[1].3));
+                expected.push(format!("ALTER {}", IDENTITY_COLUMNS[10].3));
+            }
+            for (table, name) in [
+                LEGACY_CHECK_ORDER[0],
+                LEGACY_CHECK_ORDER[1],
+                LEGACY_CHECK_ORDER[4],
+            ] {
+                expected.push(format!("DROP {table}.{name}"));
+            }
+            expected.push("cas".into());
+            assert_eq!(fake.writes(), expected);
+            let events = fake.events();
+            let preflight_reads = events.iter().filter(|event| *event == "meta").count();
+            assert_eq!(preflight_reads, 2 + 2 * (expected.len() - 1));
+            for index in 0..events.len() {
+                if events[index].starts_with("ALTER ") || events[index].starts_with("DROP ") {
+                    assert_eq!(events[index - 1], "collision");
+                    assert_eq!(events[index + 1], "meta");
+                }
+            }
+            assert!(events.ends_with(&["strict".into(), "cas".into(), "ready".into()]));
+            assert_eq!(fake.0.lock().unwrap().version, 3);
+        }
+        let full = LegacyUpgradeFake::new(1);
+        full.0.lock().unwrap().checks.clear();
+        upgrade_legacy_with_probe(&full, 1).await.unwrap();
+        assert_eq!(full.writes().len(), IDENTITY_COLUMNS.len() + 1);
+        assert_eq!(
+            full.events()
+                .iter()
+                .filter(|event| *event == "meta")
+                .count(),
+            2 + 2 * IDENTITY_COLUMNS.len()
+        );
+        for (index, &(_, _, _, statement)) in IDENTITY_COLUMNS.iter().enumerate() {
+            assert_eq!(full.writes()[index], format!("ALTER {statement}"));
+        }
+        let empty = LegacyUpgradeFake::new(2);
+        empty.0.lock().unwrap().checks.clear();
+        upgrade_legacy_with_probe(&empty, 2).await.unwrap();
+        assert_eq!(empty.writes(), vec!["cas"]);
+    }
+
+    #[tokio::test]
+    async fn legacy_upgrade_fails_closed_before_writes_on_bad_gates_and_drift() {
+        for gate in [
+            "meta",
+            "shape",
+            "fk",
+            "data",
+            "status",
+            "negative",
+            "encoding",
+            "collision",
+        ] {
+            let fake = LegacyUpgradeFake::new(1);
+            fake.0.lock().unwrap().fault_gate = Some(gate);
+            assert!(upgrade_legacy_with_probe(&fake, 1).await.is_err(), "{gate}");
+            assert!(fake.writes().is_empty(), "{gate}");
+        }
+        for version in [0, 3] {
+            let fake = LegacyUpgradeFake::new(version);
+            assert!(upgrade_legacy_with_probe(&fake, version).await.is_err());
+            assert!(fake.events().is_empty());
+        }
+        let v2_old = LegacyUpgradeFake::new(2);
+        v2_old.0.lock().unwrap().columns[0] = true;
+        assert!(upgrade_legacy_with_probe(&v2_old, 2).await.is_err());
+        assert!(v2_old.writes().is_empty());
+        for checks in [
+            vec![("outsider", "unknown")],
+            vec![LEGACY_CHECK_ORDER[0]; 2],
+        ] {
+            let fake = LegacyUpgradeFake::new(2);
+            fake.0.lock().unwrap().checks = checks;
+            assert!(upgrade_legacy_with_probe(&fake, 2).await.is_err());
+            assert!(fake.writes().is_empty());
+        }
+        let drift = LegacyUpgradeFake::new(1);
+        drift.0.lock().unwrap().drift_on_read = Some(2);
+        assert!(upgrade_legacy_with_probe(&drift, 1).await.is_err());
+        assert!(drift.writes().is_empty());
+        for (version, read_at, expected_writes) in [(1, 3, 1), (2, 2, 0), (2, 3, 1)] {
+            let drift = LegacyUpgradeFake::new(version);
+            drift.0.lock().unwrap().drift_on_read = Some(read_at);
+            assert!(upgrade_legacy_with_probe(&drift, version).await.is_err());
+            assert_eq!(drift.writes().len(), expected_writes);
+            assert_eq!(drift.0.lock().unwrap().version, version);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_upgrade_nontransactional_errors_are_retryable_but_not_success() {
+        for (version, first_drop) in [(1, false), (2, true)] {
+            for ordinal in [1, 2] {
+                for applied in [false, true] {
+                    let fake = LegacyUpgradeFake::new(version);
+                    if !first_drop {
+                        let mut state = fake.0.lock().unwrap();
+                        state.columns = [false; 11];
+                        state.columns[0] = true;
+                        state.columns[1] = true;
+                    }
+                    fake.0.lock().unwrap().fail_ddl_at = Some((ordinal, applied));
+                    assert!(upgrade_legacy_with_probe(&fake, version).await.is_err());
+                    assert_eq!(fake.0.lock().unwrap().version, version);
+                    assert_eq!(fake.writes().len(), ordinal);
+                    assert_eq!(
+                        fake.events()
+                            .iter()
+                            .filter(|event| *event == "meta")
+                            .count(),
+                        1 + 2 * ordinal
+                    );
+                    fake.0.lock().unwrap().fail_ddl_at = None;
+                    upgrade_legacy_with_probe(&fake, version).await.unwrap();
+                    let total_ddl = if first_drop { 5 } else { 7 };
+                    let already_applied = ordinal - 1 + usize::from(applied);
+                    assert_eq!(
+                        fake.writes().len() - ordinal,
+                        total_ddl - already_applied + 1
+                    );
+                    assert_eq!(fake.0.lock().unwrap().version, 3);
+                }
+            }
+        }
+        let noop = LegacyUpgradeFake::new(2);
+        noop.0.lock().unwrap().noop_drop = true;
+        assert!(upgrade_legacy_with_probe(&noop, 2).await.is_err());
+        assert_eq!(noop.writes(), vec!["DROP schema_meta.chk_schema_singleton"]);
+        assert_eq!(
+            noop.events()
+                .iter()
+                .filter(|event| *event == "meta")
+                .count(),
+            3
+        );
+        assert_eq!(noop.0.lock().unwrap().version, 2);
+    }
+
+    #[tokio::test]
+    async fn legacy_upgrade_cas_and_post_cas_failures_never_claim_success() {
+        for rows in [0, 2] {
+            let fake = LegacyUpgradeFake::new(2);
+            {
+                let mut state = fake.0.lock().unwrap();
+                state.checks.clear();
+                state.cas_rows = rows;
+            }
+            assert!(upgrade_legacy_with_probe(&fake, 2).await.is_err());
+            assert_eq!(fake.0.lock().unwrap().version, 2);
+            assert!(fake.events().contains(&"read_version".into()));
+        }
+        let uncertain = LegacyUpgradeFake::new(2);
+        uncertain.0.lock().unwrap().checks.clear();
+        uncertain.0.lock().unwrap().cas_error = true;
+        assert!(upgrade_legacy_with_probe(&uncertain, 2).await.is_err());
+        assert_eq!(uncertain.0.lock().unwrap().version, 3);
+        assert!(uncertain.events().contains(&"read_version".into()));
+        let ready = LegacyUpgradeFake::new(2);
+        ready.0.lock().unwrap().checks.clear();
+        ready.0.lock().unwrap().fault_gate = Some("ready");
+        assert!(upgrade_legacy_with_probe(&ready, 2).await.is_err());
+        assert_eq!(ready.0.lock().unwrap().version, 3);
+        let strict = LegacyUpgradeFake::new(2);
+        strict.0.lock().unwrap().checks.clear();
+        strict.0.lock().unwrap().fault_gate = Some("strict");
+        assert!(upgrade_legacy_with_probe(&strict, 2).await.is_err());
+        assert!(strict.writes().is_empty());
     }
 
     #[tokio::test]
