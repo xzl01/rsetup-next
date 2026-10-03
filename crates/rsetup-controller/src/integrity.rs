@@ -1,5 +1,185 @@
-use crate::ControllerError;
+use crate::{ControllerError, db::DbPool};
 use serde_json::Value;
+use sqlx::Row;
+
+fn scan_error(code: &'static str) -> ControllerError {
+    ControllerError::Config(format!("identity data {code}"))
+}
+
+const BOOLEAN_SCANS: &[(&str, &str)] = &[
+    (
+        "schema_meta.initialized",
+        "SELECT CAST(initialized AS SIGNED) AS raw FROM schema_meta",
+    ),
+    (
+        "users.active",
+        "SELECT CAST(active AS SIGNED) AS raw FROM users",
+    ),
+    (
+        "users.is_admin",
+        "SELECT CAST(is_admin AS SIGNED) AS raw FROM users",
+    ),
+    (
+        "users.must_change_password",
+        "SELECT CAST(must_change_password AS SIGNED) AS raw FROM users",
+    ),
+    (
+        "sessions.revoked",
+        "SELECT CAST(revoked AS SIGNED) AS raw FROM sessions",
+    ),
+    (
+        "roles.builtin",
+        "SELECT CAST(builtin AS SIGNED) AS raw FROM roles",
+    ),
+    (
+        "roles.archived",
+        "SELECT CAST(archived AS SIGNED) AS raw FROM roles",
+    ),
+    (
+        "device_groups.archived",
+        "SELECT CAST(archived AS SIGNED) AS raw FROM device_groups",
+    ),
+    (
+        "devices.archived",
+        "SELECT CAST(archived AS SIGNED) AS raw FROM devices",
+    ),
+];
+const ORPHAN_SCANS: &[(&str, &str)] = &[
+    (
+        "sessions",
+        "SELECT 1 FROM sessions s LEFT JOIN users u ON u.id=s.user_id WHERE u.id IS NULL LIMIT 1",
+    ),
+    (
+        "role_permissions",
+        "SELECT 1 FROM role_permissions p LEFT JOIN roles r ON r.id=p.role_id WHERE r.id IS NULL LIMIT 1",
+    ),
+    (
+        "group_members",
+        "SELECT 1 FROM group_members m LEFT JOIN device_groups g ON g.id=m.group_id LEFT JOIN devices d ON d.public_key=m.device_id WHERE g.id IS NULL OR d.public_key IS NULL LIMIT 1",
+    ),
+    (
+        "grants",
+        "SELECT 1 FROM grants x LEFT JOIN users u ON u.id=x.user_id LEFT JOIN roles r ON r.id=x.role_id LEFT JOIN device_groups g ON g.id=x.scope_group_id LEFT JOIN devices d ON d.public_key=x.scope_device_id WHERE u.id IS NULL OR (x.role_id IS NOT NULL AND r.id IS NULL) OR (x.scope_group_id IS NOT NULL AND g.id IS NULL) OR (x.scope_device_id IS NOT NULL AND d.public_key IS NULL) LIMIT 1",
+    ),
+    (
+        "admission_decisions",
+        "SELECT 1 FROM admission_decisions a LEFT JOIN devices d ON d.public_key=a.device_id LEFT JOIN users u ON u.id=a.actor_id WHERE d.public_key IS NULL OR (a.actor_id IS NOT NULL AND u.id IS NULL) LIMIT 1",
+    ),
+    (
+        "audit_events",
+        "SELECT 1 FROM audit_events a LEFT JOIN users u ON u.id=a.actor_user_id WHERE a.actor_user_id IS NOT NULL AND u.id IS NULL LIMIT 1",
+    ),
+];
+
+pub async fn check_identity_data(db: &DbPool) -> Result<(), ControllerError> {
+    validate_identity_rows(db, true).await
+}
+
+pub(crate) async fn validate_identity_rows(
+    db: &DbPool,
+    require_meta: bool,
+) -> Result<(), ControllerError> {
+    let mut rows = IdentityRows {
+        meta: Vec::new(),
+        usernames: Vec::new(),
+        booleans: Vec::new(),
+        devices: Vec::new(),
+        permissions: Vec::new(),
+        grants: Vec::new(),
+        orphans: Vec::new(),
+    };
+    macro_rules! query_rows {
+        ($sql:expr, $code:expr) => {
+            sqlx::query($sql)
+                .fetch_all(&db.0)
+                .await
+                .map_err(|_| scan_error($code))?
+        };
+    }
+    for row in query_rows!(
+        "SELECT singleton,schema_version FROM schema_meta ORDER BY singleton",
+        "meta.read"
+    ) {
+        rows.meta.push((
+            row.try_get("singleton")
+                .map_err(|_| scan_error("meta.decode"))?,
+            row.try_get("schema_version")
+                .map_err(|_| scan_error("meta.decode"))?,
+        ));
+    }
+    for row in query_rows!("SELECT username FROM users", "users.read") {
+        rows.usernames.push(
+            row.try_get("username")
+                .map_err(|_| scan_error("users.decode"))?,
+        );
+    }
+    for &(code, sql) in BOOLEAN_SCANS {
+        let mut values = Vec::new();
+        for row in query_rows!(sql, "boolean.read") {
+            values.push(
+                row.try_get("raw")
+                    .map_err(|_| scan_error("boolean.decode"))?,
+            );
+        }
+        rows.booleans.push((code, values));
+    }
+    for row in query_rows!(
+        "SELECT admission_state,review_decision FROM devices",
+        "devices.read"
+    ) {
+        rows.devices.push((
+            row.try_get("admission_state")
+                .map_err(|_| scan_error("devices.decode"))?,
+            row.try_get("review_decision")
+                .map_err(|_| scan_error("devices.decode"))?,
+        ));
+    }
+    for row in query_rows!(
+        "SELECT permission FROM role_permissions",
+        "role_permissions.read"
+    ) {
+        rows.permissions.push(
+            row.try_get("permission")
+                .map_err(|_| scan_error("role_permissions.decode"))?,
+        );
+    }
+    for row in query_rows!(
+        "SELECT source_kind,CAST(role_id IS NOT NULL AS SIGNED) AS has_role,CAST(permissions AS CHAR) AS permissions_json,scope_kind,CAST(scope_group_id IS NOT NULL AS SIGNED) AS has_group,CAST(scope_device_id IS NOT NULL AS SIGNED) AS has_device FROM grants",
+        "grants.read"
+    ) {
+        rows.grants.push(GrantRow {
+            source: row
+                .try_get("source_kind")
+                .map_err(|_| scan_error("grants.decode"))?,
+            has_role: row
+                .try_get("has_role")
+                .map_err(|_| scan_error("grants.decode"))?,
+            permissions_json: row
+                .try_get::<Option<String>, _>("permissions_json")
+                .map_err(|_| scan_error("grants.decode"))?,
+            scope: row
+                .try_get("scope_kind")
+                .map_err(|_| scan_error("grants.decode"))?,
+            has_group: row
+                .try_get("has_group")
+                .map_err(|_| scan_error("grants.decode"))?,
+            has_device: row
+                .try_get("has_device")
+                .map_err(|_| scan_error("grants.decode"))?,
+        });
+    }
+    for &(code, sql) in ORPHAN_SCANS {
+        rows.orphans.push((
+            code,
+            sqlx::query(sql)
+                .fetch_optional(&db.0)
+                .await
+                .map_err(|_| scan_error("reference.read"))?
+                .is_some(),
+        ));
+    }
+    validate_identity_fixture(&rows, require_meta)
+}
 
 pub fn validate_singleton_ids(ids: &[i8]) -> Result<(), ControllerError> {
     if ids == [1] {
@@ -61,6 +241,91 @@ pub fn validate_grant_fields(
     } else {
         Err(ControllerError::InvalidArgument)
     }
+}
+
+struct IdentityRows {
+    meta: Vec<(i8, i32)>,
+    usernames: Vec<String>,
+    booleans: Vec<(&'static str, Vec<i64>)>,
+    devices: Vec<(String, String)>,
+    permissions: Vec<String>,
+    grants: Vec<GrantRow>,
+    orphans: Vec<(&'static str, bool)>,
+}
+struct GrantRow {
+    source: String,
+    has_role: i64,
+    permissions_json: Option<String>,
+    scope: String,
+    has_group: i64,
+    has_device: i64,
+}
+fn validate_identity_fixture(
+    rows: &IdentityRows,
+    require_meta: bool,
+) -> Result<(), ControllerError> {
+    if (require_meta && rows.meta.as_slice() != [(1, 3)])
+        || (!require_meta && !rows.meta.is_empty())
+    {
+        return Err(scan_error("meta.singleton"));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for username in &rows.usernames {
+        if !crate::db::valid_username(username) || !seen.insert(username.as_bytes()) {
+            return Err(scan_error("users.username"));
+        }
+    }
+    for &(code, ref values) in &rows.booleans {
+        for &value in values {
+            raw_bool(value, code)?;
+        }
+    }
+    for (state, decision) in &rows.devices {
+        validate_device_fields(state, decision).map_err(|_| scan_error("devices.state"))?;
+    }
+    for permission in &rows.permissions {
+        if !valid_permission(permission) {
+            return Err(scan_error("role_permissions.permission"));
+        }
+    }
+    for row in &rows.grants {
+        let has_role = raw_bool(row.has_role, "grants.role_presence")?;
+        let has_group = raw_bool(row.has_group, "grants.group_presence")?;
+        let has_device = raw_bool(row.has_device, "grants.device_presence")?;
+        let permissions = row
+            .permissions_json
+            .as_deref()
+            .map(|text| serde_json::from_str::<Value>(text).map_err(|_| scan_error("grants.json")))
+            .transpose()?;
+        validate_grant_fields(
+            &row.source,
+            has_role,
+            permissions.as_ref(),
+            &row.scope,
+            has_group,
+            has_device,
+        )
+        .map_err(|_| scan_error("grants.fields"))?;
+    }
+    for &(code, missing) in &rows.orphans {
+        if missing {
+            return Err(scan_error(code));
+        }
+    }
+    Ok(())
+}
+fn raw_bool(raw: i64, code: &'static str) -> Result<bool, ControllerError> {
+    match raw {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(scan_error(code)),
+    }
+}
+fn valid_permission(permission: &str) -> bool {
+    matches!(
+        permission,
+        "device.read" | "device.status.read" | "device.reboot" | "device.task.read"
+    )
 }
 
 #[cfg(test)]
@@ -198,18 +463,125 @@ mod tests {
     }
 
     #[test]
-    fn invalid_inputs_have_invalid_argument_error() {
-        assert!(matches!(
-            validate_singleton_ids(&[]),
-            Err(ControllerError::InvalidArgument)
-        ));
-        assert!(matches!(
-            validate_device_fields("PENDING", "approved"),
-            Err(ControllerError::InvalidArgument)
-        ));
-        assert!(matches!(
-            validate_grant_fields("direct", false, None, "all", false, false),
-            Err(ControllerError::InvalidArgument)
-        ));
+    fn fixture_scan_rejects_corrupt_rows_without_echoing_values() {
+        let base = || IdentityRows {
+            meta: vec![(1, 3)],
+            usernames: vec!["alice".into()],
+            booleans: vec![("users.is_admin", vec![0, 1])],
+            devices: vec![("PENDING".into(), "none".into())],
+            permissions: vec!["device.read".into()],
+            grants: vec![GrantRow {
+                source: "role".into(),
+                has_role: 1,
+                permissions_json: None,
+                scope: "all".into(),
+                has_group: 0,
+                has_device: 0,
+            }],
+            orphans: vec![],
+        };
+        assert!(validate_identity_fixture(&base(), true).is_ok());
+        for bad in [vec![], vec![(0, 3)], vec![(1, 2)], vec![(1, 3), (1, 3)]] {
+            let mut rows = base();
+            rows.meta = bad;
+            assert!(validate_identity_fixture(&rows, true).is_err());
+        }
+        let mut fresh = base();
+        fresh.meta.clear();
+        assert!(validate_identity_fixture(&fresh, false).is_ok());
+        assert!(validate_identity_fixture(&base(), false).is_err());
+        for name in ["ab", "Alice", "éric", "a".repeat(65).as_str()] {
+            let mut rows = base();
+            rows.usernames = vec![name.into()];
+            assert!(validate_identity_fixture(&rows, true).is_err());
+        }
+        let mut rows = base();
+        rows.usernames.push("alice".into());
+        assert!(validate_identity_fixture(&rows, true).is_err());
+        for raw in [-1, 2] {
+            let mut rows = base();
+            rows.booleans[0].1 = vec![raw];
+            assert!(validate_identity_fixture(&rows, true).is_err());
+        }
+        for (state, decision) in [
+            ("PENDING", "denied"),
+            ("APPROVED", "approved"),
+            ("REVOKED", "revoked"),
+        ] {
+            let mut rows = base();
+            rows.devices = vec![(state.into(), decision.into())];
+            assert!(validate_identity_fixture(&rows, true).is_ok());
+        }
+        for (state, decision) in [
+            ("APPROVED", "none"),
+            ("PENDING", "approved"),
+            ("REVOKED", "denied"),
+        ] {
+            let mut rows = base();
+            rows.devices = vec![(state.into(), decision.into())];
+            assert!(validate_identity_fixture(&rows, true).is_err());
+        }
+        let mut rows = base();
+        rows.permissions = vec!["wrong.permission".into()];
+        assert!(validate_identity_fixture(&rows, true).is_err());
+        for json in [
+            Some("null"),
+            Some("[\"device.read\"]"),
+            Some("broken"),
+            Some(""),
+        ] {
+            let mut rows = base();
+            rows.grants[0].permissions_json = json.map(str::to_owned);
+            assert!(validate_identity_fixture(&rows, true).is_err());
+        }
+        for json in [
+            None,
+            Some("null"),
+            Some("[]"),
+            Some("{}"),
+            Some("[\"unknown\"]"),
+        ] {
+            let mut rows = base();
+            rows.grants[0] = GrantRow {
+                source: "direct".into(),
+                has_role: 0,
+                permissions_json: json.map(str::to_owned),
+                scope: "all".into(),
+                has_group: 0,
+                has_device: 0,
+            };
+            assert!(validate_identity_fixture(&rows, true).is_err());
+        }
+        let mut rows = base();
+        rows.grants[0] = GrantRow {
+            source: "direct".into(),
+            has_role: 0,
+            permissions_json: Some("[\"device.read\"]".into()),
+            scope: "group".into(),
+            has_group: 1,
+            has_device: 0,
+        };
+        assert!(validate_identity_fixture(&rows, true).is_ok());
+        for presence in [(2, 0, 0), (0, 2, 0), (0, 0, 2)] {
+            let mut rows = base();
+            rows.grants[0].has_role = presence.0;
+            rows.grants[0].has_group = presence.1;
+            rows.grants[0].has_device = presence.2;
+            assert!(validate_identity_fixture(&rows, true).is_err());
+        }
+        for category in [
+            "sessions",
+            "role_permissions",
+            "group_members",
+            "grants",
+            "admission_decisions",
+            "audit_events",
+        ] {
+            let mut rows = base();
+            rows.orphans = vec![(category, true)];
+            assert!(validate_identity_fixture(&rows, true).is_err());
+            rows.orphans[0].1 = false; // inactive/archived parent exists
+            assert!(validate_identity_fixture(&rows, true).is_ok());
+        }
     }
 }

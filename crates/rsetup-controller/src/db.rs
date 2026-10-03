@@ -545,6 +545,9 @@ trait IdentitySchemaProbe {
     fn validate_legacy_v2_shape(
         &self,
     ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
+    fn validate_data(
+        &self,
+    ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
 }
 
 // Only the explicitly authorized historical migration may accept a complete v2 shape.
@@ -561,7 +564,8 @@ async fn check_identity_schema_with_probe(
 ) -> Result<(), ControllerError> {
     identity_schema_decision(probe.read_version().await?)?;
     probe.validate_v2_shape().await?;
-    // The data scan and FK metadata gate belong to Task 2B/2C. Until both are
+    probe.validate_data().await?;
+    // The FK metadata gate belongs to Task 2C. Until that gate is attached,
     // attached, shape alone must never authorize bootstrap or service startup.
     Err(ControllerError::Config(
         "identity integrity checks not ready".into(),
@@ -1014,6 +1018,9 @@ impl IdentitySchemaProbe for DbPool {
     async fn validate_legacy_v2_shape(&self) -> Result<(), ControllerError> {
         validate_schema_shape(self, Some(true)).await
     }
+    async fn validate_data(&self) -> Result<(), ControllerError> {
+        crate::integrity::check_identity_data(self).await
+    }
 }
 
 pub async fn check_identity_schema(db: &DbPool) -> Result<(), ControllerError> {
@@ -1453,7 +1460,9 @@ mod tests {
             version: Option<i32>,
             reads: AtomicUsize,
             shapes: AtomicUsize,
+            data_calls: AtomicUsize,
             broken: bool,
+            bad_data: bool,
         }
         impl IdentitySchemaProbe for Fake {
             async fn read_version(&self) -> Result<Option<i32>, ControllerError> {
@@ -1471,20 +1480,31 @@ mod tests {
             async fn validate_legacy_v2_shape(&self) -> Result<(), ControllerError> {
                 self.validate_v2_shape().await
             }
+            async fn validate_data(&self) -> Result<(), ControllerError> {
+                self.data_calls.fetch_add(1, Ordering::SeqCst);
+                if self.bad_data {
+                    Err(ControllerError::Config("polluted identity data".into()))
+                } else {
+                    Ok(())
+                }
+            }
         }
-        for (version, shape_count, broken) in [
-            (None, 0, false),
-            (Some(1), 0, false),
-            (Some(2), 0, false),
-            (Some(3), 1, false),
-            (Some(3), 1, true),
-            (Some(4), 0, false),
+        for (version, shape_count, data_count, broken, bad_data) in [
+            (None, 0, 0, false, false),
+            (Some(1), 0, 0, false, false),
+            (Some(2), 0, 0, false, false),
+            (Some(3), 1, 1, false, false),
+            (Some(3), 1, 1, false, true),
+            (Some(3), 1, 0, true, false),
+            (Some(4), 0, 0, false, false),
         ] {
             let fake = Fake {
                 version,
                 reads: AtomicUsize::new(0),
                 shapes: AtomicUsize::new(0),
+                data_calls: AtomicUsize::new(0),
                 broken,
+                bad_data,
             };
             let result = check_identity_schema_with_probe(&fake).await;
             match version {
@@ -1494,6 +1514,9 @@ mod tests {
                 Some(3) if broken => assert!(
                     matches!(result, Err(ControllerError::Config(ref message)) if message == "broken shape")
                 ),
+                Some(3) if bad_data => assert!(
+                    matches!(result, Err(ControllerError::Config(ref message)) if message == "polluted identity data")
+                ),
                 Some(3) => assert!(
                     matches!(result, Err(ControllerError::Config(ref message)) if message == "identity integrity checks not ready")
                 ),
@@ -1501,6 +1524,7 @@ mod tests {
             }
             assert_eq!(fake.reads.load(Ordering::SeqCst), 1);
             assert_eq!(fake.shapes.load(Ordering::SeqCst), shape_count);
+            assert_eq!(fake.data_calls.load(Ordering::SeqCst), data_count);
         }
     }
 
@@ -1528,6 +1552,9 @@ mod tests {
                         "incomplete historical v2 shape".into(),
                     ))
                 }
+            }
+            async fn validate_data(&self) -> Result<(), ControllerError> {
+                panic!("legacy runner must not scan v3 data")
             }
         }
         for (version, shape_valid, expected_calls, accepted) in [
