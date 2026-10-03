@@ -139,6 +139,21 @@ struct ColumnMeta {
     data_type: String,
     column_type: String,
     nullable: bool,
+    character_set_name: Option<String>,
+    collation_name: Option<String>,
+}
+
+// Task 2 consumes this from the migration preflight; Task 1 only tests the pure rule.
+#[allow(dead_code)]
+pub(crate) fn valid_username(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    (3..=64).contains(&bytes.len())
+        && bytes
+            .first()
+            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && bytes.iter().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(*b, b'.' | b'_' | b'-')
+        })
 }
 
 fn validate_column_shape(
@@ -167,9 +182,39 @@ fn validate_column_shape(
         "binary" | "varbinary" | "varchar" | "char" | "datetime"
     );
     let optional = tokens.windows(2).any(|part| part == ["NOT", "NULL"]);
+    let declared_unsigned = tokens
+        .iter()
+        .any(|token| token.eq_ignore_ascii_case("UNSIGNED"));
+    let actual_unsigned = actual
+        .column_type
+        .split_whitespace()
+        .any(|token| token.eq_ignore_ascii_case("unsigned"));
+    let declared_charset = tokens
+        .windows(3)
+        .find(|part| {
+            part[0].eq_ignore_ascii_case("CHARACTER") && part[1].eq_ignore_ascii_case("SET")
+        })
+        .map(|part| part[2]);
+    let declared_collation = tokens
+        .windows(2)
+        .find(|part| part[0].eq_ignore_ascii_case("COLLATE"))
+        .map(|part| part[1]);
     if actual_type != declared_type
+        || declared_unsigned != actual_unsigned
         || (length_sensitive && declared_len != actual_len.as_deref())
         || actual.nullable == optional
+        || declared_charset.is_some_and(|expected| {
+            !actual
+                .character_set_name
+                .as_deref()
+                .is_some_and(|found| found.eq_ignore_ascii_case(expected))
+        })
+        || declared_collation.is_some_and(|expected| {
+            !actual
+                .collation_name
+                .as_deref()
+                .is_some_and(|found| found.eq_ignore_ascii_case(expected))
+        })
     {
         return Err(ControllerError::Config(format!(
             "migration incompatible column {table}.{}: expected {expected}, got {} {} nullable={}",
@@ -358,7 +403,7 @@ pub async fn migrate(db: &DbPool) -> Result<(), ControllerError> {
                         "migration DDL missing column {table}.{column}"
                     ))
                 })?;
-            let row = sqlx::query("SELECT data_type, column_type, is_nullable FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?")
+            let row = sqlx::query("SELECT data_type, column_type, is_nullable, character_set_name, collation_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?")
                 .bind(table).bind(column).fetch_optional(&db.0).await?
                 .ok_or_else(|| ControllerError::Config(format!("migration missing column {table}.{column}")))?;
             validate_column_shape(
@@ -369,6 +414,8 @@ pub async fn migrate(db: &DbPool) -> Result<(), ControllerError> {
                     data_type: row.try_get("data_type")?,
                     column_type: row.try_get("column_type")?,
                     nullable: row.try_get::<String, _>("is_nullable")? == "YES",
+                    character_set_name: row.try_get::<Option<String>, _>("character_set_name")?,
+                    collation_name: row.try_get::<Option<String>, _>("collation_name")?,
                 },
             )?;
         }
@@ -653,12 +700,141 @@ mod tests {
     }
 
     #[test]
+    fn same_width_signed_counter_is_incompatible() {
+        let signed = ColumnMeta {
+            name: "event_seq".into(),
+            data_type: "bigint".into(),
+            column_type: "bigint".into(),
+            nullable: false,
+            character_set_name: None,
+            collation_name: None,
+        };
+        let unsigned = ColumnMeta {
+            column_type: "bigint unsigned".into(),
+            ..signed.clone()
+        };
+        assert!(
+            validate_column_shape("audit_events", "BIGINT UNSIGNED NOT NULL", &unsigned).is_ok()
+        );
+        assert!(
+            validate_column_shape("audit_events", "BIGINT UNSIGNED NOT NULL", &signed).is_err()
+        );
+    }
+
+    #[test]
+    fn username_requires_ascii_bin_not_matching_width_only() {
+        let good = ColumnMeta {
+            name: "username".into(),
+            data_type: "varchar".into(),
+            column_type: "varchar(64)".into(),
+            nullable: false,
+            character_set_name: Some("ascii".into()),
+            collation_name: Some("ascii_bin".into()),
+        };
+        assert!(
+            validate_column_shape(
+                "users",
+                "VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL",
+                &good
+            )
+            .is_ok()
+        );
+        for bad in [
+            ColumnMeta {
+                character_set_name: Some("utf8mb4".into()),
+                ..good.clone()
+            },
+            ColumnMeta {
+                collation_name: Some("ascii_general_ci".into()),
+                ..good.clone()
+            },
+        ] {
+            assert!(
+                validate_column_shape(
+                    "users",
+                    "VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL",
+                    &bad
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn username_rules_reject_noncanonical_input() {
+        let long_ok = "a".repeat(64);
+        let long_bad = "a".repeat(65);
+        for good in ["abc", "a.b_c-1", long_ok.as_str()] {
+            assert!(valid_username(good));
+        }
+        for bad in [
+            "ab",
+            long_bad.as_str(),
+            "Éric",
+            "Alice",
+            "alice!",
+            "-alice",
+            "a b",
+        ] {
+            assert!(!valid_username(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn all_identity_counters_require_unsigned_but_schema_version_stays_int() {
+        for (table, column) in [
+            ("schema_meta", "authz_epoch"),
+            ("schema_meta", "admin_guard_revision"),
+            ("users", "revision"),
+            ("roles", "revision"),
+            ("device_groups", "revision"),
+            ("devices", "revision"),
+            ("grants", "revision"),
+            ("admission_decisions", "previous_revision"),
+            ("admission_decisions", "new_revision"),
+            ("audit_events", "event_seq"),
+        ] {
+            let signed = ColumnMeta {
+                name: column.into(),
+                data_type: "bigint".into(),
+                column_type: "bigint".into(),
+                nullable: false,
+                character_set_name: None,
+                collation_name: None,
+            };
+            let unsigned = ColumnMeta {
+                column_type: "bigint unsigned".into(),
+                ..signed.clone()
+            };
+            assert!(
+                validate_column_shape(table, "BIGINT UNSIGNED NOT NULL", &unsigned).is_ok(),
+                "{table}.{column}"
+            );
+            assert!(
+                validate_column_shape(table, "BIGINT UNSIGNED NOT NULL", &signed).is_err(),
+                "{table}.{column}"
+            );
+        }
+        let version = ColumnMeta {
+            name: "schema_version".into(),
+            data_type: "int".into(),
+            column_type: "int".into(),
+            nullable: false,
+            character_set_name: None,
+            collation_name: None,
+        };
+        assert!(validate_column_shape("schema_meta", "INT NOT NULL", &version).is_ok());
+    }
+
+    #[test]
     fn incompatible_binary_length_type_and_nullability_are_rejected() {
         let base = ColumnMeta {
             name: "public_key".into(),
             data_type: "binary".into(),
             column_type: "binary(32)".into(),
             nullable: false,
+            character_set_name: None,
+            collation_name: None,
         };
         assert!(validate_column_shape("devices", "BINARY(32) NOT NULL", &base).is_ok());
         for altered in [
@@ -828,12 +1004,16 @@ mod tests {
             data_type: "json".into(),
             column_type: "json".into(),
             nullable: true,
+            character_set_name: None,
+            collation_name: None,
         };
         let bool_col = ColumnMeta {
             name: "initialized".into(),
             data_type: "tinyint".into(),
             column_type: "tinyint(1)".into(),
             nullable: false,
+            character_set_name: None,
+            collation_name: None,
         };
         assert!(validate_column_shape("devices", "JSON NULL", &json).is_ok());
         assert!(
