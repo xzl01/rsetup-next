@@ -542,6 +542,19 @@ trait IdentitySchemaProbe {
     fn validate_v2_shape(
         &self,
     ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
+    fn validate_legacy_v2_shape(
+        &self,
+    ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
+}
+
+// Only the explicitly authorized historical migration may accept a complete v2 shape.
+async fn check_legacy_v2_ready(probe: &impl IdentitySchemaProbe) -> Result<(), ControllerError> {
+    if probe.read_version().await? != Some(2) {
+        return Err(ControllerError::Config(
+            "legacy identity migration requires schema version 2".into(),
+        ));
+    }
+    probe.validate_legacy_v2_shape().await
 }
 async fn check_identity_schema_with_probe(
     probe: &impl IdentitySchemaProbe,
@@ -714,6 +727,38 @@ fn validate_v3_table_collation(table: &str, table_collation: &str) -> Result<(),
     }
 }
 
+fn validate_v3_column_charset(
+    table: &str,
+    declaration: &str,
+    actual: &ColumnMeta,
+    table_collation: &str,
+) -> Result<(), ControllerError> {
+    let declared_type = declaration
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_ascii_lowercase();
+    let character_column = matches!(
+        declared_type.split('(').next().unwrap(),
+        "varchar" | "char" | "text" | "tinytext" | "mediumtext" | "longtext"
+    );
+    if !character_column || declaration.contains("CHARACTER SET ") {
+        return Ok(());
+    }
+    if actual.character_set_name.as_deref() != Some("utf8mb4")
+        || !actual
+            .collation_name
+            .as_deref()
+            .is_some_and(|found| found.eq_ignore_ascii_case(table_collation))
+    {
+        return Err(ControllerError::Config(format!(
+            "migration incompatible character metadata {table}.{}",
+            actual.name
+        )));
+    }
+    Ok(())
+}
+
 async fn validate_schema_shape(db: &DbPool, target: Option<bool>) -> Result<(), ControllerError> {
     validate_schema_shape_with_contract(db, target, MIGRATION).await
 }
@@ -742,11 +787,14 @@ async fn validate_schema_shape_with_contract(
         ));
     }
     for &(table, columns, indexes) in TABLES {
-        if migration == V3_MIGRATION {
+        let table_collation = if migration == V3_MIGRATION {
             let table_collation: String = sqlx::query_scalar("SELECT CAST(table_collation AS CHAR) AS table_collation FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?")
                 .bind(table).fetch_one(&db.0).await?;
             validate_v3_table_collation(table, &table_collation)?;
-        }
+            Some(table_collation)
+        } else {
+            None
+        };
         let parts = if migration == V3_MIGRATION {
             ddl_parts(table)
         } else {
@@ -772,6 +820,12 @@ async fn validate_schema_shape_with_contract(
             let actual = read_column(db, table, column).await?;
             if migration == V3_MIGRATION {
                 validate_column_shape(table, declaration, &actual)?;
+                validate_v3_column_charset(
+                    table,
+                    declaration,
+                    &actual,
+                    table_collation.as_deref().unwrap(),
+                )?;
             } else if IDENTITY_COLUMNS
                 .iter()
                 .any(|&(t, c, _, _)| t == table && c == column)
@@ -795,6 +849,9 @@ async fn validate_schema_shape_with_contract(
                 }
             } else {
                 validate_column_shape(table, declaration, &actual)?;
+            }
+            if migration == V3_MIGRATION {
+                validate_v3_false_default(db, table, column).await?;
             }
             if table == "schema_meta" && matches!(column, "authz_epoch" | "admin_guard_revision") {
                 validate_counter_default(db, column).await?;
@@ -879,6 +936,38 @@ async fn read_column(
     })
 }
 
+fn validate_false_default_metadata(
+    table: &str,
+    column: &str,
+    default: Option<&str>,
+) -> Result<(), ControllerError> {
+    // BOOLEAN is a TINYINT alias; only numeric 0 is accepted here. Other
+    // engine readback representations require independent verification.
+    if default == Some("0") {
+        Ok(())
+    } else {
+        Err(ControllerError::Config(format!(
+            "migration incompatible default {table}.{column}"
+        )))
+    }
+}
+
+async fn validate_v3_false_default(
+    db: &DbPool,
+    table: &str,
+    column: &str,
+) -> Result<(), ControllerError> {
+    if !matches!(
+        (table, column),
+        ("schema_meta", "initialized") | ("sessions", "revoked") | ("devices", "archived")
+    ) {
+        return Ok(());
+    }
+    let default: Option<String> = sqlx::query_scalar("SELECT CAST(column_default AS CHAR) AS column_default FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?")
+        .bind(table).bind(column).fetch_one(&db.0).await?;
+    validate_false_default_metadata(table, column, default.as_deref())
+}
+
 async fn validate_counter_default(db: &DbPool, column: &str) -> Result<(), ControllerError> {
     let default: Option<String> = sqlx::query_scalar("SELECT CAST(column_default AS CHAR) AS column_default FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'schema_meta' AND column_name = ?")
         .bind(column).fetch_one(&db.0).await?;
@@ -921,6 +1010,9 @@ impl IdentitySchemaProbe for DbPool {
     }
     async fn validate_v2_shape(&self) -> Result<(), ControllerError> {
         validate_v3_schema_shape(self).await
+    }
+    async fn validate_legacy_v2_shape(&self) -> Result<(), ControllerError> {
+        validate_schema_shape(self, Some(true)).await
     }
 }
 
@@ -1034,7 +1126,7 @@ async fn upgrade_identity_schema(
         if !matches!(mode, TestMigrationMode::Upgrade) {
             return Err(ControllerError::Config("fixture requires v1".into()));
         }
-        return check_identity_schema(db).await;
+        return check_legacy_v2_ready(db).await;
     }
     if version.is_none() {
         let tables: i64 = sqlx::query_scalar(
@@ -1121,7 +1213,7 @@ async fn upgrade_identity_schema(
             )));
         }
     }
-    check_identity_schema(db).await
+    check_legacy_v2_ready(db).await
 }
 
 pub trait AdmissionStore {
@@ -1341,6 +1433,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn explicit_legacy_upgrade_never_uses_startup_gate_as_v2_terminal_check() {
+        let body = include_str!("db.rs")
+            .split_once("async fn upgrade_identity_schema(")
+            .unwrap()
+            .1
+            .split_once("\npub trait AdmissionStore")
+            .unwrap()
+            .0;
+        assert!(!body.contains("check_identity_schema(db).await"));
+        assert_eq!(body.matches("check_legacy_v2_ready(db).await").count(), 2);
+    }
+
     #[tokio::test]
     async fn readonly_probe_gates_shape_only_after_v3_and_never_reports_ready_yet() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1362,6 +1467,9 @@ mod tests {
                 } else {
                     Ok(())
                 }
+            }
+            async fn validate_legacy_v2_shape(&self) -> Result<(), ControllerError> {
+                self.validate_v2_shape().await
             }
         }
         for (version, shape_count, broken) in [
@@ -1393,6 +1501,49 @@ mod tests {
             }
             assert_eq!(fake.reads.load(Ordering::SeqCst), 1);
             assert_eq!(fake.shapes.load(Ordering::SeqCst), shape_count);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_v2_probe_accepts_only_version_two_with_complete_historical_shape() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Fake {
+            version: Option<i32>,
+            shape_valid: bool,
+            shape_calls: AtomicUsize,
+        }
+        impl IdentitySchemaProbe for Fake {
+            async fn read_version(&self) -> Result<Option<i32>, ControllerError> {
+                Ok(self.version)
+            }
+            async fn validate_v2_shape(&self) -> Result<(), ControllerError> {
+                panic!("startup v3 shape must not be used by legacy runner")
+            }
+            async fn validate_legacy_v2_shape(&self) -> Result<(), ControllerError> {
+                self.shape_calls.fetch_add(1, Ordering::SeqCst);
+                if self.shape_valid {
+                    Ok(())
+                } else {
+                    Err(ControllerError::Config(
+                        "incomplete historical v2 shape".into(),
+                    ))
+                }
+            }
+        }
+        for (version, shape_valid, expected_calls, accepted) in [
+            (None, true, 0, false),
+            (Some(1), true, 0, false),
+            (Some(3), true, 0, false),
+            (Some(2), false, 1, false),
+            (Some(2), true, 1, true),
+        ] {
+            let fake = Fake {
+                version,
+                shape_valid,
+                shape_calls: AtomicUsize::new(0),
+            };
+            assert_eq!(check_legacy_v2_ready(&fake).await.is_ok(), accepted);
+            assert_eq!(fake.shape_calls.load(Ordering::SeqCst), expected_calls);
         }
     }
 
@@ -1724,8 +1875,8 @@ mod tests {
                 string_columns += 1;
             }
         }
-        assert_eq!(queries, 10);
-        assert_eq!(string_columns, 13);
+        assert_eq!(queries, 11);
+        assert_eq!(string_columns, 14);
     }
 
     #[test]
@@ -1887,6 +2038,107 @@ mod tests {
         assert!(validate_v3_table_collation("users", "utf8mb4_bin").is_ok());
         assert!(validate_v3_table_collation("users", "latin1_swedish_ci").is_err());
         assert!(validate_v3_table_collation("users", "utf8mb4fake_ci").is_err());
+    }
+
+    #[test]
+    fn v3_checks_implicit_character_columns_against_table_default() {
+        let source = include_str!("db.rs");
+        let body = source
+            .split_once("async fn validate_schema_shape_with_contract(")
+            .unwrap()
+            .1
+            .split_once("\nasync fn read_column(")
+            .unwrap()
+            .0;
+        assert!(body.contains("validate_v3_column_charset("));
+    }
+
+    #[test]
+    fn v3_implicit_character_metadata_rejects_column_overrides() {
+        let good = ColumnMeta {
+            name: "display_name".into(),
+            data_type: "varchar".into(),
+            column_type: "varchar(128)".into(),
+            nullable: false,
+            character_set_name: Some("utf8mb4".into()),
+            collation_name: Some("utf8mb4_bin".into()),
+        };
+        for (table, declaration) in [
+            ("users", "VARCHAR(128) NOT NULL"),
+            ("roles", "VARCHAR(128) NOT NULL"),
+            ("devices", "VARCHAR(128) NOT NULL"),
+        ] {
+            assert!(validate_v3_column_charset(table, declaration, &good, "utf8mb4_bin").is_ok());
+            for bad in [
+                ColumnMeta {
+                    character_set_name: Some("latin1".into()),
+                    ..good.clone()
+                },
+                ColumnMeta {
+                    character_set_name: Some("ascii".into()),
+                    ..good.clone()
+                },
+                ColumnMeta {
+                    collation_name: Some("utf8mb4_general_ci".into()),
+                    ..good.clone()
+                },
+                ColumnMeta {
+                    collation_name: None,
+                    ..good.clone()
+                },
+            ] {
+                assert!(
+                    validate_v3_column_charset(table, declaration, &bad, "utf8mb4_bin").is_err()
+                );
+            }
+        }
+        assert!(
+            validate_v3_column_charset(
+                "users",
+                "VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL",
+                &ColumnMeta {
+                    character_set_name: Some("ascii".into()),
+                    collation_name: Some("ascii_bin".into()),
+                    ..good
+                },
+                "utf8mb4_bin"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn v3_false_defaults_are_part_of_the_readonly_shape_gate() {
+        let source = include_str!("db.rs");
+        let body = source
+            .split_once("async fn validate_schema_shape_with_contract(")
+            .unwrap()
+            .1
+            .split_once("\nasync fn read_column(")
+            .unwrap()
+            .0;
+        assert!(body.contains("validate_v3_false_default(db, table, column).await?"));
+    }
+
+    #[test]
+    fn v3_false_defaults_reject_true_null_and_unverified_readbacks_without_value_leaks() {
+        for (table, column) in [
+            ("schema_meta", "initialized"),
+            ("sessions", "revoked"),
+            ("devices", "archived"),
+        ] {
+            assert!(validate_false_default_metadata(table, column, Some("0")).is_ok());
+            for bad in [
+                None,
+                Some("1"),
+                Some("TRUE"),
+                Some("FALSE"),
+                Some("unexpected sensitive value"),
+            ] {
+                let error = validate_false_default_metadata(table, column, bad).unwrap_err();
+                assert!(!format!("{error}").contains("unexpected sensitive value"));
+            }
+        }
     }
 
     #[test]
