@@ -1882,6 +1882,13 @@ async fn upgrade_legacy_with_probe(
             "legacy version CAS outcome uncertain".into(),
         ));
     }
+    if !matches!(probe.read_version().await, Ok(Some(3))) {
+        // A reported single CAS row is insufficient evidence that the
+        // persisted version is 3. Unknown/old/read failure stays uncertain.
+        return Err(ControllerError::Config(
+            "legacy version CAS outcome uncertain".into(),
+        ));
+    }
     probe.ready_v3().await
 }
 
@@ -3060,7 +3067,10 @@ mod tests {
         noop_drop: bool,
         drift_on_read: Option<usize>,
         cas_rows: u64,
+        cas_updates_version: bool,
+        cas_corrupt_shape: bool,
         cas_error: bool,
+        read_version_reply: Option<Option<i32>>,
     }
     impl LegacyUpgradeFake {
         fn new(version: i32) -> Self {
@@ -3074,7 +3084,10 @@ mod tests {
                 noop_drop: false,
                 drift_on_read: None,
                 cas_rows: 1,
+                cas_updates_version: true,
+                cas_corrupt_shape: false,
                 cas_error: false,
+                read_version_reply: None,
             }))
         }
         fn gate(&self, name: &'static str) -> Result<(), ControllerError> {
@@ -3191,17 +3204,34 @@ mod tests {
                 state.version = 3; // Unknown result: even an applied CAS is not success.
                 return Err(ControllerError::Config("simulated uncertain CAS".into()));
             }
-            if state.cas_rows == 1 {
+            if state.cas_rows == 1 && state.cas_updates_version {
                 state.version = to;
+            }
+            if state.cas_rows == 1 && state.cas_corrupt_shape {
+                state.columns[0] = true;
             }
             Ok(state.cas_rows)
         }
         async fn read_version(&self) -> Result<Option<i32>, ControllerError> {
             self.gate("read_version")?;
-            Ok(Some(self.0.lock().unwrap().version))
+            let state = self.0.lock().unwrap();
+            Ok(state.read_version_reply.unwrap_or(Some(state.version)))
         }
         async fn ready_v3(&self) -> Result<(), ControllerError> {
-            self.gate("ready")
+            self.gate("ready")?;
+            self.gate("ready_version")?;
+            if self.0.lock().unwrap().version != 3 {
+                return Err(legacy_preflight_error("ready.version"));
+            }
+            self.gate("ready_shape")?;
+            {
+                let state = self.0.lock().unwrap();
+                if state.columns.iter().any(|old| *old) || !state.checks.is_empty() {
+                    return Err(legacy_preflight_error("ready.shape"));
+                }
+            }
+            self.gate("ready_data")?;
+            self.gate("ready_fk")
         }
     }
 
@@ -3260,7 +3290,16 @@ mod tests {
                     assert_eq!(events[index + 1], "meta");
                 }
             }
-            assert!(events.ends_with(&["strict".into(), "cas".into(), "ready".into()]));
+            assert!(events.ends_with(&[
+                "strict".into(),
+                "cas".into(),
+                "read_version".into(),
+                "ready".into(),
+                "ready_version".into(),
+                "ready_shape".into(),
+                "ready_data".into(),
+                "ready_fk".into(),
+            ]));
             assert_eq!(fake.0.lock().unwrap().version, 3);
         }
         let full = LegacyUpgradeFake::new(1);
@@ -3409,6 +3448,84 @@ mod tests {
         strict.0.lock().unwrap().fault_gate = Some("strict");
         assert!(upgrade_legacy_with_probe(&strict, 2).await.is_err());
         assert!(strict.writes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_upgrade_rejects_cas_ok_one_when_version_remains_legacy() {
+        for version in [1, 2] {
+            let fake = LegacyUpgradeFake::new(version);
+            {
+                let mut state = fake.0.lock().unwrap();
+                state.columns = [false; 11];
+                state.checks.clear();
+                state.cas_rows = 1;
+                state.cas_updates_version = false;
+            }
+            // The original permissive ready_v3 let this pass during RED;
+            // the state machine must not infer version 3 from rowcount alone.
+            let result = upgrade_legacy_with_probe(&fake, version).await;
+            assert!(
+                matches!(result, Err(ControllerError::Config(ref message)) if message == "legacy version CAS outcome uncertain"),
+                "version {version}: {result:?}"
+            );
+            assert_eq!(fake.0.lock().unwrap().version, version);
+            assert!(fake.events().contains(&"read_version".into()));
+            assert!(!fake.events().contains(&"ready".into()));
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_upgrade_rejects_unknown_post_cas_version_without_ready() {
+        for reply in [Some(1), Some(2), None] {
+            let fake = LegacyUpgradeFake::new(2);
+            {
+                let mut state = fake.0.lock().unwrap();
+                state.checks.clear();
+                state.read_version_reply = Some(reply);
+            }
+            let result = upgrade_legacy_with_probe(&fake, 2).await;
+            assert!(
+                matches!(result, Err(ControllerError::Config(ref message)) if message == "legacy version CAS outcome uncertain"),
+                "reply {reply:?}: {result:?}"
+            );
+            assert_eq!(fake.0.lock().unwrap().version, 3);
+            assert!(!fake.events().contains(&"ready".into()));
+        }
+        let read_failure = LegacyUpgradeFake::new(2);
+        {
+            let mut state = read_failure.0.lock().unwrap();
+            state.checks.clear();
+            state.fault_gate = Some("read_version");
+        }
+        let result = upgrade_legacy_with_probe(&read_failure, 2).await;
+        assert!(
+            matches!(result, Err(ControllerError::Config(ref message)) if message == "legacy version CAS outcome uncertain")
+        );
+        assert!(!read_failure.events().contains(&"ready".into()));
+    }
+
+    #[tokio::test]
+    async fn legacy_upgrade_rejects_post_cas_shape_data_and_fk_failures() {
+        for gate in ["ready_shape", "ready_data", "ready_fk"] {
+            let fake = LegacyUpgradeFake::new(2);
+            {
+                let mut state = fake.0.lock().unwrap();
+                state.checks.clear();
+                state.fault_gate = Some(gate);
+            }
+            assert!(upgrade_legacy_with_probe(&fake, 2).await.is_err(), "{gate}");
+            assert_eq!(fake.0.lock().unwrap().version, 3);
+            assert!(fake.events().contains(&gate.into()));
+        }
+        let shape_drift = LegacyUpgradeFake::new(2);
+        {
+            let mut state = shape_drift.0.lock().unwrap();
+            state.checks.clear();
+            state.cas_corrupt_shape = true;
+        }
+        assert!(upgrade_legacy_with_probe(&shape_drift, 2).await.is_err());
+        assert_eq!(shape_drift.0.lock().unwrap().version, 3);
+        assert!(shape_drift.events().contains(&"ready_shape".into()));
     }
 
     #[tokio::test]
