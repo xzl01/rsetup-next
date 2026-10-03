@@ -11,6 +11,7 @@ impl DbPool {
 
 const MIGRATION: &str = include_str!("../migrations/0001_identity_devices.sql");
 const IDENTITY_MIGRATION: &str = include_str!("../migrations/0002_identity_contract.sql");
+const V3_MIGRATION: &str = include_str!("../migrations/0003_identity_application_integrity.sql");
 const STATISTICS_QUERY: &str = "SELECT CAST(index_name AS CHAR) AS index_name, CAST(column_name AS CHAR) AS column_name, CAST(non_unique AS SIGNED) AS non_unique, CAST(seq_in_index AS SIGNED) AS seq_in_index, CAST(sub_part AS SIGNED) AS sub_part FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? ORDER BY index_name, seq_in_index";
 // Fixed statements and identifiers: never interpolate database-supplied table/column names.
 const IDENTITY_COLUMNS: &[(&str, &str, &str, &str)] = &[
@@ -338,9 +339,9 @@ fn validate_indexes(
     Ok(())
 }
 
-fn ddl_parts(table: &str) -> Vec<String> {
+fn ddl_parts_from(migration: &str, table: &str) -> Vec<String> {
     let prefix = format!("CREATE TABLE IF NOT EXISTS {table} (");
-    let ddl = MIGRATION
+    let ddl = migration
         .split(';')
         .find(|statement| statement.trim().starts_with(&prefix))
         .expect("table declared in migration")
@@ -369,6 +370,10 @@ fn ddl_parts(table: &str) -> Vec<String> {
     }
     parts.push(body[start..].trim().to_owned());
     parts
+}
+
+fn ddl_parts(table: &str) -> Vec<String> {
+    ddl_parts_from(V3_MIGRATION, table)
 }
 
 fn normalize_check(value: &str) -> String {
@@ -542,15 +547,22 @@ async fn check_identity_schema_with_probe(
     probe: &impl IdentitySchemaProbe,
 ) -> Result<(), ControllerError> {
     identity_schema_decision(probe.read_version().await?)?;
-    probe.validate_v2_shape().await
+    probe.validate_v2_shape().await?;
+    // The data scan and FK metadata gate belong to Task 2B/2C. Until both are
+    // attached, shape alone must never authorize bootstrap or service startup.
+    Err(ControllerError::Config(
+        "identity integrity checks not ready".into(),
+    ))
 }
+
+const IDENTITY_SCHEMA_VERSION: i32 = 3;
 
 fn identity_schema_decision(version: Option<i32>) -> Result<(), ControllerError> {
     match version {
-        Some(2) => Ok(()),
-        None | Some(1) => Err(ControllerError::SchemaNotReady {
+        Some(IDENTITY_SCHEMA_VERSION) => Ok(()),
+        None | Some(1) | Some(2) => Err(ControllerError::SchemaNotReady {
             found: version,
-            required: 2,
+            required: IDENTITY_SCHEMA_VERSION,
         }),
         other => Err(ControllerError::Config(format!(
             "unsupported identity schema version {other:?}"
@@ -692,7 +704,29 @@ where
     upgrade(db).await
 }
 
+fn validate_v3_table_collation(table: &str, table_collation: &str) -> Result<(), ControllerError> {
+    if table_collation.to_ascii_lowercase().starts_with("utf8mb4_") {
+        Ok(())
+    } else {
+        Err(ControllerError::Config(format!(
+            "migration incompatible table charset {table}"
+        )))
+    }
+}
+
 async fn validate_schema_shape(db: &DbPool, target: Option<bool>) -> Result<(), ControllerError> {
+    validate_schema_shape_with_contract(db, target, MIGRATION).await
+}
+
+async fn validate_v3_schema_shape(db: &DbPool) -> Result<(), ControllerError> {
+    validate_schema_shape_with_contract(db, Some(true), V3_MIGRATION).await
+}
+
+async fn validate_schema_shape_with_contract(
+    db: &DbPool,
+    target: Option<bool>,
+    migration: &str,
+) -> Result<(), ControllerError> {
     let present: Vec<String> = sqlx::query_scalar(
         "SELECT CAST(table_name AS CHAR) AS table_name FROM information_schema.tables WHERE table_schema = DATABASE()",
     )
@@ -708,7 +742,16 @@ async fn validate_schema_shape(db: &DbPool, target: Option<bool>) -> Result<(), 
         ));
     }
     for &(table, columns, indexes) in TABLES {
-        let parts = ddl_parts(table);
+        if migration == V3_MIGRATION {
+            let table_collation: String = sqlx::query_scalar("SELECT CAST(table_collation AS CHAR) AS table_collation FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?")
+                .bind(table).fetch_one(&db.0).await?;
+            validate_v3_table_collation(table, &table_collation)?;
+        }
+        let parts = if migration == V3_MIGRATION {
+            ddl_parts(table)
+        } else {
+            ddl_parts_from(migration, table)
+        };
         let actual_columns: Vec<String> = sqlx::query_scalar("SELECT CAST(column_name AS CHAR) AS column_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ?")
             .bind(table).fetch_all(&db.0).await?;
         validate_object_names(
@@ -727,7 +770,9 @@ async fn validate_schema_shape(db: &DbPool, target: Option<bool>) -> Result<(), 
                     ))
                 })?;
             let actual = read_column(db, table, column).await?;
-            if IDENTITY_COLUMNS
+            if migration == V3_MIGRATION {
+                validate_column_shape(table, declaration, &actual)?;
+            } else if IDENTITY_COLUMNS
                 .iter()
                 .any(|&(t, c, _, _)| t == table && c == column)
             {
@@ -875,7 +920,7 @@ impl IdentitySchemaProbe for DbPool {
         read_version(self).await
     }
     async fn validate_v2_shape(&self) -> Result<(), ControllerError> {
-        validate_schema_shape(self, Some(true)).await
+        validate_v3_schema_shape(self).await
     }
 }
 
@@ -1297,7 +1342,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readonly_probe_gates_shape_only_after_v2() {
+    async fn readonly_probe_gates_shape_only_after_v3_and_never_reports_ready_yet() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         struct Fake {
             version: Option<i32>,
@@ -1322,8 +1367,10 @@ mod tests {
         for (version, shape_count, broken) in [
             (None, 0, false),
             (Some(1), 0, false),
-            (Some(2), 1, false),
-            (Some(2), 1, true),
+            (Some(2), 0, false),
+            (Some(3), 1, false),
+            (Some(3), 1, true),
+            (Some(4), 0, false),
         ] {
             let fake = Fake {
                 version,
@@ -1332,21 +1379,32 @@ mod tests {
                 broken,
             };
             let result = check_identity_schema_with_probe(&fake).await;
-            assert_eq!(result.is_ok(), version == Some(2) && !broken);
+            match version {
+                None | Some(1) | Some(2) => assert!(
+                    matches!(result, Err(ControllerError::SchemaNotReady { found, required: 3 }) if found == version)
+                ),
+                Some(3) if broken => assert!(
+                    matches!(result, Err(ControllerError::Config(ref message)) if message == "broken shape")
+                ),
+                Some(3) => assert!(
+                    matches!(result, Err(ControllerError::Config(ref message)) if message == "identity integrity checks not ready")
+                ),
+                _ => assert!(result.is_err()),
+            }
             assert_eq!(fake.reads.load(Ordering::SeqCst), 1);
             assert_eq!(fake.shapes.load(Ordering::SeqCst), shape_count);
         }
     }
 
     #[test]
-    fn empty_and_v1_are_not_ready_without_ddl() {
-        for (version, expected) in [(None, None), (Some(1), Some(1))] {
+    fn empty_and_legacy_versions_are_not_ready_without_ddl() {
+        for version in [None, Some(1), Some(2)] {
             assert!(
-                matches!(identity_schema_decision(version), Err(ControllerError::SchemaNotReady { found, required: 2 }) if found == expected)
+                matches!(identity_schema_decision(version), Err(ControllerError::SchemaNotReady { found, required: 3 }) if found == version)
             );
         }
-        assert!(identity_schema_decision(Some(2)).is_ok());
-        for version in [Some(0), Some(3), Some(-1)] {
+        assert!(identity_schema_decision(Some(3)).is_ok());
+        for version in [Some(0), Some(4), Some(-1)] {
             assert!(identity_schema_decision(version).is_err());
         }
     }
@@ -1651,6 +1709,7 @@ mod tests {
                 assert!(matches!(
                     column.1,
                     "table_name"
+                        | "table_collation"
                         | "column_name"
                         | "index_name"
                         | "constraint_name"
@@ -1665,8 +1724,8 @@ mod tests {
                 string_columns += 1;
             }
         }
-        assert_eq!(queries, 9);
-        assert_eq!(string_columns, 12);
+        assert_eq!(queries, 10);
+        assert_eq!(string_columns, 13);
     }
 
     #[test]
@@ -1709,6 +1768,125 @@ mod tests {
                 "missing {table}"
             );
         }
+    }
+
+    #[test]
+    fn v3_baseline_matches_v2_columns_and_indexes_without_checks_or_foreign_keys() {
+        let baseline = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/migrations/0003_identity_application_integrity.sql"
+        ))
+        // A missing file must still fail on the actual v1-vs-v3 contract, not a compile error.
+        .unwrap_or_else(|_| MIGRATION.to_owned());
+        let mut expected = MIGRATION.to_owned();
+        for &(table, column, _, alter) in IDENTITY_COLUMNS {
+            let old = if (table, column) == ("users", "username") {
+                "VARCHAR(128) NOT NULL"
+            } else {
+                identity_column_declarations(table, column).unwrap().0
+            };
+            let new = alter.split_once(" MODIFY COLUMN ").unwrap().1;
+            let old_definition = format!("{column} {old}");
+            assert!(
+                expected.contains(&old_definition),
+                "v1 missing {table}.{column}"
+            );
+            expected = expected.replacen(&old_definition, new, 1);
+        }
+        expected = expected.replace(
+            ", CONSTRAINT chk_schema_singleton CHECK (singleton = 1)",
+            "",
+        );
+        expected = expected
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("CONSTRAINT "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        expected = expected.replace(
+            "(admission_state, review_decision),\n",
+            "(admission_state, review_decision)\n",
+        );
+        expected = expected.replace("(user_id),\n) CHARACTER SET", "(user_id)\n) CHARACTER SET");
+        assert!(!baseline.to_ascii_uppercase().contains("FOREIGN KEY"));
+        assert!(!baseline.to_ascii_uppercase().contains("CHECK "));
+        let statements = |sql: &str| {
+            sql.split(';')
+                .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(statements(&baseline), statements(&expected));
+        assert_eq!(statements(&baseline).len(), TABLES.len());
+    }
+
+    #[test]
+    fn v3_shape_contract_uses_check_free_unsigned_declarations() {
+        let parts = ddl_parts("schema_meta");
+        assert!(parts.contains(&"authz_epoch BIGINT UNSIGNED NOT NULL DEFAULT 0".to_owned()));
+        assert!(!parts.iter().any(|part| part.starts_with("CONSTRAINT ")));
+        let users = ddl_parts("users");
+        assert!(users.contains(
+            &"username VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL".to_owned()
+        ));
+        assert_eq!(
+            expected_indexes(&users, &["PRIMARY", "uq_users_username"])
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn v3_shape_policy_is_check_free_and_keeps_legacy_checks() {
+        assert_eq!(
+            ddl_parts_from(V3_MIGRATION, "devices"),
+            ddl_parts("devices")
+        );
+        assert!(
+            ddl_parts_from(MIGRATION, "devices")
+                .iter()
+                .any(|part| part.starts_with("CONSTRAINT "))
+        );
+        for &(table, _, _) in TABLES {
+            let parts = ddl_parts(table);
+            assert!(!parts.iter().any(|p| p.starts_with("CONSTRAINT ")));
+        }
+        assert!(
+            validate_object_names("devices", "check", &[], &["chk_devices_state".into()]).is_err()
+        );
+    }
+
+    #[test]
+    fn v3_shape_policy_routes_to_v3_baseline_without_legacy_checks() {
+        let source = include_str!("db.rs");
+        let body = source
+            .split_once("async fn validate_schema_shape_with_contract(")
+            .unwrap()
+            .1
+            .split_once("\nasync fn read_column(")
+            .unwrap()
+            .0;
+        assert!(body.contains("ddl_parts(table)"));
+        assert!(body.contains("validate_column_shape(table, declaration, &actual)"));
+        assert!(body.contains("validate_indexes(table, &expected, &actual)"));
+        assert!(
+            body.contains(
+                "validate_object_names(table, \"check\", &expected_checks, &actual_checks)"
+            )
+        );
+        assert!(
+            source.contains(
+                "validate_schema_shape_with_contract(db, Some(true), V3_MIGRATION).await"
+            )
+        );
+    }
+
+    #[test]
+    fn v3_table_charset_rejects_non_utf8mb4_collation() {
+        assert!(validate_v3_table_collation("users", "utf8mb4_0900_ai_ci").is_ok());
+        assert!(validate_v3_table_collation("users", "utf8mb4_bin").is_ok());
+        assert!(validate_v3_table_collation("users", "latin1_swedish_ci").is_err());
+        assert!(validate_v3_table_collation("users", "utf8mb4fake_ci").is_err());
     }
 
     #[test]
@@ -1969,7 +2147,7 @@ mod tests {
             );
         }
         assert!(
-            ddl_parts("devices")
+            ddl_parts_from(MIGRATION, "devices")
                 .iter()
                 .any(|part| part.contains("chk_devices_state"))
         );
@@ -2039,7 +2217,7 @@ mod tests {
                 "(`review_decision` in (_utf8mb4\\'none\\',_utf8mb4\\'approved\\',_utf8mb4\\'denied\\',_utf8mb4\\'revoked\\'))",
             ),
         ] {
-            let part = ddl_parts("devices")
+            let part = ddl_parts_from(MIGRATION, "devices")
                 .into_iter()
                 .find(|part| part.starts_with(&format!("CONSTRAINT {name} ")))
                 .unwrap();
@@ -2106,7 +2284,7 @@ mod tests {
                 "((`scope_kind` = _utf8mb4'all' AND `scope_group_id` IS NULL AND `scope_device_id` IS NULL) OR (`scope_kind` = _utf8mb4'group' AND `scope_group_id` IS NOT NULL AND `scope_device_id` IS NULL) OR (`scope_kind` = _utf8mb4'device' AND `scope_group_id` IS NULL AND `scope_device_id` IS NOT NULL))",
             ),
         ] {
-            let part = ddl_parts(table)
+            let part = ddl_parts_from(MIGRATION, table)
                 .into_iter()
                 .find(|part| part.starts_with(&format!("CONSTRAINT {name} ")))
                 .unwrap();
