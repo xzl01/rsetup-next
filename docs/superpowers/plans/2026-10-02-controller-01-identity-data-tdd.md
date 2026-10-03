@@ -15,7 +15,7 @@
 1. controller-v1/draft-1 是待审阅草案；用户只批准以之作为条件性规划依据，未批准实施、安装依赖、定稿接口或发布。设计/安全/数据库负责人审阅 01/02 的字段、密码会话、权限、API、DDL/事务语义；若结论变化先改计划。
 2. 00 §6 发布阻断：服务端签名未覆盖影响重连的 reason_code；验签失败“立即断开”和“返回拒绝”冲突；AEAD 失败后连接终止策略不明确。独立协议/密码学审查修订并做板端/中控双端负向/互操作测试；本计划不做握手，也不能把审批记录当安全接入证明。
 3. PENDING 明文保活不能认证中控；HTTP 管理链路本身不加密，CSRF、Argon2、HttpOnly 不替代 TLS。须审阅可信受控网络或 TLS 反代及可信代理/Host/Origin 配置；HTTP 直连 cookie 不设置 Secure；安全关卡未过不得宣称生产可用。
-4. 拟议而非获批：opaque cookie、≥256-bit token、SHA-256 digest、重启失效、30 min idle/12 h absolute、Argon2id m=65536 KiB/t=3/p=1、用户名密码边界、reset-admin 恢复路径、四权限点、viewer/operator、MySQL 8.4 LTS/TiDB 8.5 LTS、分页 50/200、审批 1024、body 1 MiB、登录 15 min/5 次。审阅前不得固化。
+4. G0 用户确认仅限定开发验证：初次 `POST /auth/login` 必须 JSON + 精确允许 Host 和 Origin；无 Origin 的初次 CLI 登录拒绝，CLI 若需登录显式发送允许的 Origin，Origin 不是身份认证。`reset-admin` 首版本机 root CLI 限定见全局约束与 Task 2，服务账号执行延后，不能据此宣称生产批准。其余仍拟议而非获批：opaque cookie、≥256-bit token、SHA-256 digest、重启失效、30 min idle/12 h absolute、Argon2id m=65536 KiB/t=3/p=1、用户名密码边界、四权限点、viewer/operator、MySQL 8.4 LTS/TiDB 8.5 LTS、分页 50/200、审批 1024、body 1 MiB、登录 15 min/5 次。审阅前不得固化其余拟议值。
 5. 只有对真实 MySQL 与 TiDB 分别测试迁移、唯一约束、CAS/并发和恢复后才能报告具体被测版本；未运行/失败必须写未验证/失败，不得说已支持两库，也不能用 mock 代替。
 
 ## 全局约束及文件清单
@@ -30,7 +30,7 @@
 - 变更 revision/authz_epoch/审核决定历史/审计同事务；密码、cookie/token、token digest、私钥不入普通日志/审计；事务内无网络 I/O。排除设备连接/状态轮询/SSE、主子任务/重启、NTP、UI；无真实连接不得伪报在线。
 - 所有 Task 的 Step 4/5 中提到的额外边界与并发用例，**每个都须单独重复**“编写测试 → 运行确认因行为缺失而失败 → 最小实现 → 运行确认通过”；只有全部测试已绿才做 Step 5 的纯重构与完整回归。不得把 Step 5 当作先实现后补测的许可。
 - 认证成功/失败、登出、强制/自助/管理员改密、管理员本机恢复、session 撤销、用户/角色/grant/组修改、最后管理员保护命中、审批/拒绝/reopen/revoke/reauthorize 必须有语言中立审计事件码；资源拒绝不能伪记为人工拒绝。审计保留原始墙钟、参考/质量/代际及进程序号的接口；时间来源尚未实现时质量必须明确 `system_fallback`，不伪装为 `ntp_valid`。
-- 初始化已提交但首次密码日志输出前进程崩溃存在恢复窗口；拟议 `reset-admin` 仅本机受控 CLI、服务账号/root、交互终端展示临时密码、撤销 session、强制改密并审计，该路径必须单独安全审阅；不得以重新初始化替代。
+- 初始化已提交但首次密码日志输出前进程崩溃存在恢复窗口；`reset-admin` 首版是真正本机进程 CLI，非 Web，仅操作引导账号 username=`admin` 且仍 `active && is_admin`；inactive/非 admin 拒绝，不自动启用、不重新初始化。仅 OS 实际 `real UID` 和 `effective UID` 均为 root，不能用 `USER`/`SUDO_USER`/环境变量声称权限；服务账号执行延后，须另审可信 UID 来源。要求 controlling TTY 及 `stdin/stdout/stderr` 均为交互 TTY，任一重定向/无 TTY 均在 DB 写入前拒绝；临时密码只直写 `/dev/tty` 一次，普通 stdout/stderr、日志及审计不得含秘密。新哈希、must_change_password、revision、sessions revoke 和脱敏审计同事务；仅确认 commit 成功后输出，TTY 写失败不重复初始化/重显旧密码，只能由 root 受控再次 reset；commit 返回错误时提交结果未知，不输出该次秘密、不声称已回滚，受控核实 DB 再决定是否再次 reset。实现后须独立安全审查和本机 PTY + 隔离真实 DB 验证；G0 只适用开发验证，未批准生产。
 
 **未来新增文件（仅获实施授权后）：** crates/rsetup-controller/Cargo.toml；src/{lib.rs,main.rs,config.rs,error.rs,model.rs,db.rs,bootstrap.rs,audit.rs}；src/auth/{mod.rs,password.rs,session.rs,service.rs}；src/authz/{mod.rs,policy.rs,service.rs}；src/devices/{mod.rs,repository.rs,service.rs}；src/api/{mod.rs,auth.rs,users.rs,roles.rs,grants.rs,groups.rs,devices.rs,approvals.rs}；migrations/0001_identity_devices.sql；tests/{common/mod.rs,mysql_identity.rs,tidb_identity.rs}（`tests/` 集成测试目录是本项目新增 pattern，现有 crate 尚无）。migration 建 schema_meta、users、sessions、roles、role_permissions、device_groups、group_members、grants、devices、admission_decisions、audit_events；不建 task/telemetry 表。
 
@@ -124,7 +124,7 @@ pub fn parse_device_id(s: &str) -> Result<[u8; 32], ControllerError> {
 
 **Files:** `src/auth/{mod.rs,password.rs,session.rs,service.rs}`、`src/api/{mod.rs,auth.rs,users.rs}`、`src/{main.rs,db.rs,audit.rs}`；main.rs 接线 `reset-admin` 本机子命令，测试与代码在同模块。
 
-**Interfaces:** `PasswordHasher::{hash,verify}`；`AuthService::{login,authenticate,change_password(session,current_password,new_password),logout,revoke_all,reset_admin}`；`change_password` 显式验证当前密码后才更新新哈希并撤销会话，对应 02 §4 `/auth/password` 的 `current_password,new_password`；`reset_admin` 仅本机受控 CLI、服务账号/root、交互终端一次性展示临时密码，撤销全部 session、设置强制改密并写无密码审计；该路径单独安全审阅。`IdentityRepository` 的会话 token hash/用户查找/撤销；普通用户不能绕过 `must_change_password` 白名单。
+**Interfaces:** `PasswordHasher::{hash,verify}`；`AuthService::{login,authenticate,change_password(session,current_password,new_password),logout,revoke_all,reset_admin}`；`change_password` 显式验证当前密码后才更新新哈希并撤销会话，对应 02 §4 `/auth/password` 的 `current_password,new_password`；`reset_admin` 是本机进程 CLI，仅针对仍 active/is_admin 的引导账号 username=`admin`，要求 OS 的 real UID/effective UID 均为 root 与 controlling TTY、`stdin/stdout/stderr` 均交互；临时密码只在 commit 明确成功后直写 `/dev/tty` 一次，不暴露为 Web，服务账号执行延后。恢复事务与未知 commit/TTY 失败处理依全局约束，该路径单独安全审阅。`IdentityRepository` 的会话 token hash/用户查找/撤销；普通用户不能绕过 `must_change_password` 白名单。
 
 - [ ] **Step 1：先写红测试。**
 
@@ -158,10 +158,10 @@ async fn wrong_current_password_preserves_account_and_sessions() {
 
 `auth_state` 与 `AuthStateSnapshot` 是本 Step 随测试建立的未来 fake fixture：快照包含 `password_hash`、`active`、`is_admin`、`must_change_password`、`revision` 与排序后的 session digest/revoked 状态（不包含审计），可用 `assert_eq!` 比较；拒绝错误旧密码时原哈希、原会话及账号状态不变，但允许写脱敏的认证/改密失败审计事件，不断言审计表完全不变。fixture 中 alice 的原密码为 `old password`，调用时传入的 `wrong password` 不等于它，且新密码 `new password` 不等于原密码。生产密码长度等边界在审阅后配置；测试用 fixture 应选满足最终密码策略的值，避免测试因长度校验而伪 RED。
 
-同在 Step 1 单独写 RED 测试 `reset_admin_requires_local_root_and_revokes_sessions`：非本机或非服务账号/root、无交互终端均拒绝；成功后旧 session 失效、设置强制改密，临时密码只展示一次且审计不含密码。
+同在 Step 1 单独写 RED 测试 `reset_admin_requires_local_root_and_revokes_sessions`：拒绝非本机进程调用、`real UID` 或 `effective UID` 非 root（包括 `USER`/`SUDO_USER`/env 伪称 root）、非 username=`admin` 或该账号 inactive/非 admin；任一缺 controlling TTY、`stdin/stdout/stderr` 任一重定向/非交互均在 DB 变更前拒绝，不自动启用账号。成功时断言新哈希、must_change_password、revision 增量、旧 sessions 全撤销与脱敏审计同一事务，密码只在确认 commit 成功后直写 `/dev/tty` 一次，不进入普通 stdout/stderr、日志或审计。另以本机 PTY + 隔离真实 DB 独立覆盖成功、任一 TTY 不满足、TTY 写失败（不重复初始化/不重显旧密码，须 root 受控再次 reset）及 commit 返回错误但结果未知（不输出秘密、不声称回滚，受控核实 DB 后再决定是否再次 reset）；需区分明确事务失败和提交结果未知，不以 fake DB/伪 TTY 冒充本机验收。
 
-- [ ] **Step 2：运行确认失败。** 在可编译的 auth fixture、`AuthStateSnapshot`/`auth_state` 和 `change_password(session,current_password,new_password)` stub 就绪后，分别运行 `cargo test -p rsetup-controller password_hash_rejects_wrong_secret`、`cargo test -p rsetup-controller wrong_current_password_preserves_account_and_sessions` 与 `cargo test -p rsetup-controller reset_admin_requires_local_root_and_revokes_sessions`；错误旧密码用例须在能走到更新分支的可编译行为基线上，由原哈希、会话或账号状态被错误改动的断言而 RED；若 stub 一概返回错误让用例直接通过，则不构成 RED，须调整基线以暴露漏验旧密码的行为。不能以签名不匹配、helper/模块缺失、纯输入长度校验等编译或设置错误充数。正确改密的 `password_change_revokes_existing_session` 也单独确认行为 RED，随后 GREEN。
-- [ ] **Step 3：最小实现。** CSPRNG token、DB 仅存 digest/process_epoch；单调空闲/绝对截止；不存在用户名执行 dummy hash；cookie `HttpOnly; SameSite=Strict; Path=/`，HTTP 直连无 Secure；强制改密仅 me/password/logout；`change_password(session,current_password,new_password)` 先校验旧密码及新密码规则，只有旧密码正确才在短事务中替换哈希、撤销全部 session 并提交所需审计；错误旧密码不改密码哈希、session 或账号状态（允许脱敏失败审计）。若验证与提交之间另一请求改了密码，不能仅凭先前验证覆盖更新：在事务内锁定/重新验证当前 hash 或以所验证的 hash/revision 做条件更新并检查影响行数；冲突则拒绝或重新校验，不撤销另一请求会话、不覆盖较新密码；失败审计不得泄露密码。不扩展 HTTP 错误码，按审阅后的既有 02 §3 错误契约映射。改密、停用、重置撤销全部 session，管理员 Web 临时密码只在成功响应展示一次；`reset-admin` 临时密码只在本机交互终端展示一次并审计。算法、期限按通过的审阅记录设定。
+- [ ] **Step 2：运行确认失败。** 在可编译的 auth fixture、`AuthStateSnapshot`/`auth_state` 和 `change_password(session,current_password,new_password)` stub 就绪后，分别运行 `cargo test -p rsetup-controller password_hash_rejects_wrong_secret`、`cargo test -p rsetup-controller wrong_current_password_preserves_account_and_sessions` 与 `cargo test -p rsetup-controller reset_admin_requires_local_root_and_revokes_sessions`；错误旧密码用例须在能走到更新分支的可编译行为基线上，由原哈希、会话或账号状态被错误改动的断言而 RED；reset 用例须因未经真实 OS UID/TTY 校验、错误账号范围或非原子提交/泄密等行为断言而 RED；本机 PTY + 隔离真实 DB 的 TTY 写失败和 commit 返回错误结果未知用例分别验证 RED，不以 fake DB/伪 TTY 或无 URL 的环境错误冒充行为 RED，缺 URL 标未验证。若 stub 一概返回错误让用例直接通过，则不构成 RED，须调整基线以暴露缺失行为。不能以签名不匹配、helper/模块缺失、纯输入长度校验等编译或设置错误充数。正确改密的 `password_change_revokes_existing_session` 也单独确认行为 RED，随后 GREEN。
+- [ ] **Step 3：最小实现。** CSPRNG token、DB 仅存 digest/process_epoch；单调空闲/绝对截止；不存在用户名执行 dummy hash；cookie `HttpOnly; SameSite=Strict; Path=/`，HTTP 直连无 Secure；强制改密仅 me/password/logout；`change_password(session,current_password,new_password)` 先校验旧密码及新密码规则，只有旧密码正确才在短事务中替换哈希、撤销全部 session 并提交所需审计；错误旧密码不改密码哈希、session 或账号状态（允许脱敏失败审计）。若验证与提交之间另一请求改了密码，不能仅凭先前验证覆盖更新：在事务内锁定/重新验证当前 hash 或以所验证的 hash/revision 做条件更新并检查影响行数；冲突则拒绝或重新校验，不撤销另一请求会话、不覆盖较新密码；失败审计不得泄露密码。不扩展 HTTP 错误码，按审阅后的既有 02 §3 错误契约映射。改密、停用、重置撤销全部 session，管理员 Web 临时密码只在成功响应展示一次；`reset-admin` 按全局约束，仅本机 root CLI 对仍 active/is_admin 的 username=`admin` 操作；先校验 OS real/effective UID 与 controlling TTY/三个标准流的交互性，在 DB 变更前拒绝不合条件者；新哈希、must_change_password、revision、sessions revoke 和脱敏审计同事务，确认 commit 成功后只直写 `/dev/tty` 一次。TTY 写失败不重复初始化或重显旧密码；commit 返回错误且结果未知时不输出秘密，受控核实 DB 后再决定是否再次 reset。算法、期限按通过的审阅记录设定。
 
 ```rust
 pub fn token_digest(raw: &[u8]) -> [u8; 32] {
@@ -170,8 +170,8 @@ pub fn token_digest(raw: &[u8]) -> [u8; 32] {
 }
 ```
 
-- [ ] **Step 4：运行确认通过。** 分别运行 `cargo test -p rsetup-controller wrong_current_password_preserves_account_and_sessions` 和 `cargo test -p rsetup-controller password_change_revokes_existing_session`，再运行 `cargo test -p rsetup-controller auth::` 与 `cargo test -p rsetup-controller reset_admin_requires_local_root_and_revokes_sessions`；错误旧密码不得改 hash/账号状态或撤销会话，正确旧密码须成功改密且旧 cookie 失效；另确认正误密码、DB 不存明文 token、初次改密非白名单 403、进程代际不符拒绝；本机恢复非授权来源拒绝，成功后旧 session 失效、临时密码仅终端展示一次。
-- [ ] **Step 5：重构回归。** 用户名 ASCII 规则、密码 Unicode 字符数与 UTF-8 byte 双限制、不等于旧密码；并发改密时旧 hash 验证与提交间被另一请求更新不得覆盖较新密码或撤销其新会话（此用例也须按全局约束单独 RED→GREEN）；不存在用户响应/耗时形态、按账号和来源限速；最后管理员并发降级/停用；session 过期与重启失效；秘密不落普通日志/审计（脱敏失败审计允许）。`cargo test -p rsetup-controller && cargo clippy -p rsetup-controller --all-targets -- -D warnings`。
+- [ ] **Step 4：运行确认通过。** 分别运行 `cargo test -p rsetup-controller wrong_current_password_preserves_account_and_sessions` 和 `cargo test -p rsetup-controller password_change_revokes_existing_session`，再运行 `cargo test -p rsetup-controller auth::` 与 `cargo test -p rsetup-controller reset_admin_requires_local_root_and_revokes_sessions`；错误旧密码不得改 hash/账号状态或撤销会话，正确旧密码须成功改密且旧 cookie 失效；另确认正误密码、DB 不存明文 token、初次改密非白名单 403、进程代际不符拒绝；reset 非本机、非 root 实际双 UID、错误账号状态或无完整交互 TTY 均在 DB 写前拒绝，成功后旧 session 失效且临时密码仅 `/dev/tty` 展示一次。针对本机 PTY + 隔离真实 DB 分别运行 TTY 写失败和 commit 返回错误但结果未知的用例，核实前者不重显旧密码、后者绝不输出该次秘密或声称回滚；缺测试 DB URL 标未验证，不记 PASS。
+- [ ] **Step 5：重构回归。** 用户名 ASCII 规则、密码 Unicode 字符数与 UTF-8 byte 双限制、不等于旧密码；并发改密时旧 hash 验证与提交间被另一请求更新不得覆盖较新密码或撤销其新会话（此用例也须按全局约束单独 RED→GREEN）；不存在用户响应/耗时形态、按账号和来源限速；最后管理员并发降级/停用；session 过期与重启失效；reset 的本机 PTY + 隔离真实 DB 负向用例、commit 未知状态受控核实与独立安全审查；秘密不落普通 stdout/stderr、日志/审计（脱敏失败审计允许）。`cargo test -p rsetup-controller && cargo clippy -p rsetup-controller --all-targets -- -D warnings`。
 - [ ] **Step 6：小提交。** `git add crates/rsetup-controller/src/auth crates/rsetup-controller/src/api/mod.rs crates/rsetup-controller/src/api/auth.rs crates/rsetup-controller/src/api/users.rs crates/rsetup-controller/src/main.rs crates/rsetup-controller/src/db.rs crates/rsetup-controller/src/audit.rs && git commit -m "feat(controller): add local auth and accounts"`。
 
 ## Task 3：动态并集授权与可见性、role/grant 管理
@@ -300,10 +300,10 @@ async fn endpoint_read_rate_limit_has_retry_after() {
 }
 ```
 
-`test_router_with_clock_and_limits`、`session_write_req`、`endpoint_read_req`、`valid_login_req` 及阈值 helper 是未来 fixture（同首个测试落地），不是现有 API；可控时钟避免 sleep，选用明确有效的写操作/读取端点并隔离账号和配额桶。按会话写与按端点读分别单独做行为 RED→GREEN，包含超过各自窗口、等待 Retry-After 后恢复、不同会话/端点互不错误串限额；登录按账号和来源的独立限速仍由 Task 2 验证。02 §3、05 §6 提议会话写 20/s、端点读 50/s，均待审阅压测，不固化为批准值。
+`test_router_with_clock_and_limits`、`session_write_req`、`endpoint_read_req`、`valid_login_req` 及阈值 helper 是未来 fixture（同首个测试落地），不是现有 API；可控时钟避免 sleep，选用明确有效的写操作/读取端点并隔离账号和配额桶。另在 Step 1 单独写初次 `POST /auth/login` 的 RED router 测试：JSON + 精确允许 Host/Origin 成功（无需先验 session/CSRF）；缺 JSON、错误 Host/Origin、无 Origin 的初次 CLI 登录拒绝，CLI 显式发送允许的 Origin 才可登录，Origin 不是身份认证。已有有效 session 的无 Origin 非浏览器非登录操作仅在允许 Host 和绑定 CSRF 时接受；浏览器写请求缺/错 Origin 仍拒绝。按会话写与按端点读分别单独做行为 RED→GREEN，包含超过各自窗口、等待 Retry-After 后恢复、不同会话/端点互不错误串限额；登录按账号和来源的独立限速仍由 Task 2 验证。02 §3、05 §6 提议会话写 20/s、端点读 50/s，均待审阅压测，不固化为批准值。
 
-- [ ] **Step 2：运行确认失败。** `cargo test -p rsetup-controller invisible_and_missing_device_return_same_404`；预期未挂路由、缺鉴权或响应内容泄漏导致行为失败。另分别运行 `cargo test -p rsetup-controller session_write_rate_limit_has_retry_after` 和 `cargo test -p rsetup-controller endpoint_read_rate_limit_has_retry_after`；须从超过限额未返回 429/Retry-After 的断言看到 RED，不能以缺 helper/路由编译失败充数。
-- [ ] **Step 3：最小实现。** 路由注册经批准的 auth/users/roles/grants/groups/devices/approvals；非安全方法 JSON + 精确 Host/Origin + session-bound X-CSRF-Token；登录没有先验 session 仍检查同源/JSON；无任意来源带凭据 CORS；只把已认证 principal 注入 extensions，handler 不接触 raw cookie。无 Origin 客户端须有效 session/CSRF/允许 Host，不能松绑浏览器规则。另将登录按账号/来源失败限速与管理 API 按会话写、按端点读两个配额分开；超过管理限额返回 429 `RATE_LIMITED` + `Retry-After`，阈值按获批配置。
+- [ ] **Step 2：运行确认失败。** `cargo test -p rsetup-controller invisible_and_missing_device_return_same_404`；预期未挂路由、缺鉴权或响应内容泄漏导致行为失败。初次登录与已有 session 无 Origin 边界的每个新增测试也须分别因 Host/Origin/JSON/CSRF 缺失的行为而 RED，不能拿 helper/路由缺失当 RED。另分别运行 `cargo test -p rsetup-controller session_write_rate_limit_has_retry_after` 和 `cargo test -p rsetup-controller endpoint_read_rate_limit_has_retry_after`；须从超过限额未返回 429/Retry-After 的断言看到 RED，不能以缺 helper/路由编译失败充数。
+- [ ] **Step 3：最小实现。** 路由注册经批准的 auth/users/roles/grants/groups/devices/approvals；初次 `POST /auth/login` 无先验 session/CSRF，仍须 JSON + 精确允许 Host/Origin，无 Origin 初次 CLI 登录拒绝；CLI 须显式发送允许的 Origin，Origin 非身份认证。其余非安全方法默认 JSON + 精确允许 Host/Origin + session-bound X-CSRF-Token；无任意来源带凭据 CORS；只把已认证 principal 注入 extensions，handler 不接触 raw cookie。无 Origin 的非浏览器客户端仅已有有效 session 的非登录操作可凭绑定 CSRF、允许 Host 及应有的 JSON 通过，不能松绑浏览器写请求。另将登录按账号/来源失败限速与管理 API 按会话写、按端点读两个配额分开；超过管理限额返回 429 `RATE_LIMITED` + `Retry-After`，阈值按获批配置。
 
 ```rust
 pub fn build_router(state: AppState) -> axum::Router {
@@ -315,7 +315,7 @@ pub fn build_router(state: AppState) -> axum::Router {
 }
 ```
 
-- [ ] **Step 4：运行确认通过。** `cargo test -p rsetup-controller api::`；未登录 401、强制改密非白名单 403、错误 Host/Origin/CSRF 拒绝、合法 lower hex64 的不可见/不存在设备同 404、reboot-only 不泄漏 status/read 字段、管理员可用；GET 详情无变更副作用，列表排序以 ID 为稳定决胜键（见 02 §3）。另分别跑按会话写/按端点读限速用例，确认 429 和 `Retry-After`、窗口恢复且不误限登录。
+- [ ] **Step 4：运行确认通过。** `cargo test -p rsetup-controller api::`；初次登录检查 JSON + 精确允许 Host/Origin，无 Origin 的初次 CLI 登录拒绝，显式允许 Origin 可登录但不替代密码身份认证；已有 session 的无 Origin 非浏览器非登录操作仅在允许 Host 和绑定 CSRF 时可接受，浏览器写请求不因此放宽。另确认未登录 401、强制改密非白名单 403、错误 Host/Origin/CSRF 拒绝、合法 lower hex64 的不可见/不存在设备同 404、reboot-only 不泄漏 status/read 字段、管理员可用；GET 详情无变更副作用，列表排序以 ID 为稳定决胜键（见 02 §3）。另分别跑按会话写/按端点读限速用例，确认 429 和 `Retry-After`、窗口恢复且不误限登录。
 - [ ] **Step 5：重构回归。** 未知字段/枚举及 body 超限 400；revision 409；登录按账号和来源限速 429+Retry-After，管理 API 按会话写/按端点读独立 429+Retry-After（02 §3、05 §6 建议 20/s、50/s，待审）；已撤 session 拒绝；分页 cursor 绑定用户/筛选/排序、列表无隐藏总数；批量明确清单逐项结果；全部 admin endpoints 正反授权。`cargo test -p rsetup-controller`。
 - [ ] **Step 6：小提交。** `git add crates/rsetup-controller/src/api crates/rsetup-controller/src/lib.rs crates/rsetup-controller/src/error.rs && git commit -m "feat(controller): expose secured management api"`。
 
@@ -367,4 +367,4 @@ if changed != 1 { return Err(ControllerError::RevisionConflict); }
 
 Tasks 1–5 覆盖 C-ARCH/C-DATA/C-AUTH/C-ACL 及 C-ADMIT 的中控侧（准入决定与记录）；C-ARCH 由设计评审与部署形态确认，不作为功能验收项，C-ADMIT 的连接/期限语义属 02/05。Tasks 1–2、5 对应 AUTH-01/02；Tasks 3、6 覆盖 ACL-01、ADMIN-01 及 ACL-02 的授权存储/epoch 部分；ACL-02（与 03 计划 Task 2/3 联合验收）的组变更与任务提交并发、执行前重验和已发任务的撤权边界不属 01 单独验收。Tasks 1、3、4、6 对应 DB-01；Tasks 4–6 对应 API-01/ADM-01。ACL-03（普通用户任务汇总与 SSE 隐藏设备/计数、撤权后排队消息不再发出，规格 01 §8）的任务/SSE 侧与 03 计划 Task 5 联合验收，本计划保证服务层 visible_devices 与 authz_epoch 失效，不单独宣称 ACL-03 完成。AT-01←AUTH-01；AT-02←AUTH-02/ADMIN-01；AT-03←ACL-01..03（本计划承担 ACL-01、ACL-02 授权侧与最低识别；ACL-02 任务侧、ACL-03 任务/SSE 侧联合 03）；AT-14←DB-01。AT-01..03 与 04 计划联合验收（见 04 计划覆盖/退出关卡）。网络 dispatch 撤权、task/SSE、传输握手安全和前端不属本计划，不可暗示完成。
 
-审阅前不得固化 Argon2id `65536 KiB/3/1`、密码 12–128 字符/512 UTF-8 bytes、session 30 min/12 h、登录 15 min/5 次、cookie/CSRF/Host/Origin 细节、内置角色、MySQL 8.4 LTS/TiDB 8.5 LTS、审批最大 1024、分页 50/max 200、body ≤1 MiB、draft-1 API 字段、SQLx/hash/random crate 版本。它们是拟议值，不是已批准实施决策。
+除上述 G0 用户确认的开发验证限定（初次登录 Host/Origin/JSON 与本机 root reset-admin）外，审阅前不得固化 Argon2id `65536 KiB/3/1`、密码 12–128 字符/512 UTF-8 bytes、session 30 min/12 h、登录 15 min/5 次、其他 cookie/CSRF/Host/Origin 配置细节、内置角色、MySQL 8.4 LTS/TiDB 8.5 LTS、审批最大 1024、分页 50/max 200、body ≤1 MiB、draft-1 API 字段、SQLx/hash/random crate 版本。它们是拟议值，不是已批准实施决策，更不是生产批准。

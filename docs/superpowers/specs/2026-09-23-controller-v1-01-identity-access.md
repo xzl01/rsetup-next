@@ -9,7 +9,7 @@ A-01：初始化使用数据库持久标记、唯一约束和短事务，只创�
 
 随机初始密码至少128bit熵，事务提交后仅在首次初始化启动日志输出一次。数据库只存Argon2id哈希，建议参数 `m=65536 KiB,t=3,p=1`，独立随机盐。密码日志属于敏感数据，不进入普通审计或必要备份集。
 
-提交后输出前崩溃的恢复，拟议使用本机受控 `reset-admin` 命令：仅服务账号/root、交互终端输出临时密码、撤销会话、强制改密、记无密码审计。不新增匿名Web恢复，不重新初始化数据库。
+G0 用户确认仅限定开发验证的恢复路径：`reset-admin` 首版是真正的本机进程 CLI，不暴露为 Web；只允许操作引导账号 username=`admin`，且该账号仍 `active && is_admin`，inactive 或非 admin 必须拒绝，不自动重新启用、不重新初始化数据库。仅接受 OS 实际 `real UID` 与 `effective UID` 均为 root，不能信任 `USER`、`SUDO_USER` 或任何环境变量声称的权限；`服务账号执行延后`，待可信 UID 来源另行安全审阅，首版不允许服务账号代替 root。要求 controlling TTY 且 `stdin/stdout/stderr` 各自均为交互 TTY；任一重定向或无 TTY 均在修改 DB 前拒绝。新临时密码只直接写 `/dev/tty` 一次，不写普通 stdout/stderr、普通日志或审计。新 Argon2id 哈希、`must_change_password`、账号 `revision`、全部 sessions revoke 与脱敏审计在同一事务提交；仅在确认 commit 成功后输出密码。TTY 写失败不得重复初始化或重显旧密码，须由 root 受控再次 reset；commit 返回错误时提交结果未知，不得输出该次秘密或声称已回滚，应受控核实 DB 后再决定是否再次 reset。该 CLI 实现后仍需独立安全审查及本机 PTY + 隔离真实 DB 验证；G0 不是生产批准。
 
 管理员为 `active && is_admin && !must_change_password` 的用户，具有全局及全部设备权限。设备角色不能授予is_admin。防止删除最后管理员时，按 `active && is_admin` 统计保留身份，不因临时改密关卡把该身份当作不存在；最后一个这样的账号不能停用/删除/降级，相关事务锁定共同保护行串行判断。
 
@@ -27,7 +27,7 @@ A-03：拟议opaque cookie session，至少256bit随机token，只存SHA-256摘�
 
 Cookie：`HttpOnly; SameSite=Strict; Path=/`。HTTP直连不设置Secure；外部HTTPS可显式配置Secure及可信代理，不盲信转发头。cookie/token不放URL或日志，不使用浏览器localStorage长期bearer凭据。
 
-非安全方法要求JSON、精确Host/Origin允许列表及绑定会话的 `X-CSRF-Token`。登录没有先验会话token，仍须同源与JSON；成功生成CSRF token。缺失/不匹配Origin的浏览器写请求拒绝，不启用任意来源加凭据CORS。无Origin头的请求（如本机CLI）按非浏览器客户端处理：须持有效会话、X-CSRF-Token且Host在允许列表内才接受；浏览器写请求恒带Origin，无Origin不能冒充浏览器请求，浏览器边界不放宽。
+非安全方法默认要求 JSON 与精确允许列表中的 Host 和 Origin；已有有效 session 的非登录写请求还须绑定该 session 的 `X-CSRF-Token`。初次 `POST /auth/login` 无先验 session/CSRF token，但同样必须 JSON、精确允许 Host 与允许的 Origin；无 Origin 的初次 CLI 登录拒绝，CLI 如需登录必须显式发送允许的 Origin（Origin 不是身份认证）。登录成功生成 CSRF token。缺失/不匹配 Origin 的浏览器写请求拒绝，不启用任意来源加凭据 CORS。无 Origin 的非浏览器客户端仅在**已有有效 session**、绑定的 `X-CSRF-Token`、允许 Host 及应有的 JSON 四者成立时接受非登录操作；此例外不适用于初次登录，也不放宽浏览器写请求的 Origin 检查。
 
 建议登录按账号和来源分别限速，15min内5次失败后该窗口429，不永久锁死管理员；不存在账号使用同样失败形态与时延（执行dummy Argon2id校验，避免时延侧信道泄露账号存在性）。来源默认连接地址，仅显式可信代理可覆盖。
 
