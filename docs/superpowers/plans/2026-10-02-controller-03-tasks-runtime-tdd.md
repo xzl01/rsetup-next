@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - `controller-v1 / draft-1` 未获实施批准。用户仅同意条件性规划；API、状态、票据、NTP/数据库版本与限额/保留期须逐项审阅。05 §1/§2/§4/§6 的 NTP 单次请求上限3s、板端时钟 RTT 上限2s、状态保留112/s/其它48/s（可借空闲）、unknown 后台核实共用查询预算且可低频/不占重启并发槽，以及 05 §1 的私钥0600权限检查、启动进度日志，均为拟议而非获批；05 §10 仅列专项验收，不作为这些参数细节的出处。`reason_code` 签名、验签失败及 AEAD 失败策略的协议修订与双端测试完成前不得生产发布。
-- 当前 identity 0002 完成且只读检查确认完整 schema_version=2 是未来 Tasks 迁移的前置；当前身份 `check_identity_schema` 只认 v2 与精确 identity 表集合，不能仅添加 Tasks 表就使当前 v2 启动门放行。未来 Task 3 runtime 必须引入按版本校验完整 schema 的启动检查：Tasks 全部目标表、列、索引、约束验证后才推进 schema_version=3，v3 重启仍须通过完整 v3 校验。普通启动默认只读拒绝未就绪 schema，不得借未来 Tasks 迁移在生产启动中自动执行 ALTER。未来编号 0003 仅在核查目标部署及备份均未应用 Tasks 0002 后适用；如已有 Tasks 0002，必须停止并另审编号，绝不重用。当前无真实库 URL，未盘点任何实际部署或备份。
+- 依据[应用层完整性修订](../specs/2026-10-03-controller-application-integrity-design.md)，identity 0003 完成且只读结构/数据检查确认schema_version=3是未来Tasks的前置。身份v3只认精确identity表集合；未来Tasks0004必须验证完整runtime表/列/索引和应用完整性后才推进schema_version=4，重启仍完整检查。新schema无外键/CHECK，保留PK/UNIQUE/NOT NULL/类型长度；事务内校验引用与状态，不能仅添加Tasks表绕过闭合校验。普通启动只读拒绝未就绪schema，不自动ALTER。编号仅在确认实际部署与备份未占用3/4后适用；若已有Tasks0002/0003或其他占用，停下另审，不重用编号。开发库实测不等于生产部署盘点。
 - 新增依赖须在同一任务内连同根/crate manifest 与 `Cargo.lock` 提交；新依赖须过 MSRV 1.85 与 CI 多 target 检查。
 - 每个去重设备恰好一个子任务（包括失败目标）；同设备跨批次持久互斥，后来者 `DEVICE_BUSY` 且不排队。事务内无网络；dispatching 意图一旦提交视为可能已发送，恢复只查询核实。unknown 完成批次但持设备锁。
 - TTL、重试、保活、新鲜度使用单调时间，不持久复用上个进程的 monotonic 截止。独立 NTP 启动预算最多30s，fallback后仍 ready 且后台无限有界退避。每台在线设备10s常规采样/1024规模是目标而非已有性能证明；过载跳过不积压，probe 预算不得被业务挤占。
@@ -23,7 +23,7 @@
 ## 文件结构、职责和接口
 
 - Modify `crates/rsetup-controller/{Cargo.toml,src/lib.rs,src/main.rs,src/db.rs,src/model.rs,src/audit.rs,src/api/mod.rs}`：接线与复用 01 认证/ACL，不复制。
-- Create `crates/rsetup-controller/migrations/0003_tasks.sql`：task_previews、main_tasks、sub_tasks、device_operation_locks、recovery_checks，显式唯一约束与 revision CAS；已用 0001 不原地改。
+- Create `crates/rsetup-controller/migrations/0004_tasks.sql`：task_previews、main_tasks、sub_tasks、device_operation_locks、recovery_checks，显式唯一约束与 revision CAS；已用 0001 不原地改。
 - Create `crates/rsetup-controller/src/time/{mod.rs,evidence.rs,ntp.rs,board_clock.rs}`：NTP/时间质量/四时戳；`src/tasks/{mod.rs,model.rs,preview.rs,repository.rs,evidence.rs,scheduler.rs,recovery.rs}`：主子任务状态/执行/恢复；`src/polling/{mod.rs,scheduler.rs,snapshot.rs}`：有界轮询/最新缓存；`src/operations/{mod.rs,backup.rs,mode.rs,retention.rs}`：旧备份受控恢复与待审保留期；`src/api/{tasks.rs,events.rs,system.rs,audit.rs}`：管理 API。
 - Create `crates/rsetup-controller/tests/{task_db.rs,controller_recovery.rs,runtime_db.rs}`：真实 DB 集成用例一律 `#[ignore]`，使用 01 计划 `tests/common/mod.rs` 的 `required_test_db()` 和 `CONTROLLER_TEST_DATABASE_URL` 独占空库契约；缺 URL 标未验证。允许另写不调用 `required_test_db()` 的 fake repository/board 纯单测，须标明 fake 边界，不能冒充锁、CAS 或备份的真实 DB 结果。三个集成测试目标均需按引擎用显式 URL 和 `-- --ignored --test-threads=1` 运行，逐目标核对实际执行非零用例及失败数；普通 `cargo test --workspace --locked`/`make test` 不运行 ignored 用例。测试夹具随首个使用它的测试建立，不假装现成。
 - Consumes 01 的 `DeviceId/UserId/AuthzRepository/AppState/authz_epoch`；02 的 `rsetup_protocol::wire::{DeviceStatus,ClockSample,TaskRecord,RebootTicket}`。本专题新增 `BoardClient` trait：`capabilities/status/clock/prepare/execute/task_record` 均以认证 DeviceId 作为目标，返回 `Result<wire_type,BoardError>`，production adapter 使用 02 已认证 Control 流，fake 只隔离网络边界。Produces `TimeProvider::evidence()->TimeEvidence`、`TaskService::{preview,submit}`、`TaskScheduler::run_ready()`、`merge_task_record`、`PollScheduler::due(now)`、`SnapshotStore::read(device,now)`。管理路径以 02 `/api/v1/task-previews`、`/tasks`、`/events`、`/system/*` 为准；接口不一致先协调四份计划和测试，不制造第二套设备身份。
@@ -53,9 +53,9 @@
 
 ### Task 2: 预览、幂等提交与持久设备锁
 
-**Files:** Create `migrations/0003_tasks.sql`, `src/tasks/{mod.rs,model.rs,preview.rs,repository.rs}`, `tests/task_db.rs`；Modify `src/{db.rs,audit.rs}`。
+**Files:** Create `migrations/0004_tasks.sql`, `src/tasks/{mod.rs,model.rs,preview.rs,repository.rs}`, `tests/task_db.rs`；Modify `src/{db.rs,audit.rs}`。
 
-**Interfaces:** identity v2 完成并通过只读严格校验、且核查目标库/备份未应用 Tasks 0002 后，才可规划此 Tasks 0003；如已有 Tasks 0002，停下另审编号，不重用 0003。`TaskService::preview(actor,device_ids,group_ids)->Preview`；`TaskService::submit(actor,preview_token,idempotency_key)->TaskId`；按 actor+key+规范请求去重，按 DeviceId 申请 DB 唯一锁。Tasks 全目标表、列、索引、约束校验成功后才设置 schema_version=3；未来 Task 3 runtime 的版本化完整 schema 检查须覆盖 v3 且重启稳定，不能仅增加 Tasks 表就放行当前仅认 v2/精确 identity 表集合的启动门；普通启动仍只读拒绝未就绪 schema，禁止自动生产 ALTER。
+**Interfaces:** identity v3完成并通过只读结构/数据校验、部署与备份未占用3/4后才可实施Tasks0004；已占用则停下另审。`TaskService::preview(actor,device_ids,group_ids)->Preview`；`TaskService::submit(actor,preview_token,idempotency_key)->TaskId`；actor+key+规范请求去重，按DeviceId申请DB唯一锁。父用户、主任务、设备、子任务、锁关系在同一事务验证，使用共同schema_meta保护行及统一对象锁序；不声明FK/CHECK。所有runtime目标表/列/索引及应用完整性校验后设置schema_version=4，runtime按版本完整检查v4，不能仅加表绕过identity v3检查；普通启动仍只读，禁止自动生产ALTER。
 
 - [ ] **Step 1 RED：**
 ```rust
@@ -73,7 +73,7 @@ async fn later_batch_is_busy_without_network_send() {
 - [ ] **Step 2 确认失败：** 隔离真实 DB fixture（调用 `required_test_db()`）与可编译 stub 就绪后，MySQL：`CONTROLLER_TEST_DATABASE_URL="$MYSQL_TEST_URL" cargo test -p rsetup-controller --test task_db later_batch_is_busy_without_network_send -- --ignored --exact --test-threads=1`；TiDB：`CONTROLLER_TEST_DATABASE_URL="$TIDB_TEST_URL" cargo test -p rsetup-controller --test task_db later_batch_is_busy_without_network_send -- --ignored --exact --test-threads=1`。仅在各自 URL 存在时运行，逐引擎核对实际执行 1 个用例且因锁竞争/零网络行为断言失败；缺 URL 标未验证，连接错误或零用例不算 RED。
 - [ ] **Step 3 最少 GREEN：** 预览显式不可见 ID 整体404、可见组成员固定展开，去重排序/空集400/最多1024；至少128bit随机 token 只存摘要、绑定用户/重启/目标/进程代际、建议单调60s有效。提交锁 authz_epoch 短事务重查当前权限和可见性；完全不可见整体404无任务，仍可见但无reboot/离线/不支持每个也建立 failed 子任务；合格目标按 DeviceId 排序后逐项申请 DB 锁，忙即 failed/DEVICE_BUSY 不排队；queued 排队有效期建议60min（待审默认），过期转 expired；审计与一目标一子任务同事务，commit 前零网络。actor+同key同请求在 preview 过期后也返回原 ID，异请求409；请求哈希和 preview_token_hash 持久化。
 - [ ] **Step 4 确认通过：** 目标 PASS；固定清单/多组去重、显式不可见、1025、同key并发/异内容、撤权竞争、排队过期、审计失败回滚逐一红绿；真实 DB 用例全部 `#[ignore]`。MySQL：`CONTROLLER_TEST_DATABASE_URL="$MYSQL_TEST_URL" cargo test -p rsetup-controller --test task_db -- --ignored --test-threads=1`；TiDB：`CONTROLLER_TEST_DATABASE_URL="$TIDB_TEST_URL" cargo test -p rsetup-controller --test task_db -- --ignored --test-threads=1`。两引擎逐一核对实际执行非零、零失败并各记被测版本；缺 URL 标未验证，有 URL 但失败/零用例标失败，普通 `make test` 不替代此验证。
-- [ ] **Step 5 重构、回归、提交：** 抽纯预览/事务验证函数并回归；`git add crates/rsetup-controller/migrations/0003_tasks.sql crates/rsetup-controller/src/tasks crates/rsetup-controller/src/db.rs crates/rsetup-controller/src/audit.rs crates/rsetup-controller/tests/task_db.rs && git commit -m 'feat(controller): commit idempotent tasks'`。
+- [ ] **Step 5 重构、回归、提交：** 抽纯预览/事务验证函数并回归；`git add crates/rsetup-controller/migrations/0004_tasks.sql crates/rsetup-controller/src/tasks crates/rsetup-controller/src/db.rs crates/rsetup-controller/src/audit.rs crates/rsetup-controller/tests/task_db.rs && git commit -m 'feat(controller): commit idempotent tasks'`。
 
 ### Task 3: 状态机、串行下发与不重发的进程恢复
 

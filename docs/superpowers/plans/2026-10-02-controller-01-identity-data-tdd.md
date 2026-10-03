@@ -20,6 +20,8 @@
 
 ## 全局约束及文件清单
 
+- 2026-10-03 用户确认：不依赖外键/CHECK，应用层值域校验与事务引用检查保证完整性；详见[新设计](../specs/2026-10-03-controller-application-integrity-design.md)及[修订计划](2026-10-03-controller-application-integrity-tdd.md)。先落实 identity v3；原 Task2B/3/4 的生产写入口必须消费其校验器和统一锁序，不得仅在HTTP层验证或添加数据库CHECK代替。本文旧迁移/启动示例是历史草案，版本3显式迁移、普通启动只读的新契约优先；不改0001/0002原文。
+
 - 根 Rust workspace 目前只有 crates/rsetup-core 与 crates/rsetup-app 两个 members，apps/desktop/src-tauri 被 exclude；只建议新增 crates/rsetup-controller，不改现有 crates/rsetup-app/src/server.rs、板端握手或前端。
 - 新增依赖须在同一 Task 将 manifest 与根 Cargo.lock 一起提交；候选依赖须通过 MSRV 1.85 与 CI 的 aarch64/x86_64 多 target 检查。`make test` 用 `cargo test --workspace --locked`；现有 CI 的 MSRV、多 target、离线打包均检查 `--locked`，新增依赖不得只改 manifest。
 - DB fixture 的 `$MYSQL_TEST_URL`/`$TIDB_TEST_URL` 由未来实施时的本地隔离容器或 CI 显式提供，镜像/服务配置和版本随 G1 审批的 MySQL 8.4 LTS/TiDB 8.5 LTS 建议版本确定，不预设现有 CI 已有对应 service。真实 DB 测试标 `#[ignore]`，以 `CONTROLLER_TEST_DATABASE_URL` 显式门控；未来修改 `.github/workflows/ci.yml`，分别按对应 URL 执行 MySQL/TiDB 的 `-- --ignored --test-threads=1`，并核查各自实际执行用例数非零（零用例不得算 PASS）。缺某引擎 URL 标该引擎「未验证」（不记 PASS、不以缺 URL 阻塞普通 CI），URL 存在而测试失败或执行用例为零则 CI fail；本次只修计划，不配置 CI/服务。
@@ -69,7 +71,7 @@ CREATE TABLE group_members (
 
 `users.display_name` 的 `VARCHAR(512)` 是宽松 DDL 上限；服务层按 02 §1 校验 1–128 字符且 ≤512 UTF-8 字节。
 
-余下表字段/索引按 02 §2：sessions(token_hash BINARY(32) 主键、user_id 索引、process_epoch、revoked)、roles(name 唯一)、role_permissions(role_id+permission 唯一)、device_groups(name 唯一)、grants(user_id 索引、source/scope 互斥)、devices(public_key 主键、admission_state/decision/revision)、admission_decisions(追加记录)、audit_events(process_epoch+event_seq 唯一，actor/target 索引)。关键互斥由服务层验证并 DB 可行时加约束。迁移后检查信息模式中的列、索引和重复运行的版本记录；不得误以 `CREATE TABLE IF NOT EXISTS` 足以验证既有 schema 正确。
+余下表字段/索引按 02 §2：sessions(token_hash BINARY(32) 主键、user_id 索引、process_epoch、revoked)、roles(name 唯一)、role_permissions(role_id+permission 唯一)、device_groups(name 唯一)、grants(user_id 索引、source/scope 互斥)、devices(public_key 主键、admission_state/decision/revision)、admission_decisions(追加记录)、audit_events(process_epoch+event_seq 唯一，actor/target 索引)。关键互斥由应用层校验，引用关系在同一事务内检查并以统一行锁/CAS保护；不添加、不依赖外键或 CHECK，基础主键/唯一索引/NOT NULL/类型长度仍保留。迁移后检查信息模式中的列、索引和重复运行的版本记录；不得误以 `CREATE TABLE IF NOT EXISTS` 足以验证既有 schema 正确。
 
 接口草案：IdentityRepository::{user_by_username(&str)->Result<Option<UserRecord>,ControllerError>,create_session(UserId,[u8;32])->Result<(),ControllerError>,revoke_user_sessions(UserId)->Result<(),ControllerError>}（sessions 以 token_hash 为主键，不传无对应列的 Uuid）；AuthzRepository::{effective_permissions(UserId,DeviceId)->Result<EffectivePermissions,ControllerError>,visible_devices(UserId,DeviceFilter)->Result<Vec<DeviceProjection>,ControllerError>}；DeviceRepository::{get_device(DeviceId)->Result<Option<DeviceRecord>,ControllerError>,decide_admission(DeviceId,u64,ReviewDecision,UserId,Option<String> /* reason */)->Result<DeviceRecord,ControllerError>}（reject 必须传非空 reason，reject/revoke 的 reason 写入 admission_decisions.reason）；`AdmissionStore::{load,compare_and_set}` 的返回值为持久完整准入快照（可命名 `AdmissionSnapshot`：`admission_state`、`review_decision`、`revision`），按公钥读取，CAS 使用公钥与 `expected_revision`、校验预期状态及合法状态/决定转换，更新完整快照，失败返回冲突；`PENDING+none` 与 `PENDING+denied` 必须可区分，传输层据此区分继续等待与 `APPROVAL_DENIED`。DB adapter 由本 crate 提供并注入 02 计划传输层；接口形状需与 02 实施时共同审阅，不新增 HTTP API。model.rs 定义这些类型；auth/service.rs 输出 login/authenticate/change_password/logout/revoke_all；authz/service.rs 输出 effective_permissions/visible_devices；devices/service.rs 输出 patch_profile/replace_group_members/decide_admission；audit.rs 提供语言中立事件与事务内脱敏写入。审批服务不直接做网络 I/O，但事务提交后的 `{device_id,revision}` 准入变更通知须明确接线给 02 的隧道管理：通知不在事务内、失败不能回滚或掩盖已提交决定；02 在通知失败时失败关闭相应活动连接，并核对最新准入状态与连接代际后再决定是否接纳/重连。通知仅为唤醒，接纳仍读最新持久状态，不以通知代替 DB 真相；不引入持久 outbox。内部接线契约为注入的 `AdmissionChangeSink::after_commit(device_id,revision)`：仅在 repository 已提交返回后调用；02 的实现负责有界投递到 `on_admission_committed`，投递失败则触发该设备 fail-closed/补偿核对，不将通知失败作为 DB 操作失败返给调用者。该 trait 在 01 的 `devices/service.rs` 定义，controller 内的生产 adapter 调用 02 暴露的通知/定向关闭入口；02 Task 9 联调时在 controller 的 AppState/启动组装处注入，避免让 protocol 反向依赖 controller。01 阶段尚无活动隧道，测试使用记录型 sink；不得把该测试 sink 当真实连接管理器。
 
@@ -174,6 +176,8 @@ pub fn token_digest(raw: &[u8]) -> [u8; 32] {
 - [ ] **Step 5：重构回归。** 用户名 ASCII 规则、密码 Unicode 字符数与 UTF-8 byte 双限制、不等于旧密码；并发改密时旧 hash 验证与提交间被另一请求更新不得覆盖较新密码或撤销其新会话（此用例也须按全局约束单独 RED→GREEN）；不存在用户响应/耗时形态、按账号和来源限速；最后管理员并发降级/停用；session 过期与重启失效；reset 的本机 PTY + 隔离真实 DB 负向用例、commit 未知状态受控核实与独立安全审查；秘密不落普通 stdout/stderr、日志/审计（脱敏失败审计允许）。`cargo test -p rsetup-controller && cargo clippy -p rsetup-controller --all-targets -- -D warnings`。
 - [ ] **Step 6：小提交。** `git add crates/rsetup-controller/src/auth crates/rsetup-controller/src/api/mod.rs crates/rsetup-controller/src/api/auth.rs crates/rsetup-controller/src/api/users.rs crates/rsetup-controller/src/main.rs crates/rsetup-controller/src/db.rs crates/rsetup-controller/src/audit.rs && git commit -m "feat(controller): add local auth and accounts"`。
 
+**后续事务消费门禁：** 生产 IdentityRepository（原 Task2B）建 session 前在 guard/users 锁内重验 active 与已验证 hash/revision；停用/改密/重置同事务撤销会话，不靠外键级联。若事务校验与账号变更并发，重验较新数据；fixture/fake通过不等于生产仓储完成。
+
 ## Task 3：动态并集授权与可见性、role/grant 管理
 
 **Files:** `src/authz/{mod.rs,policy.rs,service.rs}`、`src/api/{roles.rs,grants.rs}`、`src/{model.rs,db.rs,audit.rs}`。
@@ -214,6 +218,8 @@ pub fn evaluate_grants(user: UserId, device: DeviceId, gs: &[Grant],
 - [ ] **Step 4：运行确认通过。** `cargo test -p rsetup-controller authz::`；all 覆盖新增设备；组移除动态撤权但多组/其它 grant 仍有效；删除 device grant 不抵消 all/group；reboot-only 没有 status；无授权拒绝。
 - [ ] **Step 5：重构回归。** 角色权限/组成员/grant 修改与 epoch/audit 原子提交；并发读/写只得同一 epoch 视图；管理员最后身份与普通设备角色区分；不可见/不存在统一 404、列表无隐藏总数；MySQL 与 TiDB 分别验证 CAS。ACL-02 的“组变更与任务提交并发、执行前重验及已发任务不能假称撤回”必须与 03 计划 Task 2/3 联合测试，不能用本 Task 的授权读写测试代替。`cargo test -p rsetup-controller`。
 - [ ] **Step 6：小提交。** `git add crates/rsetup-controller/src/authz crates/rsetup-controller/src/api/roles.rs crates/rsetup-controller/src/api/grants.rs crates/rsetup-controller/src/model.rs crates/rsetup-controller/src/db.rs crates/rsetup-controller/src/audit.rs && git commit -m "feat(controller): enforce dynamic authorization"`。
+
+**后续事务消费门禁：** role/grant 写仓储必须复用应用完整性校验，在 guard→users→roles→device_groups→devices→依赖行的统一锁序内确认引用存在且有效，更新 revision/authz_epoch/审计并整体回滚；角色/组归档在同一事务撤销相关授权，保留历史父记录，不添加FK/CHECK兜底。
 
 ## Task 4：设备档案、分组与人工审批事务
 
