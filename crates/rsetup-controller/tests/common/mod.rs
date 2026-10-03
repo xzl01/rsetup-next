@@ -1,11 +1,14 @@
-use rsetup_controller::{ControllerConfig, DbPool};
+use rsetup_controller::{ControllerConfig, DbPool, TestMigrationConfig};
 use std::sync::Mutex;
 
 pub async fn required_test_db() -> DbPool {
-    let database_url = std::env::var("CONTROLLER_TEST_DATABASE_URL")
-        .expect("CONTROLLER_TEST_DATABASE_URL must name an isolated test database");
+    let config = TestMigrationConfig::from_test_env()
+        .expect("explicit disposable test migration configuration");
+    config
+        .authorize(&config.expected_database)
+        .expect("test database migration authorization");
     let db = DbPool::connect(&ControllerConfig {
-        database_url,
+        database_url: config.test_url.clone(),
         listen_address: String::new(),
     })
     .await
@@ -14,11 +17,85 @@ pub async fn required_test_db() -> DbPool {
         .fetch_one(&db.0)
         .await
         .expect("selected test database");
-    assert!(
-        name.contains("test"),
-        "database name must identify an isolated test database"
+    config
+        .authorize(&name)
+        .expect("actual test database name must match authorization");
+    db
+}
+
+pub async fn required_fresh_identity_db() -> DbPool {
+    let db = required_test_db().await;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE()",
+    )
+    .fetch_one(&db.0)
+    .await
+    .expect("count test schema tables");
+    assert_eq!(
+        count, 0,
+        "fresh disposable test schema required; never reset existing schema"
     );
     db
+}
+
+pub async fn required_prepared_identity_db() -> DbPool {
+    let db = required_test_db().await;
+    rsetup_controller::check_identity_schema(&db)
+        .await
+        .expect("existing v2 identity schema");
+    db
+}
+
+pub fn run_explicit_identity_test_command(mode: &str) {
+    assert!(matches!(
+        mode,
+        "upgrade" | "fixture-v1" | "fixture-partial-v1"
+    ));
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_migrate-identity-test"))
+        .args(["--mode", mode])
+        .status()
+        .expect("explicit test migration binary");
+    assert!(
+        status.success(),
+        "explicit test migration failed; inspect disposable schema manually"
+    );
+}
+
+#[test]
+fn fixture_authorization_requires_all_confirmations() {
+    let base = TestMigrationConfig {
+        test_url: "mysql://fixture/test_identity".into(),
+        allow_destructive: true,
+        expected_database: "test_identity".into(),
+        backup_ref: "snapshot-42".into(),
+        migration_ack: "isolated-exclusive-backed-up-disposable".into(),
+    };
+    assert!(base.authorize("test_identity").is_ok());
+    for c in [
+        TestMigrationConfig {
+            allow_destructive: false,
+            ..base.clone()
+        },
+        TestMigrationConfig {
+            backup_ref: String::new(),
+            ..base.clone()
+        },
+        TestMigrationConfig {
+            migration_ack: String::new(),
+            ..base.clone()
+        },
+        TestMigrationConfig {
+            expected_database: "production".into(),
+            ..base.clone()
+        },
+        TestMigrationConfig {
+            test_url: String::new(),
+            ..base.clone()
+        },
+    ] {
+        assert!(c.authorize("test_identity").is_err());
+    }
+    assert!(base.authorize("test_not_expected").is_err());
 }
 
 #[derive(Default)]

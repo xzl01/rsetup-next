@@ -1,5 +1,6 @@
 [package]
 name = "rsetup-controller"
+default-run = "rsetup-controller"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

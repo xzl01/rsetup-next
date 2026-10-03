@@ -7,7 +7,10 @@ pub mod model;
 
 pub use bootstrap::{BootstrapSecretSink, bootstrap_admin};
 pub use config::ControllerConfig;
-pub use db::{AdmissionStore, DbPool, migrate};
+pub use db::{
+    AdmissionStore, DbPool, TestMigrationConfig, TestMigrationMode, check_identity_schema,
+    run_identity_test_migration,
+};
 pub use error::ControllerError;
 pub use model::{AdmissionSnapshot, AdmissionState, ReviewDecision};
 

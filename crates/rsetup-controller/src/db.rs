@@ -10,6 +10,76 @@ impl DbPool {
 }
 
 const MIGRATION: &str = include_str!("../migrations/0001_identity_devices.sql");
+const IDENTITY_MIGRATION: &str = include_str!("../migrations/0002_identity_contract.sql");
+// Fixed statements and identifiers: never interpolate database-supplied table/column names.
+const IDENTITY_COLUMNS: &[(&str, &str, &str, &str)] = &[
+    (
+        "schema_meta",
+        "authz_epoch",
+        "SELECT 1 FROM schema_meta WHERE authz_epoch < 0 LIMIT 1",
+        "ALTER TABLE schema_meta MODIFY COLUMN authz_epoch BIGINT UNSIGNED NOT NULL DEFAULT 0",
+    ),
+    (
+        "schema_meta",
+        "admin_guard_revision",
+        "SELECT 1 FROM schema_meta WHERE admin_guard_revision < 0 LIMIT 1",
+        "ALTER TABLE schema_meta MODIFY COLUMN admin_guard_revision BIGINT UNSIGNED NOT NULL DEFAULT 0",
+    ),
+    (
+        "users",
+        "revision",
+        "SELECT 1 FROM users WHERE revision < 0 LIMIT 1",
+        "ALTER TABLE users MODIFY COLUMN revision BIGINT UNSIGNED NOT NULL",
+    ),
+    (
+        "roles",
+        "revision",
+        "SELECT 1 FROM roles WHERE revision < 0 LIMIT 1",
+        "ALTER TABLE roles MODIFY COLUMN revision BIGINT UNSIGNED NOT NULL",
+    ),
+    (
+        "device_groups",
+        "revision",
+        "SELECT 1 FROM device_groups WHERE revision < 0 LIMIT 1",
+        "ALTER TABLE device_groups MODIFY COLUMN revision BIGINT UNSIGNED NOT NULL",
+    ),
+    (
+        "devices",
+        "revision",
+        "SELECT 1 FROM devices WHERE revision < 0 LIMIT 1",
+        "ALTER TABLE devices MODIFY COLUMN revision BIGINT UNSIGNED NOT NULL",
+    ),
+    (
+        "grants",
+        "revision",
+        "SELECT 1 FROM grants WHERE revision < 0 LIMIT 1",
+        "ALTER TABLE grants MODIFY COLUMN revision BIGINT UNSIGNED NOT NULL",
+    ),
+    (
+        "admission_decisions",
+        "previous_revision",
+        "SELECT 1 FROM admission_decisions WHERE previous_revision < 0 LIMIT 1",
+        "ALTER TABLE admission_decisions MODIFY COLUMN previous_revision BIGINT UNSIGNED NOT NULL",
+    ),
+    (
+        "admission_decisions",
+        "new_revision",
+        "SELECT 1 FROM admission_decisions WHERE new_revision < 0 LIMIT 1",
+        "ALTER TABLE admission_decisions MODIFY COLUMN new_revision BIGINT UNSIGNED NOT NULL",
+    ),
+    (
+        "audit_events",
+        "event_seq",
+        "SELECT 1 FROM audit_events WHERE event_seq < 0 LIMIT 1",
+        "ALTER TABLE audit_events MODIFY COLUMN event_seq BIGINT UNSIGNED NOT NULL",
+    ),
+    (
+        "users",
+        "username",
+        "",
+        "ALTER TABLE users MODIFY COLUMN username VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL",
+    ),
+];
 const TABLES: &[(&str, &[&str], &[&str])] = &[
     (
         "schema_meta",
@@ -383,14 +453,170 @@ fn expected_indexes(parts: &[String], names: &[&str]) -> Result<Vec<IndexMeta>, 
     Ok(expected)
 }
 
-pub async fn migrate(db: &DbPool) -> Result<(), ControllerError> {
-    // Each DDL is independently durable on MySQL and TiDB; an interrupted run resumes safely.
-    for statement in MIGRATION
-        .split(';')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+trait IdentitySchemaProbe {
+    fn read_version(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Option<i32>, ControllerError>> + Send;
+    fn validate_v2_shape(
+        &self,
+    ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
+}
+async fn check_identity_schema_with_probe(
+    probe: &impl IdentitySchemaProbe,
+) -> Result<(), ControllerError> {
+    identity_schema_decision(probe.read_version().await?)?;
+    probe.validate_v2_shape().await
+}
+
+fn identity_schema_decision(version: Option<i32>) -> Result<(), ControllerError> {
+    match version {
+        Some(2) => Ok(()),
+        None | Some(1) => Err(ControllerError::SchemaNotReady {
+            found: version,
+            required: 2,
+        }),
+        other => Err(ControllerError::Config(format!(
+            "unsupported identity schema version {other:?}"
+        ))),
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TestMigrationConfig {
+    pub test_url: String,
+    pub allow_destructive: bool,
+    pub expected_database: String,
+    pub backup_ref: String,
+    pub migration_ack: String,
+}
+impl TestMigrationConfig {
+    #[cfg(test)]
+    fn fixture(url: &str, name: &str) -> Self {
+        Self {
+            test_url: url.into(),
+            allow_destructive: false,
+            expected_database: name.into(),
+            backup_ref: String::new(),
+            migration_ack: String::new(),
+        }
+    }
+    pub fn from_test_env() -> Result<Self, ControllerError> {
+        let test_url = std::env::var("CONTROLLER_TEST_DATABASE_URL").unwrap_or_default();
+        if std::env::var("CONTROLLER_DATABASE_URL").is_ok_and(|service| service == test_url) {
+            return Err(ControllerError::Config(
+                "test migration cannot reuse service URL".into(),
+            ));
+        }
+        Ok(Self {
+            test_url,
+            allow_destructive: std::env::var("CONTROLLER_TEST_ALLOW_DESTRUCTIVE")
+                .is_ok_and(|v| v == "1"),
+            expected_database: std::env::var("CONTROLLER_TEST_EXPECTED_DATABASE")
+                .unwrap_or_default(),
+            backup_ref: std::env::var("CONTROLLER_TEST_BACKUP_REF").unwrap_or_default(),
+            migration_ack: std::env::var("CONTROLLER_TEST_MIGRATION_ACK").unwrap_or_default(),
+        })
+    }
+    pub fn authorize(&self, actual: &str) -> Result<(), ControllerError> {
+        authorize_test_migration(self, actual)
+    }
+}
+fn authorize_test_migration(c: &TestMigrationConfig, actual: &str) -> Result<(), ControllerError> {
+    let safe = !c.test_url.trim().is_empty()
+        && c.allow_destructive
+        && c.expected_database.starts_with("test_")
+        && c.expected_database.len() > 5
+        && c.expected_database
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && c.expected_database == actual
+        && !c.backup_ref.trim().is_empty()
+        && c.migration_ack == "isolated-exclusive-backed-up-disposable";
+    if safe {
+        Ok(())
+    } else {
+        Err(ControllerError::Config(
+            "test migration authorization required".into(),
+        ))
+    }
+}
+fn preflight_usernames<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+) -> Result<(), ControllerError> {
+    let mut seen = std::collections::HashSet::new();
+    for name in values {
+        if !valid_username(name) || !seen.insert(name.as_bytes().to_vec()) {
+            return Err(ControllerError::Config(
+                "invalid or conflicting stored username".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+fn classify_identity_column(
+    table: &str,
+    name: &str,
+    actual: &ColumnMeta,
+) -> Result<bool, ControllerError> {
+    let (old, target) = identity_column_declarations(table, name)?;
+    if validate_column_shape(table, target, actual).is_ok() {
+        return Ok(false);
+    }
+    validate_column_shape(table, old, actual)?;
+    Ok(true)
+}
+fn identity_column_declarations(
+    table: &str,
+    name: &str,
+) -> Result<(&'static str, &'static str), ControllerError> {
+    match (table, name) {
+        ("users", "username") => Ok((
+            "VARCHAR(128) CHARACTER SET utf8mb4 NOT NULL",
+            "VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL",
+        )),
+        ("schema_meta", "authz_epoch" | "admin_guard_revision") => Ok((
+            "BIGINT NOT NULL DEFAULT 0",
+            "BIGINT UNSIGNED NOT NULL DEFAULT 0",
+        )),
+        ("users" | "roles" | "device_groups" | "devices" | "grants", "revision")
+        | ("admission_decisions", "previous_revision" | "new_revision")
+        | ("audit_events", "event_seq") => Ok(("BIGINT NOT NULL", "BIGINT UNSIGNED NOT NULL")),
+        _ => Err(ControllerError::Config(
+            "unknown identity migration column".into(),
+        )),
+    }
+}
+async fn run_authorized_migration_with<D, C, CF, U, UF>(
+    config: &TestMigrationConfig,
+    connect_and_name: C,
+    upgrade: U,
+) -> Result<(), ControllerError>
+where
+    C: FnOnce() -> CF,
+    CF: std::future::Future<Output = Result<(D, String), ControllerError>>,
+    U: FnOnce(D) -> UF,
+    UF: std::future::Future<Output = Result<(), ControllerError>>,
+{
+    authorize_test_migration(config, &config.expected_database)?;
+    let (db, actual) = connect_and_name().await?;
+    authorize_test_migration(config, &actual)?;
+    upgrade(db).await
+}
+
+async fn validate_schema_shape(db: &DbPool, target: Option<bool>) -> Result<(), ControllerError> {
+    let present: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE()",
+    )
+    .fetch_all(&db.0)
+    .await?;
+    if present.len() != TABLES.len()
+        || present
+            .iter()
+            .any(|name| !TABLES.iter().any(|(table, _, _)| name == table))
     {
-        sqlx::query(statement).execute(&db.0).await?;
+        return Err(ControllerError::Config(
+            "identity schema has missing or unexpected tables; manual inspection required".into(),
+        ));
     }
     for &(table, columns, indexes) in TABLES {
         let parts = ddl_parts(table);
@@ -403,21 +629,34 @@ pub async fn migrate(db: &DbPool) -> Result<(), ControllerError> {
                         "migration DDL missing column {table}.{column}"
                     ))
                 })?;
-            let row = sqlx::query("SELECT data_type, column_type, is_nullable, character_set_name, collation_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?")
-                .bind(table).bind(column).fetch_optional(&db.0).await?
-                .ok_or_else(|| ControllerError::Config(format!("migration missing column {table}.{column}")))?;
-            validate_column_shape(
-                table,
-                declaration,
-                &ColumnMeta {
-                    name: column.to_owned(),
-                    data_type: row.try_get("data_type")?,
-                    column_type: row.try_get("column_type")?,
-                    nullable: row.try_get::<String, _>("is_nullable")? == "YES",
-                    character_set_name: row.try_get::<Option<String>, _>("character_set_name")?,
-                    collation_name: row.try_get::<Option<String>, _>("collation_name")?,
-                },
-            )?;
+            let actual = read_column(db, table, column).await?;
+            if IDENTITY_COLUMNS
+                .iter()
+                .any(|&(t, c, _, _)| t == table && c == column)
+            {
+                match target {
+                    Some(true) => {
+                        if classify_identity_column(table, column, &actual)? {
+                            return Err(ControllerError::Config(format!(
+                                "migration target column not ready {table}.{column}"
+                            )));
+                        }
+                    }
+                    Some(false) => validate_column_shape(
+                        table,
+                        identity_column_declarations(table, column)?.0,
+                        &actual,
+                    )?,
+                    None => {
+                        classify_identity_column(table, column, &actual)?;
+                    }
+                }
+            } else {
+                validate_column_shape(table, declaration, &actual)?;
+            }
+            if table == "schema_meta" && matches!(column, "authz_epoch" | "admin_guard_revision") {
+                validate_counter_default(db, column).await?;
+            }
         }
         let expected = expected_indexes(&parts, indexes)?;
         let rows = sqlx::query("SELECT index_name, column_name, non_unique, seq_in_index FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? ORDER BY index_name, seq_in_index")
@@ -453,18 +692,270 @@ pub async fn migrate(db: &DbPool) -> Result<(), ControllerError> {
             }
         }
     }
-    sqlx::query("INSERT IGNORE INTO schema_meta (singleton, schema_version, instance_id, initialized, authz_epoch, admin_guard_revision) VALUES (1, 1, ?, FALSE, 0, 0)")
-        .bind(uuid::Uuid::new_v4().as_bytes().as_slice()).execute(&db.0).await?;
-    let version: i32 =
-        sqlx::query_scalar("SELECT schema_version FROM schema_meta WHERE singleton = 1")
-            .fetch_one(&db.0)
-            .await?;
-    if version != 1 {
+    Ok(())
+}
+
+async fn read_column(
+    db: &DbPool,
+    table: &str,
+    column: &str,
+) -> Result<ColumnMeta, ControllerError> {
+    let row = sqlx::query("SELECT data_type, column_type, is_nullable, character_set_name, collation_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?")
+        .bind(table).bind(column).fetch_optional(&db.0).await?
+        .ok_or_else(|| ControllerError::Config(format!("migration missing column {table}.{column}")))?;
+    Ok(ColumnMeta {
+        name: column.to_owned(),
+        data_type: row.try_get("data_type")?,
+        column_type: row.try_get("column_type")?,
+        nullable: row.try_get::<String, _>("is_nullable")? == "YES",
+        character_set_name: row.try_get("character_set_name")?,
+        collation_name: row.try_get("collation_name")?,
+    })
+}
+
+async fn validate_counter_default(db: &DbPool, column: &str) -> Result<(), ControllerError> {
+    let default: Option<String> = sqlx::query_scalar("SELECT column_default FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'schema_meta' AND column_name = ?")
+        .bind(column).fetch_one(&db.0).await?;
+    if default.as_deref() != Some("0") {
         return Err(ControllerError::Config(format!(
-            "unsupported schema version {version}"
+            "migration incompatible default schema_meta.{column}"
         )));
     }
     Ok(())
+}
+
+async fn read_version(db: &DbPool) -> Result<Option<i32>, ControllerError> {
+    let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'schema_meta'")
+        .fetch_one(&db.0).await?;
+    if exists == 0 {
+        return Ok(None);
+    }
+    if exists != 1 {
+        return Err(ControllerError::Config(
+            "damaged schema_meta table identity".into(),
+        ));
+    }
+    let rows = sqlx::query("SELECT singleton, schema_version FROM schema_meta LIMIT 2")
+        .fetch_all(&db.0)
+        .await?;
+    match rows.as_slice() {
+        [] => Ok(None),
+        [row] if row.try_get::<i8, _>("singleton")? == 1 => {
+            Ok(Some(row.try_get("schema_version")?))
+        }
+        _ => Err(ControllerError::Config(
+            "damaged schema_meta singleton".into(),
+        )),
+    }
+}
+
+impl IdentitySchemaProbe for DbPool {
+    async fn read_version(&self) -> Result<Option<i32>, ControllerError> {
+        read_version(self).await
+    }
+    async fn validate_v2_shape(&self) -> Result<(), ControllerError> {
+        validate_schema_shape(self, Some(true)).await
+    }
+}
+
+pub async fn check_identity_schema(db: &DbPool) -> Result<(), ControllerError> {
+    check_identity_schema_with_probe(db).await
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum TestMigrationMode {
+    Upgrade,
+    FixtureV1,
+    FixturePartialV1,
+}
+
+pub async fn run_identity_test_migration(
+    config: &TestMigrationConfig,
+    mode: TestMigrationMode,
+) -> Result<(), ControllerError> {
+    if std::env::var("CONTROLLER_DATABASE_URL").is_ok_and(|service| service == config.test_url) {
+        return Err(ControllerError::Config(
+            "test migration cannot reuse service URL".into(),
+        ));
+    }
+    run_authorized_migration_with(
+        config,
+        || async {
+            let db = DbPool(
+                sqlx::MySqlPool::connect(&config.test_url)
+                    .await
+                    .map_err(|_| {
+                        ControllerError::Config("test database connection failed".into())
+                    })?,
+            );
+            let actual: String = sqlx::query_scalar("SELECT DATABASE()")
+                .fetch_one(&db.0)
+                .await
+                .map_err(|_| {
+                    ControllerError::Config("test database identity query failed".into())
+                })?;
+            Ok((db, actual))
+        },
+        |db| async move { upgrade_identity_schema(&db, mode).await },
+    )
+    .await
+}
+
+async fn preflight_values(db: &DbPool, status: &[bool]) -> Result<(), ControllerError> {
+    let usernames: Vec<String> = sqlx::query_scalar("SELECT username FROM users")
+        .fetch_all(&db.0)
+        .await?;
+    preflight_usernames(usernames.iter().map(String::as_str))?;
+    let bad_encoding: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM users WHERE BINARY username <> BINARY CONVERT(username USING ascii) LIMIT 1",
+    )
+    .fetch_optional(&db.0)
+    .await?;
+    if bad_encoding.is_some() {
+        return Err(ControllerError::Config(
+            "username cannot convert to ascii without loss".into(),
+        ));
+    }
+    let collision: Option<String> = sqlx::query_scalar("SELECT CONVERT(username USING ascii) COLLATE ascii_bin AS target_name FROM users GROUP BY target_name HAVING COUNT(*) > 1 LIMIT 1").fetch_optional(&db.0).await?;
+    if collision.is_some() {
+        return Err(ControllerError::Config(
+            "target username uniqueness collision".into(),
+        ));
+    }
+    for ((table, column, negative_query, _), old) in IDENTITY_COLUMNS.iter().zip(status) {
+        if *old && !negative_query.is_empty() {
+            let found: Option<i32> = sqlx::query(negative_query)
+                .fetch_optional(&db.0)
+                .await?
+                .map(|_| 1);
+            if found.is_some() {
+                return Err(ControllerError::Config(format!(
+                    "negative identity column {table}.{column}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn upgrade_identity_schema(
+    db: &DbPool,
+    mode: TestMigrationMode,
+) -> Result<(), ControllerError> {
+    if IDENTITY_MIGRATION
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ne(IDENTITY_COLUMNS.iter().map(|(_, _, _, alter)| *alter))
+    {
+        return Err(ControllerError::Config(
+            "identity migration SQL disagrees with fixed whitelist".into(),
+        ));
+    }
+    // All access reaches this private writer only through the authorized test command.
+    let version = read_version(db).await?;
+    if matches!(mode, TestMigrationMode::FixturePartialV1) && version != Some(1) {
+        return Err(ControllerError::Config(
+            "fixture-partial-v1 requires existing v1 test schema".into(),
+        ));
+    }
+    if matches!(mode, TestMigrationMode::FixtureV1) && version.is_some() {
+        return Err(ControllerError::Config(
+            "fixture-v1 requires empty test database".into(),
+        ));
+    }
+    if version == Some(2) {
+        if !matches!(mode, TestMigrationMode::Upgrade) {
+            return Err(ControllerError::Config("fixture requires v1".into()));
+        }
+        return check_identity_schema(db).await;
+    }
+    if version.is_none() {
+        let tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE()",
+        )
+        .fetch_one(&db.0)
+        .await?;
+        if tables != 0 {
+            return Err(ControllerError::Config(
+                "nonempty unversioned test schema requires manual handling".into(),
+            ));
+        }
+        // 0001 remains byte-identical. A failed CREATE leaves an unversioned partial schema;
+        // never repair it automatically: the operator must inspect the stopped test fixture.
+        for statement in MIGRATION
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            sqlx::query(statement).execute(&db.0).await?;
+        }
+        validate_schema_shape(db, Some(false)).await?;
+        sqlx::query("INSERT INTO schema_meta (singleton, schema_version, instance_id, initialized, authz_epoch, admin_guard_revision) VALUES (1, 1, ?, FALSE, 0, 0)")
+            .bind(uuid::Uuid::new_v4().as_bytes().as_slice()).execute(&db.0).await?;
+    } else if version != Some(1) {
+        return Err(ControllerError::Config(
+            "unsupported test identity schema version".into(),
+        ));
+    }
+    if matches!(mode, TestMigrationMode::FixtureV1) {
+        return Ok(());
+    }
+    validate_schema_shape(db, None).await?;
+    let mut status = Vec::new();
+    for &(table, column, _, _) in IDENTITY_COLUMNS {
+        status.push(classify_identity_column(
+            table,
+            column,
+            &read_column(db, table, column).await?,
+        )?);
+    }
+    preflight_values(db, &status).await?;
+    if matches!(mode, TestMigrationMode::FixturePartialV1) {
+        if !status[0] {
+            return Err(ControllerError::Config(
+                "fixture partial column already altered".into(),
+            ));
+        }
+        sqlx::query(IDENTITY_COLUMNS[0].3).execute(&db.0).await?;
+        if classify_identity_column(
+            IDENTITY_COLUMNS[0].0,
+            IDENTITY_COLUMNS[0].1,
+            &read_column(db, IDENTITY_COLUMNS[0].0, IDENTITY_COLUMNS[0].1).await?,
+        )? {
+            return Err(ControllerError::Config(
+                "partial fixture ALTER not reflected in metadata".into(),
+            ));
+        }
+        return Ok(());
+    }
+    for ((table, column, _, alter), old) in IDENTITY_COLUMNS.iter().zip(status) {
+        if old {
+            sqlx::query(alter).execute(&db.0).await?;
+            if classify_identity_column(table, column, &read_column(db, table, column).await?)? {
+                return Err(ControllerError::Config(format!(
+                    "ALTER result not reflected in metadata {table}.{column}"
+                )));
+            }
+        }
+    }
+    validate_schema_shape(db, Some(true)).await?;
+    let updated = sqlx::query(
+        "UPDATE schema_meta SET schema_version = 2 WHERE singleton = 1 AND schema_version = 1",
+    )
+    .execute(&db.0)
+    .await;
+    match updated {
+        Ok(result) if result.rows_affected() == 1 => {}
+        _ => {
+            let observed = read_version(db).await?;
+            let shape_ok = validate_schema_shape(db, Some(true)).await.is_ok();
+            return Err(ControllerError::Config(format!(
+                "identity version update uncertain; observed version {observed:?}, target shape valid={shape_ok}; inspect metadata manually"
+            )));
+        }
+    }
+    check_identity_schema(db).await
 }
 
 pub trait AdmissionStore {
@@ -649,6 +1140,222 @@ fn audit_code(decision: ReviewDecision, previous: AdmissionState) -> &'static st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn readonly_probe_gates_shape_only_after_v2() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Fake {
+            version: Option<i32>,
+            reads: AtomicUsize,
+            shapes: AtomicUsize,
+            broken: bool,
+        }
+        impl IdentitySchemaProbe for Fake {
+            async fn read_version(&self) -> Result<Option<i32>, ControllerError> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                Ok(self.version)
+            }
+            async fn validate_v2_shape(&self) -> Result<(), ControllerError> {
+                self.shapes.fetch_add(1, Ordering::SeqCst);
+                if self.broken {
+                    Err(ControllerError::Config("broken shape".into()))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        for (version, shape_count, broken) in [
+            (None, 0, false),
+            (Some(1), 0, false),
+            (Some(2), 1, false),
+            (Some(2), 1, true),
+        ] {
+            let fake = Fake {
+                version,
+                reads: AtomicUsize::new(0),
+                shapes: AtomicUsize::new(0),
+                broken,
+            };
+            let result = check_identity_schema_with_probe(&fake).await;
+            assert_eq!(result.is_ok(), version == Some(2) && !broken);
+            assert_eq!(fake.reads.load(Ordering::SeqCst), 1);
+            assert_eq!(fake.shapes.load(Ordering::SeqCst), shape_count);
+        }
+    }
+
+    #[test]
+    fn empty_and_v1_are_not_ready_without_ddl() {
+        for (version, expected) in [(None, None), (Some(1), Some(1))] {
+            assert!(
+                matches!(identity_schema_decision(version), Err(ControllerError::SchemaNotReady { found, required: 2 }) if found == expected)
+            );
+        }
+        assert!(identity_schema_decision(Some(2)).is_ok());
+        for version in [Some(0), Some(3), Some(-1)] {
+            assert!(identity_schema_decision(version).is_err());
+        }
+    }
+
+    #[test]
+    fn test_migration_needs_all_independent_confirmations() {
+        let mut config =
+            TestMigrationConfig::fixture("mysql://fixture/test_identity", "test_identity");
+        assert!(authorize_test_migration(&config, "test_identity").is_err());
+        config.allow_destructive = true;
+        assert!(authorize_test_migration(&config, "test_identity").is_err());
+        config.backup_ref = "snapshot-42".into();
+        config.migration_ack = "isolated-exclusive-backed-up-disposable".into();
+        assert!(authorize_test_migration(&config, "production").is_err());
+        assert!(authorize_test_migration(&config, "test_identity").is_ok());
+    }
+
+    #[test]
+    fn preflight_refuses_invalid_and_target_collision() {
+        let long = "a".repeat(65);
+        for names in [
+            &["alice", "Éric"][..],
+            &["alice", long.as_str()],
+            &["alice", "Alice"],
+            &["alice", "alice"],
+        ] {
+            assert!(
+                preflight_usernames(names.iter().copied()).is_err(),
+                "{names:?}"
+            );
+        }
+        assert!(preflight_usernames(["alice", "bob_1"]).is_ok());
+    }
+
+    #[test]
+    fn mixed_identity_columns_are_resumable() {
+        let old = ColumnMeta {
+            name: "revision".into(),
+            data_type: "bigint".into(),
+            column_type: "bigint".into(),
+            nullable: false,
+            character_set_name: None,
+            collation_name: None,
+        };
+        assert!(classify_identity_column("devices", "revision", &old).unwrap());
+        let new = ColumnMeta {
+            column_type: "bigint unsigned".into(),
+            ..old.clone()
+        };
+        assert!(!classify_identity_column("devices", "revision", &new).unwrap());
+        let drift = ColumnMeta {
+            data_type: "varchar".into(),
+            column_type: "varchar(20)".into(),
+            ..old
+        };
+        assert!(classify_identity_column("devices", "revision", &drift).is_err());
+    }
+
+    #[tokio::test]
+    async fn unauthorized_command_never_invokes_upgrade() {
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        let config = TestMigrationConfig::fixture("mysql://fixture/test_identity", "test_identity");
+        let result = run_authorized_migration_with(
+            &config,
+            || async { Ok(((), "test_identity".into())) },
+            |_| async {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn every_failed_authorization_blocks_connection_or_upgrade() {
+        use std::cell::Cell;
+        let base = TestMigrationConfig {
+            test_url: "mysql://fixture/test_identity".into(),
+            allow_destructive: true,
+            expected_database: "test_identity".into(),
+            backup_ref: "snapshot-42".into(),
+            migration_ack: "isolated-exclusive-backed-up-disposable".into(),
+        };
+        for config in [
+            TestMigrationConfig {
+                test_url: String::new(),
+                ..base.clone()
+            },
+            TestMigrationConfig {
+                allow_destructive: false,
+                ..base.clone()
+            },
+            TestMigrationConfig {
+                backup_ref: String::new(),
+                ..base.clone()
+            },
+            TestMigrationConfig {
+                migration_ack: String::new(),
+                ..base.clone()
+            },
+            TestMigrationConfig {
+                expected_database: "production".into(),
+                ..base.clone()
+            },
+        ] {
+            let connected = Cell::new(0);
+            let upgraded = Cell::new(0);
+            assert!(
+                run_authorized_migration_with(
+                    &config,
+                    || async {
+                        connected.set(connected.get() + 1);
+                        Ok(((), "test_identity".into()))
+                    },
+                    |_| async {
+                        upgraded.set(upgraded.get() + 1);
+                        Ok(())
+                    }
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!((connected.get(), upgraded.get()), (0, 0));
+        }
+        let upgraded = Cell::new(0);
+        assert!(
+            run_authorized_migration_with(
+                &base,
+                || async { Ok(((), "test_other".into())) },
+                |_| async {
+                    upgraded.set(upgraded.get() + 1);
+                    Ok(())
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(upgraded.get(), 0);
+        run_authorized_migration_with(
+            &base,
+            || async { Ok(((), "test_identity".into())) },
+            |_| async {
+                upgraded.set(upgraded.get() + 1);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(upgraded.get(), 1);
+    }
+
+    #[test]
+    fn fixed_identity_ddl_exactly_matches_0002() {
+        let declared: Vec<_> = IDENTITY_MIGRATION
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        let allowed: Vec<_> = IDENTITY_COLUMNS.iter().map(|entry| entry.3).collect();
+        assert_eq!(declared, allowed);
+    }
 
     #[test]
     fn migration_declares_all_identity_and_admission_tables() {
