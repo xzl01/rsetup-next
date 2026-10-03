@@ -535,13 +535,24 @@ fn identity_schema_decision(version: Option<i32>) -> Result<(), ControllerError>
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TestMigrationConfig {
     pub test_url: String,
     pub allow_destructive: bool,
     pub expected_database: String,
     pub backup_ref: String,
     pub migration_ack: String,
+}
+impl std::fmt::Debug for TestMigrationConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestMigrationConfig")
+            .field("test_url", &"[REDACTED]")
+            .field("allow_destructive", &self.allow_destructive)
+            .field("expected_database", &"[REDACTED]")
+            .field("backup_ref", &"[REDACTED]")
+            .field("migration_ack", &"[REDACTED]")
+            .finish()
+    }
 }
 impl TestMigrationConfig {
     #[cfg(test)]
@@ -554,6 +565,8 @@ impl TestMigrationConfig {
             migration_ack: String::new(),
         }
     }
+    // Raw URL equality here and in run_identity_test_migration only rejects literal reuse;
+    // different URLs do not prove physical isolation. The operator must confirm the target.
     pub fn from_test_env() -> Result<Self, ControllerError> {
         let test_url = std::env::var("CONTROLLER_TEST_DATABASE_URL").unwrap_or_default();
         if std::env::var("CONTROLLER_DATABASE_URL").is_ok_and(|service| service == test_url) {
@@ -578,8 +591,7 @@ impl TestMigrationConfig {
 fn authorize_test_migration(c: &TestMigrationConfig, actual: &str) -> Result<(), ControllerError> {
     let safe = !c.test_url.trim().is_empty()
         && c.allow_destructive
-        && c.expected_database.starts_with("test_")
-        && c.expected_database.len() > 5
+        && (1..=64).contains(&c.expected_database.len())
         && c.expected_database
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_')
@@ -1301,6 +1313,81 @@ mod tests {
     }
 
     #[test]
+    fn explicitly_authorized_unprefixed_dev_database_is_allowed() {
+        let mut config = TestMigrationConfig::fixture(
+            "mysql://fixture/development_identity",
+            "development_identity",
+        );
+        config.allow_destructive = true;
+        config.backup_ref = "snapshot-42".into();
+        config.migration_ack = "isolated-exclusive-backed-up-disposable".into();
+        assert!(config.authorize("development_identity").is_ok());
+        assert!(config.authorize("development_other").is_err());
+        for invalid in [
+            TestMigrationConfig {
+                allow_destructive: false,
+                ..config.clone()
+            },
+            TestMigrationConfig {
+                backup_ref: String::new(),
+                ..config.clone()
+            },
+            TestMigrationConfig {
+                migration_ack: String::new(),
+                ..config.clone()
+            },
+            TestMigrationConfig {
+                test_url: String::new(),
+                ..config.clone()
+            },
+        ] {
+            assert!(invalid.authorize("development_identity").is_err());
+        }
+        for invalid_name in [
+            "",
+            "development-identity",
+            " development_identity",
+            "développement",
+        ] {
+            let invalid = TestMigrationConfig {
+                expected_database: invalid_name.into(),
+                ..config.clone()
+            };
+            assert!(invalid.authorize(invalid_name).is_err());
+        }
+    }
+
+    #[test]
+    fn test_migration_database_name_accepts_64_ascii_chars_but_rejects_65() {
+        let name_64 = "a".repeat(64);
+        let name_65 = "a".repeat(65);
+        let mut config = TestMigrationConfig::fixture("mysql://fixture/dev", &name_64);
+        config.allow_destructive = true;
+        config.backup_ref = "snapshot-42".into();
+        config.migration_ack = "isolated-exclusive-backed-up-disposable".into();
+        assert!(config.authorize(&name_64).is_ok());
+        config.expected_database = name_65.clone();
+        assert!(config.authorize(&name_65).is_err());
+    }
+
+    #[test]
+    fn test_migration_config_debug_hides_fake_password() {
+        let mut config = TestMigrationConfig::fixture(
+            "mysql://fixture:fake-password-for-debug@localhost/test_identity",
+            "test_identity",
+        );
+        config.backup_ref = "fake-backup-reference".into();
+        let output = format!("{config:?}");
+        for sensitive in [
+            "fake-password-for-debug",
+            "test_identity",
+            "fake-backup-reference",
+        ] {
+            assert!(!output.contains(sensitive));
+        }
+    }
+
+    #[test]
     fn preflight_refuses_invalid_and_target_collision() {
         let long = "a".repeat(65);
         for names in [
@@ -1387,7 +1474,7 @@ mod tests {
                 ..base.clone()
             },
             TestMigrationConfig {
-                expected_database: "production".into(),
+                expected_database: String::new(),
                 ..base.clone()
             },
         ] {

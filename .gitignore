@@ -28,6 +28,7 @@
 .env
 .env.*
 !.env.example
+secret/
 
 # SDD subagent-driven-development scratch workspace (briefs, reports, ledger).
 # One task's ledger is tracked on purpose: the MMC storage TUI run is the audit
