@@ -7,7 +7,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (Some("--mode"), Some("upgrade"), None) => TestMigrationMode::Upgrade,
         (Some("--mode"), Some("fixture-v1"), None) => TestMigrationMode::FixtureV1,
         (Some("--mode"), Some("fixture-partial-v1"), None) => TestMigrationMode::FixturePartialV1,
-        _ => return Err("explicit --mode upgrade|fixture-v1|fixture-partial-v1 required".into()),
+        (Some("--mode"), Some("fixture-v2"), None) => TestMigrationMode::FixtureV2,
+        _ => {
+            return Err(
+                "explicit --mode upgrade|fixture-v1|fixture-partial-v1|fixture-v2 required".into(),
+            );
+        }
     };
     // Never log the config, environment, database URL, credentials, or administrator secret.
     let config = TestMigrationConfig::from_test_env()?;

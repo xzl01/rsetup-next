@@ -69,6 +69,63 @@ pub async fn assert_fresh_v3_is_check_and_fk_free(db: &DbPool) {
     rsetup_controller::check_identity_schema(db).await.unwrap();
 }
 
+pub async fn assert_legacy_fixture_upgrades_to_v3(mode: &str) {
+    assert!(matches!(mode, "fixture-v1" | "fixture-v2" | "mixed-v1"));
+    let db = required_fresh_identity_db().await;
+    run_explicit_identity_test_command(if mode == "mixed-v1" {
+        "fixture-v1"
+    } else {
+        mode
+    });
+    if mode == "mixed-v1" {
+        run_explicit_identity_test_command("fixture-partial-v1");
+    }
+    let original_version = if mode == "fixture-v2" { 2 } else { 1 };
+    let id: Vec<u8> = sqlx::query_scalar("SELECT instance_id FROM schema_meta WHERE singleton=1")
+        .fetch_one(&db.0)
+        .await
+        .unwrap();
+    let user_id = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id,username,display_name,password_hash,active,is_admin,must_change_password,revision,created_time) VALUES (?, 'legacy_fixture', 'Fixture', 'fixture-placeholder', TRUE, TRUE, FALSE, 7, NOW(6))")
+        .bind(user_id.as_bytes().as_slice()).execute(&db.0).await.unwrap();
+    sqlx::query("UPDATE schema_meta SET initialized=TRUE WHERE singleton=1")
+        .execute(&db.0)
+        .await
+        .unwrap();
+    assert!(matches!(
+        rsetup_controller::check_identity_schema(&db).await,
+        Err(rsetup_controller::ControllerError::SchemaNotReady { found: Some(found), required: 3 }) if found == original_version
+    ));
+    run_explicit_identity_test_command("upgrade");
+    rsetup_controller::check_identity_schema(&db).await.unwrap();
+    let meta: (i32, Vec<u8>, bool) = sqlx::query_as(
+        "SELECT schema_version,instance_id,initialized FROM schema_meta WHERE singleton=1",
+    )
+    .fetch_one(&db.0)
+    .await
+    .unwrap();
+    assert_eq!(meta.0, 3);
+    assert_eq!(meta.1, id);
+    assert!(meta.2);
+    let user: (String, u64) = sqlx::query_as("SELECT password_hash,revision FROM users WHERE id=?")
+        .bind(user_id.as_bytes().as_slice())
+        .fetch_one(&db.0)
+        .await
+        .unwrap();
+    assert_eq!(user, ("fixture-placeholder".into(), 7));
+    let constraints: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.table_constraints WHERE table_schema=DATABASE() AND constraint_type IN ('CHECK','FOREIGN KEY')")
+        .fetch_one(&db.0).await.unwrap();
+    assert_eq!(constraints, 0);
+    run_explicit_identity_test_command("upgrade");
+    let retried: (i32, Vec<u8>, bool) = sqlx::query_as(
+        "SELECT schema_version,instance_id,initialized FROM schema_meta WHERE singleton=1",
+    )
+    .fetch_one(&db.0)
+    .await
+    .unwrap();
+    assert_eq!(retried, meta);
+}
+
 pub async fn required_prepared_identity_db() -> DbPool {
     let db = required_test_db().await;
     rsetup_controller::check_identity_schema(&db)
@@ -80,7 +137,7 @@ pub async fn required_prepared_identity_db() -> DbPool {
 pub fn run_explicit_identity_test_command(mode: &str) {
     assert!(matches!(
         mode,
-        "upgrade" | "fixture-v1" | "fixture-partial-v1"
+        "upgrade" | "fixture-v1" | "fixture-partial-v1" | "fixture-v2"
     ));
     let status = std::process::Command::new(env!("CARGO_BIN_EXE_migrate-identity-test"))
         .args(["--mode", mode])
@@ -254,7 +311,7 @@ pub async fn later_column_interruption_is_resumable() {
         rsetup_controller::check_identity_schema(&db).await,
         Err(rsetup_controller::ControllerError::SchemaNotReady {
             found: Some(1),
-            required: 2
+            required: 3
         })
     ));
     run_explicit_identity_test_command("upgrade");
@@ -264,7 +321,7 @@ pub async fn later_column_interruption_is_resumable() {
             .fetch_one(&db.0)
             .await
             .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
 }
 
 #[derive(Default)]

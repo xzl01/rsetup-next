@@ -30,6 +30,24 @@ async fn fresh_v3_single_authorized_tidb_case() {
     );
 }
 
+#[tokio::test]
+#[ignore = "one independently backed-up isolated disposable EMPTY TiDB dev DB; runner and FK visibility review required"]
+async fn tidb_legacy_v1_to_v3_positive_single_case() {
+    common::assert_legacy_fixture_upgrades_to_v3("fixture-v1").await;
+}
+
+#[tokio::test]
+#[ignore = "one independently backed-up isolated disposable EMPTY TiDB dev DB; runner and FK visibility review required"]
+async fn tidb_legacy_v2_to_v3_positive_single_case() {
+    common::assert_legacy_fixture_upgrades_to_v3("fixture-v2").await;
+}
+
+#[tokio::test]
+#[ignore = "one independently backed-up isolated disposable EMPTY TiDB dev DB; runner and FK visibility review required"]
+async fn tidb_legacy_mixed_v1_to_v3_positive_single_case() {
+    common::assert_legacy_fixture_upgrades_to_v3("mixed-v1").await;
+}
+
 mod common;
 use common::{RecordingSecretSink, user_hash};
 use rsetup_controller::{ControllerError, bootstrap_admin, check_identity_schema};
@@ -50,7 +68,7 @@ async fn identity_contract_fresh_and_restart() {
             .fetch_one(&db.0)
             .await
             .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     check_identity_schema(&db).await.unwrap();
     let _prepared = common::required_prepared_identity_db().await;
 }
@@ -64,7 +82,7 @@ async fn legacy_v1_is_readonly_rejected_then_explicitly_upgraded() {
         check_identity_schema(&db).await,
         Err(ControllerError::SchemaNotReady {
             found: Some(1),
-            required: 2
+            required: 3
         })
     ));
     common::run_explicit_identity_test_command("upgrade");
@@ -81,7 +99,7 @@ async fn partial_v1_column_is_resumed_only_by_explicit_command() {
         check_identity_schema(&db).await,
         Err(ControllerError::SchemaNotReady {
             found: Some(1),
-            required: 2
+            required: 3
         })
     ));
     common::run_explicit_identity_test_command("upgrade");

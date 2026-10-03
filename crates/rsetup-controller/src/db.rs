@@ -1078,6 +1078,7 @@ fn validate_v3_column_charset(
     Ok(())
 }
 
+#[cfg(test)]
 async fn validate_schema_shape(db: &DbPool, target: Option<bool>) -> Result<(), ControllerError> {
     validate_schema_shape_with_contract(db, target, MIGRATION).await
 }
@@ -1456,6 +1457,7 @@ pub enum TestMigrationMode {
     Upgrade,
     FixtureV1,
     FixturePartialV1,
+    FixtureV2,
 }
 
 pub async fn run_identity_test_migration(
@@ -1956,6 +1958,7 @@ async fn upgrade_legacy_with_probe(
     probe.ready_v3().await
 }
 
+#[allow(dead_code)] // historical reference; active fixture preflight uses full legacy probe
 async fn preflight_values(db: &DbPool, status: &[bool]) -> Result<(), ControllerError> {
     validate_identity_status(1, status)?;
     scan_legacy_usernames(db).await?;
@@ -2001,6 +2004,34 @@ fn v3_create_statements() -> Result<Vec<(&'static str, &'static str)>, Controlle
     }
     if statements.len() != TABLES.len() {
         return Err(ControllerError::Config("incomplete v3 baseline SQL".into()));
+    }
+    Ok(statements)
+}
+
+// Historical 0001 is immutable; only its eleven known CREATE statements may
+// run in a previously confirmed empty schema. Never repair partial creation.
+fn v1_create_statements() -> Result<Vec<(&'static str, &'static str)>, ControllerError> {
+    let mut statements = Vec::new();
+    for statement in MIGRATION
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let table = statement
+            .strip_prefix("CREATE TABLE IF NOT EXISTS ")
+            .and_then(|rest| rest.split_once(" ("))
+            .map(|(name, _)| name)
+            .ok_or_else(|| legacy_preflight_error("baseline SQL"))?;
+        if !TABLES.iter().any(|(known, _, _)| *known == table)
+            || statements.iter().any(|(name, _)| *name == table)
+            || statement.to_ascii_uppercase().contains("FOREIGN KEY")
+        {
+            return Err(legacy_preflight_error("baseline SQL"));
+        }
+        statements.push((table, statement));
+    }
+    if statements.len() != TABLES.len() {
+        return Err(legacy_preflight_error("baseline SQL"));
     }
     Ok(statements)
 }
@@ -2134,10 +2165,131 @@ async fn upgrade_identity_schema(
         TestMigrationMode::Upgrade => upgrade_authorized_with_probe(db).await,
         // Historical fixtures remain explicitly selectable development tools;
         // neither path is reachable from the production startup or Upgrade.
+        TestMigrationMode::FixtureV2 => create_historical_v2_fixture(db).await,
         TestMigrationMode::FixtureV1 | TestMigrationMode::FixturePartialV1 => {
             create_historical_v1_fixture(db, mode).await
         }
     }
+}
+
+trait FixtureV2Probe: LegacyUpgradeProbe + FreshIdentityMigrationProbe {
+    async fn create_v1_table(&self, statement: &'static str) -> Result<(), ControllerError>;
+    async fn validate_created_v1(&self) -> Result<(), ControllerError>;
+    async fn insert_v1_meta(&self) -> Result<(), ControllerError>;
+    async fn cas_fixture_v2(&self) -> Result<u64, ControllerError>;
+}
+
+async fn fixture_v2_with_probe(probe: &impl FixtureV2Probe) -> Result<(), ControllerError> {
+    // Non-resumable by design: only None + reliably zero tables may run 0001.
+    if IdentitySchemaProbe::read_version(probe).await?.is_some() {
+        return Err(legacy_preflight_error("fixture-v2 requires empty schema"));
+    }
+    let statements = v1_create_statements()?;
+    if !probe.schema_tables().await?.is_empty() {
+        return Err(legacy_preflight_error("fixture-v2 requires zero tables"));
+    }
+    let mut expected = Vec::new();
+    for (table, statement) in statements {
+        probe.create_v1_table(statement).await?;
+        expected.push(table);
+        let actual = probe.schema_tables().await?;
+        if actual.len() != expected.len()
+            || actual.iter().any(|name| !expected.contains(&name.as_str()))
+        {
+            return Err(legacy_preflight_error("fixture-v2 CREATE drift"));
+        }
+    }
+    probe.validate_created_v1().await?;
+    probe.validate_empty_data().await?;
+    probe.insert_v1_meta().await?;
+    if !matches!(IdentitySchemaProbe::read_version(probe).await, Ok(Some(1))) {
+        return Err(legacy_preflight_error("fixture-v2 v1 insert uncertain"));
+    }
+    let mut trusted = probe.preflight(1).await?;
+    if trusted.old_columns.iter().any(|old| !*old) {
+        return Err(legacy_preflight_error("fixture-v2 v1 columns"));
+    }
+    for (index, &(_, _, _, statement)) in IDENTITY_COLUMNS.iter().enumerate() {
+        let before = probe.preflight(1).await?;
+        require_legacy_snapshot(&trusted, &before)?;
+        if !before.old_columns[index] {
+            return Err(legacy_preflight_error("fixture-v2 ALTER precondition"));
+        }
+        let ddl = probe.alter(statement).await;
+        // A failed nontransactional ALTER might still have applied. Re-read,
+        // but never convert an uncertain result into success.
+        let after = probe.preflight(1).await;
+        ddl?;
+        let after = after?;
+        let mut expected = before;
+        expected.old_columns[index] = false;
+        require_legacy_snapshot(&expected, &after)?;
+        trusted = after;
+    }
+    let final_read = probe.preflight(1).await?;
+    require_legacy_snapshot(&trusted, &final_read)?;
+    if final_read.old_columns.iter().any(|old| *old) {
+        return Err(legacy_preflight_error("fixture-v2 target columns"));
+    }
+    let cas = probe.cas_fixture_v2().await;
+    if !matches!(cas, Ok(1)) {
+        let _observed = IdentitySchemaProbe::read_version(probe).await;
+        return Err(legacy_preflight_error("fixture-v2 CAS uncertain"));
+    }
+    if !matches!(IdentitySchemaProbe::read_version(probe).await, Ok(Some(2))) {
+        return Err(legacy_preflight_error("fixture-v2 CAS uncertain"));
+    }
+    let ready = probe.preflight(2).await?;
+    require_legacy_snapshot(&final_read, &ready)
+}
+
+impl FixtureV2Probe for DbPool {
+    async fn create_v1_table(&self, statement: &'static str) -> Result<(), ControllerError> {
+        if !v1_create_statements()?
+            .iter()
+            .any(|&(_, sql)| sql == statement)
+        {
+            return Err(legacy_preflight_error("fixture-v2 CREATE whitelist"));
+        }
+        sqlx::query(statement)
+            .execute(&self.0)
+            .await
+            .map_err(|_| legacy_preflight_error("fixture-v2 CREATE failed"))?;
+        Ok(())
+    }
+    async fn validate_created_v1(&self) -> Result<(), ControllerError> {
+        validate_legacy_shape(self, 1).await?;
+        require_no_identity_foreign_keys(self).await?;
+        for &(table, column, _, _) in IDENTITY_COLUMNS {
+            let actual = read_column(self, table, column).await?;
+            if !classify_identity_column(table, column, &actual)? {
+                return Err(legacy_preflight_error("fixture-v2 v1 columns"));
+            }
+        }
+        Ok(())
+    }
+    async fn insert_v1_meta(&self) -> Result<(), ControllerError> {
+        let result = sqlx::query("INSERT INTO schema_meta (singleton, schema_version, instance_id, initialized, authz_epoch, admin_guard_revision) VALUES (1, 1, ?, FALSE, 0, 0)")
+            .bind(uuid::Uuid::new_v4().as_bytes().as_slice()).execute(&self.0).await
+            .map_err(|_| legacy_preflight_error("fixture-v2 v1 insert uncertain"))?;
+        if result.rows_affected() != 1 {
+            return Err(legacy_preflight_error("fixture-v2 v1 insert uncertain"));
+        }
+        Ok(())
+    }
+    async fn cas_fixture_v2(&self) -> Result<u64, ControllerError> {
+        let result = sqlx::query(
+            "UPDATE schema_meta SET schema_version = 2 WHERE singleton = 1 AND schema_version = 1",
+        )
+        .execute(&self.0)
+        .await
+        .map_err(|_| legacy_preflight_error("fixture-v2 CAS uncertain"))?;
+        Ok(result.rows_affected())
+    }
+}
+
+async fn create_historical_v2_fixture(db: &DbPool) -> Result<(), ControllerError> {
+    fixture_v2_with_probe(db).await
 }
 
 async fn create_historical_v1_fixture(
@@ -2184,16 +2336,19 @@ async fn create_historical_v1_fixture(
         }
         // 0001 remains byte-identical. A failed CREATE leaves an unversioned partial schema;
         // never repair it automatically: the operator must inspect the stopped test fixture.
-        for statement in MIGRATION
-            .split(';')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
+        for (_, statement) in v1_create_statements()? {
             sqlx::query(statement).execute(&db.0).await?;
         }
-        validate_schema_shape(db, Some(false)).await?;
+        validate_legacy_shape(db, 1).await?;
+        require_no_identity_foreign_keys(db).await?;
+        for &(table, column, _, _) in IDENTITY_COLUMNS {
+            if !classify_identity_column(table, column, &read_column(db, table, column).await?)? {
+                return Err(legacy_preflight_error("fixture-v1 old column"));
+            }
+        }
         sqlx::query("INSERT INTO schema_meta (singleton, schema_version, instance_id, initialized, authz_epoch, admin_guard_revision) VALUES (1, 1, ?, FALSE, 0, 0)")
             .bind(uuid::Uuid::new_v4().as_bytes().as_slice()).execute(&db.0).await?;
+        preflight_legacy_for_v3(db, 1).await?;
     } else if version != Some(1) {
         return Err(ControllerError::Config(
             "unsupported test identity schema version".into(),
@@ -2202,32 +2357,19 @@ async fn create_historical_v1_fixture(
     if matches!(mode, TestMigrationMode::FixtureV1) {
         return Ok(());
     }
-    validate_schema_shape(db, None).await?;
-    let mut status = Vec::new();
-    for &(table, column, _, _) in IDENTITY_COLUMNS {
-        status.push(classify_identity_column(
-            table,
-            column,
-            &read_column(db, table, column).await?,
-        )?);
-    }
-    preflight_values(db, &status).await?;
+    let trusted = preflight_legacy_for_v3(db, 1).await?;
     if matches!(mode, TestMigrationMode::FixturePartialV1) {
-        if !status[0] {
+        if !trusted.old_columns[0] {
             return Err(ControllerError::Config(
                 "fixture partial column already altered".into(),
             ));
         }
-        sqlx::query(IDENTITY_COLUMNS[0].3).execute(&db.0).await?;
-        if classify_identity_column(
-            IDENTITY_COLUMNS[0].0,
-            IDENTITY_COLUMNS[0].1,
-            &read_column(db, IDENTITY_COLUMNS[0].0, IDENTITY_COLUMNS[0].1).await?,
-        )? {
-            return Err(ControllerError::Config(
-                "partial fixture ALTER not reflected in metadata".into(),
-            ));
-        }
+        let ddl = sqlx::query(IDENTITY_COLUMNS[0].3).execute(&db.0).await;
+        let after = preflight_legacy_for_v3(db, 1).await;
+        ddl.map_err(|_| legacy_preflight_error("fixture partial ALTER failed"))?;
+        let mut expected = trusted;
+        expected.old_columns[0] = false;
+        require_legacy_snapshot(&expected, &after?)?;
         return Ok(());
     }
     Err(ControllerError::Config(
@@ -3146,6 +3288,7 @@ mod tests {
         cas_corrupt_shape: bool,
         cas_error: bool,
         read_version_reply: Option<Option<i32>>,
+        fixture_tables: Option<Vec<String>>,
     }
     impl LegacyUpgradeFake {
         fn new(version: i32) -> Self {
@@ -3163,6 +3306,7 @@ mod tests {
                 cas_corrupt_shape: false,
                 cas_error: false,
                 read_version_reply: None,
+                fixture_tables: None,
             }))
         }
         fn gate(&self, name: &'static str) -> Result<(), ControllerError> {
@@ -3333,17 +3477,181 @@ mod tests {
     impl FreshIdentityMigrationProbe for LegacyUpgradeFake {
         async fn schema_tables(&self) -> Result<Vec<String>, ControllerError> {
             self.gate("fresh_tables")?;
-            Ok(vec!["unversioned".to_owned()])
+            let state = self.0.lock().unwrap();
+            Ok(state
+                .fixture_tables
+                .clone()
+                .unwrap_or_else(|| vec!["unversioned".to_owned()]))
         }
         async fn create_table(&self, _: &str) -> Result<(), ControllerError> {
             panic!("legacy route must not create fresh tables")
         }
         async fn validate_empty_data(&self) -> Result<(), ControllerError> {
-            panic!("legacy route must not use fresh row scan")
+            if self.0.lock().unwrap().fixture_tables.is_some() {
+                self.gate("fixture_empty_data")
+            } else {
+                panic!("legacy route must not use fresh row scan")
+            }
         }
         async fn insert_v3_meta(&self) -> Result<(), ControllerError> {
             panic!("legacy route must not insert fresh metadata")
         }
+    }
+
+    impl FixtureV2Probe for LegacyUpgradeFake {
+        async fn create_v1_table(&self, statement: &'static str) -> Result<(), ControllerError> {
+            let (table, _) = v1_create_statements()?
+                .into_iter()
+                .find(|&(_, sql)| sql == statement)
+                .unwrap();
+            let mut state = self.0.lock().unwrap();
+            state.events.push(format!("CREATE {table}"));
+            state.fixture_tables.as_mut().unwrap().push(table.into());
+            Ok(())
+        }
+        async fn validate_created_v1(&self) -> Result<(), ControllerError> {
+            self.gate("fixture_v1_shape")?;
+            self.gate("fixture_v1_fk")?;
+            self.gate("fixture_v1_columns")
+        }
+        async fn insert_v1_meta(&self) -> Result<(), ControllerError> {
+            let mut state = self.0.lock().unwrap();
+            state.events.push("fixture_insert".into());
+            state.version = 1;
+            state.read_version_reply = None;
+            Ok(())
+        }
+        async fn cas_fixture_v2(&self) -> Result<u64, ControllerError> {
+            let mut state = self.0.lock().unwrap();
+            state.events.push("fixture_cas".into());
+            assert_eq!(state.version, 1);
+            if state.cas_error {
+                state.version = 2;
+                return Err(legacy_preflight_error("fixture CAS uncertain"));
+            }
+            if state.cas_rows == 1 && state.cas_updates_version {
+                state.version = 2;
+            }
+            Ok(state.cas_rows)
+        }
+    }
+
+    fn empty_v2_fixture_fake() -> LegacyUpgradeFake {
+        let fake = LegacyUpgradeFake::new(1);
+        let mut state = fake.0.lock().unwrap();
+        state.read_version_reply = Some(None);
+        state.fixture_tables = Some(Vec::new());
+        drop(state);
+        fake
+    }
+
+    #[tokio::test]
+    async fn fixture_v2_fake_builds_old_schema_then_eleven_alters_and_cas_to_two() {
+        for count in [0, 5] {
+            let fake = empty_v2_fixture_fake();
+            if count == 0 {
+                fake.0.lock().unwrap().checks.clear();
+            }
+            fixture_v2_with_probe(&fake).await.unwrap();
+            let events = fake.events();
+            assert_eq!(
+                events.iter().filter(|e| e.starts_with("CREATE ")).count(),
+                11
+            );
+            assert_eq!(
+                events.iter().filter(|e| e.starts_with("ALTER ")).count(),
+                11
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| e.starts_with("DROP ") || e == "ready")
+            );
+            assert!(
+                events.iter().position(|e| e == "fixture_v1_fk").unwrap()
+                    < events.iter().position(|e| e == "fixture_insert").unwrap()
+            );
+            assert!(
+                events.iter().position(|e| e == "data").unwrap()
+                    < events.iter().position(|e| e.starts_with("ALTER ")).unwrap()
+            );
+            assert_eq!(events.last().unwrap(), "collision");
+            let state = fake.0.lock().unwrap();
+            assert_eq!(state.version, 2);
+            assert_eq!(state.checks.len(), count);
+            assert_eq!(state.columns, [false; 11]);
+        }
+    }
+
+    #[tokio::test]
+    async fn fixture_v2_fake_refuses_nonempty_or_versioned_schema_without_ddl() {
+        for version in [Some(1), Some(2), Some(3), None] {
+            let fake = empty_v2_fixture_fake();
+            {
+                let mut state = fake.0.lock().unwrap();
+                state.read_version_reply = Some(version);
+                if version.is_none() {
+                    state.fixture_tables = Some(vec!["users".into()]);
+                }
+            }
+            assert!(fixture_v2_with_probe(&fake).await.is_err());
+            assert!(!fake.events().iter().any(|e| e.starts_with("CREATE ")
+                || e.starts_with("ALTER ")
+                || e == "fixture_cas"));
+        }
+    }
+
+    #[tokio::test]
+    async fn fixture_v2_fake_refuses_bad_preflight_before_first_alter_and_uncertain_cas() {
+        let fake = empty_v2_fixture_fake();
+        fake.0.lock().unwrap().fault_gate = Some("data");
+        assert!(fixture_v2_with_probe(&fake).await.is_err());
+        assert!(
+            !fake
+                .events()
+                .iter()
+                .any(|e| e.starts_with("ALTER ") || e == "fixture_cas")
+        );
+        for (rows, advances) in [(0, true), (1, false)] {
+            let fake = empty_v2_fixture_fake();
+            {
+                let mut state = fake.0.lock().unwrap();
+                state.cas_rows = rows;
+                state.cas_updates_version = advances;
+            }
+            assert!(fixture_v2_with_probe(&fake).await.is_err());
+            assert!(fake.events().contains(&"fixture_cas".into()));
+        }
+    }
+
+    #[test]
+    fn fixture_v2_dispatch_requires_separate_historical_route() {
+        let source = include_str!("db.rs");
+        let dispatch = source
+            .split_once("async fn upgrade_identity_schema(")
+            .unwrap()
+            .1
+            .split_once("async fn create_historical_v1_fixture(")
+            .unwrap()
+            .0;
+        assert!(dispatch.contains("TestMigrationMode::FixtureV2"));
+        assert!(dispatch.contains("create_historical_v2_fixture(db).await"));
+        assert!(!dispatch.contains("check_identity_schema(db).await"));
+    }
+
+    #[test]
+    fn historical_fixtures_require_proven_check_subset_not_exact_five() {
+        let source = include_str!("db.rs");
+        let fixture = source
+            .split_once("async fn create_historical_v1_fixture(")
+            .unwrap()
+            .1
+            .split_once("\npub trait AdmissionStore")
+            .unwrap()
+            .0;
+        assert!(fixture.contains("validate_legacy_shape(db, 1).await?"));
+        assert!(!fixture.contains("validate_schema_shape(db, Some(false)).await?"));
+        assert!(!fixture.contains("validate_schema_shape(db, None).await?"));
     }
 
     #[tokio::test]
