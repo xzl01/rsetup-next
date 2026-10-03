@@ -1599,7 +1599,7 @@ trait LegacyPreflightProbe {
     ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
 }
 
-#[allow(dead_code)] // Task 3B2 will call this only after its independent authorization gate.
+// Reused by the strict pre-CAS v3 gate after the legacy steps have finished.
 async fn preflight_legacy_for_v3(
     db: &DbPool,
     version: i32,
@@ -1766,7 +1766,6 @@ const LEGACY_CHECK_DROPS: &[(&str, &str, &str)] = &[
     ),
 ];
 
-#[allow(dead_code)] // Task 3B2B's SQLx adapter consumes the fixed SQL spelling.
 fn legacy_check_drop_sql(table: &str, name: &str) -> Result<&'static str, ControllerError> {
     LEGACY_CHECK_DROPS
         .iter()
@@ -1795,8 +1794,74 @@ fn require_legacy_snapshot(
     }
 }
 
-// The SQLx writer and authorized CLI route are deliberately left to Task 3B2B.
-#[allow(dead_code)]
+impl LegacyUpgradeProbe for DbPool {
+    async fn alter(&self, statement: &'static str) -> Result<(), ControllerError> {
+        if IDENTITY_MIGRATION
+            .split(';')
+            .map(str::trim)
+            .filter(|sql| !sql.is_empty())
+            .ne(IDENTITY_COLUMNS.iter().map(|entry| entry.3))
+            || !IDENTITY_COLUMNS.iter().any(|entry| entry.3 == statement)
+        {
+            return Err(legacy_preflight_error("alter whitelist"));
+        }
+        sqlx::query(statement)
+            .execute(&self.0)
+            .await
+            .map_err(|_| legacy_preflight_error("alter failed"))?;
+        Ok(())
+    }
+
+    async fn drop_known_check(
+        &self,
+        table: &'static str,
+        name: &'static str,
+    ) -> Result<(), ControllerError> {
+        let statement = legacy_check_drop_sql(table, name)?;
+        sqlx::query(statement)
+            .execute(&self.0)
+            .await
+            .map_err(|_| legacy_preflight_error("drop failed"))?;
+        Ok(())
+    }
+
+    async fn strict_v3_shape_without_meta_update(&self) -> Result<(), ControllerError> {
+        let version = read_version(self)
+            .await?
+            .filter(|version| matches!(version, 1 | 2))
+            .ok_or_else(|| legacy_preflight_error("version"))?;
+        validate_v3_schema_shape(self).await?;
+        require_no_identity_foreign_keys(self).await?;
+        let snapshot = preflight_legacy_for_v3(self, version).await?;
+        if snapshot.old_columns.iter().any(|old| *old) || !snapshot.observed_checks.is_empty() {
+            return Err(legacy_preflight_error("target not ready"));
+        }
+        Ok(())
+    }
+
+    async fn cas_version(&self, from: i32, to: i32) -> Result<u64, ControllerError> {
+        if !matches!(from, 1 | 2) || to != 3 {
+            return Err(legacy_preflight_error("version"));
+        }
+        let result = sqlx::query(
+            "UPDATE schema_meta SET schema_version = 3 WHERE singleton = 1 AND schema_version = ?",
+        )
+        .bind(from)
+        .execute(&self.0)
+        .await
+        .map_err(|_| legacy_preflight_error("version CAS failed"))?;
+        Ok(result.rows_affected())
+    }
+
+    async fn read_version(&self) -> Result<Option<i32>, ControllerError> {
+        read_version(self).await
+    }
+
+    async fn ready_v3(&self) -> Result<(), ControllerError> {
+        check_identity_schema(self).await
+    }
+}
+
 trait LegacyUpgradeProbe: LegacyPreflightProbe {
     async fn preflight(&self, version: i32) -> Result<LegacyPreflight, ControllerError>
     where
@@ -1816,7 +1881,6 @@ trait LegacyUpgradeProbe: LegacyPreflightProbe {
     async fn ready_v3(&self) -> Result<(), ControllerError>;
 }
 
-#[allow(dead_code)]
 async fn upgrade_legacy_with_probe(
     probe: &impl LegacyUpgradeProbe,
     version: i32,
@@ -2052,12 +2116,22 @@ impl FreshIdentityMigrationProbe for DbPool {
     }
 }
 
+async fn upgrade_authorized_with_probe<P>(probe: &P) -> Result<(), ControllerError>
+where
+    P: FreshIdentityMigrationProbe + LegacyUpgradeProbe,
+{
+    match IdentitySchemaProbe::read_version(probe).await? {
+        Some(version @ (1 | 2)) => upgrade_legacy_with_probe(probe, version).await,
+        _ => upgrade_fresh_v3(probe).await,
+    }
+}
+
 async fn upgrade_identity_schema(
     db: &DbPool,
     mode: TestMigrationMode,
 ) -> Result<(), ControllerError> {
     match mode {
-        TestMigrationMode::Upgrade => upgrade_fresh_v3(db).await,
+        TestMigrationMode::Upgrade => upgrade_authorized_with_probe(db).await,
         // Historical fixtures remain explicitly selectable development tools;
         // neither path is reachable from the production startup or Upgrade.
         TestMigrationMode::FixtureV1 | TestMigrationMode::FixturePartialV1 => {
@@ -2482,7 +2556,8 @@ mod tests {
             .split_once("\npub trait AdmissionStore")
             .unwrap()
             .0;
-        assert!(dispatch.contains("TestMigrationMode::Upgrade => upgrade_fresh_v3"));
+        assert!(dispatch.contains("TestMigrationMode::Upgrade => upgrade_authorized_with_probe"));
+        assert!(source.contains("_ => upgrade_fresh_v3(probe).await"));
         assert!(
             dispatch.contains("TestMigrationMode::FixtureV1 | TestMigrationMode::FixturePartialV1")
         );
@@ -3233,6 +3308,117 @@ mod tests {
             self.gate("ready_data")?;
             self.gate("ready_fk")
         }
+    }
+
+    impl IdentitySchemaProbe for LegacyUpgradeFake {
+        async fn read_version(&self) -> Result<Option<i32>, ControllerError> {
+            LegacyUpgradeProbe::read_version(self).await
+        }
+        async fn validate_v2_shape(&self) -> Result<(), ControllerError> {
+            assert_eq!(self.0.lock().unwrap().version, 3);
+            self.gate("fresh_shape")
+        }
+        async fn validate_legacy_v2_shape(&self) -> Result<(), ControllerError> {
+            panic!("legacy route must not use historical version-2 startup")
+        }
+        async fn validate_data(&self) -> Result<(), ControllerError> {
+            assert_eq!(self.0.lock().unwrap().version, 3);
+            self.gate("fresh_data")
+        }
+        async fn validate_fk(&self) -> Result<(), ControllerError> {
+            assert_eq!(self.0.lock().unwrap().version, 3);
+            self.gate("fresh_fk")
+        }
+    }
+    impl FreshIdentityMigrationProbe for LegacyUpgradeFake {
+        async fn schema_tables(&self) -> Result<Vec<String>, ControllerError> {
+            self.gate("fresh_tables")?;
+            Ok(vec!["unversioned".to_owned()])
+        }
+        async fn create_table(&self, _: &str) -> Result<(), ControllerError> {
+            panic!("legacy route must not create fresh tables")
+        }
+        async fn validate_empty_data(&self) -> Result<(), ControllerError> {
+            panic!("legacy route must not use fresh row scan")
+        }
+        async fn insert_v3_meta(&self) -> Result<(), ControllerError> {
+            panic!("legacy route must not insert fresh metadata")
+        }
+    }
+
+    #[tokio::test]
+    async fn authorized_upgrade_routes_legacy_versions_to_resumable_probe() {
+        for version in [1, 2] {
+            let fake = LegacyUpgradeFake::new(version);
+            {
+                let mut state = fake.0.lock().unwrap();
+                state.columns = [false; 11];
+                state.checks.clear();
+            }
+            upgrade_authorized_with_probe(&fake).await.unwrap();
+            assert_eq!(fake.writes(), vec!["cas"]);
+            assert_eq!(fake.0.lock().unwrap().version, 3);
+            assert_eq!(fake.events()[0], "read_version");
+        }
+    }
+
+    #[tokio::test]
+    async fn authorized_upgrade_v3_is_readonly_and_unknown_version_is_rejected() {
+        let ready = LegacyUpgradeFake::new(3);
+        {
+            let mut state = ready.0.lock().unwrap();
+            state.columns = [false; 11];
+            state.checks.clear();
+        }
+        upgrade_authorized_with_probe(&ready).await.unwrap();
+        assert!(ready.writes().is_empty());
+        assert_eq!(
+            ready.events(),
+            vec![
+                "read_version",
+                "read_version",
+                "read_version",
+                "fresh_shape",
+                "fresh_data",
+                "fresh_fk"
+            ]
+        );
+        let unknown = LegacyUpgradeFake::new(4);
+        assert!(upgrade_authorized_with_probe(&unknown).await.is_err());
+        assert_eq!(unknown.events(), vec!["read_version", "read_version"]);
+        assert!(unknown.writes().is_empty());
+        let unversioned = LegacyUpgradeFake::new(1);
+        unversioned.0.lock().unwrap().read_version_reply = Some(None);
+        assert!(upgrade_authorized_with_probe(&unversioned).await.is_err());
+        assert_eq!(
+            unversioned.events(),
+            vec!["read_version", "read_version", "fresh_tables"]
+        );
+        assert!(unversioned.writes().is_empty());
+    }
+
+    #[test]
+    fn sqlx_legacy_adapter_has_fixed_ddl_and_narrow_version_cas() {
+        let source = include_str!("db.rs");
+        let adapter = source
+            .split_once("impl LegacyUpgradeProbe for DbPool {")
+            .map_or("", |(_, rest)| {
+                rest.split_once("\ntrait LegacyUpgradeProbe").unwrap().0
+            });
+        assert!(adapter.contains("IDENTITY_COLUMNS.iter().any(|entry| entry.3 == statement)"));
+        assert!(adapter.contains("legacy_check_drop_sql(table, name)?"));
+        assert!(adapter.contains(
+            "UPDATE schema_meta SET schema_version = 3 WHERE singleton = 1 AND schema_version = ?"
+        ));
+        assert!(adapter.contains(".bind(from)"));
+        assert!(adapter.contains("result.rows_affected()"));
+        assert!(adapter.contains("validate_v3_schema_shape(self).await?"));
+        assert!(adapter.contains("require_no_identity_foreign_keys(self).await?"));
+        assert!(adapter.contains("preflight_legacy_for_v3(self, version).await?"));
+        assert!(adapter.contains("check_identity_schema(self).await"));
+        assert!(!adapter.contains("format!(\"ALTER"));
+        assert!(!adapter.contains("DROP DATABASE"));
+        assert!(!adapter.contains("tidb_enable_check_constraint"));
     }
 
     #[test]
