@@ -294,11 +294,26 @@ fn validate_column_shape(
     Ok(())
 }
 
+fn validate_object_names(
+    table: &str,
+    kind: &str,
+    expected: &[String],
+    actual: &[String],
+) -> Result<(), ControllerError> {
+    if expected.len() != actual.len() || expected.iter().any(|name| !actual.contains(name)) {
+        return Err(ControllerError::Config(format!(
+            "migration incompatible {kind} names in {table}"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct IndexMeta {
     name: String,
     columns: Vec<String>,
     unique: bool,
+    sub_parts: Vec<Option<i64>>,
 }
 
 fn validate_indexes(
@@ -306,6 +321,11 @@ fn validate_indexes(
     expected: &[IndexMeta],
     actual: &[IndexMeta],
 ) -> Result<(), ControllerError> {
+    if expected.len() != actual.len() {
+        return Err(ControllerError::Config(format!(
+            "migration incompatible index set in {table}"
+        )));
+    }
     for index in expected {
         if !actual.iter().any(|found| found == index) {
             return Err(ControllerError::Config(format!(
@@ -351,51 +371,84 @@ fn ddl_parts(table: &str) -> Vec<String> {
 }
 
 fn normalize_check(value: &str) -> String {
-    // MySQL can add this introducer to CHECK string literals on metadata readback.
-    // Remove it only at a literal boundary, never inside a string or identifier.
+    // Normalize SQL formatting, not the bytes of quoted string literals. MySQL may
+    // introduce _utf8mb4 on readback; other introducers have different semantics.
     let bytes = value.as_bytes();
-    let mut without_introducers = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    let mut quote = None;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if let Some(delimiter) = quote {
-            without_introducers.push(byte);
-            if byte == b'\\' && delimiter != b'`' && index + 1 < bytes.len() {
-                index += 1;
-                without_introducers.push(bytes[index]);
-            } else if byte == delimiter {
-                if bytes.get(index + 1) == Some(&delimiter) {
-                    index += 1;
-                    without_introducers.push(bytes[index]);
-                } else {
-                    quote = None;
-                }
-            }
-        } else if byte == b'_'
-            && (index == 0
-                || !matches!(bytes[index - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$'))
-            && bytes
-                .get(index..index + 8)
-                .is_some_and(|word| word.eq_ignore_ascii_case(b"_utf8mb4"))
-            && bytes.get(index + 8) == Some(&b'\'')
-        {
-            index += 8;
-            continue;
-        } else {
-            without_introducers.push(byte);
-            if matches!(byte, b'\'' | b'"' | b'`') {
-                quote = Some(byte);
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if bytes.get(i..i + 2) == Some(b"/*") && bytes.get(i + 2) != Some(&b'!') {
+            if let Some(end) = bytes[i + 2..].windows(2).position(|pair| pair == b"*/") {
+                i += end + 4;
+                continue;
             }
         }
-        index += 1;
+        if byte == b'#'
+            || (bytes.get(i..i + 2) == Some(b"--")
+                && bytes.get(i + 2).is_some_and(u8::is_ascii_whitespace))
+        {
+            i += if byte == b'#' { 1 } else { 2 };
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if byte == b'_'
+            && (i == 0
+                || !matches!(bytes[i - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$'))
+            && bytes
+                .get(i..i + 8)
+                .is_some_and(|word| word.eq_ignore_ascii_case(b"_utf8mb4"))
+            && bytes.get(i + 8) == Some(&b'\'')
+        {
+            i += 8;
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"' | b'`') {
+            let delimiter = byte;
+            if delimiter != b'`' {
+                out.push(byte);
+            }
+            i += 1;
+            while i < bytes.len() {
+                let current = bytes[i];
+                if current == delimiter {
+                    if bytes.get(i + 1) == Some(&delimiter) {
+                        if delimiter == b'`' {
+                            out.push(current.to_ascii_lowercase());
+                        } else {
+                            out.extend_from_slice(&bytes[i..i + 2]);
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    if delimiter != b'`' {
+                        out.push(current);
+                    }
+                    i += 1;
+                    break;
+                }
+                if current == b'\\' && delimiter != b'`' && i + 1 < bytes.len() {
+                    out.extend_from_slice(&bytes[i..i + 2]);
+                    i += 2;
+                    continue;
+                }
+                out.push(if delimiter == b'`' {
+                    current.to_ascii_lowercase()
+                } else {
+                    current
+                });
+                i += 1;
+            }
+            continue;
+        }
+        if !byte.is_ascii_whitespace() {
+            out.push(byte.to_ascii_lowercase());
+        }
+        i += 1;
     }
-    let mut text = String::from_utf8(without_introducers)
-        .expect("removing ASCII introducers preserves UTF-8")
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '`')
-        .flat_map(char::to_lowercase)
-        .collect::<String>();
+    let mut text = String::from_utf8(out).expect("ASCII normalization preserves UTF-8");
     while text.starts_with('(') && text.ends_with(')') {
         let mut depth = 0;
         let fully_wrapped = text.char_indices().all(|(i, c)| {
@@ -446,6 +499,7 @@ fn expected_indexes(parts: &[String], names: &[&str]) -> Result<Vec<IndexMeta>, 
         };
         expected.push(IndexMeta {
             name: name.to_owned(),
+            sub_parts: vec![None; columns.len()],
             columns,
             unique: name == "PRIMARY" || definition.contains("UNIQUE KEY"),
         });
@@ -620,6 +674,14 @@ async fn validate_schema_shape(db: &DbPool, target: Option<bool>) -> Result<(), 
     }
     for &(table, columns, indexes) in TABLES {
         let parts = ddl_parts(table);
+        let actual_columns: Vec<String> = sqlx::query_scalar("SELECT column_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ?")
+            .bind(table).fetch_all(&db.0).await?;
+        validate_object_names(
+            table,
+            "column",
+            &columns.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+            &actual_columns,
+        )?;
         for &column in columns {
             let declaration = parts
                 .iter()
@@ -659,24 +721,46 @@ async fn validate_schema_shape(db: &DbPool, target: Option<bool>) -> Result<(), 
             }
         }
         let expected = expected_indexes(&parts, indexes)?;
-        let rows = sqlx::query("SELECT index_name, column_name, non_unique, seq_in_index FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? ORDER BY index_name, seq_in_index")
+        let rows = sqlx::query("SELECT index_name, column_name, non_unique, seq_in_index, sub_part FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? ORDER BY index_name, seq_in_index")
             .bind(table).fetch_all(&db.0).await?;
         let mut actual: Vec<IndexMeta> = Vec::new();
         for row in rows {
             let name: String = row.try_get("index_name")?;
             let column: String = row.try_get("column_name")?;
             let non_unique: i64 = row.try_get("non_unique")?;
+            let sub_part: Option<i64> = row.try_get("sub_part")?;
+            let seq: i64 = row.try_get("seq_in_index")?;
             if let Some(index) = actual.iter_mut().find(|entry| entry.name == name) {
+                if seq != index.columns.len() as i64 + 1 || index.unique != (non_unique == 0) {
+                    return Err(ControllerError::Config(format!(
+                        "migration incompatible index order {table}.{name}"
+                    )));
+                }
                 index.columns.push(column);
+                index.sub_parts.push(sub_part);
             } else {
+                if seq != 1 {
+                    return Err(ControllerError::Config(format!(
+                        "migration incompatible index order {table}.{name}"
+                    )));
+                }
                 actual.push(IndexMeta {
                     name,
                     columns: vec![column],
                     unique: non_unique == 0,
+                    sub_parts: vec![sub_part],
                 });
             }
         }
         validate_indexes(table, &expected, &actual)?;
+        let expected_checks: Vec<String> = parts
+            .iter()
+            .filter(|part| part.starts_with("CONSTRAINT "))
+            .map(|part| part.split_whitespace().nth(1).unwrap().to_owned())
+            .collect();
+        let actual_checks: Vec<String> = sqlx::query_scalar("SELECT constraint_name FROM information_schema.table_constraints WHERE table_schema = DATABASE() AND table_name = ? AND constraint_type = 'CHECK'")
+            .bind(table).fetch_all(&db.0).await?;
+        validate_object_names(table, "check", &expected_checks, &actual_checks)?;
         for part in parts.iter().filter(|part| part.starts_with("CONSTRAINT ")) {
             let name = part.split_whitespace().nth(1).unwrap();
             let stored: Option<String> = sqlx::query_scalar("SELECT cc.check_clause FROM information_schema.table_constraints tc JOIN information_schema.check_constraints cc ON cc.constraint_schema = tc.constraint_schema AND cc.constraint_name = tc.constraint_name WHERE tc.table_schema = DATABASE() AND tc.table_name = ? AND tc.constraint_name = ? AND tc.constraint_type = 'CHECK'")
@@ -1347,6 +1431,42 @@ mod tests {
     }
 
     #[test]
+    fn closed_identity_metadata_rejects_extra_or_missing_objects() {
+        for kind in ["column", "check"] {
+            let expected = vec!["known".to_owned()];
+            assert!(validate_object_names("users", kind, &expected, &expected).is_ok());
+            assert!(
+                validate_object_names(
+                    "users",
+                    kind,
+                    &expected,
+                    &["known".into(), "unknown".into()]
+                )
+                .is_err(),
+                "{kind}"
+            );
+            assert!(
+                validate_object_names("users", kind, &expected, &[]).is_err(),
+                "{kind}"
+            );
+        }
+        let expected =
+            expected_indexes(&ddl_parts("users"), &["PRIMARY", "uq_users_username"]).unwrap();
+        let mut extra = expected.clone();
+        extra.push(IndexMeta {
+            name: "ix_extra".into(),
+            columns: vec!["username".into()],
+            unique: false,
+            sub_parts: vec![None],
+        });
+        assert!(validate_indexes("users", &expected, &extra).is_err());
+        assert!(validate_indexes("users", &expected, &expected[..1]).is_err());
+        let mut prefix = expected.clone();
+        prefix[1].sub_parts = vec![Some(3)];
+        assert!(validate_indexes("users", &expected, &prefix).is_err());
+    }
+
+    #[test]
     fn fixed_identity_ddl_exactly_matches_0002() {
         let declared: Vec<_> = IDENTITY_MIGRATION
             .split(';')
@@ -1569,6 +1689,7 @@ mod tests {
             name: "uq_audit_epoch_seq".into(),
             columns: vec!["process_epoch".into(), "event_seq".into()],
             unique: true,
+            sub_parts: vec![None, None],
         }];
         for broken in [
             IndexMeta {
@@ -1627,6 +1748,58 @@ mod tests {
             ddl_parts("devices")
                 .iter()
                 .any(|part| part.contains("chk_devices_state"))
+        );
+    }
+
+    #[test]
+    fn check_literals_are_byte_sensitive_while_external_format_is_not() {
+        let declared = "admission_state IN ('PENDING','it''s')";
+        for changed in [
+            "admission_state IN ('PEND ING','it''s')",
+            "admission_state IN ('PEND`ING','it''s')",
+            "admission_state IN ('pending','it''s')",
+            "admission_state IN ('PENDING','its')",
+            "admission_state IN ('PENDING','it''''s')",
+            "admission_state IN (_latin1'PENDING','it''s')",
+        ] {
+            assert_ne!(
+                normalize_check(declared),
+                normalize_check(changed),
+                "{changed}"
+            );
+        }
+        assert_eq!(
+            normalize_check(declared),
+            normalize_check("((`admission_state` in (_utf8mb4'PENDING', _utf8mb4'it''s')))"),
+        );
+        assert_eq!(
+            normalize_check("source_kind = 'it''_utf8mb4role'"),
+            normalize_check("(`source_kind` = _utf8mb4'it''_utf8mb4role')"),
+        );
+        assert_eq!(
+            normalize_check("source_kind = \"Ro\"\"le\""),
+            normalize_check("(`source_kind` = \"Ro\"\"le\")"),
+        );
+        assert_ne!(
+            normalize_check("source_kind = \"Ro\"\"le\""),
+            normalize_check("source_kind = \"Ro\"\" le\""),
+        );
+    }
+
+    #[test]
+    fn check_normalization_ignores_sql_comments_outside_literals_only() {
+        let declared = "source_kind = 'role'";
+        assert_eq!(
+            normalize_check(declared),
+            normalize_check("(`source_kind` /* metadata */ = _utf8mb4'role')")
+        );
+        assert_eq!(
+            normalize_check(declared),
+            normalize_check("source_kind -- metadata\n = _utf8mb4'role'")
+        );
+        assert_ne!(
+            normalize_check(declared),
+            normalize_check("source_kind = 'ro/* metadata */le'")
         );
     }
 

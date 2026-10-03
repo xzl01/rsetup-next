@@ -184,29 +184,30 @@ async fn invalid_stored_usernames_prevent_all_alters() {
     }
 }
 
+macro_rules! negative_signed_case {
+    ($name:ident, $index:expr) => {
+        #[tokio::test]
+        #[ignore = "one independently backed-up isolated disposable empty test DB and operator authorization required"]
+        async fn $name() {
+            common::negative_fixture_prevents_all_alters($index).await;
+        }
+    };
+}
+negative_signed_case!(negative_authz_epoch_prevents_all_alters, 0);
+negative_signed_case!(negative_admin_guard_revision_prevents_all_alters, 1);
+negative_signed_case!(negative_users_revision_prevents_all_alters, 2);
+negative_signed_case!(negative_roles_revision_prevents_all_alters, 3);
+negative_signed_case!(negative_device_groups_revision_prevents_all_alters, 4);
+negative_signed_case!(negative_devices_revision_prevents_all_alters, 5);
+negative_signed_case!(negative_grants_revision_prevents_all_alters, 6);
+negative_signed_case!(negative_previous_revision_prevents_all_alters, 7);
+negative_signed_case!(negative_new_revision_prevents_all_alters, 8);
+negative_signed_case!(negative_audit_event_seq_prevents_all_alters, 9);
+
 #[tokio::test]
 #[ignore = "one independently backed-up isolated disposable empty test DB and operator authorization required"]
-async fn negative_epoch_prevents_all_alters() {
-    let db = common::required_fresh_identity_db().await;
-    common::run_explicit_identity_test_command("fixture-v1");
-    sqlx::query("UPDATE schema_meta SET authz_epoch = -1 WHERE singleton = 1")
-        .execute(&db.0)
-        .await
-        .unwrap();
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_migrate-identity-test"))
-        .args(["--mode", "upgrade"])
-        .status()
-        .unwrap();
-    assert!(!status.success());
-    let (version, epoch): (i32, i64) =
-        sqlx::query_as("SELECT schema_version, authz_epoch FROM schema_meta WHERE singleton = 1")
-            .fetch_one(&db.0)
-            .await
-            .unwrap();
-    assert_eq!((version, epoch), (1, -1));
-    let column_type: String = sqlx::query_scalar("SELECT column_type FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'schema_meta' AND column_name = 'authz_epoch'")
-        .fetch_one(&db.0).await.unwrap();
-    assert_eq!(column_type.to_ascii_lowercase(), "bigint");
+async fn later_column_interruption_then_explicit_retry() {
+    common::later_column_interruption_is_resumable().await;
 }
 
 #[tokio::test]

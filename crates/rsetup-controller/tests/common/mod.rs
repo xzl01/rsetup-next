@@ -98,6 +98,144 @@ fn fixture_authorization_requires_all_confirmations() {
     assert!(base.authorize("test_not_expected").is_err());
 }
 
+// Each caller must provide a different authorized, backed-up, empty database. Never
+// run the entire ignored matrix against one URL; each invocation consumes its fixture.
+const NEGATIVE_FIXTURES: [(&str, &str, &str, &str); 10] = [
+    (
+        "schema_meta",
+        "authz_epoch",
+        "UPDATE schema_meta SET authz_epoch = -1 WHERE singleton = 1",
+        "SELECT authz_epoch FROM schema_meta WHERE singleton = 1",
+    ),
+    (
+        "schema_meta",
+        "admin_guard_revision",
+        "UPDATE schema_meta SET admin_guard_revision = -1 WHERE singleton = 1",
+        "SELECT admin_guard_revision FROM schema_meta WHERE singleton = 1",
+    ),
+    (
+        "users",
+        "revision",
+        "INSERT INTO users (id,username,display_name,password_hash,active,is_admin,must_change_password,revision,created_time) VALUES (UNHEX(REPLACE(UUID(),'-','')),'alice','fixture','hash',TRUE,FALSE,FALSE,-1,NOW(6))",
+        "SELECT revision FROM users",
+    ),
+    (
+        "roles",
+        "revision",
+        "INSERT INTO roles (id,name,builtin,archived,revision) VALUES (UNHEX(REPLACE(UUID(),'-','')),'fixture',FALSE,FALSE,-1)",
+        "SELECT revision FROM roles",
+    ),
+    (
+        "device_groups",
+        "revision",
+        "INSERT INTO device_groups (id,name,archived,revision) VALUES (UNHEX(REPLACE(UUID(),'-','')),'fixture',FALSE,-1)",
+        "SELECT revision FROM device_groups",
+    ),
+    (
+        "devices",
+        "revision",
+        "INSERT INTO devices (public_key,display_name,admission_state,review_decision,revision,archived) VALUES (REPEAT('x',32),'fixture','PENDING','none',-1,FALSE)",
+        "SELECT revision FROM devices",
+    ),
+    (
+        "grants",
+        "revision",
+        "INSERT INTO grants (id,user_id,source_kind,permissions,scope_kind,revision) VALUES (UNHEX(REPLACE(UUID(),'-','')),UNHEX(REPLACE(UUID(),'-','')),'direct','{}','all',-1)",
+        "SELECT revision FROM grants",
+    ),
+    (
+        "admission_decisions",
+        "previous_revision",
+        "INSERT INTO admission_decisions (id,device_id,decision,previous_revision,new_revision,time_evidence) VALUES (UNHEX(REPLACE(UUID(),'-','')),REPEAT('x',32),'approved',-1,0,'{}')",
+        "SELECT previous_revision FROM admission_decisions",
+    ),
+    (
+        "admission_decisions",
+        "new_revision",
+        "INSERT INTO admission_decisions (id,device_id,decision,previous_revision,new_revision,time_evidence) VALUES (UNHEX(REPLACE(UUID(),'-','')),REPEAT('x',32),'approved',0,-1,'{}')",
+        "SELECT new_revision FROM admission_decisions",
+    ),
+    (
+        "audit_events",
+        "event_seq",
+        "INSERT INTO audit_events (id,actor_kind,event_type,params_redacted,outcome,time_evidence,process_epoch,event_seq) VALUES (UNHEX(REPLACE(UUID(),'-','')),'system','fixture','{}','success','{}',UNHEX(REPLACE(UUID(),'-','')),-1)",
+        "SELECT event_seq FROM audit_events",
+    ),
+];
+
+pub async fn negative_fixture_prevents_all_alters(index: usize) {
+    let db = required_fresh_identity_db().await;
+    run_explicit_identity_test_command("fixture-v1");
+    let (table, column, inject, read_value) = NEGATIVE_FIXTURES[index];
+    sqlx::query(inject).execute(&db.0).await.unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_migrate-identity-test"))
+        .args(["--mode", "upgrade"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "negative {table}.{column} must refuse migration"
+    );
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        diagnostic.contains(&format!("negative identity column {table}.{column}")),
+        "migration must reject injected {table}.{column}, not another error"
+    );
+    let version: i32 =
+        sqlx::query_scalar("SELECT schema_version FROM schema_meta WHERE singleton = 1")
+            .fetch_one(&db.0)
+            .await
+            .unwrap();
+    assert_eq!(version, 1);
+    let value: i64 = sqlx::query_scalar(read_value)
+        .fetch_one(&db.0)
+        .await
+        .unwrap();
+    assert_eq!(value, -1, "original {table}.{column} must survive");
+    for &(name, field, _, _) in &NEGATIVE_FIXTURES {
+        let shape: String = sqlx::query_scalar("SELECT column_type FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?")
+            .bind(name).bind(field).fetch_one(&db.0).await.unwrap();
+        assert_eq!(
+            shape.to_ascii_lowercase(),
+            "bigint",
+            "ALTER occurred before preflight: {name}.{field}"
+        );
+    }
+}
+
+pub async fn later_column_interruption_is_resumable() {
+    let db = required_fresh_identity_db().await;
+    run_explicit_identity_test_command("fixture-v1");
+    // Stop after the second exact 0002 ALTER in this authorized disposable DB.
+    for statement in [
+        "ALTER TABLE schema_meta MODIFY COLUMN authz_epoch BIGINT UNSIGNED NOT NULL DEFAULT 0",
+        "ALTER TABLE schema_meta MODIFY COLUMN admin_guard_revision BIGINT UNSIGNED NOT NULL DEFAULT 0",
+    ] {
+        sqlx::query(statement).execute(&db.0).await.unwrap();
+    }
+    let version: i32 =
+        sqlx::query_scalar("SELECT schema_version FROM schema_meta WHERE singleton = 1")
+            .fetch_one(&db.0)
+            .await
+            .unwrap();
+    assert_eq!(version, 1);
+    assert!(matches!(
+        rsetup_controller::check_identity_schema(&db).await,
+        Err(rsetup_controller::ControllerError::SchemaNotReady {
+            found: Some(1),
+            required: 2
+        })
+    ));
+    run_explicit_identity_test_command("upgrade");
+    rsetup_controller::check_identity_schema(&db).await.unwrap();
+    let version: i32 =
+        sqlx::query_scalar("SELECT schema_version FROM schema_meta WHERE singleton = 1")
+            .fetch_one(&db.0)
+            .await
+            .unwrap();
+    assert_eq!(version, 2);
+}
+
 #[derive(Default)]
 pub struct RecordingSecretSink(Mutex<Vec<String>>);
 impl rsetup_controller::BootstrapSecretSink for RecordingSecretSink {
