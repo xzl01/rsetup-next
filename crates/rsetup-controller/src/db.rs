@@ -13,6 +13,9 @@ const MIGRATION: &str = include_str!("../migrations/0001_identity_devices.sql");
 const IDENTITY_MIGRATION: &str = include_str!("../migrations/0002_identity_contract.sql");
 const V3_MIGRATION: &str = include_str!("../migrations/0003_identity_application_integrity.sql");
 const STATISTICS_QUERY: &str = "SELECT CAST(index_name AS CHAR) AS index_name, CAST(column_name AS CHAR) AS column_name, CAST(non_unique AS SIGNED) AS non_unique, CAST(seq_in_index AS SIGNED) AS seq_in_index, CAST(sub_part AS SIGNED) AS sub_part FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? ORDER BY index_name, seq_in_index";
+const FK_CONSTRAINTS_QUERY: &str = "SELECT CAST(table_name AS CHAR) AS table_name, CAST(constraint_name AS CHAR) AS constraint_name FROM information_schema.table_constraints WHERE table_schema = DATABASE() AND constraint_type = 'FOREIGN KEY'";
+const FK_REFERENCES_QUERY: &str = "SELECT CAST(COUNT(*) AS SIGNED) AS fk_count FROM information_schema.referential_constraints WHERE constraint_schema = DATABASE()";
+const FK_COLUMNS_QUERY: &str = "SELECT CAST(COUNT(*) AS SIGNED) AS fk_count FROM information_schema.key_column_usage WHERE table_schema = DATABASE() AND referenced_table_schema IS NOT NULL";
 // Fixed statements and identifiers: never interpolate database-supplied table/column names.
 const IDENTITY_COLUMNS: &[(&str, &str, &str, &str)] = &[
     (
@@ -548,6 +551,7 @@ trait IdentitySchemaProbe {
     fn validate_data(
         &self,
     ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
+    fn validate_fk(&self) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
 }
 
 // Only the explicitly authorized historical migration may accept a complete v2 shape.
@@ -565,11 +569,7 @@ async fn check_identity_schema_with_probe(
     identity_schema_decision(probe.read_version().await?)?;
     probe.validate_v2_shape().await?;
     probe.validate_data().await?;
-    // The FK metadata gate belongs to Task 2C. Until that gate is attached,
-    // attached, shape alone must never authorize bootstrap or service startup.
-    Err(ControllerError::Config(
-        "identity integrity checks not ready".into(),
-    ))
+    probe.validate_fk().await
 }
 
 const IDENTITY_SCHEMA_VERSION: i32 = 3;
@@ -769,6 +769,56 @@ async fn validate_schema_shape(db: &DbPool, target: Option<bool>) -> Result<(), 
 
 async fn validate_v3_schema_shape(db: &DbPool) -> Result<(), ControllerError> {
     validate_schema_shape_with_contract(db, Some(true), V3_MIGRATION).await
+}
+
+// Reusable by Task 3's legacy preflight before its first DDL. Call only after
+// confirming full schema visibility/shape with the same DbPool identity; zero
+// metadata rows alone cannot establish that the account can see all objects.
+#[allow(dead_code)]
+pub(crate) async fn require_no_identity_foreign_keys(db: &DbPool) -> Result<(), ControllerError> {
+    let constraints = sqlx::query(FK_CONSTRAINTS_QUERY)
+        .fetch_optional(&db.0)
+        .await
+        .map_err(|_| ())
+        .and_then(|row| {
+            row.map(|row| {
+                Ok((
+                    row.try_get::<Option<String>, _>("table_name")
+                        .map_err(|_| ())?,
+                    row.try_get::<Option<String>, _>("constraint_name")
+                        .map_err(|_| ())?,
+                ))
+            })
+            .transpose()
+        });
+    let references: Result<Option<i64>, ()> = sqlx::query_scalar(FK_REFERENCES_QUERY)
+        .fetch_one(&db.0)
+        .await
+        .map_err(|_| ());
+    let columns: Result<Option<i64>, ()> = sqlx::query_scalar(FK_COLUMNS_QUERY)
+        .fetch_one(&db.0)
+        .await
+        .map_err(|_| ());
+    validate_fk_metadata(constraints, references, columns)
+}
+
+// SQL/decoding errors and NULLs must never be interpreted as an empty set.
+type FkConstraintsRead = Result<Option<(Option<String>, Option<String>)>, ()>;
+
+fn validate_fk_metadata(
+    constraints: FkConstraintsRead,
+    references: Result<Option<i64>, ()>,
+    columns: Result<Option<i64>, ()>,
+) -> Result<(), ControllerError> {
+    if !matches!(constraints, Ok(None))
+        || !matches!(references, Ok(Some(0)))
+        || !matches!(columns, Ok(Some(0)))
+    {
+        return Err(ControllerError::Config(
+            "identity foreign key metadata unavailable or nonempty".into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn validate_schema_shape_with_contract(
@@ -1020,6 +1070,9 @@ impl IdentitySchemaProbe for DbPool {
     }
     async fn validate_data(&self) -> Result<(), ControllerError> {
         crate::integrity::check_identity_data(self).await
+    }
+    async fn validate_fk(&self) -> Result<(), ControllerError> {
+        require_no_identity_foreign_keys(self).await
     }
 }
 
@@ -1453,78 +1506,173 @@ mod tests {
         assert_eq!(body.matches("check_legacy_v2_ready(db).await").count(), 2);
     }
 
+    #[test]
+    fn fk_metadata_requires_three_independent_trustworthy_empty_views() {
+        // Breaking the final metadata decision to accept any nonzero count or
+        // unknown result must turn one of these cases red.
+        let empty = Ok(None);
+        let zero = Ok(Some(0));
+        assert!(validate_fk_metadata(empty.clone(), zero, zero).is_ok());
+        for first in [
+            Ok(Some((Some("users".into()), Some("fk_named".into())))),
+            Ok(Some((
+                Some("other_table".into()),
+                Some("other_table_ibfk_1".into()),
+            ))),
+            Ok(Some((None, Some("fk_unknown".into())))),
+            Ok(Some((Some("users".into()), None))),
+            Ok(Some((Some(String::new()), Some("fk_invalid".into())))),
+            Err(()),
+        ] {
+            assert!(validate_fk_metadata(first, zero, zero).is_err());
+        }
+        for invalid in [Ok(Some(1)), Ok(Some(2)), Ok(Some(-1)), Ok(None), Err(())] {
+            assert!(validate_fk_metadata(empty.clone(), invalid, zero).is_err());
+            assert!(validate_fk_metadata(empty.clone(), zero, invalid).is_err());
+        }
+        // Referential constraints count FKs, key column usage counts FK columns;
+        // equality of positive counts is neither required nor sufficient.
+        assert!(validate_fk_metadata(empty, Ok(Some(1)), Ok(Some(2))).is_err());
+    }
+
+    #[test]
+    fn fk_metadata_errors_never_echo_names_or_query_details() {
+        let cases = [
+            validate_fk_metadata(
+                Ok(Some((
+                    Some("user_supplied_secret".into()),
+                    Some("fk_secret".into()),
+                ))),
+                Ok(Some(0)),
+                Ok(Some(0)),
+            ),
+            validate_fk_metadata(Err(()), Ok(Some(0)), Ok(Some(0))),
+            validate_fk_metadata(Ok(None), Err(()), Ok(Some(0))),
+            validate_fk_metadata(Ok(None), Ok(Some(0)), Err(())),
+        ];
+        for case in cases {
+            assert!(
+                matches!(case, Err(ControllerError::Config(ref reason)) if reason == "identity foreign key metadata unavailable or nonempty")
+            );
+        }
+    }
+
     #[tokio::test]
-    async fn readonly_probe_gates_shape_only_after_v3_and_never_reports_ready_yet() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+    async fn readonly_probe_requires_version_shape_data_and_trusted_empty_fk_metadata() {
+        use std::sync::Mutex;
         struct Fake {
             version: Option<i32>,
-            reads: AtomicUsize,
-            shapes: AtomicUsize,
-            data_calls: AtomicUsize,
-            broken: bool,
+            broken_shape: bool,
             bad_data: bool,
+            fk: &'static str,
+            calls: Mutex<Vec<&'static str>>,
         }
         impl IdentitySchemaProbe for Fake {
             async fn read_version(&self) -> Result<Option<i32>, ControllerError> {
-                self.reads.fetch_add(1, Ordering::SeqCst);
+                self.calls.lock().unwrap().push("version");
                 Ok(self.version)
             }
             async fn validate_v2_shape(&self) -> Result<(), ControllerError> {
-                self.shapes.fetch_add(1, Ordering::SeqCst);
-                if self.broken {
+                self.calls.lock().unwrap().push("shape");
+                if self.broken_shape {
                     Err(ControllerError::Config("broken shape".into()))
                 } else {
                     Ok(())
                 }
             }
             async fn validate_legacy_v2_shape(&self) -> Result<(), ControllerError> {
-                self.validate_v2_shape().await
+                panic!("startup must never use historical v2 shape")
             }
             async fn validate_data(&self) -> Result<(), ControllerError> {
-                self.data_calls.fetch_add(1, Ordering::SeqCst);
+                self.calls.lock().unwrap().push("data");
                 if self.bad_data {
                     Err(ControllerError::Config("polluted identity data".into()))
                 } else {
                     Ok(())
                 }
             }
+            async fn validate_fk(&self) -> Result<(), ControllerError> {
+                self.calls.lock().unwrap().push("fk");
+                match self.fk {
+                    "empty" => Ok(()),
+                    "present" => Err(ControllerError::Config(
+                        "identity foreign keys present".into(),
+                    )),
+                    "unknown" => Err(ControllerError::Config(
+                        "identity FK metadata unavailable".into(),
+                    )),
+                    _ => unreachable!(),
+                }
+            }
         }
-        for (version, shape_count, data_count, broken, bad_data) in [
-            (None, 0, 0, false, false),
-            (Some(1), 0, 0, false, false),
-            (Some(2), 0, 0, false, false),
-            (Some(3), 1, 1, false, false),
-            (Some(3), 1, 1, false, true),
-            (Some(3), 1, 0, true, false),
-            (Some(4), 0, 0, false, false),
+        for (version, broken_shape, bad_data, fk, expected_calls, expected_error) in [
+            (None, false, false, "empty", &[][..], "not-ready"),
+            (Some(1), false, false, "empty", &[][..], "not-ready"),
+            (Some(2), false, false, "empty", &[][..], "not-ready"),
+            (Some(4), false, false, "empty", &[][..], "unsupported"),
+            (
+                Some(3),
+                true,
+                false,
+                "empty",
+                &["shape"][..],
+                "broken shape",
+            ),
+            (
+                Some(3),
+                false,
+                true,
+                "empty",
+                &["shape", "data"][..],
+                "polluted identity data",
+            ),
+            (
+                Some(3),
+                false,
+                false,
+                "unknown",
+                &["shape", "data", "fk"][..],
+                "identity FK metadata unavailable",
+            ),
+            (
+                Some(3),
+                false,
+                false,
+                "present",
+                &["shape", "data", "fk"][..],
+                "identity foreign keys present",
+            ),
+            (
+                Some(3),
+                false,
+                false,
+                "empty",
+                &["shape", "data", "fk"][..],
+                "ready",
+            ),
         ] {
             let fake = Fake {
                 version,
-                reads: AtomicUsize::new(0),
-                shapes: AtomicUsize::new(0),
-                data_calls: AtomicUsize::new(0),
-                broken,
+                broken_shape,
                 bad_data,
+                fk,
+                calls: Mutex::new(Vec::new()),
             };
             let result = check_identity_schema_with_probe(&fake).await;
-            match version {
-                None | Some(1) | Some(2) => assert!(
+            match expected_error {
+                "not-ready" => assert!(
                     matches!(result, Err(ControllerError::SchemaNotReady { found, required: 3 }) if found == version)
                 ),
-                Some(3) if broken => assert!(
-                    matches!(result, Err(ControllerError::Config(ref message)) if message == "broken shape")
+                "ready" => assert!(result.is_ok(), "four valid gates must be ready: {result:?}"),
+                "unsupported" => assert!(result.is_err()),
+                message => assert!(
+                    matches!(result, Err(ControllerError::Config(ref found)) if found == message),
+                    "{result:?}"
                 ),
-                Some(3) if bad_data => assert!(
-                    matches!(result, Err(ControllerError::Config(ref message)) if message == "polluted identity data")
-                ),
-                Some(3) => assert!(
-                    matches!(result, Err(ControllerError::Config(ref message)) if message == "identity integrity checks not ready")
-                ),
-                _ => assert!(result.is_err()),
             }
-            assert_eq!(fake.reads.load(Ordering::SeqCst), 1);
-            assert_eq!(fake.shapes.load(Ordering::SeqCst), shape_count);
-            assert_eq!(fake.data_calls.load(Ordering::SeqCst), data_count);
+            let calls = fake.calls.lock().unwrap();
+            assert_eq!(calls.first(), Some(&"version"));
+            assert_eq!(&calls[1..], expected_calls, "version={version:?} fk={fk}");
         }
     }
 
@@ -1555,6 +1703,9 @@ mod tests {
             }
             async fn validate_data(&self) -> Result<(), ControllerError> {
                 panic!("legacy runner must not scan v3 data")
+            }
+            async fn validate_fk(&self) -> Result<(), ControllerError> {
+                panic!("legacy v2 terminal check must not use the startup FK gate")
             }
         }
         for (version, shape_valid, expected_calls, accepted) in [
@@ -1871,6 +2022,7 @@ mod tests {
                 if matches!(
                     projection,
                     "COUNT(*)"
+                        | "CAST(COUNT(*) AS SIGNED) AS fk_count"
                         | "CAST(non_unique AS SIGNED) AS non_unique"
                         | "CAST(seq_in_index AS SIGNED) AS seq_in_index"
                         | "CAST(sub_part AS SIGNED) AS sub_part"
@@ -1902,8 +2054,8 @@ mod tests {
                 string_columns += 1;
             }
         }
-        assert_eq!(queries, 11);
-        assert_eq!(string_columns, 14);
+        assert_eq!(queries, 14);
+        assert_eq!(string_columns, 16);
     }
 
     #[test]
