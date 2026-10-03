@@ -71,6 +71,34 @@ const ORPHAN_SCANS: &[(&str, &str)] = &[
     ),
 ];
 
+fn legacy_expected_version(version: i32) -> Result<i32, ControllerError> {
+    if matches!(version, 1 | 2) {
+        Ok(version)
+    } else {
+        Err(scan_error("meta.singleton"))
+    }
+}
+
+fn validate_meta_row(
+    singleton: i8,
+    version: i32,
+    expected_version: Option<i32>,
+) -> Result<(), ControllerError> {
+    if expected_version != Some(version) || singleton != 1 {
+        Err(scan_error("meta.singleton"))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_meta_count(count: usize, expected_version: Option<i32>) -> Result<(), ControllerError> {
+    if count == usize::from(expected_version.is_some()) {
+        Ok(())
+    } else {
+        Err(scan_error("meta.singleton"))
+    }
+}
+
 pub async fn check_identity_data(db: &DbPool) -> Result<(), ControllerError> {
     validate_identity_rows(db, true).await
 }
@@ -78,6 +106,23 @@ pub async fn check_identity_data(db: &DbPool) -> Result<(), ControllerError> {
 pub(crate) async fn validate_identity_rows(
     db: &DbPool,
     require_meta: bool,
+) -> Result<(), ControllerError> {
+    scan_identity_rows(db, require_meta.then_some(3)).await
+}
+
+// Only the explicit legacy preflight may call this; normal v3 startup remains
+// pinned to version 3 and fresh migration remains pinned to an empty meta table.
+#[allow(dead_code)] // consumed by the following legacy preflight task
+pub(crate) async fn validate_identity_rows_for_version(
+    db: &DbPool,
+    expected_version: i32,
+) -> Result<(), ControllerError> {
+    scan_identity_rows(db, Some(legacy_expected_version(expected_version)?)).await
+}
+
+async fn scan_identity_rows(
+    db: &DbPool,
+    expected_version: Option<i32>,
 ) -> Result<(), ControllerError> {
     // A single scoped transaction keeps all SELECTs on one connection. A
     // REPEATABLE READ session should offer a stable row snapshot; verify the
@@ -109,16 +154,15 @@ pub(crate) async fn validate_identity_rows(
                 .try_get("schema_version")
                 .map_err(|_| scan_error("meta.decode"))?;
             meta_count += 1;
-            if meta_count > 1 || !require_meta || (singleton, version) != (1, 3) {
+            if meta_count > 1 {
                 return Err(scan_error("meta.singleton"));
             }
+            validate_meta_row(singleton, version, expected_version)?;
         }
     );
-    if require_meta && meta_count != 1 {
-        return Err(scan_error("meta.singleton"));
-    }
-    // v3's prior strict shape check establishes a full UNIQUE(username) index
-    // with ascii_bin collation; valid_username then excludes identical raw bytes.
+    validate_meta_count(meta_count, expected_version)?;
+    // The caller's strict shape check establishes a full UNIQUE(username) index;
+    // valid lowercase ASCII usernames cannot have identical raw bytes under it.
     // Do not remove the separate v1/v2 migration collision preflight in db.rs.
     scan!("SELECT username FROM users", "users.read", |row| {
         let username: &str = row
@@ -343,11 +387,17 @@ fn validate_identity_fixture(
     rows: &IdentityRows,
     require_meta: bool,
 ) -> Result<(), ControllerError> {
-    if (require_meta && rows.meta.as_slice() != [(1, 3)])
-        || (!require_meta && !rows.meta.is_empty())
-    {
-        return Err(scan_error("meta.singleton"));
+    validate_identity_fixture_with_meta(rows, require_meta.then_some(3))
+}
+#[cfg(test)]
+fn validate_identity_fixture_with_meta(
+    rows: &IdentityRows,
+    expected_version: Option<i32>,
+) -> Result<(), ControllerError> {
+    for &(singleton, version) in &rows.meta {
+        validate_meta_row(singleton, version, expected_version)?;
     }
+    validate_meta_count(rows.meta.len(), expected_version)?;
     let mut seen = std::collections::HashSet::new();
     for username in &rows.usernames {
         validate_username_row(username)?;
@@ -717,6 +767,124 @@ mod tests {
             assert!(validate_identity_fixture(&rows, true).is_err());
             rows.orphans[0].1 = false; // inactive/archived parent exists
             assert!(validate_identity_fixture(&rows, true).is_ok());
+        }
+    }
+
+    #[test]
+    fn legacy_fixture_reuses_full_scan_with_exact_v1_v2_meta() {
+        // The pre-existing v3 gate rejects clean legacy data. All cases below
+        // exercise the same fixture row validators, not a database connection.
+        fn legacy_scan(rows: &IdentityRows, expected_version: i32) -> Result<(), ControllerError> {
+            let version = legacy_expected_version(expected_version)?;
+            validate_identity_fixture_with_meta(rows, Some(version))
+        }
+        let clean = |version| IdentityRows {
+            meta: vec![(1, version)],
+            usernames: vec!["alice".into()],
+            booleans: BOOLEAN_SCANS
+                .iter()
+                .map(|&(code, _)| (code, vec![0, 1]))
+                .collect(),
+            devices: vec![
+                ("PENDING".into(), "none".into()),
+                ("PENDING".into(), "denied".into()),
+                ("APPROVED".into(), "approved".into()),
+                ("REVOKED".into(), "revoked".into()),
+            ],
+            permissions: [
+                "device.read",
+                "device.status.read",
+                "device.reboot",
+                "device.task.read",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            grants: vec![
+                GrantRow {
+                    source: "role".into(),
+                    has_role: 1,
+                    permissions_json: None,
+                    scope: "all".into(),
+                    has_group: 0,
+                    has_device: 0,
+                },
+                GrantRow {
+                    source: "direct".into(),
+                    has_role: 0,
+                    permissions_json: Some("[\"device.read\"]".into()),
+                    scope: "device".into(),
+                    has_group: 0,
+                    has_device: 1,
+                },
+            ],
+            orphans: ORPHAN_SCANS
+                .iter()
+                .map(|&(code, _)| (code, false))
+                .collect(),
+        };
+        for version in [1, 2] {
+            let rows = clean(version);
+            assert!(legacy_scan(&rows, version).is_ok(), "clean v{version}");
+            assert!(validate_identity_fixture(&rows, true).is_err(), "v3 gate");
+            assert!(
+                validate_identity_fixture(&rows, false).is_err(),
+                "fresh gate"
+            );
+            for wrong in [0, 3, 4, if version == 1 { 2 } else { 1 }] {
+                assert!(legacy_scan(&rows, wrong).is_err(), "expected v{wrong}");
+            }
+            for meta in [
+                vec![],
+                vec![(0, version)],
+                vec![(2, version)],
+                vec![(1, version); 2],
+            ] {
+                let mut rows = clean(version);
+                rows.meta = meta;
+                assert!(
+                    legacy_scan(&rows, version).is_err(),
+                    "meta cardinality/value"
+                );
+            }
+            let mut rows = clean(version);
+            rows.booleans[0].1 = vec![2];
+            assert_eq!(
+                legacy_scan(&rows, version).unwrap_err().to_string(),
+                "configuration: identity data schema_meta.initialized"
+            );
+            let mut rows = clean(version);
+            rows.usernames[0] = "BadUser".into();
+            assert!(legacy_scan(&rows, version).is_err());
+            let mut rows = clean(version);
+            rows.devices[0] = ("APPROVED".into(), "none".into());
+            assert!(legacy_scan(&rows, version).is_err());
+            let mut rows = clean(version);
+            rows.permissions[0] = "unknown".into();
+            assert!(legacy_scan(&rows, version).is_err());
+            for invalid_json in ["broken", "null", "[]", "[\"unknown\"]"] {
+                let mut rows = clean(version);
+                rows.grants[1].permissions_json = Some(invalid_json.into());
+                assert!(legacy_scan(&rows, version).is_err(), "invalid grant JSON");
+            }
+            let mut rows = clean(version);
+            rows.grants[0].permissions_json = Some("null".into());
+            assert!(
+                legacy_scan(&rows, version).is_err(),
+                "JSON null != SQL NULL"
+            );
+            for (role, group, device) in [(2, 0, 0), (0, 2, 0), (0, 0, 2)] {
+                let mut rows = clean(version);
+                rows.grants[1].has_role = role;
+                rows.grants[1].has_group = group;
+                rows.grants[1].has_device = device;
+                assert!(legacy_scan(&rows, version).is_err(), "invalid presence");
+            }
+            for category in 0..ORPHAN_SCANS.len() {
+                let mut rows = clean(version);
+                rows.orphans[category].1 = true;
+                assert!(legacy_scan(&rows, version).is_err(), "orphan {category}");
+            }
         }
     }
 }
