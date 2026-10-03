@@ -21,7 +21,7 @@
 ## 全局约束及文件清单
 
 - 根 Rust workspace 目前只有 crates/rsetup-core 与 crates/rsetup-app 两个 members，apps/desktop/src-tauri 被 exclude；只建议新增 crates/rsetup-controller，不改现有 crates/rsetup-app/src/server.rs、板端握手或前端。
-- 新增依赖须在同一 Task 将 manifest 与根 Cargo.lock 一起提交；候选依赖须通过 MSRV 1.85 与 CI 的 armv7/aarch64/i686/x86_64 多 target 检查。`make test` 用 `cargo test --workspace --locked`；现有 CI 的 MSRV、多 target、离线打包均检查 `--locked`，新增依赖不得只改 manifest。
+- 新增依赖须在同一 Task 将 manifest 与根 Cargo.lock 一起提交；候选依赖须通过 MSRV 1.85 与 CI 的 aarch64/x86_64 多 target 检查。`make test` 用 `cargo test --workspace --locked`；现有 CI 的 MSRV、多 target、离线打包均检查 `--locked`，新增依赖不得只改 manifest。
 - DB fixture 的 `$MYSQL_TEST_URL`/`$TIDB_TEST_URL` 由未来实施时的本地隔离容器或 CI 显式提供，镜像/服务配置和版本随 G1 审批的 MySQL 8.4 LTS/TiDB 8.5 LTS 建议版本确定，不预设现有 CI 已有对应 service。真实 DB 测试标 `#[ignore]`，以 `CONTROLLER_TEST_DATABASE_URL` 显式门控；未来修改 `.github/workflows/ci.yml`，分别按对应 URL 执行 MySQL/TiDB 的 `-- --ignored --test-threads=1`，并核查各自实际执行用例数非零（零用例不得算 PASS）。缺某引擎 URL 标该引擎「未验证」（不记 PASS、不以缺 URL 阻塞普通 CI），URL 存在而测试失败或执行用例为零则 CI fail；本次只修计划，不配置 CI/服务。
 - DeviceId 是 Ed25519 公钥 32B，HTTP lower hex64、DB BINARY(32)，SN/IP 不得作身份；UUIDv4 API 小写/DB BINARY(16)；revision/counter JSON 十进制字符串；未知字段/枚举 400，expected_revision 冲突 409。
 - utf8mb4、显式唯一键/索引、短事务；不能假定 MySQL/TiDB DDL 回滚、锁、自增、JSON 查询一致。migration 与首次 admin 事务分离；初始化持久标记/唯一约束防重复，随机密码只在成功提交后写一次受限日志，DB 只存哈希，不能因用户表为空或重启重置。
