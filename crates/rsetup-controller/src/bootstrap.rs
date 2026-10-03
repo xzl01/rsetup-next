@@ -1,10 +1,9 @@
-use crate::{ControllerError, DbPool};
+use crate::{ControllerError, DbPool, auth::password::PasswordHasher};
 
 pub trait BootstrapSecretSink: Send + Sync {
     fn emit(&self, username: &str, password: &str) -> Result<(), ControllerError>;
 }
 
-use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
 use rand::{RngCore, rngs::OsRng};
 
 pub async fn bootstrap_admin(
@@ -42,11 +41,7 @@ fn generate_secret() -> Result<(String, String), ControllerError> {
     let mut entropy = [0u8; 32];
     OsRng.fill_bytes(&mut entropy);
     let secret = hex::encode(entropy);
-    let salt = SaltString::generate(&mut OsRng);
-    let hash = Argon2::default()
-        .hash_password(secret.as_bytes(), &salt)
-        .map_err(|_| ControllerError::Crypto)?
-        .to_string();
+    let hash = PasswordHasher::new().hash(&secret)?;
     Ok((secret, hash))
 }
 
@@ -61,6 +56,9 @@ mod tests {
         assert!(secret.len() >= 32, "at least 128 bits represented in hex");
         let parsed = PasswordHash::new(&hash).unwrap();
         assert_eq!(parsed.algorithm.as_str(), "argon2id");
+        assert_eq!(parsed.params.get("m").unwrap().decimal().unwrap(), 65536);
+        assert_eq!(parsed.params.get("t").unwrap().decimal().unwrap(), 3);
+        assert_eq!(parsed.params.get("p").unwrap().decimal().unwrap(), 1);
         Argon2::default()
             .verify_password(secret.as_bytes(), &parsed)
             .unwrap();
