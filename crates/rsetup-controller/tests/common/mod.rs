@@ -308,6 +308,49 @@ pub async fn counts(db: &DbPool, public_key: &[u8; 32]) -> (i64, i64) {
     (history, audit)
 }
 
+fn assert_max_snapshot_unchanged(
+    before: rsetup_controller::AdmissionSnapshot,
+    after: rsetup_controller::AdmissionSnapshot,
+) {
+    assert_eq!(after, before, "MAX CAS must not change the snapshot");
+}
+
+#[test]
+fn max_snapshot_assertion_detects_state_change_at_same_revision() {
+    use rsetup_controller::{AdmissionSnapshot, AdmissionState, ReviewDecision};
+    let before = AdmissionSnapshot {
+        admission_state: AdmissionState::Pending,
+        review_decision: ReviewDecision::Approved,
+        revision: u64::MAX,
+    };
+    let after = AdmissionSnapshot {
+        admission_state: AdmissionState::Approved,
+        ..before
+    };
+    assert!(
+        std::panic::catch_unwind(|| assert_max_snapshot_unchanged(before, after)).is_err(),
+        "MAX snapshot assertion must reject state changes with unchanged revision"
+    );
+}
+
+#[test]
+fn max_snapshot_assertion_detects_decision_change_at_same_revision() {
+    use rsetup_controller::{AdmissionSnapshot, AdmissionState, ReviewDecision};
+    let before = AdmissionSnapshot {
+        admission_state: AdmissionState::Pending,
+        review_decision: ReviewDecision::Approved,
+        revision: u64::MAX,
+    };
+    let after = AdmissionSnapshot {
+        review_decision: ReviewDecision::Revoked,
+        ..before
+    };
+    assert!(
+        std::panic::catch_unwind(|| assert_max_snapshot_unchanged(before, after)).is_err(),
+        "MAX snapshot assertion must reject decision changes with unchanged revision"
+    );
+}
+
 pub async fn admission_cas_scenarios(db: &DbPool) {
     use rsetup_controller::{AdmissionState, AdmissionStore, ControllerError, ReviewDecision};
     let public_key = unique_public_key();
@@ -347,7 +390,9 @@ pub async fn admission_cas_scenarios(db: &DbPool) {
     // after device UPDATE and admission_decisions INSERT, forcing a real transaction rollback.
     let (epoch, seq): (Vec<u8>, u64) = sqlx::query_as("SELECT process_epoch, event_seq FROM audit_events WHERE target_id = ? ORDER BY event_seq DESC LIMIT 1")
         .bind(hex::encode(public_key)).fetch_one(&db.0).await.unwrap();
-    let next_seq = seq + 1;
+    let next_seq = seq
+        .checked_add(1)
+        .expect("collision fixture requires an audit sequence below u64::MAX");
     let collision_id = uuid::Uuid::new_v4();
     sqlx::query("INSERT INTO audit_events (id, actor_kind, event_type, params_redacted, outcome, time_evidence, process_epoch, event_seq) VALUES (?, 'system', 'test.collision', '{}', 'success', '{}', ?, ?)")
         .bind(collision_id.as_bytes().as_slice()).bind(&epoch).bind(next_seq).execute(&db.0).await.unwrap();
@@ -536,7 +581,8 @@ pub async fn identity_unsigned_high_half_round_trip(db: &DbPool) {
         .execute(&db.0)
         .await
         .unwrap();
-    assert_eq!(db.load(key).await.unwrap().revision, u64::MAX);
+    let max_snapshot = db.load(key).await.unwrap();
+    assert_eq!(max_snapshot.revision, u64::MAX);
     let before = counts(db, &key).await;
     assert!(matches!(
         db.compare_and_set(
@@ -550,7 +596,7 @@ pub async fn identity_unsigned_high_half_round_trip(db: &DbPool) {
         .await,
         Err(ControllerError::RevisionConflict)
     ));
-    assert_eq!(db.load(key).await.unwrap().revision, u64::MAX);
+    assert_max_snapshot_unchanged(max_snapshot, db.load(key).await.unwrap());
     assert_eq!(
         counts(db, &key).await,
         before,
