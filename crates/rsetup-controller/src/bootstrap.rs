@@ -1,7 +1,7 @@
 use crate::{ControllerError, DbPool};
 
 pub trait BootstrapSecretSink: Send + Sync {
-    fn emit(&self, username: &str, password: &str);
+    fn emit(&self, username: &str, password: &str) -> Result<(), ControllerError>;
 }
 
 use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
@@ -35,8 +35,7 @@ pub async fn bootstrap_admin(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    sink.emit("admin", &secret);
-    Ok(())
+    sink.emit("admin", &secret)
 }
 
 fn generate_secret() -> Result<(String, String), ControllerError> {
