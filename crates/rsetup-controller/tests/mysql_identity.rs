@@ -212,6 +212,15 @@ async fn later_column_interruption_then_explicit_retry() {
 
 #[tokio::test]
 #[ignore = "one independently backed-up isolated disposable empty test DB and operator authorization required"]
+async fn identity_unsigned_high_half_round_trip() {
+    let db = common::required_fresh_identity_db().await;
+    common::run_explicit_identity_test_command("upgrade");
+    check_identity_schema(&db).await.unwrap();
+    common::identity_unsigned_high_half_round_trip(&db).await;
+}
+
+#[tokio::test]
+#[ignore = "one independently backed-up isolated disposable empty test DB and operator authorization required"]
 async fn admission_cas_persists_history_and_audit_atomically() {
     let db = fresh_v2().await;
     common::admission_cas_scenarios(&db).await;

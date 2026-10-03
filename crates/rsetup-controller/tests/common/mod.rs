@@ -345,7 +345,7 @@ pub async fn admission_cas_scenarios(db: &DbPool) {
 
     // Reserve the next real (process_epoch,event_seq) unique key: audit insertion then fails
     // after device UPDATE and admission_decisions INSERT, forcing a real transaction rollback.
-    let (epoch, seq): (Vec<u8>, i64) = sqlx::query_as("SELECT process_epoch, event_seq FROM audit_events WHERE target_id = ? ORDER BY event_seq DESC LIMIT 1")
+    let (epoch, seq): (Vec<u8>, u64) = sqlx::query_as("SELECT process_epoch, event_seq FROM audit_events WHERE target_id = ? ORDER BY event_seq DESC LIMIT 1")
         .bind(hex::encode(public_key)).fetch_one(&db.0).await.unwrap();
     let next_seq = seq + 1;
     let collision_id = uuid::Uuid::new_v4();
@@ -379,6 +379,183 @@ pub async fn admission_cas_scenarios(db: &DbPool) {
         .execute(&db.0)
         .await
         .unwrap();
+}
+
+pub async fn identity_unsigned_high_half_round_trip(db: &DbPool) {
+    use rsetup_controller::{AdmissionState, AdmissionStore, ControllerError, ReviewDecision};
+    use sqlx::Row;
+
+    let key = unique_public_key();
+    let high = i64::MAX as u64 + 9;
+    sqlx::query("INSERT INTO devices (public_key,display_name,admission_state,review_decision,revision,archived) VALUES (?,'high','PENDING','none',?,FALSE)")
+        .bind(key.as_slice()).bind(high).execute(&db.0).await.unwrap();
+    assert_eq!(db.load(key).await.unwrap().revision, high);
+    let next = db
+        .compare_and_set(
+            key,
+            high,
+            AdmissionState::Pending,
+            ReviewDecision::Approved,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(next.revision, high + 1);
+    let row = sqlx::query("SELECT revision FROM devices WHERE public_key=?")
+        .bind(key.as_slice())
+        .fetch_one(&db.0)
+        .await
+        .unwrap();
+    assert_eq!(row.try_get::<u64, _>("revision").unwrap(), high + 1);
+    let history = sqlx::query(
+        "SELECT previous_revision,new_revision FROM admission_decisions WHERE device_id=?",
+    )
+    .bind(key.as_slice())
+    .fetch_one(&db.0)
+    .await
+    .unwrap();
+    assert_eq!(
+        history.try_get::<u64, _>("previous_revision").unwrap(),
+        high
+    );
+    assert_eq!(history.try_get::<u64, _>("new_revision").unwrap(), high + 1);
+    let before = counts(db, &key).await;
+    assert!(matches!(
+        db.compare_and_set(
+            key,
+            high,
+            AdmissionState::Pending,
+            ReviewDecision::Denied,
+            None,
+            None
+        )
+        .await,
+        Err(ControllerError::RevisionConflict)
+    ));
+    assert_eq!(db.load(key).await.unwrap(), next);
+    assert_eq!(
+        counts(db, &key).await,
+        before,
+        "stale CAS must not add history/audit"
+    );
+
+    sqlx::query("UPDATE schema_meta SET authz_epoch=?, admin_guard_revision=? WHERE singleton=1")
+        .bind(high)
+        .bind(high)
+        .execute(&db.0)
+        .await
+        .unwrap();
+    let meta =
+        sqlx::query("SELECT authz_epoch,admin_guard_revision FROM schema_meta WHERE singleton=1")
+            .fetch_one(&db.0)
+            .await
+            .unwrap();
+    assert_eq!(meta.try_get::<u64, _>("authz_epoch").unwrap(), high);
+    assert_eq!(
+        meta.try_get::<u64, _>("admin_guard_revision").unwrap(),
+        high
+    );
+
+    let user_id = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id,username,display_name,password_hash,active,is_admin,must_change_password,revision,created_time) VALUES (?,'high_user','High','hash',TRUE,FALSE,FALSE,?,NOW(6))")
+        .bind(user_id.as_bytes().as_slice()).bind(high).execute(&db.0).await.unwrap();
+    let user = sqlx::query("SELECT revision FROM users WHERE id=?")
+        .bind(user_id.as_bytes().as_slice())
+        .fetch_one(&db.0)
+        .await
+        .unwrap();
+    assert_eq!(user.try_get::<u64, _>("revision").unwrap(), high);
+
+    let role_id = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO roles (id,name,builtin,archived,revision) VALUES (?,'high_role',FALSE,FALSE,?)")
+        .bind(role_id.as_bytes().as_slice()).bind(high).execute(&db.0).await.unwrap();
+    let role = sqlx::query("SELECT revision FROM roles WHERE id=?")
+        .bind(role_id.as_bytes().as_slice())
+        .fetch_one(&db.0)
+        .await
+        .unwrap();
+    assert_eq!(role.try_get::<u64, _>("revision").unwrap(), high);
+
+    let group_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO device_groups (id,name,archived,revision) VALUES (?,'high_group',FALSE,?)",
+    )
+    .bind(group_id.as_bytes().as_slice())
+    .bind(high)
+    .execute(&db.0)
+    .await
+    .unwrap();
+    let group = sqlx::query("SELECT revision FROM device_groups WHERE id=?")
+        .bind(group_id.as_bytes().as_slice())
+        .fetch_one(&db.0)
+        .await
+        .unwrap();
+    assert_eq!(group.try_get::<u64, _>("revision").unwrap(), high);
+
+    let grant_id = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO grants (id,user_id,source_kind,permissions,scope_kind,revision) VALUES (?,?,'direct','{}','all',?)")
+        .bind(grant_id.as_bytes().as_slice()).bind(user_id.as_bytes().as_slice()).bind(high)
+        .execute(&db.0).await.unwrap();
+    let grant = sqlx::query("SELECT revision FROM grants WHERE id=?")
+        .bind(grant_id.as_bytes().as_slice())
+        .fetch_one(&db.0)
+        .await
+        .unwrap();
+    assert_eq!(grant.try_get::<u64, _>("revision").unwrap(), high);
+
+    let audit_id = uuid::Uuid::new_v4();
+    let audit_epoch = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO audit_events (id,actor_kind,event_type,params_redacted,outcome,time_evidence,process_epoch,event_seq) VALUES (?,'system','high.fixture','{}','success','{}',?,?)")
+        .bind(audit_id.as_bytes().as_slice()).bind(audit_epoch.as_bytes().as_slice()).bind(high)
+        .execute(&db.0).await.unwrap();
+    let audit = sqlx::query("SELECT event_seq FROM audit_events WHERE id=?")
+        .bind(audit_id.as_bytes().as_slice())
+        .fetch_one(&db.0)
+        .await
+        .unwrap();
+    assert_eq!(audit.try_get::<u64, _>("event_seq").unwrap(), high);
+
+    // A second epoch isolates this maximum-value bind from the live process audit counter.
+    let max_audit_id = uuid::Uuid::new_v4();
+    let max_epoch = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO audit_events (id,actor_kind,event_type,params_redacted,outcome,time_evidence,process_epoch,event_seq) VALUES (?,'system','max.fixture','{}','success','{}',?,?)")
+        .bind(max_audit_id.as_bytes().as_slice()).bind(max_epoch.as_bytes().as_slice()).bind(u64::MAX)
+        .execute(&db.0).await.unwrap();
+    let max_audit = sqlx::query("SELECT event_seq FROM audit_events WHERE id=?")
+        .bind(max_audit_id.as_bytes().as_slice())
+        .fetch_one(&db.0)
+        .await
+        .unwrap();
+    assert_eq!(max_audit.try_get::<u64, _>("event_seq").unwrap(), u64::MAX);
+
+    // The limit is a real row and the evidence is persistent COUNT(*), not a fake call count.
+    sqlx::query("UPDATE devices SET revision=? WHERE public_key=?")
+        .bind(u64::MAX)
+        .bind(key.as_slice())
+        .execute(&db.0)
+        .await
+        .unwrap();
+    assert_eq!(db.load(key).await.unwrap().revision, u64::MAX);
+    let before = counts(db, &key).await;
+    assert!(matches!(
+        db.compare_and_set(
+            key,
+            u64::MAX,
+            AdmissionState::Approved,
+            ReviewDecision::Revoked,
+            None,
+            None
+        )
+        .await,
+        Err(ControllerError::RevisionConflict)
+    ));
+    assert_eq!(db.load(key).await.unwrap().revision, u64::MAX);
+    assert_eq!(
+        counts(db, &key).await,
+        before,
+        "overflow must not write history/audit"
+    );
 }
 
 pub async fn bootstrap_failure_does_not_reinitialize(db: &DbPool) {

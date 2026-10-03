@@ -1050,7 +1050,7 @@ pub trait AdmissionStore {
     fn compare_and_set(
         &self,
         public_key: [u8; 32],
-        expected_revision: i64,
+        expected_revision: u64,
         expected_state: AdmissionState,
         decision: ReviewDecision,
         actor_id: Option<[u8; 16]>,
@@ -1061,7 +1061,7 @@ pub trait AdmissionStore {
 fn decode_snapshot(
     state: &str,
     decision: &str,
-    revision: i64,
+    revision: u64,
 ) -> Result<AdmissionSnapshot, ControllerError> {
     let admission_state = match state {
         "PENDING" => AdmissionState::Pending,
@@ -1130,6 +1130,16 @@ fn system_fallback_time_evidence() -> String {
     .to_string()
 }
 
+fn next_event_seq(counter: &std::sync::atomic::AtomicU64) -> Result<u64, ControllerError> {
+    counter
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |n| n.checked_add(1),
+        )
+        .map_err(|_| ControllerError::RevisionConflict)
+}
+
 impl AdmissionStore for DbPool {
     async fn load(&self, public_key: [u8; 32]) -> Result<AdmissionSnapshot, ControllerError> {
         let row = sqlx::query(
@@ -1142,32 +1152,29 @@ impl AdmissionStore for DbPool {
         decode_snapshot(
             row.try_get("admission_state")?,
             row.try_get("review_decision")?,
-            row.try_get("revision")?,
+            row.try_get::<u64, _>("revision")?,
         )
     }
 
     async fn compare_and_set(
         &self,
         public_key: [u8; 32],
-        expected_revision: i64,
+        expected_revision: u64,
         expected_state: AdmissionState,
         decision: ReviewDecision,
         actor_id: Option<[u8; 16]>,
         reason: Option<&str>,
     ) -> Result<AdmissionSnapshot, ControllerError> {
-        use std::sync::{
-            OnceLock,
-            atomic::{AtomicI64, Ordering},
-        };
+        use std::sync::{OnceLock, atomic::AtomicU64};
         static PROCESS_EPOCH: OnceLock<uuid::Uuid> = OnceLock::new();
-        static EVENT_SEQ: AtomicI64 = AtomicI64::new(0);
+        static EVENT_SEQ: AtomicU64 = AtomicU64::new(0);
         let mut tx = self.0.begin().await?;
         let row = sqlx::query("SELECT admission_state, review_decision, revision FROM devices WHERE public_key = ? FOR UPDATE")
             .bind(public_key.as_slice()).fetch_optional(&mut *tx).await?.ok_or(ControllerError::NotFound)?;
         let current = decode_snapshot(
             row.try_get("admission_state")?,
             row.try_get("review_decision")?,
-            row.try_get("revision")?,
+            row.try_get::<u64, _>("revision")?,
         )?;
         if current.revision != expected_revision || current.admission_state != expected_state {
             return Err(ControllerError::RevisionConflict);
@@ -1199,7 +1206,7 @@ impl AdmissionStore for DbPool {
             .bind(current.revision).bind(next.revision).bind(reason).bind(&evidence)
             .execute(&mut *tx).await?;
         let epoch = PROCESS_EPOCH.get_or_init(uuid::Uuid::new_v4);
-        let seq = EVENT_SEQ.fetch_add(1, Ordering::Relaxed);
+        let seq = next_event_seq(&EVENT_SEQ)?;
         sqlx::query("INSERT INTO audit_events (id, actor_kind, actor_user_id, event_type, target_kind, target_id, params_redacted, outcome, time_evidence, process_epoch, event_seq) VALUES (?, ?, ?, ?, 'device', ?, '{}', 'success', ?, ?, ?)")
             .bind(uuid::Uuid::new_v4().as_bytes().as_slice())
             .bind(if actor_id.is_some() { "user" } else { "system" })
@@ -1908,6 +1915,39 @@ mod tests {
         let primary = expected_indexes(&parts, &["PRIMARY"]).unwrap();
         assert_eq!(primary[0].columns, vec!["public_key"]);
         assert!(primary[0].unique);
+    }
+
+    #[test]
+    fn audit_sequence_never_wraps() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let seq = AtomicU64::new(u64::MAX);
+        assert!(next_event_seq(&seq).is_err());
+        assert_eq!(seq.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn max_admission_revision_rejects_transition_without_wrap() {
+        let current = AdmissionSnapshot {
+            admission_state: AdmissionState::Pending,
+            review_decision: ReviewDecision::None,
+            revision: u64::MAX,
+        };
+        assert!(matches!(
+            next_snapshot(current, ReviewDecision::Approved),
+            Err(ControllerError::RevisionConflict)
+        ));
+        assert_eq!(current.revision, u64::MAX);
+    }
+
+    #[test]
+    fn admission_revision_crosses_signed_boundary() {
+        let current = AdmissionSnapshot {
+            admission_state: AdmissionState::Pending,
+            review_decision: ReviewDecision::None,
+            revision: i64::MAX as _,
+        };
+        let next = next_snapshot(current, ReviewDecision::Approved).unwrap();
+        assert_eq!(next.revision, i64::MAX as u64 + 1);
     }
 
     #[test]

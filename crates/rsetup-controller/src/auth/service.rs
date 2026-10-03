@@ -15,7 +15,7 @@ pub struct IdentityUser {
     pub active: bool,
     pub is_admin: bool,
     pub must_change_password: bool,
-    pub revision: i64,
+    pub revision: u64,
 }
 #[derive(Clone, Debug)]
 pub struct Session {
@@ -151,7 +151,7 @@ mod tests {
         active: bool,
         is_admin: bool,
         must_change_password: bool,
-        revision: i64,
+        revision: u64,
         sessions: Vec<([u8; 32], bool)>,
     }
     type StoredSession = ([u8; 32], bool, [u8; 16], [u8; 16]);
@@ -243,8 +243,13 @@ mod tests {
             {
                 return Err(ControllerError::InvalidArgument);
             }
+            let next_revision = state
+                .0
+                .revision
+                .checked_add(1)
+                .ok_or(ControllerError::RevisionConflict)?;
             state.0.password_hash = next_hash.into();
-            state.0.revision += 1;
+            state.0.revision = next_revision;
             state.0.must_change_password = false;
             for session in &mut state.1 {
                 session.1 = true;
@@ -432,6 +437,22 @@ mod tests {
         assert!(svc.authenticate(&login.raw_token).await.is_err());
         assert!(svc.login("alice", "new password").await.is_ok());
     }
+    #[tokio::test]
+    async fn overflowing_password_revision_preserves_live_session_and_account() {
+        let (svc, repo) = auth_fixture();
+        repo.state.lock().unwrap().0.revision = u64::MAX;
+        let old = svc.login("alice", "old password").await.unwrap();
+        let live = svc.login("alice", "old password").await.unwrap();
+        let before = repo.auth_state();
+        assert!(matches!(
+            svc.change_password(&old.session, "old password", "new password")
+                .await,
+            Err(ControllerError::RevisionConflict)
+        ));
+        assert_eq!(repo.auth_state(), before);
+        assert!(svc.authenticate(&live.raw_token).await.is_ok());
+    }
+
     #[tokio::test]
     async fn concurrent_password_change_does_not_overwrite_new_hash_or_revoke_new_session() {
         let (svc, repo) = auth_fixture();
