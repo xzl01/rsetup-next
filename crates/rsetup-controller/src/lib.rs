@@ -3,6 +3,7 @@ pub mod bootstrap;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod integrity;
 pub mod model;
 
 pub use bootstrap::{BootstrapSecretSink, bootstrap_admin};
@@ -12,6 +13,7 @@ pub use db::{
     run_identity_test_migration,
 };
 pub use error::ControllerError;
+pub use integrity::{validate_device_fields, validate_grant_fields, validate_singleton_ids};
 pub use model::{AdmissionSnapshot, AdmissionState, ReviewDecision};
 
 pub fn parse_device_id(s: &str) -> Result<[u8; 32], ControllerError> {

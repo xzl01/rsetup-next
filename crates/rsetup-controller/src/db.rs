@@ -1100,6 +1100,9 @@ fn decode_snapshot(
     decision: &str,
     revision: u64,
 ) -> Result<AdmissionSnapshot, ControllerError> {
+    crate::validate_device_fields(state, decision).map_err(|_| {
+        ControllerError::Config("invalid stored admission state/decision combination".into())
+    })?;
     let admission_state = match state {
         "PENDING" => AdmissionState::Pending,
         "APPROVED" => AdmissionState::Approved,
@@ -1268,6 +1271,30 @@ fn audit_code(decision: ReviewDecision, previous: AdmissionState) -> &'static st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_snapshot_rejects_invalid_pairs_even_when_values_are_known() {
+        for (state, decision) in [
+            ("PENDING", "none"),
+            ("PENDING", "denied"),
+            ("APPROVED", "approved"),
+            ("REVOKED", "revoked"),
+        ] {
+            assert_eq!(decode_snapshot(state, decision, 42).unwrap().revision, 42);
+        }
+        for (state, decision) in [
+            ("PENDING", "approved"),
+            ("APPROVED", "none"),
+            ("REVOKED", "denied"),
+            ("pending", "none"),
+            ("PENDING", "NONE"),
+        ] {
+            assert!(
+                decode_snapshot(state, decision, 42).is_err(),
+                "{state}/{decision}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn readonly_probe_gates_shape_only_after_v2() {
