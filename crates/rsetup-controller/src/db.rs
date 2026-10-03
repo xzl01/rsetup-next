@@ -499,6 +499,176 @@ fn check_clause_matches(table: &str, name: &str, stored: &str, declared: &str) -
     }
 }
 
+// Treat a stored CHECK as the 0001 expression only when its tokens can be
+// compared without changing SQL string-literal bytes or joining identifiers.
+// Unknown metadata spellings fail closed; this is not a general SQL parser.
+fn legacy_check_tokens(value: &str) -> Option<Vec<String>> {
+    let bytes = value.as_bytes();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        if bytes[i] == b'`' {
+            i += 1;
+            let name_start = i;
+            while i < bytes.len() && bytes[i] != b'`' {
+                if !(bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    return None;
+                }
+                i += 1;
+            }
+            if i == bytes.len()
+                || i == name_start
+                || !matches!(
+                    &value[name_start..i].to_ascii_lowercase()[..],
+                    "singleton"
+                        | "admission_state"
+                        | "review_decision"
+                        | "source_kind"
+                        | "role_id"
+                        | "permissions"
+                        | "scope_kind"
+                        | "scope_group_id"
+                        | "scope_device_id"
+                )
+            {
+                return None;
+            }
+            tokens.push(value[name_start..i].to_ascii_lowercase());
+            i += 1;
+        } else if bytes[i] == b'\''
+            || bytes
+                .get(i..i + 8)
+                .is_some_and(|part| part.eq_ignore_ascii_case(b"_utf8mb4"))
+                && bytes.get(i + 8) == Some(&b'\'')
+        {
+            if bytes[i] != b'\'' {
+                i += 8;
+            }
+            let quote_start = i;
+            i += 1;
+            loop {
+                if i == bytes.len() {
+                    return None;
+                }
+                if bytes[i] == b'\\' {
+                    return None;
+                }
+                if bytes[i] == b'\'' {
+                    if bytes.get(i + 1) == Some(&b'\'') {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            tokens.push(value[quote_start..i].to_owned());
+        } else if bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' {
+            i += 1;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            tokens.push(value[start..i].to_ascii_lowercase());
+        } else if matches!(bytes[i], b'(' | b')' | b',' | b'=') {
+            tokens.push(value[i..i + 1].to_owned());
+            i += 1;
+        } else {
+            return None;
+        }
+    }
+    while tokens.first().is_some_and(|s| s == "(") && tokens.last().is_some_and(|s| s == ")") {
+        let mut depth = 0;
+        let wrapped = tokens.iter().enumerate().all(|(idx, token)| {
+            if token == "(" {
+                depth += 1;
+            }
+            if token == ")" {
+                depth -= 1;
+            }
+            depth > 0 || idx == tokens.len() - 1
+        });
+        if !wrapped {
+            break;
+        }
+        tokens.remove(0);
+        tokens.pop();
+    }
+    Some(tokens)
+}
+
+fn known_legacy_check(table: &str, name: &str) -> Option<(&'static str, &'static str)> {
+    let (table, name) = match (table, name) {
+        ("schema_meta", "chk_schema_singleton") => ("schema_meta", "chk_schema_singleton"),
+        ("devices", "chk_devices_state") => ("devices", "chk_devices_state"),
+        ("devices", "chk_devices_decision") => ("devices", "chk_devices_decision"),
+        ("grants", "chk_grants_source") => ("grants", "chk_grants_source"),
+        ("grants", "chk_grants_scope") => ("grants", "chk_grants_scope"),
+        _ => return None,
+    };
+    Some((table, name))
+}
+
+fn validate_legacy_check_metadata(
+    rows: &[(Option<String>, Option<String>, Option<String>)],
+) -> Result<Vec<(&'static str, &'static str)>, ControllerError> {
+    let mut confirmed = Vec::new();
+    for (table, name, clause) in rows {
+        let proof = (|| {
+            let (table, name) = known_legacy_check(table.as_deref()?, name.as_deref()?)?;
+            if confirmed.contains(&(table, name)) { return None; }
+            let declared = ddl_parts_from(MIGRATION, table).into_iter()
+                .find(|part| part.starts_with(&format!("CONSTRAINT {name} CHECK ")))?;
+            let expression = declared.split_once("CHECK ")?.1;
+            let stored = clause.as_deref()?;
+            let tokens_match = legacy_check_tokens(stored)
+                .zip(legacy_check_tokens(expression))
+                .is_some_and(|(stored, expected)| stored == expected);
+            if !tokens_match && !check_clause_matches(table, name, stored, expression) {
+                return None;
+            }
+            // The old comparator also normalizes arbitrary outside-literal
+            // whitespace. Only its two exact, observed escaped forms are safe.
+            if !tokens_match && !matches!((table, name, stored),
+                ("devices", "chk_devices_state", "(`admission_state` in (_utf8mb4\\'PENDING\\',_utf8mb4\\'APPROVED\\',_utf8mb4\\'REVOKED\\'))") |
+                ("devices", "chk_devices_decision", "(`review_decision` in (_utf8mb4\\'none\\',_utf8mb4\\'approved\\',_utf8mb4\\'denied\\',_utf8mb4\\'revoked\\'))")) {
+                return None;
+            }
+            Some((table, name))
+        })().ok_or_else(|| ControllerError::Config("legacy CHECK metadata unavailable or incompatible".into()))?;
+        confirmed.push(proof);
+    }
+    Ok(confirmed)
+}
+
+fn validate_legacy_column(
+    version: i32,
+    table: &str,
+    column: &str,
+    actual: &ColumnMeta,
+) -> Result<bool, ControllerError> {
+    match version {
+        1 => classify_identity_column(table, column, actual),
+        2 => {
+            let old = classify_identity_column(table, column, actual)?;
+            if old {
+                return Err(ControllerError::Config(format!(
+                    "migration target column not ready {table}.{column}"
+                )));
+            }
+            Ok(false)
+        }
+        _ => Err(ControllerError::Config(
+            "unsupported legacy shape version".into(),
+        )),
+    }
+}
+
 fn expected_indexes(parts: &[String], names: &[&str]) -> Result<Vec<IndexMeta>, ControllerError> {
     let mut expected = Vec::new();
     for &name in names {
@@ -927,6 +1097,26 @@ async fn validate_schema_shape_with_contract(
     target: Option<bool>,
     migration: &str,
 ) -> Result<(), ControllerError> {
+    validate_schema_shape_with_policy(db, target, migration, None).await
+}
+
+// Private SELECT-only entry point for Task 3B1B; not wired to Upgrade.
+#[allow(dead_code)]
+async fn validate_legacy_shape(db: &DbPool, version: i32) -> Result<(), ControllerError> {
+    if !matches!(version, 1 | 2) {
+        return Err(ControllerError::Config(
+            "unsupported legacy shape version".into(),
+        ));
+    }
+    validate_schema_shape_with_policy(db, None, MIGRATION, Some(version)).await
+}
+
+async fn validate_schema_shape_with_policy(
+    db: &DbPool,
+    target: Option<bool>,
+    migration: &str,
+    legacy_version: Option<i32>,
+) -> Result<(), ControllerError> {
     let present: Vec<String> = sqlx::query_scalar(
         "SELECT CAST(table_name AS CHAR) AS table_name FROM information_schema.tables WHERE table_schema = DATABASE()",
     )
@@ -942,7 +1132,7 @@ async fn validate_schema_shape_with_contract(
         ));
     }
     for &(table, columns, indexes) in TABLES {
-        let table_collation = if migration == V3_MIGRATION {
+        let table_collation = if migration == V3_MIGRATION || legacy_version.is_some() {
             let table_collation: String = sqlx::query_scalar("SELECT CAST(table_collation AS CHAR) AS table_collation FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?")
                 .bind(table).fetch_one(&db.0).await?;
             validate_v3_table_collation(table, &table_collation)?;
@@ -975,37 +1165,61 @@ async fn validate_schema_shape_with_contract(
             let actual = read_column(db, table, column).await?;
             if migration == V3_MIGRATION {
                 validate_column_shape(table, declaration, &actual)?;
-                validate_v3_column_charset(
-                    table,
-                    declaration,
-                    &actual,
-                    table_collation.as_deref().unwrap(),
-                )?;
             } else if IDENTITY_COLUMNS
                 .iter()
                 .any(|&(t, c, _, _)| t == table && c == column)
             {
-                match target {
-                    Some(true) => {
-                        if classify_identity_column(table, column, &actual)? {
-                            return Err(ControllerError::Config(format!(
-                                "migration target column not ready {table}.{column}"
-                            )));
+                if let Some(version) = legacy_version {
+                    validate_legacy_column(version, table, column, &actual)?;
+                } else {
+                    match target {
+                        Some(true) => {
+                            if classify_identity_column(table, column, &actual)? {
+                                return Err(ControllerError::Config(format!(
+                                    "migration target column not ready {table}.{column}"
+                                )));
+                            }
                         }
-                    }
-                    Some(false) => validate_column_shape(
-                        table,
-                        identity_column_declarations(table, column)?.0,
-                        &actual,
-                    )?,
-                    None => {
-                        classify_identity_column(table, column, &actual)?;
+                        Some(false) => validate_column_shape(
+                            table,
+                            identity_column_declarations(table, column)?.0,
+                            &actual,
+                        )?,
+                        None => {
+                            classify_identity_column(table, column, &actual)?;
+                        }
                     }
                 }
             } else {
                 validate_column_shape(table, declaration, &actual)?;
             }
+            if migration == V3_MIGRATION || legacy_version.is_some() {
+                let charset_declaration = if legacy_version.is_some()
+                    && (table, column) == ("users", "username")
+                    && !classify_identity_column(table, column, &actual)?
+                {
+                    identity_column_declarations(table, column)?.1
+                } else {
+                    declaration
+                };
+                validate_v3_column_charset(
+                    table,
+                    charset_declaration,
+                    &actual,
+                    table_collation.as_deref().unwrap(),
+                )?;
+            }
             if migration == V3_MIGRATION {
+                validate_v3_false_default(db, table, column).await?;
+            }
+            if legacy_version.is_some()
+                && matches!(
+                    (table, column),
+                    ("schema_meta", "initialized")
+                        | ("sessions", "revoked")
+                        | ("devices", "archived")
+                )
+            {
                 validate_v3_false_default(db, table, column).await?;
             }
             if table == "schema_meta" && matches!(column, "authz_epoch" | "admin_guard_revision") {
@@ -1047,6 +1261,33 @@ async fn validate_schema_shape_with_contract(
             }
         }
         validate_indexes(table, &expected, &actual)?;
+        if legacy_version.is_some() {
+            let rows = sqlx::query("SELECT CAST(tc.table_name AS CHAR) AS table_name, CAST(tc.constraint_name AS CHAR) AS constraint_name, CAST(cc.check_clause AS CHAR) AS check_clause FROM information_schema.table_constraints tc LEFT JOIN information_schema.check_constraints cc ON cc.constraint_schema = tc.constraint_schema AND cc.constraint_name = tc.constraint_name WHERE tc.table_schema = DATABASE() AND tc.table_name = ? AND tc.constraint_type = 'CHECK'")
+                .bind(table).fetch_all(&db.0).await
+                .map_err(|_| ControllerError::Config("legacy CHECK metadata unavailable or incompatible".into()))?;
+            let mut metadata = Vec::with_capacity(rows.len());
+            for row in rows {
+                metadata.push((
+                    row.try_get("table_name").map_err(|_| {
+                        ControllerError::Config(
+                            "legacy CHECK metadata unavailable or incompatible".into(),
+                        )
+                    })?,
+                    row.try_get("constraint_name").map_err(|_| {
+                        ControllerError::Config(
+                            "legacy CHECK metadata unavailable or incompatible".into(),
+                        )
+                    })?,
+                    row.try_get("check_clause").map_err(|_| {
+                        ControllerError::Config(
+                            "legacy CHECK metadata unavailable or incompatible".into(),
+                        )
+                    })?,
+                ));
+            }
+            validate_legacy_check_metadata(&metadata)?;
+            continue;
+        }
         let expected_checks: Vec<String> = parts
             .iter()
             .filter(|part| part.starts_with("CONSTRAINT "))
@@ -2669,8 +2910,8 @@ mod tests {
                 string_columns += 1;
             }
         }
-        assert_eq!(queries, 15);
-        assert_eq!(string_columns, 17);
+        assert_eq!(queries, 16);
+        assert_eq!(string_columns, 20);
     }
 
     #[test]
@@ -3197,6 +3438,171 @@ mod tests {
                 .iter()
                 .any(|part| part.contains("chk_devices_state"))
         );
+    }
+
+    #[test]
+    fn legacy_check_subsets_require_semantic_proof_even_when_empty() {
+        let mut originals = Vec::new();
+        for (table, name) in [
+            ("schema_meta", "chk_schema_singleton"),
+            ("devices", "chk_devices_state"),
+            ("devices", "chk_devices_decision"),
+            ("grants", "chk_grants_source"),
+            ("grants", "chk_grants_scope"),
+        ] {
+            let part = ddl_parts_from(MIGRATION, table)
+                .into_iter()
+                .find(|p| p.starts_with(&format!("CONSTRAINT {name} ")))
+                .unwrap();
+            originals.push((
+                Some(table.to_owned()),
+                Some(name.to_owned()),
+                Some(part.split_once("CHECK ").unwrap().1.to_owned()),
+            ));
+        }
+        for mask in 0u32..32 {
+            let rows: Vec<_> = originals
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, row)| row.clone())
+                .collect();
+            let confirmed = validate_legacy_check_metadata(&rows).unwrap();
+            assert_eq!(confirmed.len(), mask.count_ones() as usize, "subset {mask}");
+        }
+        let mut bad = originals[1].clone();
+        for changed in [
+            "(admission_state IN ('PEND ING','APPROVED','REVOKED'))",
+            "(admission_state IN ('pending','APPROVED','REVOKED'))",
+            "(admission_state IN (_latin1'PENDING','APPROVED','REVOKED'))",
+            "(admission_state IN ('PENDING','APPROVED','REVOKED') OR 1=1)",
+            "(admission _state IN ('PENDING','APPROVED','REVOKED'))",
+        ] {
+            bad.2 = Some(changed.to_owned());
+            assert!(validate_legacy_check_metadata(&[bad.clone()]).is_err());
+        }
+        let observed = "(`admission_state` in (_utf8mb4\\'PENDING\\',_utf8mb4\\'APPROVED\\',_utf8mb4\\'REVOKED\\'))";
+        bad.2 = Some(observed.to_owned());
+        assert!(validate_legacy_check_metadata(&[bad.clone()]).is_ok());
+        bad.2 = Some(observed.replace("PENDING", "PEND ING"));
+        assert!(validate_legacy_check_metadata(&[bad]).is_err());
+        for row in [
+            (
+                Some("grants".into()),
+                originals[1].1.clone(),
+                originals[1].2.clone(),
+            ),
+            (
+                Some("devices".into()),
+                Some("unknown".into()),
+                originals[1].2.clone(),
+            ),
+            (None, originals[1].1.clone(), originals[1].2.clone()),
+            (originals[1].0.clone(), None, originals[1].2.clone()),
+            (originals[1].0.clone(), originals[1].1.clone(), None),
+        ] {
+            assert!(validate_legacy_check_metadata(&[row]).is_err());
+        }
+        assert!(
+            validate_legacy_check_metadata(&[originals[1].clone(), originals[1].clone()]).is_err()
+        );
+        assert!(legacy_check_tokens("('PENDING' /* metadata */)").is_none());
+        let readbacks = [
+            ("schema_meta", "chk_schema_singleton", "(`singleton` = 1)"),
+            (
+                "devices",
+                "chk_devices_state",
+                "(`admission_state` in (_utf8mb4'PENDING',_utf8mb4'APPROVED',_utf8mb4'REVOKED'))",
+            ),
+            (
+                "devices",
+                "chk_devices_decision",
+                "(`review_decision` in (_utf8mb4'none',_utf8mb4'approved',_utf8mb4'denied',_utf8mb4'revoked'))",
+            ),
+            (
+                "grants",
+                "chk_grants_source",
+                "((`source_kind` = _utf8mb4'role' AND `role_id` IS NOT NULL AND `permissions` IS NULL) OR (`source_kind` = _utf8mb4'direct' AND `role_id` IS NULL AND `permissions` IS NOT NULL))",
+            ),
+            (
+                "grants",
+                "chk_grants_scope",
+                "((`scope_kind` = _utf8mb4'all' AND `scope_group_id` IS NULL AND `scope_device_id` IS NULL) OR (`scope_kind` = _utf8mb4'group' AND `scope_group_id` IS NOT NULL AND `scope_device_id` IS NULL) OR (`scope_kind` = _utf8mb4'device' AND `scope_group_id` IS NULL AND `scope_device_id` IS NOT NULL))",
+            ),
+        ];
+        for (table, name, clause) in readbacks {
+            assert!(
+                validate_legacy_check_metadata(&[(
+                    Some(table.into()),
+                    Some(name.into()),
+                    Some(clause.into())
+                )])
+                .is_ok(),
+                "{table}.{name}"
+            );
+        }
+        let grants_unobserved_backslashes = readbacks[3].2.replace("'role'", "\\'role\\'");
+        assert!(
+            validate_legacy_check_metadata(&[(
+                Some("grants".into()),
+                Some("chk_grants_source".into()),
+                Some(grants_unobserved_backslashes)
+            )])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn v1_mixed_and_v2_target_columns_are_version_specific() {
+        for (table, column, _, _) in IDENTITY_COLUMNS {
+            let (old, target) = identity_column_declarations(table, column).unwrap();
+            let meta = |decl: &str| {
+                let type_token = decl.split_whitespace().next().unwrap().to_ascii_lowercase();
+                let data_type = type_token.split('(').next().unwrap().to_owned();
+                ColumnMeta {
+                    name: (*column).into(),
+                    data_type,
+                    column_type: if decl.contains("UNSIGNED") {
+                        format!("{type_token} unsigned")
+                    } else {
+                        type_token
+                    },
+                    nullable: false,
+                    character_set_name: if *column == "username" {
+                        Some(
+                            if decl.contains("ascii") {
+                                "ascii"
+                            } else {
+                                "utf8mb4"
+                            }
+                            .into(),
+                        )
+                    } else {
+                        None
+                    },
+                    collation_name: if decl.contains("ascii_bin") {
+                        Some("ascii_bin".into())
+                    } else {
+                        None
+                    },
+                }
+            };
+            let old = meta(old);
+            let target = meta(target);
+            assert!(validate_legacy_column(1, table, column, &old).unwrap());
+            assert!(!validate_legacy_column(1, table, column, &target).unwrap());
+            assert!(validate_legacy_column(2, table, column, &old).is_err());
+            assert!(!validate_legacy_column(2, table, column, &target).unwrap());
+        }
+        let old = ColumnMeta {
+            name: "revision".into(),
+            data_type: "bigint".into(),
+            column_type: "bigint".into(),
+            nullable: false,
+            character_set_name: None,
+            collation_name: None,
+        };
+        assert!(validate_legacy_column(3, "users", "revision", &old).is_err());
     }
 
     #[test]
