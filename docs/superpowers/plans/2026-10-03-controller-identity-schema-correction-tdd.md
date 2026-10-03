@@ -1,6 +1,6 @@
 # Controller identity schema correction TDD 实施计划
 
-> **致执行代理：** 单独获准实施后按 superpowers:executing-plans 逐项执行；本计划不是生产迁移许可。
+> **致执行代理：** 必需子技能：使用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 分任务落实，使用 `- [ ]` 跟踪步骤。本计划不是生产迁移许可。
 
 **Goal:** 保留已提交 0001，新增 identity 0002 修正 Revision/Counter 为 `BIGINT UNSIGNED`/u64、用户名为 `VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin`；未来 Tasks 顺延为 0003。
 
@@ -90,7 +90,7 @@ fn valid_username(s: &str) -> bool {
 }
 ```
 
-首字节判别同时阻止 Unicode/非 ASCII；不做折叠/截断。最终目标列由新 0002 声明覆盖，不能让旧 0001 signed/varchar128 作为最终预期。
+首字节判别同时阻止 Unicode/非 ASCII；不做折叠/截断。Task 1 仅补纯函数/元数据测试与 `information_schema` 读取，**不得先把目标列的严格校验接进当前 `migrate()` 启动路径**：合法旧 v1 必须留给 Task 2 分类/升级，升级时旧形与目标形都可辨识，完整目标校验只在 ALTER 完成后启用；否则会在首次 ALTER 前将自身 0001 误判为不兼容。最终目标列由新 0002 声明覆盖，不能让旧 0001 signed/varchar128 作为最终预期。
 - [ ] **Step 4 回归。** 重跑三个目标命令及 `cargo test -p rsetup-controller db::tests`；表驱动对十列各验证 signed 错、unsigned 对；保持 `schema_version INT`、BOOLEAN/JSON、BINARY 长度、索引/CHECK 老测试绿。`cargo fmt --all -- --check && cargo test -p rsetup-controller`。
 - [ ] **Step 5 审查/提交。** 独立审查 metadata 字段在实际查询读取且未让所有字符列变 ascii；`git add crates/rsetup-controller/src/db.rs && git commit -m 'test(controller): enforce identity column metadata'`。
 
@@ -176,7 +176,7 @@ pub async fn legacy_identity_schema(db: &DbPool) {
 }
 ```
 
-调用 legacy helper 前必须先通过 fresh helper 的门槛。
+两个 helper 仅在各用例获得**不同的**新建且空的 disposable schema/URL 时调用：同一用例内部新库/重启检查可复用其 URL，但下一测试用例必须由操作者另行提供新的空 schema URL，不能把一份 `$MYSQL_TEST_URL`/`$TIDB_TEST_URL` 反复用于 `-- --ignored` 全套后把“非空拒绝”当功能失败。无需获得 CREATE DATABASE 权限，也不得自动 DROP 或覆盖现存库；若无足够的独立 URL，只运行可安全验证的用例，其余标未验证。调用 legacy helper 前必须先通过 fresh helper 的门槛。
 
 ```rust
 #[tokio::test]
