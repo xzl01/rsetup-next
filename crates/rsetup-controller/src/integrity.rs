@@ -79,106 +79,182 @@ pub(crate) async fn validate_identity_rows(
     db: &DbPool,
     require_meta: bool,
 ) -> Result<(), ControllerError> {
-    let mut rows = IdentityRows {
-        meta: Vec::new(),
-        usernames: Vec::new(),
-        booleans: Vec::new(),
-        devices: Vec::new(),
-        permissions: Vec::new(),
-        grants: Vec::new(),
-        orphans: Vec::new(),
-    };
-    macro_rules! query_rows {
-        ($sql:expr, $code:expr) => {
-            sqlx::query($sql)
-                .fetch_all(&db.0)
-                .await
-                .map_err(|_| scan_error($code))?
-        };
+    // A single scoped transaction keeps all SELECTs on one connection. A
+    // REPEATABLE READ session should offer a stable row snapshot; verify the
+    // actual target engine and session isolation before relying on that property.
+    let mut tx =
+        db.0.begin()
+            .await
+            .map_err(|_| scan_error("transaction.begin"))?;
+    // A stream borrows tx: exhaust/drop it before starting the next SELECT.
+    // BoxStream exposes poll_next on its pinned trait object without a new dependency.
+    macro_rules! scan {
+        ($sql:expr, $read:expr, |$row:ident| $body:block) => {{
+            let mut stream = sqlx::query($sql).fetch(&mut *tx);
+            while let Some(item) = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
+                let $row = item.map_err(|_| scan_error($read))?;
+                $body
+            }
+        }};
     }
-    for row in query_rows!(
-        "SELECT singleton,schema_version FROM schema_meta ORDER BY singleton",
-        "meta.read"
-    ) {
-        rows.meta.push((
-            row.try_get("singleton")
-                .map_err(|_| scan_error("meta.decode"))?,
-            row.try_get("schema_version")
-                .map_err(|_| scan_error("meta.decode"))?,
-        ));
-    }
-    for row in query_rows!("SELECT username FROM users", "users.read") {
-        rows.usernames.push(
-            row.try_get("username")
-                .map_err(|_| scan_error("users.decode"))?,
-        );
-    }
-    for &(code, sql) in BOOLEAN_SCANS {
-        let mut values = Vec::new();
-        for row in query_rows!(sql, "boolean.read") {
-            values.push(
-                row.try_get("raw")
-                    .map_err(|_| scan_error("boolean.decode"))?,
-            );
+    let mut meta_count = 0;
+    scan!(
+        "SELECT singleton,schema_version FROM schema_meta LIMIT 2",
+        "meta.read",
+        |row| {
+            let singleton: i8 = row
+                .try_get("singleton")
+                .map_err(|_| scan_error("meta.decode"))?;
+            let version: i32 = row
+                .try_get("schema_version")
+                .map_err(|_| scan_error("meta.decode"))?;
+            meta_count += 1;
+            if meta_count > 1 || !require_meta || (singleton, version) != (1, 3) {
+                return Err(scan_error("meta.singleton"));
+            }
         }
-        rows.booleans.push((code, values));
+    );
+    if require_meta && meta_count != 1 {
+        return Err(scan_error("meta.singleton"));
     }
-    for row in query_rows!(
-        "SELECT admission_state,review_decision FROM devices",
-        "devices.read"
-    ) {
-        rows.devices.push((
-            row.try_get("admission_state")
-                .map_err(|_| scan_error("devices.decode"))?,
-            row.try_get("review_decision")
-                .map_err(|_| scan_error("devices.decode"))?,
-        ));
-    }
-    for row in query_rows!(
-        "SELECT permission FROM role_permissions",
-        "role_permissions.read"
-    ) {
-        rows.permissions.push(
-            row.try_get("permission")
-                .map_err(|_| scan_error("role_permissions.decode"))?,
-        );
-    }
-    for row in query_rows!(
-        "SELECT source_kind,CAST(role_id IS NOT NULL AS SIGNED) AS has_role,CAST(permissions AS CHAR) AS permissions_json,scope_kind,CAST(scope_group_id IS NOT NULL AS SIGNED) AS has_group,CAST(scope_device_id IS NOT NULL AS SIGNED) AS has_device FROM grants",
-        "grants.read"
-    ) {
-        rows.grants.push(GrantRow {
-            source: row
-                .try_get("source_kind")
-                .map_err(|_| scan_error("grants.decode"))?,
-            has_role: row
-                .try_get("has_role")
-                .map_err(|_| scan_error("grants.decode"))?,
-            permissions_json: row
-                .try_get::<Option<String>, _>("permissions_json")
-                .map_err(|_| scan_error("grants.decode"))?,
-            scope: row
-                .try_get("scope_kind")
-                .map_err(|_| scan_error("grants.decode"))?,
-            has_group: row
-                .try_get("has_group")
-                .map_err(|_| scan_error("grants.decode"))?,
-            has_device: row
-                .try_get("has_device")
-                .map_err(|_| scan_error("grants.decode"))?,
+    // v3's prior strict shape check establishes a full UNIQUE(username) index
+    // with ascii_bin collation; valid_username then excludes identical raw bytes.
+    // Do not remove the separate v1/v2 migration collision preflight in db.rs.
+    scan!("SELECT username FROM users", "users.read", |row| {
+        let username: &str = row
+            .try_get("username")
+            .map_err(|_| scan_error("users.decode"))?;
+        validate_username_row(username)?;
+    });
+    for &(code, sql) in BOOLEAN_SCANS {
+        scan!(sql, "boolean.read", |row| {
+            let raw: i64 = row
+                .try_get("raw")
+                .map_err(|_| scan_error("boolean.decode"))?;
+            raw_bool(raw, code)?;
         });
     }
-    for &(code, sql) in ORPHAN_SCANS {
-        rows.orphans.push((
-            code,
-            sqlx::query(sql)
-                .fetch_optional(&db.0)
-                .await
-                .map_err(|_| scan_error("reference.read"))?
-                .is_some(),
-        ));
+    scan!(
+        "SELECT admission_state,review_decision FROM devices",
+        "devices.read",
+        |row| {
+            let state: &str = row
+                .try_get("admission_state")
+                .map_err(|_| scan_error("devices.decode"))?;
+            let decision: &str = row
+                .try_get("review_decision")
+                .map_err(|_| scan_error("devices.decode"))?;
+            validate_device_fields(state, decision).map_err(|_| scan_error("devices.state"))?;
+        }
+    );
+    scan!(
+        "SELECT permission FROM role_permissions",
+        "role_permissions.read",
+        |row| {
+            let permission: &str = row
+                .try_get("permission")
+                .map_err(|_| scan_error("role_permissions.decode"))?;
+            validate_permission_row(permission)?;
+        }
+    );
+    // Only four short permission literals are allowed, so 4096 bytes is a
+    // deliberately generous fixed bound for one JSON array. Check on the server
+    // BEFORE fetching any JSON; SQL/guard failure is fail-closed, no truncation.
+    if sqlx::query(
+        "SELECT 1 FROM grants WHERE OCTET_LENGTH(CAST(permissions AS CHAR)) > 4096 LIMIT 1",
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| scan_error("grants.length_read"))?
+    .is_some()
+    {
+        return Err(scan_error("grants.json_length"));
     }
-    validate_identity_fixture(&rows, require_meta)
+    scan!(
+        "SELECT source_kind,CAST(role_id IS NOT NULL AS SIGNED) AS has_role,CAST(permissions AS CHAR) AS permissions_json,scope_kind,CAST(scope_group_id IS NOT NULL AS SIGNED) AS has_group,CAST(scope_device_id IS NOT NULL AS SIGNED) AS has_device FROM grants",
+        "grants.read",
+        |row| {
+            let source: &str = row
+                .try_get("source_kind")
+                .map_err(|_| scan_error("grants.decode"))?;
+            let has_role: i64 = row
+                .try_get("has_role")
+                .map_err(|_| scan_error("grants.decode"))?;
+            let permissions: Option<&str> = row
+                .try_get("permissions_json")
+                .map_err(|_| scan_error("grants.decode"))?;
+            let scope: &str = row
+                .try_get("scope_kind")
+                .map_err(|_| scan_error("grants.decode"))?;
+            let has_group: i64 = row
+                .try_get("has_group")
+                .map_err(|_| scan_error("grants.decode"))?;
+            let has_device: i64 = row
+                .try_get("has_device")
+                .map_err(|_| scan_error("grants.decode"))?;
+            validate_grant_row(source, has_role, permissions, scope, has_group, has_device)?;
+        }
+    );
+    for &(code, sql) in ORPHAN_SCANS {
+        if sqlx::query(sql)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| scan_error("reference.read"))?
+            .is_some()
+        {
+            return Err(scan_error(code));
+        }
+    }
+    // Dropping a read-only transaction rolls it back; explicit rollback exposes
+    // transaction cleanup errors instead of silently accepting the scan.
+    tx.rollback()
+        .await
+        .map_err(|_| scan_error("transaction.end"))?;
+    Ok(())
+}
+
+fn validate_username_row(username: &str) -> Result<(), ControllerError> {
+    if crate::db::valid_username(username) {
+        Ok(())
+    } else {
+        Err(scan_error("users.username"))
+    }
+}
+
+fn validate_permission_row(permission: &str) -> Result<(), ControllerError> {
+    if valid_permission(permission) {
+        Ok(())
+    } else {
+        Err(scan_error("role_permissions.permission"))
+    }
+}
+
+fn validate_grant_row(
+    source: &str,
+    has_role: i64,
+    permissions_json: Option<&str>,
+    scope: &str,
+    has_group: i64,
+    has_device: i64,
+) -> Result<(), ControllerError> {
+    let has_role = raw_bool(has_role, "grants.role_presence")?;
+    let has_group = raw_bool(has_group, "grants.group_presence")?;
+    let has_device = raw_bool(has_device, "grants.device_presence")?;
+    if permissions_json.is_some_and(|text| text.len() > 4096) {
+        return Err(scan_error("grants.json_length"));
+    }
+    let permissions = permissions_json
+        .map(|text| serde_json::from_str::<Value>(text).map_err(|_| scan_error("grants.json")))
+        .transpose()?;
+    validate_grant_fields(
+        source,
+        has_role,
+        permissions.as_ref(),
+        scope,
+        has_group,
+        has_device,
+    )
+    .map_err(|_| scan_error("grants.fields"))
 }
 
 pub fn validate_singleton_ids(ids: &[i8]) -> Result<(), ControllerError> {
@@ -243,6 +319,7 @@ pub fn validate_grant_fields(
     }
 }
 
+#[cfg(test)]
 struct IdentityRows {
     meta: Vec<(i8, i32)>,
     usernames: Vec<String>,
@@ -252,6 +329,7 @@ struct IdentityRows {
     grants: Vec<GrantRow>,
     orphans: Vec<(&'static str, bool)>,
 }
+#[cfg(test)]
 struct GrantRow {
     source: String,
     has_role: i64,
@@ -260,6 +338,7 @@ struct GrantRow {
     has_group: i64,
     has_device: i64,
 }
+#[cfg(test)]
 fn validate_identity_fixture(
     rows: &IdentityRows,
     require_meta: bool,
@@ -271,7 +350,8 @@ fn validate_identity_fixture(
     }
     let mut seen = std::collections::HashSet::new();
     for username in &rows.usernames {
-        if !crate::db::valid_username(username) || !seen.insert(username.as_bytes()) {
+        validate_username_row(username)?;
+        if !seen.insert(username.as_bytes()) {
             return Err(scan_error("users.username"));
         }
     }
@@ -284,28 +364,17 @@ fn validate_identity_fixture(
         validate_device_fields(state, decision).map_err(|_| scan_error("devices.state"))?;
     }
     for permission in &rows.permissions {
-        if !valid_permission(permission) {
-            return Err(scan_error("role_permissions.permission"));
-        }
+        validate_permission_row(permission)?;
     }
     for row in &rows.grants {
-        let has_role = raw_bool(row.has_role, "grants.role_presence")?;
-        let has_group = raw_bool(row.has_group, "grants.group_presence")?;
-        let has_device = raw_bool(row.has_device, "grants.device_presence")?;
-        let permissions = row
-            .permissions_json
-            .as_deref()
-            .map(|text| serde_json::from_str::<Value>(text).map_err(|_| scan_error("grants.json")))
-            .transpose()?;
-        validate_grant_fields(
+        validate_grant_row(
             &row.source,
-            has_role,
-            permissions.as_ref(),
+            row.has_role,
+            row.permissions_json.as_deref(),
             &row.scope,
-            has_group,
-            has_device,
-        )
-        .map_err(|_| scan_error("grants.fields"))?;
+            row.has_group,
+            row.has_device,
+        )?;
     }
     for &(code, missing) in &rows.orphans {
         if missing {
@@ -460,6 +529,72 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn grant_json_over_safe_bound_fails_without_echoing_contents() {
+        // A valid but oversized direct grant must be rejected before JSON parsing.
+        let json = format!("[\"device.read\"{}]", " ".repeat(4096));
+        let rows = IdentityRows {
+            meta: vec![(1, 3)],
+            usernames: vec![],
+            booleans: vec![],
+            devices: vec![],
+            permissions: vec![],
+            grants: vec![GrantRow {
+                source: "direct".into(),
+                has_role: 0,
+                permissions_json: Some(json.clone()),
+                scope: "all".into(),
+                has_group: 0,
+                has_device: 0,
+            }],
+            orphans: vec![],
+        };
+        let error = validate_identity_fixture(&rows, true).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "configuration: identity data grants.json_length"
+        );
+        assert!(!error.to_string().contains(&json));
+    }
+
+    #[test]
+    fn row_validators_consume_lazy_high_count_and_fail_on_first_bad_row() {
+        let mut visited = 0;
+        (0..100_000)
+            .try_for_each(|i| {
+                visited += 1;
+                let username = format!("user{i:06}");
+                validate_username_row(&username)
+            })
+            .unwrap();
+        assert_eq!(visited, 100_000);
+
+        let mut visited = 0;
+        let error = (0..100_000)
+            .try_for_each(|i| {
+                visited += 1;
+                let username = if i == 10 {
+                    "BadUser".to_owned()
+                } else {
+                    format!("user{i:06}")
+                };
+                validate_username_row(&username)
+            })
+            .unwrap_err();
+        assert_eq!(visited, 11);
+        assert_eq!(
+            error.to_string(),
+            "configuration: identity data users.username"
+        );
+        assert!(validate_grant_row("role", 1, None, "all", 0, 0).is_ok());
+        assert_eq!(
+            validate_grant_row("role", 1, Some("null"), "all", 0, 0)
+                .unwrap_err()
+                .to_string(),
+            "configuration: identity data grants.fields"
+        );
     }
 
     #[test]
