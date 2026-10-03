@@ -75,7 +75,7 @@ JSON 字面量 `null` 不等于 SQL NULL；空数组、非数组、非字符串�
 ## 5. 存量数据与启动
 
 - 新目标 identity schema_version=3。普通启动只执行 SELECT 元数据/数据检查；空库、v1/v2 或未知版本返回结构化 SchemaNotReady，不 CREATE/ALTER/DROP、不 bootstrap、不监听业务接口。
-- v3 启动仍严格核对身份表、列、PK/唯一/普通索引、NULL/类型/字符集、版本单例；目标 CHECK/FK 集合为空。出现未知额外对象拒绝，不静默删除或忽略。
+- v3 启动仍严格核对身份表、列、PK/唯一/普通索引、NULL/类型/字符集、版本单例；目标 CHECK/FK 集合为空。出现未知额外对象拒绝，不静默删除或忽略。固定十一表（`schema_meta`、`users`、`sessions`、`roles`、`role_permissions`、`grants`、`device_groups`、`group_members`、`devices`、`admission_decisions`、`audit_events`）的只读结构检查必须单独枚举 `information_schema.table_constraints` 中 `table_schema=DATABASE()`、`table_name IN (固定十一表)`、`constraint_type='FOREIGN KEY'` 的 `(table_name,constraint_name)`，断言结果空集；不能以 CHECK 数量、PK/UNIQUE 查询或基线 SQL 没声明 FK 代替。元数据查询报错/权限不足、字段缺失或无法可靠枚举时 fail-closed，不把失败当空集；必要时与 `information_schema.key_column_usage` 中同 schema/表且 `REFERENCED_TABLE_NAME IS NOT NULL` 的 `(table_name,constraint_name)` 集合交叉核验，不一致同样拒绝。
 - v3 首次启动执行只读数据完整性扫描：原五项规则、用户名/布尔值、grant 权限数据形状、关系孤儿检查。查询只报告规则代码/固定表列，不打印密码、token、真实连接值或用户输入。
 - 读取路径仍校验触及的数据，存量扫描不是长期事务保护。非法记录导致 NOT_READY/STORAGE_UNAVAILABLE 类失败关闭；不把非法值转成默认枚举、空权限成功或自动修复。
 
@@ -90,17 +90,18 @@ JSON 字面量 `null` 不等于 SQL NULL；空数组、非数组、非字符串�
 ### 6.2 显式迁移路径
 
 - 空库：确认目标身份与表数0；执行新 v3 基线，无 CHECK/FK；验证结构后插入 singleton=1/schema_version=3/initialized=false/新 instance_id；普通启动不做这些操作。
-- v1：只读验证允许的旧/已升级混合列、原五个具名 CHECK 的任意子集、基础索引和数据不变量；先全部预检，随后复用0002固定十一条 ALTER 的按列恢复逻辑；移除实际存在的已知 CHECK，完整 v3 校验后 CAS 写版本3。
-- v2：同样先数据/元数据预检；不重复列 ALTER，只移除实际存在的已知 CHECK，再最终校验并 CAS 2→3。
-- 旧引擎忽略 CHECK 而导致五个 CHECK 缺失，不单独视为数据正确：只允许已知约束子集，仍必须通过逐项应用数据检查。未知 CHECK/FK、不相符列/索引和已占用版本拒绝；不删除未知对象。
-- MySQL 使用固定模板 `ALTER TABLE <known_table> DROP CHECK <known_constraint>`；TiDB 使用经真实引擎验证的固定模板（优先显式 `DROP CHECK`，若对应版本只支持 `DROP CONSTRAINT`，按识别的引擎分支）；仅操作源码白名单中的五个名称，标识符不来自请求。不设置 TiDB 全局开关。
+- v1：在任何 DDL 前只读验证允许的旧/已升级混合列、基础索引、数据不变量，以及每个现存具名 CHECK 的名称与表达式语义；同时复用 §5 的固定十一表 FK 空集检查，未知 FK 或 FK 元数据不可可靠枚举即拒绝，绝不删除未知 FK。先全部预检，随后复用0002固定十一条 ALTER 的按列恢复逻辑；只移除经预检确认为原始定义的已知具名 CHECK，完整 v3 校验后 CAS 写版本3。
+- v2：同样在任何 DDL 前完成数据/元数据、现存 CHECK 语义及同一 FK 空集预检；不重复列 ALTER，只移除经确认的已知具名 CHECK，再最终校验并 CAS 2→3。
+- 旧 CHECK 仅接受 `0001_identity_devices.sql` 中原五个表名+约束名+表达式的任意子集。按每条现存约束取得可判定的表达式元数据，并与对应 0001 声明做安全可证明等价比较；只容许经验证的 MySQL/TiDB 元数据重写（例如外层括号、标识符引用、大小写、特定 `_utf8mb4` 引介符及已证实的转义读回格式），SQL 字符串字面量须保留字节敏感，`PENDING` 不等于 `PEND ING`。不能无条件删除空白或改写字面量；同名但表达式被篡改者视为不兼容，首次 DDL 前拒绝，原版本与数据不变。
+- 必须区分“可可靠枚举、确认约束确实不存在”和“元数据缺失/NULL/不可读/无法安全比较”；后者一律在 DDL 前 fail-closed，不将未知或无法证明原定义的对象列入 DROP 白名单。旧引擎忽略 CHECK 而真正不存在的已知约束可缺失，不单独视为数据正确：仍须通过逐项应用数据预检。未知 CHECK/FK、不相符列/索引和已占用版本拒绝；不删除未知对象。
+- MySQL 使用固定模板 `ALTER TABLE <known_table> DROP CHECK <known_constraint>`；TiDB 使用经真实引擎验证的固定模板（优先显式 `DROP CHECK`，若对应版本只支持 `DROP CONSTRAINT`，按识别的引擎分支）；仅对元数据已确证为 0001 原定义且实际存在的五个具名约束使用源码白名单标识符，不从请求构造标识符。不设置 TiDB 全局开关。
 - 每次 DDL 后重读元数据；DDL 不可整体事务回滚。旧版本升级中断后保留旧版本，允许已知 CHECK 子集及旧/新列混合态继续；错误不伪称恢复成功。空库建表中断形成无版本非空库则拒绝自动接管，保留证据，由已授权操作者恢复空库后重试。
 - 迁移预检不变更用户密码、不插入 admin、不重置 initialized、instance_id 或业务 revision。真实备份、独占停写、准确目标及现有多确认门禁全部保留；生产 ALTER 仍未批准。
 
 ## 7. 验收与完成边界
 
 - 纯测试：完整五规则正反矩阵、JSON null/SQL NULL、非法状态组合、未知权限与revision溢出；源文件扫描只能辅助防回归，不替代真实行为证据。
-- 两引擎独立实测：新空库→v3、v1→v3、v2→v3、旧 CHECK 缺失/部分删除、非事务中断重试、非法数据在首次 DDL 前无损拒绝、重复升级、只读启动拒旧版本；MySQL与TiDB分别记录精确版本、实际用例数与失败数。
+- 两引擎独立实测：新空库→v3、v1→v3、v2→v3、旧 CHECK 确实缺失/已知子集的等价元数据读回、非事务中断重试、非法数据在首次 DDL 前无损拒绝、重复升级、只读启动拒旧版本；同名 CHECK 被篡改为非法新表达式在首次 DDL 前拒绝，证明 0 DDL、原版本与数据不变。无 CHECK 且数据合法的旧库允许升级；无法在真实引擎制造的元数据缺失/不可比较反例以 probe/纯比较器验证，明确标记证据类型而不冒称实测。MySQL与TiDB分别记录精确版本、实际用例数与失败数。
 - 明确证明数据库没有 CHECK/FK，但受控应用写入仍拒绝非法值/悬空actor；审计写失败回滚设备/历史/epoch；bootstrap 并发只一个账号与一次输出。
 - 已授权事务路径之间用 barrier 控制并发测试，不使用 sleep 假定锁先后。未来账户/授权/组成员入口必须覆盖停用↔建会话、归档↔新增关联、撤权↔任务提交的两种串行顺序。
 - 不把客户端任意SQL写入视为应用拒绝证据。测试可用直接SQL注入污染，再断言读取/启动/迁移拒绝；这不是对绕过应用SQL的防护承诺。
