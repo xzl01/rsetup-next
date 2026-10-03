@@ -38,11 +38,42 @@ pub async fn required_fresh_identity_db() -> DbPool {
     db
 }
 
+pub async fn assert_fresh_v3_is_check_and_fk_free(db: &DbPool) {
+    let version: i32 =
+        sqlx::query_scalar("SELECT schema_version FROM schema_meta WHERE singleton = 1")
+            .fetch_one(&db.0)
+            .await
+            .unwrap();
+    assert_eq!(version, 3);
+    let initialized: bool =
+        sqlx::query_scalar("SELECT initialized FROM schema_meta WHERE singleton = 1")
+            .fetch_one(&db.0)
+            .await
+            .unwrap();
+    assert!(!initialized);
+    let meta_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_meta")
+        .fetch_one(&db.0)
+        .await
+        .unwrap();
+    assert_eq!(meta_rows, 1);
+    let constraints: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.table_constraints WHERE table_schema = DATABASE() AND constraint_type IN ('CHECK', 'FOREIGN KEY')")
+        .fetch_one(&db.0).await.unwrap();
+    assert_eq!(constraints, 0);
+    let tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE()",
+    )
+    .fetch_one(&db.0)
+    .await
+    .unwrap();
+    assert_eq!(tables, 11);
+    rsetup_controller::check_identity_schema(db).await.unwrap();
+}
+
 pub async fn required_prepared_identity_db() -> DbPool {
     let db = required_test_db().await;
     rsetup_controller::check_identity_schema(&db)
         .await
-        .expect("existing v2 identity schema");
+        .expect("existing v3 identity schema");
     db
 }
 

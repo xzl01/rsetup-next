@@ -1,3 +1,35 @@
+#[tokio::test]
+#[ignore = "one independently backed-up isolated disposable EMPTY MySQL dev DB; never run without operator confirmation"]
+async fn fresh_v3_single_authorized_mysql_case() {
+    let db = common::required_fresh_identity_db().await;
+    let engine: String = sqlx::query_scalar("SELECT VERSION()")
+        .fetch_one(&db.0)
+        .await
+        .unwrap();
+    assert!(
+        !engine.trim().is_empty(),
+        "SELECT VERSION() must return a version"
+    );
+    common::run_explicit_identity_test_command("upgrade");
+    common::assert_fresh_v3_is_check_and_fk_free(&db).await;
+    let first_id: Vec<u8> =
+        sqlx::query_scalar("SELECT instance_id FROM schema_meta WHERE singleton=1")
+            .fetch_one(&db.0)
+            .await
+            .unwrap();
+    common::run_explicit_identity_test_command("upgrade");
+    common::assert_fresh_v3_is_check_and_fk_free(&db).await;
+    let second_id: Vec<u8> =
+        sqlx::query_scalar("SELECT instance_id FROM schema_meta WHERE singleton=1")
+            .fetch_one(&db.0)
+            .await
+            .unwrap();
+    assert_eq!(
+        first_id, second_id,
+        "v3 read-only retry preserves instance identity"
+    );
+}
+
 mod common;
 use common::{RecordingSecretSink, user_hash};
 use rsetup_controller::{ControllerError, bootstrap_admin, check_identity_schema};

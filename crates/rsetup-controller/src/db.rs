@@ -545,6 +545,7 @@ trait IdentitySchemaProbe {
     fn validate_v2_shape(
         &self,
     ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
+    #[cfg(test)]
     fn validate_legacy_v2_shape(
         &self,
     ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
@@ -554,7 +555,9 @@ trait IdentitySchemaProbe {
     fn validate_fk(&self) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
 }
 
-// Only the explicitly authorized historical migration may accept a complete v2 shape.
+// Retain the historical v2 probe solely as a unit-test reference: Upgrade
+// cannot call it until Task3B adds a separately reviewed legacy preflight.
+#[cfg(test)]
 async fn check_legacy_v2_ready(probe: &impl IdentitySchemaProbe) -> Result<(), ControllerError> {
     if probe.read_version().await? != Some(2) {
         return Err(ControllerError::Config(
@@ -1065,6 +1068,7 @@ impl IdentitySchemaProbe for DbPool {
     async fn validate_v2_shape(&self) -> Result<(), ControllerError> {
         validate_v3_schema_shape(self).await
     }
+    #[cfg(test)]
     async fn validate_legacy_v2_shape(&self) -> Result<(), ControllerError> {
         validate_schema_shape(self, Some(true)).await
     }
@@ -1156,7 +1160,161 @@ async fn preflight_values(db: &DbPool, status: &[bool]) -> Result<(), Controller
     Ok(())
 }
 
+// The complete v3 baseline is only for an authorized, genuinely empty schema.
+// Every identifier comes from the checked-in migration and the fixed TABLES set.
+fn v3_create_statements() -> Result<Vec<(&'static str, &'static str)>, ControllerError> {
+    let mut statements = Vec::new();
+    for statement in V3_MIGRATION
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let table = statement
+            .strip_prefix("CREATE TABLE IF NOT EXISTS ")
+            .and_then(|rest| rest.split_once(" ("))
+            .map(|(name, _)| name)
+            .ok_or_else(|| ControllerError::Config("invalid v3 baseline SQL".into()))?;
+        if !TABLES.iter().any(|(known, _, _)| *known == table)
+            || statements.iter().any(|(name, _)| *name == table)
+            || statement.to_ascii_uppercase().contains("FOREIGN KEY")
+            || statement.to_ascii_uppercase().contains(" CHECK ")
+        {
+            return Err(ControllerError::Config("invalid v3 baseline SQL".into()));
+        }
+        statements.push((table, statement));
+    }
+    if statements.len() != TABLES.len() {
+        return Err(ControllerError::Config("incomplete v3 baseline SQL".into()));
+    }
+    Ok(statements)
+}
+
+trait FreshIdentityMigrationProbe: IdentitySchemaProbe {
+    fn schema_tables(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<String>, ControllerError>> + Send;
+    fn create_table(
+        &self,
+        statement: &str,
+    ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
+    fn validate_empty_data(
+        &self,
+    ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
+    fn insert_v3_meta(
+        &self,
+    ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
+}
+
+async fn upgrade_fresh_v3(probe: &impl FreshIdentityMigrationProbe) -> Result<(), ControllerError> {
+    match probe.read_version().await? {
+        Some(3) => return check_identity_schema_with_probe(probe).await,
+        Some(1 | 2) => {
+            return Err(ControllerError::Config(
+                "legacy v3 upgrade not ready".into(),
+            ));
+        }
+        Some(_) => {
+            return Err(ControllerError::Config(
+                "unsupported test identity schema version".into(),
+            ));
+        }
+        None => {}
+    }
+    let statements = v3_create_statements()?;
+    if !probe.schema_tables().await?.is_empty() {
+        return Err(ControllerError::Config(
+            "nonempty unversioned test schema requires manual handling".into(),
+        ));
+    }
+    let mut expected = Vec::new();
+    for (table, statement) in statements {
+        // CREATE is non-transactional. A failed or unverifiable step leaves the
+        // partial unversioned schema for an operator, never an automatic retry.
+        probe.create_table(statement).await?;
+        expected.push(table);
+        let actual = probe.schema_tables().await?;
+        if actual.len() != expected.len()
+            || actual.iter().any(|name| !expected.contains(&name.as_str()))
+        {
+            return Err(ControllerError::Config(
+                "v3 CREATE result not reflected in schema metadata".into(),
+            ));
+        }
+    }
+    probe.validate_v2_shape().await?;
+    probe.validate_fk().await?;
+    probe.validate_empty_data().await?;
+    if probe.insert_v3_meta().await.is_err() {
+        // Even when a subsequent read sees version 3, the outcome of this INSERT
+        // is uncertain; never claim success or reset an operator's partial schema.
+        let _observed = probe.read_version().await;
+        let _shape = probe.validate_v2_shape().await;
+        let _fk = probe.validate_fk().await;
+        return Err(ControllerError::Config(
+            "v3 metadata insert uncertain; inspect schema manually".into(),
+        ));
+    }
+    check_identity_schema_with_probe(probe).await
+}
+
+impl FreshIdentityMigrationProbe for DbPool {
+    async fn schema_tables(&self) -> Result<Vec<String>, ControllerError> {
+        Ok(sqlx::query_scalar("SELECT CAST(table_name AS CHAR) AS table_name FROM information_schema.tables WHERE table_schema = DATABASE()")
+            .fetch_all(&self.0).await?)
+    }
+    async fn create_table(&self, statement: &str) -> Result<(), ControllerError> {
+        sqlx::query(statement).execute(&self.0).await.map_err(|_| {
+            ControllerError::Config(
+                "v3 CREATE failed; partial schema needs manual inspection".into(),
+            )
+        })?;
+        Ok(())
+    }
+    async fn validate_empty_data(&self) -> Result<(), ControllerError> {
+        crate::integrity::validate_identity_rows(self, false).await?;
+        // The bounded scanner checks values; freshness additionally requires *no*
+        // business rows, including otherwise valid rows inserted by another writer.
+        for &(table, _, _) in TABLES {
+            let statement = format!("SELECT 1 FROM {table} LIMIT 1");
+            if sqlx::query(&statement)
+                .fetch_optional(&self.0)
+                .await?
+                .is_some()
+            {
+                return Err(ControllerError::Config(
+                    "v3 fresh schema contains rows before version insert".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+    async fn insert_v3_meta(&self) -> Result<(), ControllerError> {
+        let result = sqlx::query("INSERT INTO schema_meta (singleton, schema_version, instance_id, initialized, authz_epoch, admin_guard_revision) VALUES (1, 3, ?, FALSE, 0, 0)")
+            .bind(uuid::Uuid::new_v4().as_bytes().as_slice()).execute(&self.0).await?;
+        if result.rows_affected() != 1 {
+            return Err(ControllerError::Config(
+                "v3 metadata insert affected unexpected rows".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 async fn upgrade_identity_schema(
+    db: &DbPool,
+    mode: TestMigrationMode,
+) -> Result<(), ControllerError> {
+    match mode {
+        TestMigrationMode::Upgrade => upgrade_fresh_v3(db).await,
+        // Historical fixtures remain explicitly selectable development tools;
+        // neither path is reachable from the production startup or Upgrade.
+        TestMigrationMode::FixtureV1 | TestMigrationMode::FixturePartialV1 => {
+            create_historical_v1_fixture(db, mode).await
+        }
+    }
+}
+
+async fn create_historical_v1_fixture(
     db: &DbPool,
     mode: TestMigrationMode,
 ) -> Result<(), ControllerError> {
@@ -1183,10 +1341,9 @@ async fn upgrade_identity_schema(
         ));
     }
     if version == Some(2) {
-        if !matches!(mode, TestMigrationMode::Upgrade) {
-            return Err(ControllerError::Config("fixture requires v1".into()));
-        }
-        return check_legacy_v2_ready(db).await;
+        return Err(ControllerError::Config(
+            "historical fixture requires v1".into(),
+        ));
     }
     if version.is_none() {
         let tables: i64 = sqlx::query_scalar(
@@ -1247,33 +1404,9 @@ async fn upgrade_identity_schema(
         }
         return Ok(());
     }
-    for ((table, column, _, alter), old) in IDENTITY_COLUMNS.iter().zip(status) {
-        if old {
-            sqlx::query(alter).execute(&db.0).await?;
-            if classify_identity_column(table, column, &read_column(db, table, column).await?)? {
-                return Err(ControllerError::Config(format!(
-                    "ALTER result not reflected in metadata {table}.{column}"
-                )));
-            }
-        }
-    }
-    validate_schema_shape(db, Some(true)).await?;
-    let updated = sqlx::query(
-        "UPDATE schema_meta SET schema_version = 2 WHERE singleton = 1 AND schema_version = 1",
-    )
-    .execute(&db.0)
-    .await;
-    match updated {
-        Ok(result) if result.rows_affected() == 1 => {}
-        _ => {
-            let observed = read_version(db).await?;
-            let shape_ok = validate_schema_shape(db, Some(true)).await.is_ok();
-            return Err(ControllerError::Config(format!(
-                "identity version update uncertain; observed version {observed:?}, target shape valid={shape_ok}; inspect metadata manually"
-            )));
-        }
-    }
-    check_legacy_v2_ready(db).await
+    Err(ControllerError::Config(
+        "historical fixture mode not supported for this state".into(),
+    ))
 }
 
 pub trait AdmissionStore {
@@ -1494,16 +1627,260 @@ mod tests {
     }
 
     #[test]
-    fn explicit_legacy_upgrade_never_uses_startup_gate_as_v2_terminal_check() {
-        let body = include_str!("db.rs")
+    fn fresh_upgrades_to_check_free_v3_not_historical_v2() {
+        // This deliberately guards the executable dispatch, not just the already
+        // present v3 SQL file: a v3 file alone did not make Upgrade use it.
+        let source = include_str!("db.rs");
+        let dispatch = source
             .split_once("async fn upgrade_identity_schema(")
             .unwrap()
             .1
             .split_once("\npub trait AdmissionStore")
             .unwrap()
             .0;
-        assert!(!body.contains("check_identity_schema(db).await"));
-        assert_eq!(body.matches("check_legacy_v2_ready(db).await").count(), 2);
+        assert!(dispatch.contains("TestMigrationMode::Upgrade => upgrade_fresh_v3"));
+        assert!(
+            dispatch.contains("TestMigrationMode::FixtureV1 | TestMigrationMode::FixturePartialV1")
+        );
+    }
+
+    #[test]
+    fn fresh_v3_fixed_baseline_has_exactly_eleven_create_only_statements() {
+        let statements = v3_create_statements().unwrap();
+        assert_eq!(statements.len(), 11);
+        assert_eq!(statements[0].0, "schema_meta");
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|(name, _)| *name == "users")
+                .count(),
+            1
+        );
+        assert!(statements.iter().all(|(name, sql)| {
+            TABLES.iter().any(|(known, _, _)| known == name)
+                && sql.starts_with(&format!("CREATE TABLE IF NOT EXISTS {name} ("))
+                && !sql.contains("CHECK (")
+                && !sql.contains("FOREIGN KEY")
+        }));
+    }
+
+    #[tokio::test]
+    async fn upgrade_fresh_v3_fake_records_closed_checks_and_no_legacy_writes() {
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct State {
+            version: Option<i32>,
+            tables: Vec<String>,
+            calls: Vec<&'static str>,
+            creates: usize,
+            inserts: usize,
+            fail_version: bool,
+            fail_tables: bool,
+            fail_at_create: Option<usize>,
+            stale_metadata: bool,
+            fail_empty: bool,
+            fail_shape: bool,
+            fail_fk: bool,
+            fail_insert: bool,
+        }
+        #[derive(Default)]
+        struct Fake(Mutex<State>);
+        impl IdentitySchemaProbe for Fake {
+            async fn read_version(&self) -> Result<Option<i32>, ControllerError> {
+                let mut state = self.0.lock().unwrap();
+                state.calls.push("version");
+                if state.fail_version {
+                    return Err(ControllerError::Config(
+                        "version metadata unavailable".into(),
+                    ));
+                }
+                Ok(state.version)
+            }
+            async fn validate_v2_shape(&self) -> Result<(), ControllerError> {
+                let mut state = self.0.lock().unwrap();
+                state.calls.push("shape");
+                if state.fail_shape {
+                    Err(ControllerError::Config("shape".into()))
+                } else {
+                    Ok(())
+                }
+            }
+            #[cfg(test)]
+            async fn validate_legacy_v2_shape(&self) -> Result<(), ControllerError> {
+                panic!("historical shape is not part of Upgrade")
+            }
+            async fn validate_data(&self) -> Result<(), ControllerError> {
+                self.0.lock().unwrap().calls.push("data");
+                Ok(())
+            }
+            async fn validate_fk(&self) -> Result<(), ControllerError> {
+                let mut state = self.0.lock().unwrap();
+                state.calls.push("fk");
+                if state.fail_fk {
+                    Err(ControllerError::Config("fk".into()))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        impl FreshIdentityMigrationProbe for Fake {
+            async fn schema_tables(&self) -> Result<Vec<String>, ControllerError> {
+                let mut state = self.0.lock().unwrap();
+                state.calls.push("tables");
+                if state.fail_tables {
+                    return Err(ControllerError::Config("table metadata unavailable".into()));
+                }
+                let mut actual = state.tables.clone();
+                if state.stale_metadata && state.creates != 0 {
+                    actual.pop();
+                }
+                Ok(actual)
+            }
+            async fn create_table(&self, statement: &str) -> Result<(), ControllerError> {
+                let (name, _) = v3_create_statements()?
+                    .into_iter()
+                    .find(|(_, sql)| *sql == statement)
+                    .ok_or_else(|| ControllerError::Config("unwhitelisted CREATE".into()))?;
+                let mut state = self.0.lock().unwrap();
+                state.calls.push("create");
+                state.creates += 1;
+                if state.fail_at_create == Some(state.creates) {
+                    return Err(ControllerError::Config("CREATE failed".into()));
+                }
+                state.tables.push(name.to_owned());
+                Ok(())
+            }
+            async fn validate_empty_data(&self) -> Result<(), ControllerError> {
+                let mut state = self.0.lock().unwrap();
+                state.calls.push("empty");
+                if state.fail_empty {
+                    Err(ControllerError::Config("nonempty".into()))
+                } else {
+                    Ok(())
+                }
+            }
+            async fn insert_v3_meta(&self) -> Result<(), ControllerError> {
+                let mut state = self.0.lock().unwrap();
+                state.calls.push("insert");
+                state.inserts += 1;
+                if state.fail_insert {
+                    Err(ControllerError::Config("insert uncertain".into()))
+                } else {
+                    state.version = Some(3);
+                    Ok(())
+                }
+            }
+        }
+        let fresh = Fake::default();
+        upgrade_fresh_v3(&fresh).await.unwrap();
+        {
+            let state = fresh.0.lock().unwrap();
+            assert_eq!(
+                (state.version, state.creates, state.inserts),
+                (Some(3), 11, 1)
+            );
+            assert_eq!(&state.calls[..2], &["version", "tables"]);
+            assert_eq!(
+                &state.calls[24..],
+                &[
+                    "shape", "fk", "empty", "insert", "version", "shape", "data", "fk"
+                ]
+            );
+        }
+        let before = fresh.0.lock().unwrap().calls.len();
+        upgrade_fresh_v3(&fresh).await.unwrap();
+        {
+            let state = fresh.0.lock().unwrap();
+            assert_eq!((state.creates, state.inserts), (11, 1));
+            assert_eq!(
+                &state.calls[before..],
+                &["version", "version", "shape", "data", "fk"]
+            );
+        }
+
+        for version in [Some(1), Some(2), Some(4)] {
+            let fake = Fake(Mutex::new(State {
+                version,
+                ..State::default()
+            }));
+            let error = upgrade_fresh_v3(&fake).await.unwrap_err();
+            assert!(matches!(error, ControllerError::Config(_)));
+            let state = fake.0.lock().unwrap();
+            assert_eq!((state.creates, state.inserts), (0, 0));
+            assert_eq!(state.calls, ["version"]);
+        }
+        for state in [
+            State {
+                fail_version: true,
+                ..State::default()
+            },
+            State {
+                fail_tables: true,
+                ..State::default()
+            },
+            State {
+                tables: vec!["schema_meta".into()],
+                ..State::default()
+            },
+            State {
+                fail_at_create: Some(3),
+                ..State::default()
+            },
+            State {
+                stale_metadata: true,
+                ..State::default()
+            },
+            State {
+                fail_shape: true,
+                ..State::default()
+            },
+            State {
+                fail_fk: true,
+                ..State::default()
+            },
+            State {
+                fail_empty: true,
+                ..State::default()
+            },
+            State {
+                fail_insert: true,
+                ..State::default()
+            },
+        ] {
+            let fake = Fake(Mutex::new(state));
+            let error = upgrade_fresh_v3(&fake).await.unwrap_err();
+            let state = fake.0.lock().unwrap();
+            assert_eq!(state.inserts, if state.fail_insert { 1 } else { 0 });
+            if state.fail_at_create.is_some() {
+                assert_eq!(
+                    state.tables.len(),
+                    2,
+                    "failed nontransactional CREATE is not rolled back"
+                );
+            }
+            if state.fail_insert {
+                assert!(format!("{error}").contains("uncertain"));
+                assert_ne!(
+                    state.calls.last(),
+                    Some(&"insert"),
+                    "uncertain insert must re-read"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn historical_fixtures_never_write_v2_version() {
+        let body = include_str!("db.rs")
+            .split_once("async fn create_historical_v1_fixture(")
+            .unwrap()
+            .1
+            .split_once("\npub trait AdmissionStore")
+            .unwrap()
+            .0;
+        assert!(!body.contains("SET schema_version = 2"));
+        assert!(!body.contains("check_legacy_v2_ready(db).await"));
     }
 
     #[test]
@@ -1580,6 +1957,7 @@ mod tests {
                     Ok(())
                 }
             }
+            #[cfg(test)]
             async fn validate_legacy_v2_shape(&self) -> Result<(), ControllerError> {
                 panic!("startup must never use historical v2 shape")
             }
@@ -1691,6 +2069,7 @@ mod tests {
             async fn validate_v2_shape(&self) -> Result<(), ControllerError> {
                 panic!("startup v3 shape must not be used by legacy runner")
             }
+            #[cfg(test)]
             async fn validate_legacy_v2_shape(&self) -> Result<(), ControllerError> {
                 self.shape_calls.fetch_add(1, Ordering::SeqCst);
                 if self.shape_valid {
@@ -2054,8 +2433,8 @@ mod tests {
                 string_columns += 1;
             }
         }
-        assert_eq!(queries, 14);
-        assert_eq!(string_columns, 16);
+        assert_eq!(queries, 15);
+        assert_eq!(string_columns, 17);
     }
 
     #[test]
