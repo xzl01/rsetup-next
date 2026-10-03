@@ -216,6 +216,7 @@ struct ColumnMeta {
     nullable: bool,
     character_set_name: Option<String>,
     collation_name: Option<String>,
+    default: Option<String>,
 }
 
 // Task 2 consumes this from the migration preflight; Task 1 only tests the pure rule.
@@ -294,6 +295,42 @@ fn validate_column_shape(
         return Err(ControllerError::Config(format!(
             "migration incompatible column {table}.{}: expected {expected}, got {} {} nullable={}",
             actual.name, actual.data_type, actual.column_type, actual.nullable
+        )));
+    }
+    validate_column_default(table, &actual.name, &tokens, actual.default.as_deref())?;
+    Ok(())
+}
+
+fn validate_column_default(
+    table: &str,
+    column: &str,
+    declaration: &[&str],
+    default: Option<&str>,
+) -> Result<(), ControllerError> {
+    let declared = declaration
+        .windows(2)
+        .find(|part| part[0].eq_ignore_ascii_case("DEFAULT"))
+        .map(|part| part[1]);
+    let expected = match declared {
+        Some(value) if value.eq_ignore_ascii_case("FALSE") || value == "0" => Some("0"),
+        None if !declaration
+            .iter()
+            .any(|token| token.eq_ignore_ascii_case("DEFAULT")) =>
+        {
+            None
+        }
+        _ => {
+            return Err(ControllerError::Config(format!(
+                "migration unsupported default declaration {table}.{column}"
+            )));
+        }
+    };
+    if expected == Some("0") {
+        return validate_false_default_metadata(table, column, default);
+    }
+    if default.is_some() {
+        return Err(ControllerError::Config(format!(
+            "migration incompatible default {table}.{column}"
         )));
     }
     Ok(())
@@ -1017,7 +1054,13 @@ fn validate_v3_column_charset(
         declared_type.split('(').next().unwrap(),
         "varchar" | "char" | "text" | "tinytext" | "mediumtext" | "longtext"
     );
-    if !character_column || declaration.contains("CHARACTER SET ") {
+    if !character_column {
+        return Ok(());
+    }
+    // The old username declaration is annotated with its inherited utf8mb4
+    // charset for classification, but does not declare its own collation.
+    // It must still inherit the table collation from the original 0001 DDL.
+    if declaration.contains("CHARACTER SET ") && !declaration.contains("CHARACTER SET utf8mb4") {
         return Ok(());
     }
     if actual.character_set_name.as_deref() != Some("utf8mb4")
@@ -1209,22 +1252,8 @@ async fn validate_schema_shape_with_policy(
                     table_collation.as_deref().unwrap(),
                 )?;
             }
-            if migration == V3_MIGRATION {
-                validate_v3_false_default(db, table, column).await?;
-            }
-            if legacy_version.is_some()
-                && matches!(
-                    (table, column),
-                    ("schema_meta", "initialized")
-                        | ("sessions", "revoked")
-                        | ("devices", "archived")
-                )
-            {
-                validate_v3_false_default(db, table, column).await?;
-            }
-            if table == "schema_meta" && matches!(column, "authz_epoch" | "admin_guard_revision") {
-                validate_counter_default(db, column).await?;
-            }
+            // Every column's default is checked by validate_column_shape,
+            // including the legacy old/target classification above.
         }
         let expected = expected_indexes(&parts, indexes)?;
         let rows = sqlx::query(STATISTICS_QUERY)
@@ -1319,17 +1348,36 @@ async fn read_column(
     table: &str,
     column: &str,
 ) -> Result<ColumnMeta, ControllerError> {
-    let row = sqlx::query("SELECT CAST(data_type AS CHAR) AS data_type, CAST(column_type AS CHAR) AS column_type, CAST(is_nullable AS CHAR) AS is_nullable, CAST(character_set_name AS CHAR) AS character_set_name, CAST(collation_name AS CHAR) AS collation_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?")
+    let row = sqlx::query("SELECT CAST(data_type AS CHAR) AS data_type, CAST(column_type AS CHAR) AS column_type, CAST(is_nullable AS CHAR) AS is_nullable, CAST(character_set_name AS CHAR) AS character_set_name, CAST(collation_name AS CHAR) AS collation_name, CAST(column_default AS CHAR) AS column_default FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?")
         .bind(table).bind(column).fetch_optional(&db.0).await?
         .ok_or_else(|| ControllerError::Config(format!("migration missing column {table}.{column}")))?;
     Ok(ColumnMeta {
         name: column.to_owned(),
         data_type: row.try_get("data_type")?,
         column_type: row.try_get("column_type")?,
-        nullable: row.try_get::<String, _>("is_nullable")? == "YES",
+        nullable: parse_nullable_metadata(
+            table,
+            column,
+            row.try_get::<Option<String>, _>("is_nullable")?.as_deref(),
+        )?,
         character_set_name: row.try_get("character_set_name")?,
         collation_name: row.try_get("collation_name")?,
+        default: row.try_get("column_default")?,
     })
+}
+
+fn parse_nullable_metadata(
+    table: &str,
+    column: &str,
+    value: Option<&str>,
+) -> Result<bool, ControllerError> {
+    match value {
+        Some("YES") => Ok(true),
+        Some("NO") => Ok(false),
+        _ => Err(ControllerError::Config(format!(
+            "migration incompatible nullability metadata {table}.{column}"
+        ))),
+    }
 }
 
 fn validate_false_default_metadata(
@@ -1346,33 +1394,6 @@ fn validate_false_default_metadata(
             "migration incompatible default {table}.{column}"
         )))
     }
-}
-
-async fn validate_v3_false_default(
-    db: &DbPool,
-    table: &str,
-    column: &str,
-) -> Result<(), ControllerError> {
-    if !matches!(
-        (table, column),
-        ("schema_meta", "initialized") | ("sessions", "revoked") | ("devices", "archived")
-    ) {
-        return Ok(());
-    }
-    let default: Option<String> = sqlx::query_scalar("SELECT CAST(column_default AS CHAR) AS column_default FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?")
-        .bind(table).bind(column).fetch_one(&db.0).await?;
-    validate_false_default_metadata(table, column, default.as_deref())
-}
-
-async fn validate_counter_default(db: &DbPool, column: &str) -> Result<(), ControllerError> {
-    let default: Option<String> = sqlx::query_scalar("SELECT CAST(column_default AS CHAR) AS column_default FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'schema_meta' AND column_name = ?")
-        .bind(column).fetch_one(&db.0).await?;
-    if default.as_deref() != Some("0") {
-        return Err(ControllerError::Config(format!(
-            "migration incompatible default schema_meta.{column}"
-        )));
-    }
-    Ok(())
 }
 
 async fn read_version(db: &DbPool) -> Result<Option<i32>, ControllerError> {
@@ -2671,6 +2692,7 @@ mod tests {
             nullable: false,
             character_set_name: None,
             collation_name: None,
+            default: None,
         };
         assert!(classify_identity_column("devices", "revision", &old).unwrap());
         let new = ColumnMeta {
@@ -2910,8 +2932,8 @@ mod tests {
                 string_columns += 1;
             }
         }
-        assert_eq!(queries, 16);
-        assert_eq!(string_columns, 20);
+        assert_eq!(queries, 14);
+        assert_eq!(string_columns, 19);
     }
 
     #[test]
@@ -3097,6 +3119,7 @@ mod tests {
             nullable: false,
             character_set_name: Some("utf8mb4".into()),
             collation_name: Some("utf8mb4_bin".into()),
+            default: None,
         };
         for (table, declaration) in [
             ("users", "VARCHAR(128) NOT NULL"),
@@ -3143,6 +3166,50 @@ mod tests {
     }
 
     #[test]
+    fn legacy_username_utf8mb4_collation_matches_table_default() {
+        let old = ColumnMeta {
+            name: "username".into(),
+            data_type: "varchar".into(),
+            column_type: "varchar(128)".into(),
+            nullable: false,
+            character_set_name: Some("utf8mb4".into()),
+            collation_name: Some("utf8mb4_bin".into()),
+            default: None,
+        };
+        let old_declaration = identity_column_declarations("users", "username").unwrap().0;
+        assert!(validate_v3_table_collation("users", "utf8mb4_bin").is_ok());
+        assert!(validate_column_shape("users", old_declaration, &old).is_ok());
+        assert!(validate_v3_column_charset("users", old_declaration, &old, "utf8mb4_bin").is_ok());
+        let changed = ColumnMeta {
+            collation_name: Some("utf8mb4_general_ci".into()),
+            ..old.clone()
+        };
+        assert!(
+            validate_v3_column_charset("users", old_declaration, &changed, "utf8mb4_bin").is_err()
+        );
+        // Original 0001 has no explicit charset and already rejects this drift.
+        assert!(
+            validate_v3_column_charset("users", "VARCHAR(128) NOT NULL", &changed, "utf8mb4_bin")
+                .is_err()
+        );
+        let target = ColumnMeta {
+            column_type: "varchar(64)".into(),
+            character_set_name: Some("ascii".into()),
+            collation_name: Some("ascii_bin".into()),
+            ..old
+        };
+        assert!(
+            validate_v3_column_charset(
+                "users",
+                identity_column_declarations("users", "username").unwrap().1,
+                &target,
+                "utf8mb4_bin"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn v3_false_defaults_are_part_of_the_readonly_shape_gate() {
         let source = include_str!("db.rs");
         let body = source
@@ -3152,7 +3219,128 @@ mod tests {
             .split_once("\nasync fn read_column(")
             .unwrap()
             .0;
-        assert!(body.contains("validate_v3_false_default(db, table, column).await?"));
+        assert!(body.contains("validate_column_shape(table, declaration, &actual)"));
+        assert!(source.contains("CAST(column_default AS CHAR) AS column_default"));
+    }
+
+    #[test]
+    fn every_legacy_and_v3_column_rejects_unexpected_defaults() {
+        let validate_with_default =
+            |table: &str, declaration: &str, actual: &ColumnMeta, default: Option<&str>| {
+                validate_column_shape(
+                    table,
+                    declaration,
+                    &ColumnMeta {
+                        default: default.map(str::to_owned),
+                        ..actual.clone()
+                    },
+                )
+            };
+        let active = ColumnMeta {
+            name: "active".into(),
+            data_type: "tinyint".into(),
+            column_type: "tinyint(1)".into(),
+            nullable: false,
+            character_set_name: None,
+            collation_name: None,
+            default: None,
+        };
+        for migration in [MIGRATION, V3_MIGRATION] {
+            let declaration = ddl_parts_from(migration, "users")
+                .into_iter()
+                .find_map(|part| part.strip_prefix("active ").map(str::to_owned))
+                .unwrap();
+            assert!(validate_with_default("users", &declaration, &active, None).is_ok());
+            assert!(validate_with_default("users", &declaration, &active, Some("1")).is_err());
+        }
+    }
+
+    #[test]
+    fn every_ddl_column_default_is_closed_in_legacy_and_v3() {
+        for migration in [MIGRATION, V3_MIGRATION] {
+            let mut columns = 0;
+            let mut explicit_zero = 0;
+            for &(table, names, _) in TABLES {
+                let parts = ddl_parts_from(migration, table);
+                for &name in names {
+                    let declaration = parts
+                        .iter()
+                        .find_map(|part| part.strip_prefix(&format!("{name} ")))
+                        .unwrap();
+                    let token = declaration
+                        .split_whitespace()
+                        .next()
+                        .unwrap()
+                        .to_ascii_lowercase();
+                    let data_type = token.split('(').next().unwrap();
+                    let actual_type = if data_type == "boolean" {
+                        "tinyint(1)".to_owned()
+                    } else if declaration.contains("UNSIGNED") {
+                        format!("{token} unsigned")
+                    } else {
+                        token.clone()
+                    };
+                    let default = declaration.contains("DEFAULT ").then(|| "0".to_owned());
+                    let actual = ColumnMeta {
+                        name: name.into(),
+                        data_type: if data_type == "boolean" {
+                            "tinyint"
+                        } else {
+                            data_type
+                        }
+                        .into(),
+                        column_type: actual_type,
+                        nullable: !declaration.contains("NOT NULL"),
+                        character_set_name: declaration
+                            .contains("CHARACTER SET ascii")
+                            .then(|| "ascii".into()),
+                        collation_name: declaration
+                            .contains("COLLATE ascii_bin")
+                            .then(|| "ascii_bin".into()),
+                        default: default.clone(),
+                    };
+                    assert!(
+                        validate_column_shape(table, declaration, &actual).is_ok(),
+                        "{table}.{name}"
+                    );
+                    let drift = ColumnMeta {
+                        default: Some("1".into()),
+                        ..actual.clone()
+                    };
+                    let error = validate_column_shape(table, declaration, &drift).unwrap_err();
+                    assert!(!format!("{error}").contains("1"));
+                    if default.is_some() {
+                        explicit_zero += 1;
+                        assert!(
+                            validate_column_shape(
+                                table,
+                                declaration,
+                                &ColumnMeta {
+                                    default: None,
+                                    ..actual.clone()
+                                }
+                            )
+                            .is_err()
+                        );
+                    } else {
+                        assert!(
+                            validate_column_shape(
+                                table,
+                                declaration,
+                                &ColumnMeta {
+                                    default: Some("CURRENT_TIMESTAMP".into()),
+                                    ..actual.clone()
+                                }
+                            )
+                            .is_err()
+                        );
+                    }
+                    columns += 1;
+                }
+            }
+            assert_eq!(columns, 70);
+            assert_eq!(explicit_zero, 5);
+        }
     }
 
     #[test]
@@ -3224,6 +3412,7 @@ mod tests {
             nullable: false,
             character_set_name: None,
             collation_name: None,
+            default: None,
         };
         let unsigned = ColumnMeta {
             column_type: "bigint unsigned".into(),
@@ -3246,6 +3435,7 @@ mod tests {
             nullable: false,
             character_set_name: Some("ascii".into()),
             collation_name: Some("ascii_bin".into()),
+            default: None,
         };
         assert!(
             validate_column_shape(
@@ -3317,6 +3507,7 @@ mod tests {
                 nullable: false,
                 character_set_name: None,
                 collation_name: None,
+                default: None,
             };
             let unsigned = ColumnMeta {
                 column_type: "bigint unsigned".into(),
@@ -3338,6 +3529,7 @@ mod tests {
             nullable: false,
             character_set_name: None,
             collation_name: None,
+            default: None,
         };
         assert!(validate_column_shape("schema_meta", "INT NOT NULL", &version).is_ok());
     }
@@ -3351,6 +3543,7 @@ mod tests {
             nullable: false,
             character_set_name: None,
             collation_name: None,
+            default: None,
         };
         assert!(validate_column_shape("devices", "BINARY(32) NOT NULL", &base).is_ok());
         for altered in [
@@ -3585,6 +3778,7 @@ mod tests {
                     } else {
                         None
                     },
+                    default: decl.contains("DEFAULT 0").then(|| "0".into()),
                 }
             };
             let old = meta(old);
@@ -3601,6 +3795,7 @@ mod tests {
             nullable: false,
             character_set_name: None,
             collation_name: None,
+            default: None,
         };
         assert!(validate_legacy_column(3, "users", "revision", &old).is_err());
     }
@@ -3787,6 +3982,17 @@ mod tests {
     }
 
     #[test]
+    fn nullable_readback_accepts_only_yes_or_no() {
+        let parse = |value: Option<&str>| parse_nullable_metadata("users", "active", value);
+        assert!(parse(Some("YES")).unwrap());
+        assert!(!parse(Some("NO")).unwrap());
+        for unknown in [None, Some("UNKNOWN"), Some("FALSE"), Some("no"), Some("")] {
+            let error = parse(unknown).unwrap_err();
+            assert!(!format!("{error}").contains("UNKNOWN"));
+        }
+    }
+
+    #[test]
     fn nullable_json_and_boolean_alias_match_migration() {
         let json = ColumnMeta {
             name: "descriptor_json".into(),
@@ -3795,6 +4001,7 @@ mod tests {
             nullable: true,
             character_set_name: None,
             collation_name: None,
+            default: None,
         };
         let bool_col = ColumnMeta {
             name: "initialized".into(),
@@ -3803,6 +4010,7 @@ mod tests {
             nullable: false,
             character_set_name: None,
             collation_name: None,
+            default: Some("0".into()),
         };
         assert!(validate_column_shape("devices", "JSON NULL", &json).is_ok());
         assert!(
