@@ -33,7 +33,7 @@
 
 **Files:** Modify/Test `crates/rsetup-controller/src/db.rs`（现有 `ColumnMeta`、`validate_column_shape`、全部旧 `ColumnMeta` fixture 和测试）。
 
-**Interfaces:** 保留 `validate_column_shape(table: &str, expected: &str, actual: &ColumnMeta) -> Result<(),ControllerError>`；`ColumnMeta` 新增 `character_set_name: Option<String>, collation_name: Option<String>`；新增 `fn valid_username(s: &str) -> bool` 给 Task 2 使用。
+**Interfaces:** 保留 `validate_column_shape(table: &str, expected: &str, actual: &ColumnMeta) -> Result<(),ControllerError>`；`ColumnMeta` 新增 `character_set_name: Option<String>, collation_name: Option<String>`；新增 `pub(crate) fn valid_username(s: &str) -> bool` 给 Task 2 使用。
 
 - [ ] **Step 1 测试。** 只加两个 metadata 字段并给旧 fixture 补 `None`，不加入新的比较；先给 `valid_username` 可编译桩 `fn valid_username(_: &str) -> bool { true }`。在 `db.rs::tests` 加：
 
@@ -81,7 +81,7 @@ WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?
 `row.try_get::<Option<String>, _>("character_set_name")?` 与 `collation_name` 装入新字段；比 `DATA_TYPE`、`COLUMN_TYPE` 的 unsigned token（不能只看 bigint 同宽）、长度、nullable 和 username 确切 ascii/ascii_bin；非字符列字段为 None。用户名检查直接使用：
 
 ```rust
-fn valid_username(s: &str) -> bool {
+pub(crate) fn valid_username(s: &str) -> bool {
     let bytes = s.as_bytes();
     (3..=64).contains(&bytes.len())
         && bytes.first().is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
@@ -210,7 +210,7 @@ async fn identity_contract_fresh_and_restart() {
 #[test]
 fn admission_revision_crosses_signed_boundary() {
     let current = AdmissionSnapshot { admission_state: AdmissionState::Pending,
-        review_decision: ReviewDecision::None, revision: i64::MAX };
+        review_decision: ReviewDecision::None, revision: i64::MAX as _ };
     let next = next_snapshot(current, ReviewDecision::Approved).unwrap();
     assert_eq!(next.revision as u64, i64::MAX as u64 + 1);
 }
