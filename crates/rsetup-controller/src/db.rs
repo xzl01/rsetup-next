@@ -11,6 +11,7 @@ impl DbPool {
 
 const MIGRATION: &str = include_str!("../migrations/0001_identity_devices.sql");
 const IDENTITY_MIGRATION: &str = include_str!("../migrations/0002_identity_contract.sql");
+const STATISTICS_QUERY: &str = "SELECT CAST(index_name AS CHAR) AS index_name, CAST(column_name AS CHAR) AS column_name, CAST(non_unique AS SIGNED) AS non_unique, CAST(seq_in_index AS SIGNED) AS seq_in_index, CAST(sub_part AS SIGNED) AS sub_part FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? ORDER BY index_name, seq_in_index";
 // Fixed statements and identifiers: never interpolate database-supplied table/column names.
 const IDENTITY_COLUMNS: &[(&str, &str, &str, &str)] = &[
     (
@@ -468,6 +469,28 @@ fn normalize_check(value: &str) -> String {
     text
 }
 
+fn check_clause_matches(table: &str, name: &str, stored: &str, declared: &str) -> bool {
+    if normalize_check(stored) == normalize_check(declared) {
+        return true;
+    }
+    // MySQL 8.0.46 with CAST(check_clause AS CHAR) was observed returning
+    // literal backslashes before each quote. Accept only these two complete
+    // readbacks against their unchanged fixed 0001 declarations.
+    match (table, name, stored) {
+        (
+            "devices",
+            "chk_devices_state",
+            "(`admission_state` in (_utf8mb4\\'PENDING\\',_utf8mb4\\'APPROVED\\',_utf8mb4\\'REVOKED\\'))",
+        ) => declared == "(admission_state IN ('PENDING','APPROVED','REVOKED'))",
+        (
+            "devices",
+            "chk_devices_decision",
+            "(`review_decision` in (_utf8mb4\\'none\\',_utf8mb4\\'approved\\',_utf8mb4\\'denied\\',_utf8mb4\\'revoked\\'))",
+        ) => declared == "(review_decision IN ('none','approved','denied','revoked'))",
+        _ => false,
+    }
+}
+
 fn expected_indexes(parts: &[String], names: &[&str]) -> Result<Vec<IndexMeta>, ControllerError> {
     let mut expected = Vec::new();
     for &name in names {
@@ -594,7 +617,7 @@ fn authorize_test_migration(c: &TestMigrationConfig, actual: &str) -> Result<(),
         && (1..=64).contains(&c.expected_database.len())
         && c.expected_database
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
         && c.expected_database == actual
         && !c.backup_ref.trim().is_empty()
         && c.migration_ack == "isolated-exclusive-backed-up-disposable";
@@ -671,7 +694,7 @@ where
 
 async fn validate_schema_shape(db: &DbPool, target: Option<bool>) -> Result<(), ControllerError> {
     let present: Vec<String> = sqlx::query_scalar(
-        "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE()",
+        "SELECT CAST(table_name AS CHAR) AS table_name FROM information_schema.tables WHERE table_schema = DATABASE()",
     )
     .fetch_all(&db.0)
     .await?;
@@ -686,7 +709,7 @@ async fn validate_schema_shape(db: &DbPool, target: Option<bool>) -> Result<(), 
     }
     for &(table, columns, indexes) in TABLES {
         let parts = ddl_parts(table);
-        let actual_columns: Vec<String> = sqlx::query_scalar("SELECT column_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ?")
+        let actual_columns: Vec<String> = sqlx::query_scalar("SELECT CAST(column_name AS CHAR) AS column_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ?")
             .bind(table).fetch_all(&db.0).await?;
         validate_object_names(
             table,
@@ -733,8 +756,10 @@ async fn validate_schema_shape(db: &DbPool, target: Option<bool>) -> Result<(), 
             }
         }
         let expected = expected_indexes(&parts, indexes)?;
-        let rows = sqlx::query("SELECT index_name, column_name, non_unique, seq_in_index, sub_part FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? ORDER BY index_name, seq_in_index")
-            .bind(table).fetch_all(&db.0).await?;
+        let rows = sqlx::query(STATISTICS_QUERY)
+            .bind(table)
+            .fetch_all(&db.0)
+            .await?;
         let mut actual: Vec<IndexMeta> = Vec::new();
         for row in rows {
             let name: String = row.try_get("index_name")?;
@@ -770,17 +795,17 @@ async fn validate_schema_shape(db: &DbPool, target: Option<bool>) -> Result<(), 
             .filter(|part| part.starts_with("CONSTRAINT "))
             .map(|part| part.split_whitespace().nth(1).unwrap().to_owned())
             .collect();
-        let actual_checks: Vec<String> = sqlx::query_scalar("SELECT constraint_name FROM information_schema.table_constraints WHERE table_schema = DATABASE() AND table_name = ? AND constraint_type = 'CHECK'")
+        let actual_checks: Vec<String> = sqlx::query_scalar("SELECT CAST(constraint_name AS CHAR) AS constraint_name FROM information_schema.table_constraints WHERE table_schema = DATABASE() AND table_name = ? AND constraint_type = 'CHECK'")
             .bind(table).fetch_all(&db.0).await?;
         validate_object_names(table, "check", &expected_checks, &actual_checks)?;
         for part in parts.iter().filter(|part| part.starts_with("CONSTRAINT ")) {
             let name = part.split_whitespace().nth(1).unwrap();
-            let stored: Option<String> = sqlx::query_scalar("SELECT cc.check_clause FROM information_schema.table_constraints tc JOIN information_schema.check_constraints cc ON cc.constraint_schema = tc.constraint_schema AND cc.constraint_name = tc.constraint_name WHERE tc.table_schema = DATABASE() AND tc.table_name = ? AND tc.constraint_name = ? AND tc.constraint_type = 'CHECK'")
+            let stored: Option<String> = sqlx::query_scalar("SELECT CAST(cc.check_clause AS CHAR) AS check_clause FROM information_schema.table_constraints tc JOIN information_schema.check_constraints cc ON cc.constraint_schema = tc.constraint_schema AND cc.constraint_name = tc.constraint_name WHERE tc.table_schema = DATABASE() AND tc.table_name = ? AND tc.constraint_name = ? AND tc.constraint_type = 'CHECK'")
                 .bind(table).bind(name).fetch_optional(&db.0).await?;
             let declared = part.split_once("CHECK ").unwrap().1;
             if !stored
                 .as_deref()
-                .is_some_and(|value| normalize_check(value) == normalize_check(declared))
+                .is_some_and(|value| check_clause_matches(table, name, value, declared))
             {
                 return Err(ControllerError::Config(format!(
                     "migration incompatible check constraint {table}.{name}"
@@ -796,7 +821,7 @@ async fn read_column(
     table: &str,
     column: &str,
 ) -> Result<ColumnMeta, ControllerError> {
-    let row = sqlx::query("SELECT data_type, column_type, is_nullable, character_set_name, collation_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?")
+    let row = sqlx::query("SELECT CAST(data_type AS CHAR) AS data_type, CAST(column_type AS CHAR) AS column_type, CAST(is_nullable AS CHAR) AS is_nullable, CAST(character_set_name AS CHAR) AS character_set_name, CAST(collation_name AS CHAR) AS collation_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?")
         .bind(table).bind(column).fetch_optional(&db.0).await?
         .ok_or_else(|| ControllerError::Config(format!("migration missing column {table}.{column}")))?;
     Ok(ColumnMeta {
@@ -810,7 +835,7 @@ async fn read_column(
 }
 
 async fn validate_counter_default(db: &DbPool, column: &str) -> Result<(), ControllerError> {
-    let default: Option<String> = sqlx::query_scalar("SELECT column_default FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'schema_meta' AND column_name = ?")
+    let default: Option<String> = sqlx::query_scalar("SELECT CAST(column_default AS CHAR) AS column_default FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'schema_meta' AND column_name = ?")
         .bind(column).fetch_one(&db.0).await?;
     if default.as_deref() != Some("0") {
         return Err(ControllerError::Config(format!(
@@ -1323,6 +1348,10 @@ mod tests {
         config.migration_ack = "isolated-exclusive-backed-up-disposable".into();
         assert!(config.authorize("development_identity").is_ok());
         assert!(config.authorize("development_other").is_err());
+        config.expected_database = "development-identity".into();
+        assert!(config.authorize("development-identity").is_ok());
+        assert!(config.authorize("development_identity").is_err());
+        config.expected_database = "development_identity".into();
         for invalid in [
             TestMigrationConfig {
                 allow_destructive: false,
@@ -1343,12 +1372,7 @@ mod tests {
         ] {
             assert!(invalid.authorize("development_identity").is_err());
         }
-        for invalid_name in [
-            "",
-            "development-identity",
-            " development_identity",
-            "développement",
-        ] {
+        for invalid_name in ["", " development_identity", "développement"] {
             let invalid = TestMigrationConfig {
                 expected_database: invalid_name.into(),
                 ..config.clone()
@@ -1558,6 +1582,85 @@ mod tests {
         let mut prefix = expected.clone();
         prefix[1].sub_parts = vec![Some(3)];
         assert!(validate_indexes("users", &expected, &prefix).is_err());
+    }
+
+    #[test]
+    fn information_schema_string_projections_are_cast_for_sqlx() {
+        // These SQL literals are kept on single source lines; catch new uncast
+        // information_schema string projections without connecting to a database.
+        let source = include_str!("db.rs");
+        let production = source.split_once("\n#[cfg(test)]\nmod tests {").unwrap().0;
+        let mut queries = 0;
+        let mut string_columns = 0;
+        for line in production
+            .lines()
+            .filter(|line| line.contains("SELECT ") && line.contains("information_schema."))
+        {
+            queries += 1;
+            let projections = line
+                .split_once("SELECT ")
+                .unwrap()
+                .1
+                .split_once(" FROM ")
+                .unwrap()
+                .0;
+            for projection in projections.split(", ") {
+                if matches!(
+                    projection,
+                    "COUNT(*)"
+                        | "CAST(non_unique AS SIGNED) AS non_unique"
+                        | "CAST(seq_in_index AS SIGNED) AS seq_in_index"
+                        | "CAST(sub_part AS SIGNED) AS sub_part"
+                ) {
+                    continue;
+                }
+                let column = projection
+                    .strip_prefix("CAST(")
+                    .and_then(|value| value.split_once(" AS CHAR) AS "))
+                    .unwrap_or_else(|| {
+                        panic!("uncast information_schema projection: {projection}")
+                    });
+                assert_eq!(column.0.rsplit('.').next().unwrap(), column.1);
+                assert!(matches!(
+                    column.1,
+                    "table_name"
+                        | "column_name"
+                        | "index_name"
+                        | "constraint_name"
+                        | "check_clause"
+                        | "data_type"
+                        | "column_type"
+                        | "is_nullable"
+                        | "character_set_name"
+                        | "collation_name"
+                        | "column_default"
+                ));
+                string_columns += 1;
+            }
+        }
+        assert_eq!(queries, 9);
+        assert_eq!(string_columns, 12);
+    }
+
+    #[test]
+    fn statistics_numeric_projections_keep_lowercase_result_names() {
+        let projections = STATISTICS_QUERY
+            .split_once("SELECT ")
+            .unwrap()
+            .1
+            .split_once(" FROM information_schema.statistics ")
+            .unwrap()
+            .0;
+        assert_eq!(
+            projections.split(", ").collect::<Vec<_>>(),
+            [
+                "CAST(index_name AS CHAR) AS index_name",
+                "CAST(column_name AS CHAR) AS column_name",
+                "CAST(non_unique AS SIGNED) AS non_unique",
+                "CAST(seq_in_index AS SIGNED) AS seq_in_index",
+                "CAST(sub_part AS SIGNED) AS sub_part",
+            ]
+        );
     }
 
     #[test]
@@ -1895,6 +1998,61 @@ mod tests {
             normalize_check(declared),
             normalize_check("source_kind = 'ro/* metadata */le'")
         );
+    }
+
+    #[test]
+    fn mysql_8046_escaped_check_readback_accepts_only_observed_forms() {
+        for (name, observed) in [
+            (
+                "chk_devices_state",
+                "(`admission_state` in (_utf8mb4\\'PENDING\\',_utf8mb4\\'APPROVED\\',_utf8mb4\\'REVOKED\\'))",
+            ),
+            (
+                "chk_devices_decision",
+                "(`review_decision` in (_utf8mb4\\'none\\',_utf8mb4\\'approved\\',_utf8mb4\\'denied\\',_utf8mb4\\'revoked\\'))",
+            ),
+        ] {
+            let part = ddl_parts("devices")
+                .into_iter()
+                .find(|part| part.starts_with(&format!("CONSTRAINT {name} ")))
+                .unwrap();
+            let declared = part.split_once("CHECK ").unwrap().1;
+            assert!(
+                check_clause_matches("devices", name, observed, declared),
+                "{name}"
+            );
+            for changed in [
+                observed.replace("PENDING", "PEND ING"),
+                observed.replace("PENDING", "pending"),
+                observed.replace("none", "None"),
+                observed.replace("_utf8mb4", "_latin1"),
+                observed.replace("\\'approved", "\\'app''roved"),
+                observed.replace("\\'PENDING", "'PENDING"),
+                observed.replace("\\'", "\\\\'"),
+                format!("{observed} OR 1=1"),
+            ] {
+                if changed != observed {
+                    assert!(
+                        !check_clause_matches("devices", name, &changed, declared),
+                        "{changed}"
+                    );
+                }
+            }
+            assert!(!check_clause_matches("grants", name, observed, declared));
+            assert!(!check_clause_matches(
+                "devices",
+                "chk_grants_source",
+                observed,
+                declared
+            ));
+            assert!(!check_clause_matches("devices", name, observed, "(1 = 1)"));
+        }
+        assert!(check_clause_matches(
+            "schema_meta",
+            "chk_schema_singleton",
+            "(`singleton` = 1)",
+            "(singleton = 1)"
+        ));
     }
 
     #[test]
