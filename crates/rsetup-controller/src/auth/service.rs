@@ -43,9 +43,13 @@ pub trait IdentityRepository: Send + Sync {
         digest: [u8; 32],
         epoch: [u8; 16],
     ) -> impl Future<Output = Result<Option<IdentityUser>, ControllerError>> + Send;
+    /// Atomically require an unrevoked session with this digest, user id and
+    /// process epoch, an active user, and the supplied hash/revision; only then
+    /// update the password and revoke that user's sessions in the same boundary.
     fn change_password(
         &self,
-        user: &IdentityUser,
+        session: &Session,
+        epoch: [u8; 16],
         next_hash: &str,
     ) -> impl Future<Output = Result<(), ControllerError>> + Send;
     fn revoke_session(
@@ -89,14 +93,23 @@ impl<R: IdentityRepository> AuthService<R> {
         })
     }
     pub async fn authenticate(&self, raw: &str) -> Result<Session, ControllerError> {
+        self.authenticate_with_now(raw, Instant::now).await
+    }
+    async fn authenticate_with_now(
+        &self,
+        raw: &str,
+        now: impl Fn() -> Instant,
+    ) -> Result<Session, ControllerError> {
         let digest = token_digest(raw.as_bytes());
-        self.clock
-            .check(digest, &self.clock.epoch, Instant::now())?;
         let user = self
             .repo
             .find_session(digest, self.clock.epoch)
             .await?
             .ok_or(ControllerError::InvalidArgument)?;
+        if !user.active {
+            return Err(ControllerError::InvalidArgument);
+        }
+        self.clock.check(digest, &self.clock.epoch, now())?;
         Ok(Session { user, digest })
     }
     pub async fn change_password(
@@ -113,7 +126,9 @@ impl<R: IdentityRepository> AuthService<R> {
         }
         crate::auth::password::validate_new_password(current_password, new_password)?;
         let next_hash = self.hasher.hash(new_password)?;
-        self.repo.change_password(&session.user, &next_hash).await
+        self.repo
+            .change_password(session, self.clock.epoch, &next_hash)
+            .await
     }
     pub async fn logout(&self, session: &Session) -> Result<(), ControllerError> {
         self.repo.revoke_session(session.digest).await?;
@@ -125,7 +140,11 @@ impl<R: IdentityRepository> AuthService<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use crate::auth::session::IDLE;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct AuthStateSnapshot {
         password_hash: String,
@@ -135,9 +154,11 @@ mod tests {
         revision: i64,
         sessions: Vec<([u8; 32], bool)>,
     }
-    type StoredSession = ([u8; 32], bool, [u8; 16]);
+    type StoredSession = ([u8; 32], bool, [u8; 16], [u8; 16]);
     struct FakeRepo {
         state: Mutex<(IdentityUser, Vec<StoredSession>)>,
+        lookup_error: AtomicBool,
+        lookup_advance: Mutex<Option<Arc<Mutex<Instant>>>>,
     }
     impl FakeRepo {
         fn auth_state(&self) -> AuthStateSnapshot {
@@ -145,7 +166,7 @@ mod tests {
             let mut sessions: Vec<_> = state
                 .1
                 .iter()
-                .map(|(hash, revoked, _)| (*hash, *revoked))
+                .map(|(hash, revoked, _, _)| (*hash, *revoked))
                 .collect();
             sessions.sort();
             AuthStateSnapshot {
@@ -165,11 +186,15 @@ mod tests {
         }
         async fn insert_session(
             &self,
-            _user_id: [u8; 16],
+            user_id: [u8; 16],
             digest: [u8; 32],
             epoch: [u8; 16],
         ) -> Result<(), ControllerError> {
-            self.state.lock().unwrap().1.push((digest, false, epoch));
+            self.state
+                .lock()
+                .unwrap()
+                .1
+                .push((digest, false, epoch, user_id));
             Ok(())
         }
         async fn find_session(
@@ -177,21 +202,46 @@ mod tests {
             digest: [u8; 32],
             epoch: [u8; 16],
         ) -> Result<Option<IdentityUser>, ControllerError> {
+            if self.lookup_error.load(Ordering::SeqCst) {
+                return Err(ControllerError::InvalidArgument);
+            }
+            if let Some(now) = self.lookup_advance.lock().unwrap().as_ref() {
+                *now.lock().unwrap() += IDLE;
+            }
             let state = self.state.lock().unwrap();
             Ok(state
                 .1
                 .iter()
-                .any(|(h, r, e)| h == &digest && !r && e == &epoch)
+                .any(|(h, r, e, user_id)| {
+                    h == &digest && !r && e == &epoch && user_id == &state.0.id
+                })
                 .then(|| state.0.clone()))
         }
         async fn change_password(
             &self,
-            user: &IdentityUser,
+            session: &Session,
+            epoch: [u8; 16],
             next_hash: &str,
         ) -> Result<(), ControllerError> {
             let mut state = self.state.lock().unwrap();
-            if state.0.revision != user.revision || state.0.password_hash != user.password_hash {
+            if state.0.revision != session.user.revision
+                || state.0.password_hash != session.user.password_hash
+            {
                 return Err(ControllerError::RevisionConflict);
+            }
+            if !state
+                .1
+                .iter()
+                .any(|(digest, revoked, stored_epoch, user_id)| {
+                    digest == &session.digest
+                        && !revoked
+                        && stored_epoch == &epoch
+                        && user_id == &session.user.id
+                })
+                || !state.0.active
+                || state.0.id != session.user.id
+            {
+                return Err(ControllerError::InvalidArgument);
             }
             state.0.password_hash = next_hash.into();
             state.0.revision += 1;
@@ -225,8 +275,136 @@ mod tests {
                 },
                 Vec::new(),
             )),
+            lookup_error: AtomicBool::new(false),
+            lookup_advance: Mutex::new(None),
         });
         (AuthService::new(repo.clone()), repo)
+    }
+    #[tokio::test]
+    async fn slow_lookup_cannot_extend_session_past_old_idle_deadline() {
+        let (svc, repo) = auth_fixture();
+        let login = svc.login("alice", "old password").await.unwrap();
+        let now = Instant::now();
+        let manual_now = Arc::new(Mutex::new(now));
+        svc.clock.insert(login.session.digest, now - IDLE / 2);
+        *repo.lookup_advance.lock().unwrap() = Some(manual_now.clone());
+        let result = svc
+            .authenticate_with_now(&login.raw_token, || *manual_now.lock().unwrap())
+            .await;
+        assert!(matches!(result, Err(ControllerError::InvalidArgument)));
+        *repo.lookup_advance.lock().unwrap() = None;
+        assert!(
+            svc.authenticate_with_now(&login.raw_token, || *manual_now.lock().unwrap())
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn missing_session_does_not_extend_idle_on_recovery() {
+        let (svc, repo) = auth_fixture();
+        let login = svc.login("alice", "old password").await.unwrap();
+        let now = Instant::now();
+        svc.clock.insert(login.session.digest, now - IDLE / 2);
+        repo.state.lock().unwrap().1[0].1 = true;
+        assert!(svc.authenticate(&login.raw_token).await.is_err());
+        repo.state.lock().unwrap().1[0].1 = false;
+        assert!(
+            svc.authenticate_with_now(&login.raw_token, || now + IDLE / 2)
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn lookup_error_does_not_extend_idle_on_recovery() {
+        let (svc, repo) = auth_fixture();
+        let login = svc.login("alice", "old password").await.unwrap();
+        let now = Instant::now();
+        svc.clock.insert(login.session.digest, now - IDLE / 2);
+        repo.lookup_error.store(true, Ordering::SeqCst);
+        assert!(svc.authenticate(&login.raw_token).await.is_err());
+        repo.lookup_error.store(false, Ordering::SeqCst);
+        assert!(
+            svc.authenticate_with_now(&login.raw_token, || now + IDLE / 2)
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn inactive_user_cannot_authenticate_existing_session_or_extend_idle() {
+        let (svc, repo) = auth_fixture();
+        let login = svc.login("alice", "old password").await.unwrap();
+        let now = Instant::now();
+        svc.clock.insert(login.session.digest, now - IDLE / 2);
+        repo.state.lock().unwrap().0.active = false;
+        assert!(svc.authenticate(&login.raw_token).await.is_err());
+        assert!(
+            svc.clock
+                .check(login.session.digest, &svc.clock.epoch, now + IDLE / 2)
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn logged_out_session_snapshot_cannot_change_password() {
+        let (svc, repo) = auth_fixture();
+        let login = svc.login("alice", "old password").await.unwrap();
+        svc.logout(&login.session).await.unwrap();
+        let before = repo.auth_state();
+        let result = svc
+            .change_password(&login.session, "old password", "new password")
+            .await;
+        assert!(matches!(result, Err(ControllerError::InvalidArgument)));
+        assert_eq!(repo.auth_state(), before);
+        assert!(svc.login("alice", "old password").await.is_ok());
+    }
+    #[tokio::test]
+    async fn separately_revoked_snapshot_cannot_change_password_or_revoke_live_session() {
+        let (svc, repo) = auth_fixture();
+        let old = svc.login("alice", "old password").await.unwrap();
+        let live = svc.login("alice", "old password").await.unwrap();
+        repo.revoke_session(old.session.digest).await.unwrap();
+        let before = repo.auth_state();
+        let result = svc
+            .change_password(&old.session, "old password", "new password")
+            .await;
+        assert!(matches!(result, Err(ControllerError::InvalidArgument)));
+        assert_eq!(repo.auth_state(), before);
+        assert!(svc.authenticate(&live.raw_token).await.is_ok());
+    }
+    #[tokio::test]
+    async fn inactive_snapshot_cannot_change_password() {
+        let (svc, repo) = auth_fixture();
+        let login = svc.login("alice", "old password").await.unwrap();
+        repo.state.lock().unwrap().0.active = false;
+        let before = repo.auth_state();
+        let result = svc
+            .change_password(&login.session, "old password", "new password")
+            .await;
+        assert!(matches!(result, Err(ControllerError::InvalidArgument)));
+        assert_eq!(repo.auth_state(), before);
+    }
+    #[tokio::test]
+    async fn old_process_epoch_snapshot_cannot_change_password() {
+        let (svc, repo) = auth_fixture();
+        let login = svc.login("alice", "old password").await.unwrap();
+        let restarted = AuthService::new(repo.clone());
+        let before = repo.auth_state();
+        let result = restarted
+            .change_password(&login.session, "old password", "new password")
+            .await;
+        assert!(matches!(result, Err(ControllerError::InvalidArgument)));
+        assert_eq!(repo.auth_state(), before);
+    }
+    #[tokio::test]
+    async fn session_for_different_user_id_cannot_change_password() {
+        let (svc, repo) = auth_fixture();
+        let login = svc.login("alice", "old password").await.unwrap();
+        repo.state.lock().unwrap().1[0].3 = [2; 16];
+        let before = repo.auth_state();
+        let result = svc
+            .change_password(&login.session, "old password", "new password")
+            .await;
+        assert!(matches!(result, Err(ControllerError::InvalidArgument)));
+        assert_eq!(repo.auth_state(), before);
     }
     #[tokio::test]
     async fn wrong_current_password_preserves_account_and_sessions() {
