@@ -236,7 +236,47 @@ fn ddl_parts(table: &str) -> Vec<String> {
 }
 
 fn normalize_check(value: &str) -> String {
-    let mut text = value
+    // MySQL can add this introducer to CHECK string literals on metadata readback.
+    // Remove it only at a literal boundary, never inside a string or identifier.
+    let bytes = value.as_bytes();
+    let mut without_introducers = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    let mut quote = None;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(delimiter) = quote {
+            without_introducers.push(byte);
+            if byte == b'\\' && delimiter != b'`' && index + 1 < bytes.len() {
+                index += 1;
+                without_introducers.push(bytes[index]);
+            } else if byte == delimiter {
+                if bytes.get(index + 1) == Some(&delimiter) {
+                    index += 1;
+                    without_introducers.push(bytes[index]);
+                } else {
+                    quote = None;
+                }
+            }
+        } else if byte == b'_'
+            && (index == 0
+                || !matches!(bytes[index - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$'))
+            && bytes
+                .get(index..index + 8)
+                .is_some_and(|word| word.eq_ignore_ascii_case(b"_utf8mb4"))
+            && bytes.get(index + 8) == Some(&b'\'')
+        {
+            index += 8;
+            continue;
+        } else {
+            without_introducers.push(byte);
+            if matches!(byte, b'\'' | b'"' | b'`') {
+                quote = Some(byte);
+            }
+        }
+        index += 1;
+    }
+    let mut text = String::from_utf8(without_introducers)
+        .expect("removing ASCII introducers preserves UTF-8")
         .chars()
         .filter(|c| !c.is_whitespace() && *c != '`')
         .flat_map(char::to_lowercase)
@@ -704,6 +744,67 @@ mod tests {
             ddl_parts("devices")
                 .iter()
                 .any(|part| part.contains("chk_devices_state"))
+        );
+    }
+
+    #[test]
+    fn check_clause_normalization_accepts_utf8mb4_rewritten_ddl_literals() {
+        for (table, name, stored) in [
+            (
+                "devices",
+                "chk_devices_state",
+                "(`admission_state` in (_utf8mb4'PENDING',_utf8mb4'APPROVED',_utf8mb4'REVOKED'))",
+            ),
+            (
+                "devices",
+                "chk_devices_decision",
+                "(`review_decision` in (_utf8mb4'none',_utf8mb4'approved',_utf8mb4'denied',_utf8mb4'revoked'))",
+            ),
+            (
+                "grants",
+                "chk_grants_source",
+                "((`source_kind` = _utf8mb4'role' AND `role_id` IS NOT NULL AND `permissions` IS NULL) OR (`source_kind` = _utf8mb4'direct' AND `role_id` IS NULL AND `permissions` IS NOT NULL))",
+            ),
+            (
+                "grants",
+                "chk_grants_scope",
+                "((`scope_kind` = _utf8mb4'all' AND `scope_group_id` IS NULL AND `scope_device_id` IS NULL) OR (`scope_kind` = _utf8mb4'group' AND `scope_group_id` IS NOT NULL AND `scope_device_id` IS NULL) OR (`scope_kind` = _utf8mb4'device' AND `scope_group_id` IS NULL AND `scope_device_id` IS NOT NULL))",
+            ),
+        ] {
+            let part = ddl_parts(table)
+                .into_iter()
+                .find(|part| part.starts_with(&format!("CONSTRAINT {name} ")))
+                .unwrap();
+            let declared = part.split_once("CHECK ").unwrap().1;
+            assert_eq!(
+                normalize_check(stored),
+                normalize_check(declared),
+                "{table}.{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_clause_normalization_preserves_other_literals_and_expressions() {
+        let declared = "source_kind = 'role'";
+        for changed in [
+            "source_kind = _latin1'role'",
+            "source_kind = '_utf8mb4role'",
+            "source_kind = 'direct'",
+            "source_kind = _utf8mb4'role' AND role_id IS NULL",
+            "source_kind = x_utf8mb4'role'",
+            "source_kind = `_utf8mb4`'role'",
+            "source_kind = 'it\\'_utf8mb4role'",
+        ] {
+            assert_ne!(
+                normalize_check(changed),
+                normalize_check(declared),
+                "{changed}"
+            );
+        }
+        assert_ne!(
+            normalize_check("source_kind = 'it''_utf8mb4role'"),
+            normalize_check("source_kind = 'it''role'")
         );
     }
 
