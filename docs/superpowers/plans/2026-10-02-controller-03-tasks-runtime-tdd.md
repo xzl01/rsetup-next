@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - `controller-v1 / draft-1` 未获实施批准。用户仅同意条件性规划；API、状态、票据、NTP/数据库版本与限额/保留期须逐项审阅。05 §1/§2/§4/§6 的 NTP 单次请求上限3s、板端时钟 RTT 上限2s、状态保留112/s/其它48/s（可借空闲）、unknown 后台核实共用查询预算且可低频/不占重启并发槽，以及 05 §1 的私钥0600权限检查、启动进度日志，均为拟议而非获批；05 §10 仅列专项验收，不作为这些参数细节的出处。`reason_code` 签名、验签失败及 AEAD 失败策略的协议修订与双端测试完成前不得生产发布。
-- 依据[应用层完整性修订](../specs/2026-10-03-controller-application-integrity-design.md)，identity 0003 完成且只读结构/数据检查确认schema_version=3是未来Tasks的前置。身份v3只认精确identity表集合；未来Tasks0004必须验证完整runtime表/列/索引和应用完整性后才推进schema_version=4，重启仍完整检查。新schema无外键/CHECK，保留PK/UNIQUE/NOT NULL/类型长度；事务内校验引用与状态，不能仅添加Tasks表绕过闭合校验。普通启动只读拒绝未就绪schema，不自动ALTER。编号仅在确认实际部署与备份未占用3/4后适用；若已有Tasks0002/0003或其他占用，停下另审，不重用编号。开发库实测不等于生产部署盘点。
+- 依据[应用层完整性修订](../specs/2026-10-03-controller-application-integrity-design.md)，identity `0003_identity_application_integrity.sql` 完成且只读结构/数据检查确认 schema_version=3 是未来 Tasks 前置；迁移文件为 `0004_tasks.sql`，完成后 schema_version=4。v3 仅认精确 identity 表集合；v4 同时闭合检查 identity 与 runtime 的表/列/PK/唯一及普通索引、NULL/类型和应用数据完整性。空库、旧版或未知编号一律只读拒绝普通启动，不自动 CREATE/ALTER；未知/已占用 0003、0004 或版本标记与实际结构不符，停止迁移另审，不能猜编号、跳过 identity3 或只加 runtime 表。新 schema 无 FK/CHECK，保留 PK/UNIQUE/NOT NULL/类型长度；事务内校验引用、状态与锁所有权，不以 DB 约束替代。部署/备份编号盘点及两库测试均未由本计划完成；原协议安全门不变。
 - 新增依赖须在同一任务内连同根/crate manifest 与 `Cargo.lock` 提交；新依赖须过 MSRV 1.85 与 CI 多 target 检查。
 - 每个去重设备恰好一个子任务（包括失败目标）；同设备跨批次持久互斥，后来者 `DEVICE_BUSY` 且不排队。事务内无网络；dispatching 意图一旦提交视为可能已发送，恢复只查询核实。unknown 完成批次但持设备锁。
 - TTL、重试、保活、新鲜度使用单调时间，不持久复用上个进程的 monotonic 截止。独立 NTP 启动预算最多30s，fallback后仍 ready 且后台无限有界退避。每台在线设备10s常规采样/1024规模是目标而非已有性能证明；过载跳过不积压，probe 预算不得被业务挤占。
@@ -55,7 +55,7 @@
 
 **Files:** Create `migrations/0004_tasks.sql`, `src/tasks/{mod.rs,model.rs,preview.rs,repository.rs}`, `tests/task_db.rs`；Modify `src/{db.rs,audit.rs}`。
 
-**Interfaces:** identity v3完成并通过只读结构/数据校验、部署与备份未占用3/4后才可实施Tasks0004；已占用则停下另审。`TaskService::preview(actor,device_ids,group_ids)->Preview`；`TaskService::submit(actor,preview_token,idempotency_key)->TaskId`；actor+key+规范请求去重，按DeviceId申请DB唯一锁。父用户、主任务、设备、子任务、锁关系在同一事务验证，使用共同schema_meta保护行及统一对象锁序；不声明FK/CHECK。所有runtime目标表/列/索引及应用完整性校验后设置schema_version=4，runtime按版本完整检查v4，不能仅加表绕过identity v3检查；普通启动仍只读，禁止自动生产ALTER。
+**Interfaces:** identity schema_version=3 完成并通过只读结构/数据校验、部署与备份确认未占用 0003/0004 后才可执行 `0004_tasks.sql`；占用、未知版本或身份数据污染则拒绝，不能跳号/猜测表意义。`TaskService::preview(actor,device_ids,group_ids)->Preview`；`TaskService::submit(actor,preview_token,idempotency_key)->TaskId`；actor+key+规范请求去重，按 DeviceId 申请 DB 唯一锁。提交或撤权操作共享 `schema_meta(singleton=1) FOR UPDATE` guard；事务内重新确认 actor 存在且 active、权限与 authz_epoch、组/设备存在且未归档、preview/主任务/子任务及锁的父子引用和 state/owner/generation；按 users(UUID)→roles(UUID)→device_groups(UUID)→devices(公钥)→依赖行取锁，同类型按 ID 排序。不可把事务外 preview/鉴权快照当提交资格；关系与主子任务、设备锁唯一性同时依应用校验及 PK/UNIQUE/CAS，不能仅内存互斥或 FK/CHECK。先验证全部 runtime 表/列/索引及应用完整性再推进 schema_version=4；普通启动仍只读，禁止自动生产 ALTER。
 
 - [ ] **Step 1 RED：**
 ```rust
@@ -71,7 +71,7 @@ async fn later_batch_is_busy_without_network_send() {
 }
 ```
 - [ ] **Step 2 确认失败：** 隔离真实 DB fixture（调用 `required_test_db()`）与可编译 stub 就绪后，MySQL：`CONTROLLER_TEST_DATABASE_URL="$MYSQL_TEST_URL" cargo test -p rsetup-controller --test task_db later_batch_is_busy_without_network_send -- --ignored --exact --test-threads=1`；TiDB：`CONTROLLER_TEST_DATABASE_URL="$TIDB_TEST_URL" cargo test -p rsetup-controller --test task_db later_batch_is_busy_without_network_send -- --ignored --exact --test-threads=1`。仅在各自 URL 存在时运行，逐引擎核对实际执行 1 个用例且因锁竞争/零网络行为断言失败；缺 URL 标未验证，连接错误或零用例不算 RED。
-- [ ] **Step 3 最少 GREEN：** 预览显式不可见 ID 整体404、可见组成员固定展开，去重排序/空集400/最多1024；至少128bit随机 token 只存摘要、绑定用户/重启/目标/进程代际、建议单调60s有效。提交锁 authz_epoch 短事务重查当前权限和可见性；完全不可见整体404无任务，仍可见但无reboot/离线/不支持每个也建立 failed 子任务；合格目标按 DeviceId 排序后逐项申请 DB 锁，忙即 failed/DEVICE_BUSY 不排队；queued 排队有效期建议60min（待审默认），过期转 expired；审计与一目标一子任务同事务，commit 前零网络。actor+同key同请求在 preview 过期后也返回原 ID，异请求409；请求哈希和 preview_token_hash 持久化。
+- [ ] **Step 3 最少 GREEN：** 预览显式不可见 ID 整体404、可见组成员固定展开，去重排序/空集400/最多1024；至少128bit随机 token 只存摘要、绑定用户/重启/目标/进程代际、建议单调60s有效。提交与撤权/组成员变更使用共同 guard 和对象锁序，在短事务重读 actor active、authz_epoch、当前授权与设备/组状态；barrier 分别测试“撤权先提交→任务拒绝/失败”及“任务先提交→撤权不伪称已撤回已发任务”，并检查审计失败时任务/锁/epoch 回滚。完全不可见整体404无任务，仍可见但无reboot/离线/不支持每个也建立 failed 子任务；合格目标按 DeviceId 排序后逐项申请 DB 锁，忙即 failed/DEVICE_BUSY 不排队；queued 排队有效期建议60min（待审默认），过期转 expired；审计与一目标一子任务同事务，commit 前零网络。actor+同key同请求在 preview 过期后也返回原 ID，异请求409；请求哈希和 preview_token_hash 持久化。
 - [ ] **Step 4 确认通过：** 目标 PASS；固定清单/多组去重、显式不可见、1025、同key并发/异内容、撤权竞争、排队过期、审计失败回滚逐一红绿；真实 DB 用例全部 `#[ignore]`。MySQL：`CONTROLLER_TEST_DATABASE_URL="$MYSQL_TEST_URL" cargo test -p rsetup-controller --test task_db -- --ignored --test-threads=1`；TiDB：`CONTROLLER_TEST_DATABASE_URL="$TIDB_TEST_URL" cargo test -p rsetup-controller --test task_db -- --ignored --test-threads=1`。两引擎逐一核对实际执行非零、零失败并各记被测版本；缺 URL 标未验证，有 URL 但失败/零用例标失败，普通 `make test` 不替代此验证。
 - [ ] **Step 5 重构、回归、提交：** 抽纯预览/事务验证函数并回归；`git add crates/rsetup-controller/migrations/0004_tasks.sql crates/rsetup-controller/src/tasks crates/rsetup-controller/src/db.rs crates/rsetup-controller/src/audit.rs crates/rsetup-controller/tests/task_db.rs && git commit -m 'feat(controller): commit idempotent tasks'`。
 

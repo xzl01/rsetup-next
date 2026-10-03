@@ -44,7 +44,7 @@
 | group_members | group_id,device_id | 联合唯一，device反向索引 |
 | grants | id,user_id,source_kind,role_id?,permissions?,scope_kind,scope_group_id?,scope_device_id?,revision | user_id；source/scope字段互斥 |
 
-角色/组删除采用归档并同事务撤销关联，递增epoch；用户只停用保留任务引用。内置角色不可归档，可复制自定义。
+角色/组删除采用归档并同事务撤销关联，递增epoch；用户只停用保留任务引用。内置角色不可归档，可复制自定义。未来生产会话创建须在 `schema_meta` guard→users 锁内重验 active 与登录已验证的 password_hash/revision，停用/改密/重置同事务撤销 sessions；事务外已验密码不能单独授权新会话。grants 的持久化读取及写入复用 `validate_grant_fields`：source(role/direct)、scope(all/group/device) 互斥，SQL NULL 不等于 JSON `null`，direct 权限非空、合法、无重复；role_permissions 则校验角色存在及权限目录，污染数据均失败关闭，不按空权限悄悄继续。新建关联须检查 active 用户、未归档角色/组/设备；guard→users→roles→device_groups→devices→依赖行取锁，同类按 UUID/设备公钥字节序；revision、authz_epoch 和脱敏审计同事务，失败整体回滚。角色归档撤销 role grants 并清理 role_permissions；组归档清理 group_members 和 group-scope grants；设备归档清理 group_members 和指向该设备的 device-scope grants（包括 role/direct source），但历史角色/组/设备父行、admission_decisions 与 audit_events 保留。历史引用存在性不等于可新建有效关联，当前授权始终过滤 inactive/archived。上述尚属未来仓储消费契约，不代表生产写入口已就绪。
 
 ### 2.2 设备与准入
 
@@ -76,7 +76,7 @@
 | audit_events | id,actor_kind/user_id,event_type,target_kind/id,params_redacted,outcome,TimeEvidence,process_epoch,event_seq | process_epoch+seq唯一，目标/actor/id |
 | recovery_checks | id,task_id?,device_id?,actor_id,check_type,evidence,decision,TimeEvidence | 时间核验、unknown释放、受控恢复 |
 
-未决/held/持锁记录不按普通终态期限删。结果更新CAS，板端结果版本存evidence，详细状态唯一来源为04。
+未决/held/持锁记录不按普通终态期限删。结果更新CAS，板端结果版本存evidence，详细状态唯一来源为04。身份基线 `0003_identity_application_integrity.sql` 先达到 schema_version=3，且只读结构/数据校验通过；未来 `0004_tasks.sql` 才扩展 runtime 并在完整 runtime 表/列/索引、身份与任务应用完整性检查后推进 schema_version=4。两个编号若已被部署或备份占用，或启动读到未知版本/不相符结构，均拒绝猜测或自动迁移；普通启动只读拒绝未就绪库。`task_previews.actor_id`、`main_tasks.actor_id`、`sub_tasks.main_task_id/device_id`、`device_operation_locks.device_id/sub_task_id` 及 `recovery_checks` 非空 actor/task/device 等引用在创建/更新事务内检查存在性、状态及锁 owner/generation；历史用户/设备不物理删除。任务提交与撤权共享 guard、统一对象锁序并重验 active actor/当前授权及 authz_epoch；同一设备锁依 DB 主键/唯一索引加事务 CAS 保持互斥，不能仅靠内存锁，亦无 FK/CHECK 兜底。迁移存量检查不把归档/停用历史父行误判为孤儿，授权读取仍只按当前有效状态计算。
 
 必审事件（最小集）：登录成功/失败、登出；改密（自助/强制/管理员重置）、reset-admin；会话撤销（停用、重置、重启）；用户/角色/授权/组变更（含最后管理员保护命中）；准入approve/reject/reopen/revoke/reauthorize（资源拒绝与人工拒绝分别记录）；任务创建/取消/时间核验/unknown释放；设备锁获取与释放；受控恢复模式进入/退出；NTP回退/恢复/过期/跳钟。event_type为稳定语言中立枚举，参数细节入params_redacted，不记录密码、私钥与凭据。
 
