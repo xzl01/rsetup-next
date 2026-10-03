@@ -661,6 +661,100 @@ fn authorize_test_migration(c: &TestMigrationConfig, actual: &str) -> Result<(),
         ))
     }
 }
+fn schema_metadata_privilege_error() -> ControllerError {
+    ControllerError::Config("test schema metadata privileges unverified".into())
+}
+
+// Only the direct schema-wide ALL form observed for these isolated dev engines
+// proves that the account can enumerate schema objects. Never parse account
+// names into diagnostics; roles, partial revokes and unknown grant syntax deny.
+fn grant_grantee_is_simple_account(grantee: &str) -> bool {
+    fn quoted_part(input: &[u8]) -> Option<usize> {
+        let quote = *input.first()?;
+        if quote != b'`' && quote != b'\'' {
+            return None;
+        }
+        let mut i = 1;
+        while i < input.len() {
+            match input[i] {
+                b'\\' if quote == b'\'' && i + 1 < input.len() => i += 2,
+                byte if byte == quote && input.get(i + 1) == Some(&quote) => i += 2,
+                byte if byte == quote && i > 1 => return Some(i + 1),
+                b'\n' | b'\r' | 0 => return None,
+                _ => i += 1,
+            }
+        }
+        None
+    }
+    let bytes = grantee.as_bytes();
+    let Some(user_end) = quoted_part(bytes) else {
+        return false;
+    };
+    if bytes.get(user_end) != Some(&b'@') {
+        return false;
+    }
+    quoted_part(&bytes[user_end + 1..]) == Some(bytes.len() - user_end - 1)
+}
+
+fn validate_schema_metadata_grants(
+    grants: &[Option<String>],
+    expected_database: &str,
+) -> Result<(), ControllerError> {
+    if !(1..=64).contains(&expected_database.len())
+        || !expected_database
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(schema_metadata_privilege_error());
+    }
+    let direct_prefix = format!("GRANT ALL PRIVILEGES ON `{expected_database}`.* TO ");
+    let mut direct = false;
+    let mut account: Option<&str> = None;
+    for row in grants {
+        let text = row.as_deref().ok_or_else(schema_metadata_privilege_error)?;
+        let (is_direct, remainder) = if let Some(rest) = text.strip_prefix(&direct_prefix) {
+            (true, rest)
+        } else if let Some(rest) = text.strip_prefix("GRANT USAGE ON *.* TO ") {
+            (false, rest)
+        } else {
+            return Err(schema_metadata_privilege_error());
+        };
+        let grantee = remainder
+            .strip_suffix(" WITH GRANT OPTION")
+            .unwrap_or(remainder);
+        if !grant_grantee_is_simple_account(grantee)
+            || account.is_some_and(|previous| previous != grantee)
+        {
+            return Err(schema_metadata_privilege_error());
+        }
+        account = Some(grantee);
+        direct |= is_direct;
+    }
+    if direct {
+        Ok(())
+    } else {
+        Err(schema_metadata_privilege_error())
+    }
+}
+
+async fn require_schema_metadata_privilege(
+    connection: &mut sqlx::pool::PoolConnection<sqlx::MySql>,
+    expected_database: &str,
+) -> Result<(), ControllerError> {
+    let rows = sqlx::query("SHOW GRANTS")
+        .fetch_all(&mut **connection)
+        .await
+        .map_err(|_| schema_metadata_privilege_error())?;
+    let grants = rows
+        .iter()
+        .map(|row| {
+            row.try_get::<Option<String>, _>(0)
+                .map_err(|_| schema_metadata_privilege_error())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_schema_metadata_grants(&grants, expected_database)
+}
+
 fn preflight_usernames<'a>(
     values: impl IntoIterator<Item = &'a str>,
 ) -> Result<(), ControllerError> {
@@ -707,20 +801,24 @@ fn identity_column_declarations(
         )),
     }
 }
-async fn run_authorized_migration_with<D, C, CF, U, UF>(
+async fn run_authorized_migration_with<D, E, C, CF, G, GF, U, UF>(
     config: &TestMigrationConfig,
     connect_and_name: C,
+    verify_grants: G,
     upgrade: U,
 ) -> Result<(), ControllerError>
 where
     C: FnOnce() -> CF,
     CF: std::future::Future<Output = Result<(D, String), ControllerError>>,
-    U: FnOnce(D) -> UF,
+    G: FnOnce(D, String) -> GF,
+    GF: std::future::Future<Output = Result<E, ControllerError>>,
+    U: FnOnce(E) -> UF,
     UF: std::future::Future<Output = Result<(), ControllerError>>,
 {
     authorize_test_migration(config, &config.expected_database)?;
     let (db, actual) = connect_and_name().await?;
     authorize_test_migration(config, &actual)?;
+    let db = verify_grants(db, actual).await?;
     upgrade(db).await
 }
 
@@ -1110,13 +1208,23 @@ pub async fn run_identity_test_migration(
                         ControllerError::Config("test database connection failed".into())
                     })?,
             );
-            let actual: String = sqlx::query_scalar("SELECT DATABASE()")
-                .fetch_one(&db.0)
+            let mut connection = db.0.acquire().await.map_err(|_| {
+                ControllerError::Config("test database identity query failed".into())
+            })?;
+            let actual: Option<String> = sqlx::query_scalar("SELECT DATABASE()")
+                .fetch_one(&mut *connection)
                 .await
                 .map_err(|_| {
                     ControllerError::Config("test database identity query failed".into())
                 })?;
-            Ok((db, actual))
+            let actual = actual.ok_or_else(|| {
+                ControllerError::Config("test database identity query failed".into())
+            })?;
+            Ok(((db, connection), actual))
+        },
+        |(db, mut connection), actual| async move {
+            require_schema_metadata_privilege(&mut connection, &actual).await?;
+            Ok(db)
         },
         |db| async move { upgrade_identity_schema(&db, mode).await },
     )
@@ -1624,6 +1732,98 @@ mod tests {
                 "{state}/{decision}"
             );
         }
+    }
+
+    #[test]
+    fn schema_metadata_grants_require_exact_direct_schema_all() {
+        let target = "dev_identity";
+        let direct = "GRANT ALL PRIVILEGES ON `dev_identity`.* TO `tester`@`localhost`";
+        let usage = "GRANT USAGE ON *.* TO `tester`@`localhost`";
+        assert!(validate_schema_metadata_grants(&[Some(direct.into())], target).is_ok());
+        assert!(
+            validate_schema_metadata_grants(
+                &[
+                    Some(usage.into()),
+                    Some(format!("{direct} WITH GRANT OPTION"))
+                ],
+                target,
+            )
+            .is_ok()
+        );
+        for invalid in [
+            "GRANT ALL PRIVILEGES ON `dev_identity_backup`.* TO `tester`@`localhost`",
+            "GRANT ALL PRIVILEGES ON `other_dev_identity`.* TO `tester`@`localhost`",
+            "GRANT ALL PRIVILEGES ON *.* TO `tester`@`localhost`",
+            "GRANT USAGE ON *.* TO `tester`@`localhost`",
+            "GRANT `metadata_role`@`localhost` TO `tester`@`localhost`",
+            "not a recognized SHOW GRANTS row",
+            "GRANT ALL PRIVILEGES ON `dev_identity`.* TO `tester`@`localhost` arbitrary",
+        ] {
+            assert!(validate_schema_metadata_grants(&[Some(invalid.into())], target).is_err());
+        }
+        for grants in [
+            vec![],
+            vec![None],
+            vec![Some(direct.into()), None],
+            vec![
+                Some(direct.into()),
+                Some("REVOKE SELECT ON `dev_identity`.`hidden` FROM `tester`@`localhost`".into()),
+            ],
+            vec![
+                Some(direct.into()),
+                Some("GRANT USAGE ON *.* TO `different`@`localhost`".into()),
+            ],
+            vec![
+                Some(direct.into()),
+                Some("GRANT `metadata_role`@`localhost` TO `tester`@`localhost`".into()),
+            ],
+        ] {
+            assert!(validate_schema_metadata_grants(&grants, target).is_err());
+        }
+        assert!(
+            validate_schema_metadata_grants(&[Some(direct.into())], "dev_identity_bad").is_err()
+        );
+        assert!(validate_schema_metadata_grants(&[Some(direct.into())], "dev_identity`").is_err());
+        assert!(
+            !format!(
+                "{}",
+                validate_schema_metadata_grants(&[None], target).unwrap_err()
+            )
+            .contains(target)
+        );
+    }
+
+    #[test]
+    fn explicit_migration_checks_session_grants_before_any_upgrade_branch() {
+        let source = include_str!("db.rs");
+        let entry = source
+            .split_once("pub async fn run_identity_test_migration(")
+            .unwrap()
+            .1
+            .split_once("\nasync fn preflight_values(")
+            .unwrap()
+            .0;
+        let name = entry.find("SELECT DATABASE()").unwrap();
+        let grants = entry
+            .find("require_schema_metadata_privilege(&mut connection, &actual).await?")
+            .unwrap();
+        let upgrade = entry
+            .find("upgrade_identity_schema(&db, mode).await")
+            .unwrap();
+        let gate = source
+            .split_once("async fn run_authorized_migration_with<")
+            .unwrap()
+            .1
+            .split_once("\nfn validate_v3_table_collation(")
+            .unwrap()
+            .0;
+        let authorized = gate
+            .find("authorize_test_migration(config, &actual)?")
+            .unwrap();
+        let verify = gate.find("verify_grants(db, actual).await?").unwrap();
+        let dispatch = gate.find("upgrade(db).await").unwrap();
+        assert!(name < grants && grants < upgrade);
+        assert!(authorized < verify && verify < dispatch);
     }
 
     #[test]
@@ -2253,6 +2453,7 @@ mod tests {
         let result = run_authorized_migration_with(
             &config,
             || async { Ok(((), "test_identity".into())) },
+            |db, _| async move { Ok(db) },
             |_| async {
                 calls.set(calls.get() + 1);
                 Ok(())
@@ -2304,6 +2505,7 @@ mod tests {
                         connected.set(connected.get() + 1);
                         Ok(((), "test_identity".into()))
                     },
+                    |db, _| async move { Ok(db) },
                     |_| async {
                         upgraded.set(upgraded.get() + 1);
                         Ok(())
@@ -2319,6 +2521,7 @@ mod tests {
             run_authorized_migration_with(
                 &base,
                 || async { Ok(((), "test_other".into())) },
+                |db, _| async move { Ok(db) },
                 |_| async {
                     upgraded.set(upgraded.get() + 1);
                     Ok(())
@@ -2331,6 +2534,7 @@ mod tests {
         run_authorized_migration_with(
             &base,
             || async { Ok(((), "test_identity".into())) },
+            |db, _| async move { Ok(db) },
             |_| async {
                 upgraded.set(upgraded.get() + 1);
                 Ok(())
@@ -2339,6 +2543,38 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(upgraded.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_grants_read_blocks_upgrade_after_actual_database_authorization() {
+        use std::cell::RefCell;
+        let calls = RefCell::new(Vec::new());
+        let config = TestMigrationConfig {
+            test_url: "mysql://fixture/test_identity".into(),
+            allow_destructive: true,
+            expected_database: "test_identity".into(),
+            backup_ref: "snapshot-placeholder".into(),
+            migration_ack: "isolated-exclusive-backed-up-disposable".into(),
+        };
+        let result = run_authorized_migration_with(
+            &config,
+            || async {
+                calls.borrow_mut().push("connect_and_database");
+                Ok(((), "test_identity".into()))
+            },
+            |_, actual| {
+                calls.borrow_mut().push("read_grants");
+                assert_eq!(actual, "test_identity");
+                async { Err::<(), _>(schema_metadata_privilege_error()) }
+            },
+            |_| async {
+                calls.borrow_mut().push("upgrade_or_fixture_ddl");
+                Ok(())
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(ControllerError::Config(_))));
+        assert_eq!(*calls.borrow(), ["connect_and_database", "read_grants"]);
     }
 
     #[test]
