@@ -962,6 +962,7 @@ async fn require_schema_metadata_privilege(
     validate_schema_metadata_grants(&grants, expected_database)
 }
 
+#[cfg(test)]
 fn preflight_usernames<'a>(
     values: impl IntoIterator<Item = &'a str>,
 ) -> Result<(), ControllerError> {
@@ -1140,12 +1141,17 @@ async fn validate_schema_shape_with_contract(
     target: Option<bool>,
     migration: &str,
 ) -> Result<(), ControllerError> {
-    validate_schema_shape_with_policy(db, target, migration, None).await
+    validate_schema_shape_with_policy(db, target, migration, None)
+        .await
+        .map(|_| ())
 }
 
 // Private SELECT-only entry point for Task 3B1B; not wired to Upgrade.
 #[allow(dead_code)]
-async fn validate_legacy_shape(db: &DbPool, version: i32) -> Result<(), ControllerError> {
+async fn validate_legacy_shape(
+    db: &DbPool,
+    version: i32,
+) -> Result<Vec<(&'static str, &'static str)>, ControllerError> {
     if !matches!(version, 1 | 2) {
         return Err(ControllerError::Config(
             "unsupported legacy shape version".into(),
@@ -1159,7 +1165,8 @@ async fn validate_schema_shape_with_policy(
     target: Option<bool>,
     migration: &str,
     legacy_version: Option<i32>,
-) -> Result<(), ControllerError> {
+) -> Result<Vec<(&'static str, &'static str)>, ControllerError> {
+    let mut confirmed_checks = Vec::new();
     let present: Vec<String> = sqlx::query_scalar(
         "SELECT CAST(table_name AS CHAR) AS table_name FROM information_schema.tables WHERE table_schema = DATABASE()",
     )
@@ -1314,7 +1321,7 @@ async fn validate_schema_shape_with_policy(
                     })?,
                 ));
             }
-            validate_legacy_check_metadata(&metadata)?;
+            confirmed_checks.extend(validate_legacy_check_metadata(&metadata)?);
             continue;
         }
         let expected_checks: Vec<String> = parts
@@ -1340,7 +1347,7 @@ async fn validate_schema_shape_with_policy(
             }
         }
     }
-    Ok(())
+    Ok(confirmed_checks)
 }
 
 async fn read_column(
@@ -1493,33 +1500,251 @@ pub async fn run_identity_test_migration(
     .await
 }
 
-async fn preflight_values(db: &DbPool, status: &[bool]) -> Result<(), ControllerError> {
-    let usernames: Vec<String> = sqlx::query_scalar("SELECT username FROM users")
-        .fetch_all(&db.0)
-        .await?;
-    preflight_usernames(usernames.iter().map(String::as_str))?;
-    let bad_encoding: Option<i32> = sqlx::query_scalar(
+async fn scan_legacy_usernames(db: &DbPool) -> Result<(), ControllerError> {
+    // Full UNIQUE(username) was verified in the shape gate; no unbounded name set.
+    let mut stream = sqlx::query("SELECT username FROM users").fetch(&db.0);
+    while let Some(item) = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
+        let row = item.map_err(|_| legacy_preflight_error("username.read"))?;
+        let username: &str = row
+            .try_get("username")
+            .map_err(|_| legacy_preflight_error("username.decode"))?;
+        if !valid_username(username) {
+            return Err(legacy_preflight_error("username.invalid"));
+        }
+    }
+    Ok(())
+}
+
+async fn username_encoding_is_lossless(db: &DbPool) -> Result<(), ControllerError> {
+    // The shared bounded scanner already validates each username as lowercase ASCII.
+    // Retain the independent server-side target conversion guard without fetching names.
+    let bad = sqlx::query(
         "SELECT 1 FROM users WHERE BINARY username <> BINARY CONVERT(username USING ascii) LIMIT 1",
     )
     .fetch_optional(&db.0)
-    .await?;
-    if bad_encoding.is_some() {
-        return Err(ControllerError::Config(
-            "username cannot convert to ascii without loss".into(),
-        ));
+    .await
+    .map_err(|_| legacy_preflight_error("username.encoding_read"))?;
+    if bad.is_some() {
+        return Err(legacy_preflight_error("username.encoding"));
     }
-    let collision: Option<String> = sqlx::query_scalar("SELECT CONVERT(username USING ascii) COLLATE ascii_bin AS target_name FROM users GROUP BY target_name HAVING COUNT(*) > 1 LIMIT 1").fetch_optional(&db.0).await?;
+    Ok(())
+}
+
+async fn username_target_has_no_collision(db: &DbPool) -> Result<(), ControllerError> {
+    let collision = sqlx::query("SELECT 1 FROM users GROUP BY CONVERT(username USING ascii) COLLATE ascii_bin HAVING COUNT(*) > 1 LIMIT 1")
+        .fetch_optional(&db.0).await
+        .map_err(|_| legacy_preflight_error("username.collision_read"))?;
     if collision.is_some() {
-        return Err(ControllerError::Config(
-            "target username uniqueness collision".into(),
-        ));
+        return Err(legacy_preflight_error("username.collision"));
     }
+    Ok(())
+}
+
+// The status is only an observation of this read-only pass, never authority to
+// ALTER or DROP: Task 3B2 must re-read each column/CHECK immediately before DDL
+// and use identifiers and statements from the fixed source whitelist only.
+#[allow(dead_code)] // consumed by the subsequent legacy write phase
+struct LegacyPreflight {
+    old_columns: [bool; 11], // positional keys are IDENTITY_COLUMNS, never database names
+    observed_checks: Vec<(&'static str, &'static str)>,
+}
+
+fn legacy_preflight_error(code: &'static str) -> ControllerError {
+    ControllerError::Config(format!("legacy preflight {code}"))
+}
+
+fn validate_identity_status(version: i32, status: &[bool]) -> Result<(), ControllerError> {
+    if status.len() != 11 || IDENTITY_COLUMNS.len() != 11 {
+        return Err(legacy_preflight_error("column.count"));
+    }
+    if version == 2 && status.iter().any(|old| *old) {
+        return Err(legacy_preflight_error("column.v2_old"));
+    }
+    if !matches!(version, 1 | 2) {
+        return Err(legacy_preflight_error("version"));
+    }
+    Ok(())
+}
+
+trait LegacyPreflightProbe {
+    fn read_legacy_meta(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<(i8, i32)>, ControllerError>> + Send;
+    fn legacy_shape(
+        &self,
+        version: i32,
+    ) -> impl std::future::Future<
+        Output = Result<Vec<(&'static str, &'static str)>, ControllerError>,
+    > + Send;
+    fn no_foreign_keys(
+        &self,
+    ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
+    fn identity_rows(
+        &self,
+        version: i32,
+    ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
+    fn column_status(
+        &self,
+        version: i32,
+    ) -> impl std::future::Future<Output = Result<Vec<bool>, ControllerError>> + Send;
+    fn negative(
+        &self,
+        query: &'static str,
+    ) -> impl std::future::Future<Output = Result<bool, ControllerError>> + Send;
+    fn username_encoding(
+        &self,
+    ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
+    fn username_collision(
+        &self,
+    ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
+}
+
+#[allow(dead_code)] // Task 3B2 will call this only after its independent authorization gate.
+async fn preflight_legacy_for_v3(
+    db: &DbPool,
+    version: i32,
+) -> Result<LegacyPreflight, ControllerError> {
+    preflight_legacy_with_probe(db, version).await
+}
+
+async fn preflight_legacy_with_probe(
+    probe: &impl LegacyPreflightProbe,
+    version: i32,
+) -> Result<LegacyPreflight, ControllerError> {
+    if !matches!(version, 1 | 2) {
+        return Err(legacy_preflight_error("version"));
+    }
+    let meta = probe
+        .read_legacy_meta()
+        .await
+        .map_err(|_| legacy_preflight_error("meta.read"))?;
+    if meta.as_slice() != [(1, version)] {
+        return Err(legacy_preflight_error("meta.singleton"));
+    }
+    let observed_checks = probe
+        .legacy_shape(version)
+        .await
+        .map_err(|_| legacy_preflight_error("shape"))?;
+    let mut unique_checks = Vec::new();
+    for &(table, name) in &observed_checks {
+        if known_legacy_check(table, name) != Some((table, name))
+            || unique_checks.contains(&(table, name))
+        {
+            return Err(legacy_preflight_error("check.whitelist"));
+        }
+        unique_checks.push((table, name));
+    }
+    probe
+        .no_foreign_keys()
+        .await
+        .map_err(|_| legacy_preflight_error("foreign_keys"))?;
+    probe
+        .identity_rows(version)
+        .await
+        .map_err(|_| legacy_preflight_error("data"))?;
+    let status = probe
+        .column_status(version)
+        .await
+        .map_err(|_| legacy_preflight_error("column.read"))?;
+    validate_identity_status(version, &status)?;
+    for ((table, column, negative_query, _), old) in IDENTITY_COLUMNS.iter().zip(&status) {
+        if *old
+            && !negative_query.is_empty()
+            && probe
+                .negative(negative_query)
+                .await
+                .map_err(|_| legacy_preflight_error("counter.read"))?
+        {
+            return Err(ControllerError::Config(format!(
+                "negative identity column {table}.{column}"
+            )));
+        }
+    }
+    probe
+        .username_encoding()
+        .await
+        .map_err(|_| legacy_preflight_error("username.encoding"))?;
+    probe
+        .username_collision()
+        .await
+        .map_err(|_| legacy_preflight_error("username.collision"))?;
+    Ok(LegacyPreflight {
+        old_columns: status
+            .try_into()
+            .map_err(|_| legacy_preflight_error("column.count"))?,
+        observed_checks,
+    })
+}
+
+impl LegacyPreflightProbe for DbPool {
+    async fn read_legacy_meta(&self) -> Result<Vec<(i8, i32)>, ControllerError> {
+        let rows = sqlx::query("SELECT singleton,schema_version FROM schema_meta LIMIT 2")
+            .fetch_all(&self.0)
+            .await
+            .map_err(|_| legacy_preflight_error("meta.read"))?;
+        rows.iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("singleton")
+                        .map_err(|_| legacy_preflight_error("meta.decode"))?,
+                    row.try_get("schema_version")
+                        .map_err(|_| legacy_preflight_error("meta.decode"))?,
+                ))
+            })
+            .collect()
+    }
+    async fn legacy_shape(
+        &self,
+        version: i32,
+    ) -> Result<Vec<(&'static str, &'static str)>, ControllerError> {
+        validate_legacy_shape(self, version).await
+    }
+    async fn no_foreign_keys(&self) -> Result<(), ControllerError> {
+        require_no_identity_foreign_keys(self).await
+    }
+    async fn identity_rows(&self, version: i32) -> Result<(), ControllerError> {
+        crate::integrity::validate_identity_rows_for_version(self, version).await
+    }
+    async fn column_status(&self, version: i32) -> Result<Vec<bool>, ControllerError> {
+        let mut status = Vec::with_capacity(IDENTITY_COLUMNS.len());
+        for &(table, column, _, _) in IDENTITY_COLUMNS {
+            let actual = read_column(self, table, column)
+                .await
+                .map_err(|_| legacy_preflight_error("column.read"))?;
+            status.push(validate_legacy_column(version, table, column, &actual)?);
+        }
+        Ok(status)
+    }
+    async fn negative(&self, query: &'static str) -> Result<bool, ControllerError> {
+        if !IDENTITY_COLUMNS
+            .iter()
+            .any(|entry| entry.2 == query && !query.is_empty())
+        {
+            return Err(legacy_preflight_error("counter.query"));
+        }
+        Ok(sqlx::query(query)
+            .fetch_optional(&self.0)
+            .await
+            .map_err(|_| legacy_preflight_error("counter.read"))?
+            .is_some())
+    }
+    async fn username_encoding(&self) -> Result<(), ControllerError> {
+        username_encoding_is_lossless(self).await
+    }
+    async fn username_collision(&self) -> Result<(), ControllerError> {
+        username_target_has_no_collision(self).await
+    }
+}
+
+async fn preflight_values(db: &DbPool, status: &[bool]) -> Result<(), ControllerError> {
+    validate_identity_status(1, status)?;
+    scan_legacy_usernames(db).await?;
     for ((table, column, negative_query, _), old) in IDENTITY_COLUMNS.iter().zip(status) {
         if *old && !negative_query.is_empty() {
-            let found: Option<i32> = sqlx::query(negative_query)
+            let found = sqlx::query(negative_query)
                 .fetch_optional(&db.0)
-                .await?
-                .map(|_| 1);
+                .await
+                .map_err(|_| legacy_preflight_error("counter.read"))?;
             if found.is_some() {
                 return Err(ControllerError::Config(format!(
                     "negative identity column {table}.{column}"
@@ -1527,7 +1752,8 @@ async fn preflight_values(db: &DbPool, status: &[bool]) -> Result<(), Controller
             }
         }
     }
-    Ok(())
+    username_encoding_is_lossless(db).await?;
+    username_target_has_no_collision(db).await
 }
 
 // The complete v3 baseline is only for an authorized, genuinely empty schema.
@@ -2664,6 +2890,222 @@ mod tests {
         ] {
             assert!(!output.contains(sensitive));
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_preflight_orders_all_select_gates_and_never_calls_a_writer() {
+        use std::sync::Mutex;
+        struct Fake {
+            meta: Vec<(i8, i32)>,
+            status: Vec<bool>,
+            fault: Option<&'static str>,
+            negative_at: Option<usize>,
+            checks: Vec<(&'static str, &'static str)>,
+            calls: Mutex<Vec<&'static str>>,
+            writes: Mutex<usize>,
+        }
+        impl Fake {
+            fn clean(version: i32) -> Self {
+                Self {
+                    meta: vec![(1, version)],
+                    status: vec![version == 1; IDENTITY_COLUMNS.len()],
+                    fault: None,
+                    negative_at: None,
+                    checks: vec![("devices", "chk_devices_state")],
+                    calls: Mutex::new(Vec::new()),
+                    writes: Mutex::new(0),
+                }
+            }
+            fn step(&self, name: &'static str) -> Result<(), ControllerError> {
+                self.calls.lock().unwrap().push(name);
+                if self.fault == Some(name) {
+                    Err(ControllerError::Config("simulated metadata failure".into()))
+                } else {
+                    Ok(())
+                }
+            }
+            fn write(&self) {
+                *self.writes.lock().unwrap() += 1;
+            }
+        }
+        impl LegacyPreflightProbe for Fake {
+            async fn read_legacy_meta(&self) -> Result<Vec<(i8, i32)>, ControllerError> {
+                self.step("meta")?;
+                Ok(self.meta.clone())
+            }
+            async fn legacy_shape(
+                &self,
+                _: i32,
+            ) -> Result<Vec<(&'static str, &'static str)>, ControllerError> {
+                self.step("shape")?;
+                Ok(self.checks.clone())
+            }
+            async fn no_foreign_keys(&self) -> Result<(), ControllerError> {
+                self.step("fk")
+            }
+            async fn identity_rows(&self, _: i32) -> Result<(), ControllerError> {
+                self.step("data")
+            }
+            async fn column_status(&self, _: i32) -> Result<Vec<bool>, ControllerError> {
+                self.step("status")?;
+                Ok(self.status.clone())
+            }
+            async fn negative(&self, query: &'static str) -> Result<bool, ControllerError> {
+                self.step("negative")?;
+                Ok(self
+                    .negative_at
+                    .is_some_and(|i| IDENTITY_COLUMNS[i].2 == query))
+            }
+            async fn username_encoding(&self) -> Result<(), ControllerError> {
+                self.step("encoding")
+            }
+            async fn username_collision(&self) -> Result<(), ControllerError> {
+                self.step("collision")
+            }
+        }
+        for version in [1, 2] {
+            let good = Fake::clean(version);
+            let status = preflight_legacy_with_probe(&good, version).await.unwrap();
+            assert_eq!(status.old_columns.len(), 11);
+            assert_eq!(status.old_columns, [version == 1; 11]);
+            assert_eq!(
+                status.observed_checks,
+                vec![("devices", "chk_devices_state")]
+            );
+            let calls = good.calls.lock().unwrap().clone();
+            assert_eq!(&calls[..5], &["meta", "shape", "fk", "data", "status"]);
+            assert_eq!(&calls[calls.len() - 2..], &["encoding", "collision"]);
+            assert_eq!(
+                calls.iter().filter(|&&name| name == "negative").count(),
+                if version == 1 { 10 } else { 0 }
+            );
+            assert_eq!(*good.writes.lock().unwrap(), 0);
+
+            let empty_checks = Fake {
+                checks: vec![],
+                ..Fake::clean(version)
+            };
+            assert!(
+                preflight_legacy_with_probe(&empty_checks, version)
+                    .await
+                    .unwrap()
+                    .observed_checks
+                    .is_empty()
+            );
+            for checks in [
+                vec![("unknown_table", "chk_looks_known")],
+                vec![("devices", "chk_devices_state"); 2],
+            ] {
+                let untrusted = Fake {
+                    checks,
+                    ..Fake::clean(version)
+                };
+                assert!(
+                    preflight_legacy_with_probe(&untrusted, version)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(&*untrusted.calls.lock().unwrap(), &["meta", "shape"]);
+                assert_eq!(*untrusted.writes.lock().unwrap(), 0);
+            }
+            for meta in [
+                vec![],
+                vec![(0, version)],
+                vec![(1, version + 1)],
+                vec![(1, version), (1, version)],
+            ] {
+                let bad = Fake {
+                    meta,
+                    ..Fake::clean(version)
+                };
+                assert!(preflight_legacy_with_probe(&bad, version).await.is_err());
+                assert_eq!(&*bad.calls.lock().unwrap(), &["meta"]);
+                assert_eq!(*bad.writes.lock().unwrap(), 0);
+            }
+            for fault in [
+                "meta",
+                "shape",
+                "fk",
+                "data",
+                "status",
+                "encoding",
+                "collision",
+            ] {
+                let bad = Fake {
+                    fault: Some(fault),
+                    ..Fake::clean(version)
+                };
+                assert!(
+                    preflight_legacy_with_probe(&bad, version).await.is_err(),
+                    "{fault}"
+                );
+                assert_eq!(bad.calls.lock().unwrap().last(), Some(&fault));
+                assert_eq!(*bad.writes.lock().unwrap(), 0);
+            }
+            for length in [0, 10, 12] {
+                let bad = Fake {
+                    status: vec![false; length],
+                    ..Fake::clean(version)
+                };
+                assert!(preflight_legacy_with_probe(&bad, version).await.is_err());
+                assert_eq!(
+                    &*bad.calls.lock().unwrap(),
+                    &["meta", "shape", "fk", "data", "status"]
+                );
+            }
+            if version == 2 {
+                let bad = Fake {
+                    status: vec![true; 11],
+                    ..Fake::clean(version)
+                };
+                assert!(preflight_legacy_with_probe(&bad, version).await.is_err());
+                assert_eq!(
+                    &*bad.calls.lock().unwrap(),
+                    &["meta", "shape", "fk", "data", "status"]
+                );
+            } else {
+                for i in 0..10 {
+                    let bad = Fake {
+                        negative_at: Some(i),
+                        ..Fake::clean(version)
+                    };
+                    assert!(
+                        preflight_legacy_with_probe(&bad, version).await.is_err(),
+                        "negative {i}"
+                    );
+                    assert_eq!(bad.calls.lock().unwrap().last(), Some(&"negative"));
+                    assert_eq!(*bad.writes.lock().unwrap(), 0);
+                }
+                let bad = Fake {
+                    fault: Some("negative"),
+                    ..Fake::clean(version)
+                };
+                assert!(preflight_legacy_with_probe(&bad, version).await.is_err());
+                let mut mixed = Fake::clean(version);
+                mixed.status = vec![false; 11];
+                mixed.status[0] = true;
+                assert!(preflight_legacy_with_probe(&mixed, version).await.is_ok());
+                assert_eq!(
+                    mixed
+                        .calls
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|&&name| name == "negative")
+                        .count(),
+                    1
+                );
+            }
+        }
+        for version in [0, 3, -1] {
+            let bad = Fake::clean(version);
+            assert!(preflight_legacy_with_probe(&bad, version).await.is_err());
+            assert!(bad.calls.lock().unwrap().is_empty());
+        }
+        // A separate writer witness is deliberately never invoked by this read-only entry.
+        let fake = Fake::clean(1);
+        let _writer: fn(&Fake) = Fake::write;
+        assert_eq!(*fake.writes.lock().unwrap(), 0);
     }
 
     #[test]
