@@ -69,9 +69,63 @@ pub async fn assert_fresh_v3_is_check_and_fk_free(db: &DbPool) {
     rsetup_controller::check_identity_schema(db).await.unwrap();
 }
 
-pub async fn assert_legacy_fixture_upgrades_to_v3(mode: &str) {
+#[derive(Clone, Copy, Debug)]
+pub enum ExpectedIdentityEngine {
+    MySql,
+    TiDb,
+}
+
+fn version_matches_expected_engine(version: &str, expected: ExpectedIdentityEngine) -> bool {
+    match expected {
+        ExpectedIdentityEngine::MySql => {
+            let lower = version.to_ascii_lowercase();
+            version
+                .strip_prefix("8.")
+                .is_some_and(|tail| tail.starts_with(|c: char| c.is_ascii_digit()))
+                && !lower.contains("tidb")
+                && !lower.contains("mariadb")
+        }
+        ExpectedIdentityEngine::TiDb => version.contains("-TiDB-v"),
+    }
+}
+
+#[test]
+fn version_gate_rejects_wrong_engine_without_live_database() {
+    use ExpectedIdentityEngine::{MySql, TiDb};
+    for (version, expected) in [
+        ("8.0.39", MySql),
+        ("8.4.2-commercial", MySql),
+        ("5.7.25-TiDB-v7.5.0", TiDb),
+        ("8.0.11-TiDB-v8.5.0", TiDb),
+    ] {
+        assert!(version_matches_expected_engine(version, expected));
+    }
+    for (version, expected) in [
+        ("5.7.25-TiDB-v7.5.0", MySql),
+        ("8.0.11-TiDB-v8.5.0", MySql),
+        ("10.11.6-MariaDB", MySql),
+        ("5.7.44", MySql),
+        ("9.0.0", MySql),
+        ("8.0.39", TiDb),
+        ("10.11.6-MariaDB", TiDb),
+        ("", MySql),
+        ("", TiDb),
+    ] {
+        assert!(!version_matches_expected_engine(version, expected));
+    }
+}
+
+pub async fn assert_legacy_fixture_upgrades_to_v3(mode: &str, expected: ExpectedIdentityEngine) {
     assert!(matches!(mode, "fixture-v1" | "fixture-v2" | "mixed-v1"));
     let db = required_fresh_identity_db().await;
+    let version: String = sqlx::query_scalar("SELECT VERSION()")
+        .fetch_one(&db.0)
+        .await
+        .expect("read target engine identity before fixture DDL");
+    assert!(
+        version_matches_expected_engine(&version, expected),
+        "fixture target engine does not match expected identity"
+    );
     run_explicit_identity_test_command(if mode == "mixed-v1" {
         "fixture-v1"
     } else {
@@ -228,19 +282,19 @@ const NEGATIVE_FIXTURES: [(&str, &str, &str, &str); 10] = [
     (
         "grants",
         "revision",
-        "INSERT INTO grants (id,user_id,source_kind,permissions,scope_kind,revision) VALUES (UNHEX(REPLACE(UUID(),'-','')),UNHEX(REPLACE(UUID(),'-','')),'direct','{}','all',-1)",
+        "INSERT INTO grants (id,user_id,source_kind,permissions,scope_kind,revision) VALUES (UNHEX(REPLACE(UUID(),'-','')),?,'direct','[\"device.read\"]','all',-1)",
         "SELECT revision FROM grants",
     ),
     (
         "admission_decisions",
         "previous_revision",
-        "INSERT INTO admission_decisions (id,device_id,decision,previous_revision,new_revision,time_evidence) VALUES (UNHEX(REPLACE(UUID(),'-','')),REPEAT('x',32),'approved',-1,0,'{}')",
+        "INSERT INTO admission_decisions (id,device_id,decision,previous_revision,new_revision,time_evidence) VALUES (UNHEX(REPLACE(UUID(),'-','')),?,'approved',-1,0,'{}')",
         "SELECT previous_revision FROM admission_decisions",
     ),
     (
         "admission_decisions",
         "new_revision",
-        "INSERT INTO admission_decisions (id,device_id,decision,previous_revision,new_revision,time_evidence) VALUES (UNHEX(REPLACE(UUID(),'-','')),REPEAT('x',32),'approved',0,-1,'{}')",
+        "INSERT INTO admission_decisions (id,device_id,decision,previous_revision,new_revision,time_evidence) VALUES (UNHEX(REPLACE(UUID(),'-','')),?,'approved',0,-1,'{}')",
         "SELECT new_revision FROM admission_decisions",
     ),
     (
@@ -251,11 +305,78 @@ const NEGATIVE_FIXTURES: [(&str, &str, &str, &str); 10] = [
     ),
 ];
 
+// Every negative child references a real parent; all other row fields remain valid.
+const NEGATIVE_PARENT_SEEDS: [Option<&str>; 10] = [
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    Some(
+        "INSERT INTO users (id,username,display_name,password_hash,active,is_admin,must_change_password,revision,created_time) VALUES (?,'negative_parent','Fixture','fixture-placeholder',TRUE,FALSE,FALSE,0,NOW(6))",
+    ),
+    Some(
+        "INSERT INTO devices (public_key,display_name,admission_state,review_decision,revision,archived) VALUES (?,'negative parent','PENDING','none',0,FALSE)",
+    ),
+    Some(
+        "INSERT INTO devices (public_key,display_name,admission_state,review_decision,revision,archived) VALUES (?,'negative parent','PENDING','none',0,FALSE)",
+    ),
+    None,
+];
+
+#[test]
+fn negative_revision_fixtures_have_valid_existing_parents_and_grant_permissions() {
+    assert_eq!(NEGATIVE_PARENT_SEEDS.len(), NEGATIVE_FIXTURES.len());
+    for (index, table) in [(6, "users"), (7, "devices"), (8, "devices")] {
+        let seed = NEGATIVE_PARENT_SEEDS[index].expect("negative child requires a parent");
+        assert!(seed.starts_with(&format!("INSERT INTO {table} ")));
+        assert!(seed.contains('?'), "parent id must be bound");
+        assert!(
+            NEGATIVE_FIXTURES[index].2.contains('?'),
+            "child must bind the same id"
+        );
+    }
+    assert!(
+        NEGATIVE_PARENT_SEEDS
+            .iter()
+            .enumerate()
+            .all(|(i, seed)| (6..=8).contains(&i) || seed.is_none())
+    );
+    let grant = NEGATIVE_FIXTURES[6].2;
+    assert!(
+        grant.contains("'[\"device.read\"]'"),
+        "direct grant needs valid permission JSON"
+    );
+    assert!(!grant.contains("'{}'"));
+    for (_, _, inject, _) in NEGATIVE_FIXTURES.iter().take(9).skip(6) {
+        assert!(inject.contains("-1"));
+    }
+}
+
 pub async fn negative_fixture_prevents_all_alters(index: usize) {
     let db = required_fresh_identity_db().await;
     run_explicit_identity_test_command("fixture-v1");
     let (table, column, inject, read_value) = NEGATIVE_FIXTURES[index];
-    sqlx::query(inject).execute(&db.0).await.unwrap();
+    if let Some(parent_sql) = NEGATIVE_PARENT_SEEDS[index] {
+        let parent_id = if index == 6 {
+            uuid::Uuid::new_v4().as_bytes().to_vec()
+        } else {
+            unique_public_key().to_vec()
+        };
+        sqlx::query(parent_sql)
+            .bind(parent_id.as_slice())
+            .execute(&db.0)
+            .await
+            .unwrap();
+        sqlx::query(inject)
+            .bind(parent_id.as_slice())
+            .execute(&db.0)
+            .await
+            .unwrap();
+    } else {
+        sqlx::query(inject).execute(&db.0).await.unwrap();
+    }
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_migrate-identity-test"))
         .args(["--mode", "upgrade"])
         .output()

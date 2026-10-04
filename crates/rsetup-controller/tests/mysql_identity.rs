@@ -33,19 +33,28 @@ async fn fresh_v3_single_authorized_mysql_case() {
 #[tokio::test]
 #[ignore = "one independently backed-up isolated disposable EMPTY MySQL dev DB; runner and FK visibility review required"]
 async fn mysql_legacy_v1_to_v3_positive_single_case() {
-    common::assert_legacy_fixture_upgrades_to_v3("fixture-v1").await;
+    common::assert_legacy_fixture_upgrades_to_v3(
+        "fixture-v1",
+        common::ExpectedIdentityEngine::MySql,
+    )
+    .await;
 }
 
 #[tokio::test]
 #[ignore = "one independently backed-up isolated disposable EMPTY MySQL dev DB; runner and FK visibility review required"]
 async fn mysql_legacy_v2_to_v3_positive_single_case() {
-    common::assert_legacy_fixture_upgrades_to_v3("fixture-v2").await;
+    common::assert_legacy_fixture_upgrades_to_v3(
+        "fixture-v2",
+        common::ExpectedIdentityEngine::MySql,
+    )
+    .await;
 }
 
 #[tokio::test]
 #[ignore = "one independently backed-up isolated disposable EMPTY MySQL dev DB; runner and FK visibility review required"]
 async fn mysql_legacy_mixed_v1_to_v3_positive_single_case() {
-    common::assert_legacy_fixture_upgrades_to_v3("mixed-v1").await;
+    common::assert_legacy_fixture_upgrades_to_v3("mixed-v1", common::ExpectedIdentityEngine::MySql)
+        .await;
 }
 
 mod common;
