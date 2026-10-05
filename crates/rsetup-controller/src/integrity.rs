@@ -164,12 +164,13 @@ async fn scan_identity_rows(
     // The caller's strict shape check establishes a full UNIQUE(username) index;
     // valid lowercase ASCII usernames cannot have identical raw bytes under it.
     // Do not remove the separate v1/v2 migration collision preflight in db.rs.
-    scan!("SELECT username FROM users", "users.read", |row| {
-        let username: &str = row
-            .try_get("username")
-            .map_err(|_| scan_error("users.decode"))?;
-        validate_username_row(username)?;
-    });
+    scan!(
+        "SELECT CAST(username AS BINARY) AS username FROM users",
+        "users.read",
+        |row| {
+            validate_username_bytes(row.try_get::<&[u8], _>("username"))?;
+        }
+    );
     for &(code, sql) in BOOLEAN_SCANS {
         scan!(sql, "boolean.read", |row| {
             let raw: i64 = row
@@ -255,6 +256,12 @@ async fn scan_identity_rows(
         .await
         .map_err(|_| scan_error("transaction.end"))?;
     Ok(())
+}
+
+fn validate_username_bytes(username: Result<&[u8], sqlx::Error>) -> Result<(), ControllerError> {
+    let bytes = username.map_err(|_| scan_error("users.decode"))?;
+    let username = std::str::from_utf8(bytes).map_err(|_| scan_error("users.decode"))?;
+    validate_username_row(username)
 }
 
 fn validate_username_row(username: &str) -> Result<(), ControllerError> {
@@ -610,13 +617,79 @@ mod tests {
     }
 
     #[test]
+    fn username_bytes_accept_original_rule_boundaries() {
+        for username in ["abc", "0._-", &"a".repeat(64)] {
+            assert!(validate_username_bytes(Ok(username.as_bytes())).is_ok());
+        }
+    }
+
+    #[test]
+    fn username_bytes_reject_invalid_names_without_normalization() {
+        for username in [
+            "ab",
+            &"a".repeat(65),
+            ".ab",
+            "_ab",
+            "-ab",
+            "Alice",
+            " abc",
+            "abc ",
+            "a b",
+            "ab\t",
+            "ab\n",
+            "ab\0",
+            "éab",
+        ] {
+            assert_eq!(
+                validate_username_bytes(Ok(username.as_bytes()))
+                    .unwrap_err()
+                    .to_string(),
+                "configuration: identity data users.username"
+            );
+        }
+    }
+
+    #[test]
+    fn username_bytes_reject_invalid_utf8_as_fixed_decode_error() {
+        for username in [&b"ab\xff"[..], &b"ab\xe2\x82"[..], &b"ab\xc0\xaf"[..]] {
+            assert_eq!(
+                validate_username_bytes(Ok(username))
+                    .unwrap_err()
+                    .to_string(),
+                "configuration: identity data users.decode"
+            );
+        }
+    }
+
+    #[test]
+    fn username_bytes_redact_sqlx_errors_including_null() {
+        for error in [
+            sqlx::Error::ColumnDecode {
+                index: "synthetic-sensitive-column".into(),
+                source: Box::new(sqlx::error::UnexpectedNullError),
+            },
+            sqlx::Error::ColumnDecode {
+                index: "synthetic-sensitive-column".into(),
+                source: Box::new(std::io::Error::other("synthetic-sensitive-value")),
+            },
+            sqlx::Error::ColumnNotFound("synthetic-sensitive-column".into()),
+            sqlx::Error::Decode(Box::new(std::io::Error::other("synthetic-sensitive-value"))),
+        ] {
+            assert_eq!(
+                validate_username_bytes(Err(error)).unwrap_err().to_string(),
+                "configuration: identity data users.decode"
+            );
+        }
+    }
+
+    #[test]
     fn row_validators_consume_lazy_high_count_and_fail_on_first_bad_row() {
         let mut visited = 0;
         (0..100_000)
             .try_for_each(|i| {
                 visited += 1;
                 let username = format!("user{i:06}");
-                validate_username_row(&username)
+                validate_username_bytes(Ok(username.as_bytes()))
             })
             .unwrap();
         assert_eq!(visited, 100_000);
@@ -630,7 +703,7 @@ mod tests {
                 } else {
                     format!("user{i:06}")
                 };
-                validate_username_row(&username)
+                validate_username_bytes(Ok(username.as_bytes()))
             })
             .unwrap_err();
         assert_eq!(visited, 11);

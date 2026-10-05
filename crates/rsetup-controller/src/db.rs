@@ -651,6 +651,127 @@ fn known_legacy_check(table: &str, name: &str) -> Option<(&'static str, &'static
     Some((table, name))
 }
 
+// These two layouts are a closed MySQL 8.0.46 serialization of the fixed
+// 0001 predicate trees: each = / IS [NOT] NULL atom is parenthesized, and
+// AND/OR retain the original grouping. print_expr introduces _utf8mb4 and
+// the I_S view's print escapes each quote once more. Neither observed text
+// nor the legacy tokenizer is used to construct the accepted bytes.
+fn mysql_8046_grant_clause(table: &str, name: &str, stored: &str, declared: &str) -> bool {
+    let (original, serialized) = match (table, name) {
+        ("grants", "chk_grants_source") => (
+            "((source_kind = 'role' AND role_id IS NOT NULL AND permissions IS NULL) OR (source_kind = 'direct' AND role_id IS NULL AND permissions IS NOT NULL))",
+            concat!(
+                "(((`source_kind` = _utf8mb4'role') AND (`role_id` IS NOT NULL) AND (`permissions` IS NULL)) OR ",
+                "((`source_kind` = _utf8mb4'direct') AND (`role_id` IS NULL) AND (`permissions` IS NOT NULL)))",
+            ),
+        ),
+        ("grants", "chk_grants_scope") => (
+            "((scope_kind = 'all' AND scope_group_id IS NULL AND scope_device_id IS NULL) OR (scope_kind = 'group' AND scope_group_id IS NOT NULL AND scope_device_id IS NULL) OR (scope_kind = 'device' AND scope_group_id IS NULL AND scope_device_id IS NOT NULL))",
+            concat!(
+                "(((`scope_kind` = _utf8mb4'all') AND (`scope_group_id` IS NULL) AND (`scope_device_id` IS NULL)) OR ",
+                "((`scope_kind` = _utf8mb4'group') AND (`scope_group_id` IS NOT NULL) AND (`scope_device_id` IS NULL)) OR ",
+                "((`scope_kind` = _utf8mb4'device') AND (`scope_group_id` IS NULL) AND (`scope_device_id` IS NOT NULL)))",
+            ),
+        ),
+        _ => return false,
+    };
+    if declared != original {
+        return false;
+    }
+    let expected = serialized.replace('\'', "\\'");
+    let expected = expected.as_bytes();
+    let actual = stored.as_bytes();
+    if actual.len() != expected.len() {
+        return false;
+    }
+    // Only whole, fixed SQL keyword words may vary in ASCII case. All other
+    // bytes, including quoting, spaces, introducers and wrappers, are exact.
+    let mut pos = 0;
+    while pos < expected.len() {
+        if expected[pos].is_ascii_alphabetic() {
+            let end = pos
+                + expected[pos..]
+                    .iter()
+                    .take_while(|b| b.is_ascii_alphabetic())
+                    .count();
+            let word = &expected[pos..end];
+            let keyword = [b"AND".as_slice(), b"OR", b"IS", b"NOT", b"NULL"].contains(&word);
+            if if keyword {
+                !actual[pos..end].eq_ignore_ascii_case(word)
+            } else {
+                actual[pos..end] != *word
+            } {
+                return false;
+            }
+            pos = end;
+        } else {
+            if actual[pos] != expected[pos] {
+                return false;
+            }
+            pos += 1;
+        }
+    }
+    true
+}
+
+fn legacy_check_metadata_error() -> ControllerError {
+    ControllerError::Config("legacy CHECK metadata unavailable or incompatible".into())
+}
+
+type LegacyCheckVersionRow = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+// Only the caller which read VERSION(), ENFORCED and the complete clauses on
+// one held connection can supply this context. The older pure comparison has
+// no path to the new permission.
+fn validate_legacy_check_metadata_with_version(
+    rows: &[LegacyCheckVersionRow],
+    version: Result<Option<&str>, ()>,
+) -> Result<Vec<(&'static str, &'static str)>, ControllerError> {
+    let version = version
+        .map_err(|_| legacy_check_metadata_error())?
+        .ok_or_else(legacy_check_metadata_error)?;
+    let mut confirmed = Vec::new();
+    for (table, name, clause, enforced) in rows {
+        let (table, name) = known_legacy_check(
+            table.as_deref().ok_or_else(legacy_check_metadata_error)?,
+            name.as_deref().ok_or_else(legacy_check_metadata_error)?,
+        )
+        .ok_or_else(legacy_check_metadata_error)?;
+        if confirmed.contains(&(table, name)) {
+            return Err(legacy_check_metadata_error());
+        }
+        let stored = clause.as_deref().ok_or_else(legacy_check_metadata_error)?;
+        let old_row = (
+            Some(table.to_owned()),
+            Some(name.to_owned()),
+            Some(stored.to_owned()),
+        );
+        if validate_legacy_check_metadata(&[old_row]).is_err() {
+            let declared = ddl_parts_from(MIGRATION, table)
+                .into_iter()
+                .find(|part| part.starts_with(&format!("CONSTRAINT {name} CHECK ")))
+                .ok_or_else(legacy_check_metadata_error)?;
+            let expression = declared
+                .split_once("CHECK ")
+                .ok_or_else(legacy_check_metadata_error)?
+                .1;
+            if version != "8.0.46"
+                || enforced.as_deref() != Some("YES")
+                || !mysql_8046_grant_clause(table, name, stored, expression)
+            {
+                return Err(legacy_check_metadata_error());
+            }
+        }
+        confirmed.push((table, name));
+    }
+    Ok(confirmed)
+}
+
 fn validate_legacy_check_metadata(
     rows: &[(Option<String>, Option<String>, Option<String>)],
 ) -> Result<Vec<(&'static str, &'static str)>, ControllerError> {
@@ -1299,30 +1420,7 @@ async fn validate_schema_shape_with_policy(
         }
         validate_indexes(table, &expected, &actual)?;
         if legacy_version.is_some() {
-            let rows = sqlx::query("SELECT CAST(tc.table_name AS CHAR) AS table_name, CAST(tc.constraint_name AS CHAR) AS constraint_name, CAST(cc.check_clause AS CHAR) AS check_clause FROM information_schema.table_constraints tc LEFT JOIN information_schema.check_constraints cc ON cc.constraint_schema = tc.constraint_schema AND cc.constraint_name = tc.constraint_name WHERE tc.table_schema = DATABASE() AND tc.table_name = ? AND tc.constraint_type = 'CHECK'")
-                .bind(table).fetch_all(&db.0).await
-                .map_err(|_| ControllerError::Config("legacy CHECK metadata unavailable or incompatible".into()))?;
-            let mut metadata = Vec::with_capacity(rows.len());
-            for row in rows {
-                metadata.push((
-                    row.try_get("table_name").map_err(|_| {
-                        ControllerError::Config(
-                            "legacy CHECK metadata unavailable or incompatible".into(),
-                        )
-                    })?,
-                    row.try_get("constraint_name").map_err(|_| {
-                        ControllerError::Config(
-                            "legacy CHECK metadata unavailable or incompatible".into(),
-                        )
-                    })?,
-                    row.try_get("check_clause").map_err(|_| {
-                        ControllerError::Config(
-                            "legacy CHECK metadata unavailable or incompatible".into(),
-                        )
-                    })?,
-                ));
-            }
-            confirmed_checks.extend(validate_legacy_check_metadata(&metadata)?);
+            confirmed_checks.extend(read_legacy_checks_for_table(db, table).await?);
             continue;
         }
         let expected_checks: Vec<String> = parts
@@ -1349,6 +1447,80 @@ async fn validate_schema_shape_with_policy(
         }
     }
     Ok(confirmed_checks)
+}
+
+// The grants branch acquires once. VERSION(), ENFORCED and the complete
+// check_clause rows are read on that very connection; no second sample can
+// turn an interrupted or incompatible read into permission to drop a CHECK.
+async fn read_legacy_checks_for_table(
+    db: &DbPool,
+    table: &str,
+) -> Result<Vec<(&'static str, &'static str)>, ControllerError> {
+    const BASIC: &str = "SELECT CAST(tc.table_name AS CHAR) AS table_name, CAST(tc.constraint_name AS CHAR) AS constraint_name, CAST(cc.check_clause AS CHAR) AS check_clause FROM information_schema.table_constraints tc LEFT JOIN information_schema.check_constraints cc ON cc.constraint_schema = tc.constraint_schema AND cc.constraint_name = tc.constraint_name WHERE tc.table_schema = DATABASE() AND tc.table_name = ? AND tc.constraint_type = 'CHECK'";
+    if table == "grants" {
+        let mut connection =
+            db.0.acquire()
+                .await
+                .map_err(|_| legacy_check_metadata_error())?;
+        let version: Option<String> = sqlx::query_scalar("SELECT CAST(VERSION() AS CHAR)")
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(|_| legacy_check_metadata_error())?;
+        let version = version.ok_or_else(legacy_check_metadata_error)?;
+        if version == "8.0.46" {
+            let rows = sqlx::query("SELECT CAST(tc.table_name AS CHAR) AS table_name, CAST(tc.constraint_name AS CHAR) AS constraint_name, CAST(cc.check_clause AS CHAR) AS check_clause, CAST(tc.enforced AS CHAR) AS enforced FROM information_schema.table_constraints tc LEFT JOIN information_schema.check_constraints cc ON cc.constraint_schema = tc.constraint_schema AND cc.constraint_name = tc.constraint_name WHERE tc.table_schema = DATABASE() AND tc.table_name = ? AND tc.constraint_type = 'CHECK'")
+                .bind(table).fetch_all(&mut *connection).await.map_err(|_| legacy_check_metadata_error())?;
+            let mut metadata = Vec::with_capacity(rows.len());
+            for row in rows {
+                metadata.push((
+                    row.try_get("table_name")
+                        .map_err(|_| legacy_check_metadata_error())?,
+                    row.try_get("constraint_name")
+                        .map_err(|_| legacy_check_metadata_error())?,
+                    row.try_get("check_clause")
+                        .map_err(|_| legacy_check_metadata_error())?,
+                    row.try_get("enforced")
+                        .map_err(|_| legacy_check_metadata_error())?,
+                ));
+            }
+            return validate_legacy_check_metadata_with_version(&metadata, Ok(Some(&version)));
+        }
+        let rows = sqlx::query(BASIC)
+            .bind(table)
+            .fetch_all(&mut *connection)
+            .await
+            .map_err(|_| legacy_check_metadata_error())?;
+        let mut metadata = Vec::with_capacity(rows.len());
+        for row in rows {
+            metadata.push((
+                row.try_get("table_name")
+                    .map_err(|_| legacy_check_metadata_error())?,
+                row.try_get("constraint_name")
+                    .map_err(|_| legacy_check_metadata_error())?,
+                row.try_get("check_clause")
+                    .map_err(|_| legacy_check_metadata_error())?,
+            ));
+        }
+        return validate_legacy_check_metadata(&metadata);
+    }
+    // Preserve old behavior and TiDB compatibility for all non-grants tables.
+    let rows = sqlx::query(BASIC)
+        .bind(table)
+        .fetch_all(&db.0)
+        .await
+        .map_err(|_| legacy_check_metadata_error())?;
+    let mut metadata = Vec::with_capacity(rows.len());
+    for row in rows {
+        metadata.push((
+            row.try_get("table_name")
+                .map_err(|_| legacy_check_metadata_error())?,
+            row.try_get("constraint_name")
+                .map_err(|_| legacy_check_metadata_error())?,
+            row.try_get("check_clause")
+                .map_err(|_| legacy_check_metadata_error())?,
+        ));
+    }
+    validate_legacy_check_metadata(&metadata)
 }
 
 async fn read_column(
@@ -2570,6 +2742,2271 @@ fn audit_code(decision: ReviewDecision, previous: AdmissionState) -> &'static st
 mod tests {
     use super::*;
 
+    mod readonly_preflight_diagnostic {
+        use super::*;
+        use std::sync::Mutex;
+
+        // Offline tests below exercise summary mapping, not fabricated driver rows.
+        struct UsernameSample<'a> {
+            // Raw access succeeded: value non-NULL, type non-NULL, str/bytes compatibility.
+            metadata: Option<[bool; 4]>,
+            original_str: Result<&'a str, sqlx::Error>,
+            original_bytes: Result<&'a [u8], sqlx::Error>,
+            cast_bytes: Result<&'a [u8], sqlx::Error>,
+        }
+
+        fn username_sample_summary(sample: Option<UsernameSample<'_>>) -> String {
+            let code = |value: Option<bool>| match value {
+                Some(true) => "true",
+                Some(false) => "false",
+                None => "not_evaluated",
+            };
+            let mut fields = [None; 9];
+            let mut class = "not_evaluated";
+            if let Some(sample) = &sample {
+                if let Some(metadata) = sample.metadata {
+                    for (field, value) in fields.iter_mut().zip(metadata) {
+                        *field = Some(value);
+                    }
+                }
+                fields[4] = Some(sample.original_bytes.is_ok());
+                fields[5] = Some(sample.cast_bytes.is_ok());
+                if let (Ok(original), Ok(cast)) = (&sample.original_bytes, &sample.cast_bytes) {
+                    fields[6] = Some(original == cast);
+                }
+                if let Ok(raw) = sample.cast_bytes {
+                    let utf8 = std::str::from_utf8(raw);
+                    fields[7] = Some(utf8.is_ok());
+                    fields[8] = utf8.ok().map(valid_username);
+                }
+                class = if sample.metadata.is_some_and(|metadata| !metadata[0]) {
+                    "null"
+                } else {
+                    match &sample.original_str {
+                        Ok(_) => "none",
+                        Err(sqlx::Error::ColumnDecode { source, .. })
+                            if source.is::<sqlx::error::UnexpectedNullError>() =>
+                        {
+                            "null"
+                        }
+                        Err(sqlx::Error::ColumnDecode { .. })
+                            if matches!(sample.metadata, Some([true, true, false, _])) =>
+                        {
+                            "type_mismatch"
+                        }
+                        Err(
+                            sqlx::Error::ColumnDecode { source, .. } | sqlx::Error::Decode(source),
+                        ) if source.is::<std::str::Utf8Error>() => "utf8",
+                        Err(sqlx::Error::ColumnDecode { .. } | sqlx::Error::Decode(_)) => {
+                            "other_decode"
+                        }
+                        Err(
+                            sqlx::Error::ColumnNotFound(_)
+                            | sqlx::Error::ColumnIndexOutOfBounds { .. },
+                        ) => "column_access",
+                        Err(_) => "other",
+                    }
+                };
+            }
+            let [
+                original_non_null,
+                type_non_null,
+                str_compatible,
+                bytes_compatible,
+                original_bytes_ok,
+                cast_bytes_ok,
+                bytes_equal,
+                utf8_valid,
+                username_valid,
+            ] = fields.map(code);
+            format!(
+                "sample_present={} original_non_null={original_non_null} type_non_null={type_non_null} str_compatible={str_compatible} bytes_compatible={bytes_compatible} original_bytes_ok={original_bytes_ok} cast_bytes_ok={cast_bytes_ok} bytes_equal={bytes_equal} utf8_valid={utf8_valid} username_valid={username_valid} str_error_class={class} diagnostic_complete=true",
+                sample.is_some()
+            )
+        }
+
+        fn sample_evidence(bytes: &[u8]) -> UsernameSample<'_> {
+            UsernameSample {
+                metadata: Some([true, true, false, true]),
+                original_str: Err(sqlx::Error::ColumnDecode {
+                    index: "private-column-marker".into(),
+                    source: "private-error-marker".into(),
+                }),
+                original_bytes: Ok(bytes),
+                cast_bytes: Ok(bytes),
+            }
+        }
+
+        fn assert_sample_fields(summary: &str, expected: &[(&str, &str)]) {
+            let fields: Vec<_> = summary.split_whitespace().collect();
+            assert_eq!(fields.len(), 12);
+            assert!(fields.contains(&"diagnostic_complete=true"));
+            for (key, value) in expected {
+                assert!(
+                    fields.contains(&format!("{key}={value}").as_str()),
+                    "missing {key}={value}"
+                );
+            }
+            for field in fields {
+                let (_, value) = field.split_once('=').unwrap();
+                assert!(
+                    [
+                        "true",
+                        "false",
+                        "not_evaluated",
+                        "none",
+                        "type_mismatch",
+                        "null",
+                        "utf8",
+                        "other_decode",
+                        "column_access",
+                        "other"
+                    ]
+                    .contains(&value)
+                );
+            }
+            assert!(!summary.contains("private-"));
+        }
+
+        #[test]
+        fn username_sample_no_row_is_not_evaluated() {
+            assert_eq!(
+                username_sample_summary(None),
+                "sample_present=false original_non_null=not_evaluated type_non_null=not_evaluated str_compatible=not_evaluated bytes_compatible=not_evaluated original_bytes_ok=not_evaluated cast_bytes_ok=not_evaluated bytes_equal=not_evaluated utf8_valid=not_evaluated username_valid=not_evaluated str_error_class=not_evaluated diagnostic_complete=true"
+            );
+        }
+
+        #[test]
+        fn username_sample_proves_mismatch_without_error_text() {
+            let summary = username_sample_summary(Some(sample_evidence(b"private-user-marker")));
+            assert_sample_fields(
+                &summary,
+                &[
+                    ("sample_present", "true"),
+                    ("original_non_null", "true"),
+                    ("type_non_null", "true"),
+                    ("str_compatible", "false"),
+                    ("bytes_compatible", "true"),
+                    ("original_bytes_ok", "true"),
+                    ("cast_bytes_ok", "true"),
+                    ("bytes_equal", "true"),
+                    ("utf8_valid", "true"),
+                    ("username_valid", "true"),
+                    ("str_error_class", "type_mismatch"),
+                ],
+            );
+        }
+
+        #[test]
+        fn username_sample_null_and_missing_metadata_do_not_prove_mismatch() {
+            for metadata in [
+                Some([false, true, false, true]),
+                Some([true, false, false, true]),
+                None,
+            ] {
+                let mut sample = sample_evidence(b"private-user-marker");
+                sample.metadata = metadata;
+                sample.original_bytes = Err(sqlx::Error::Decode("private-error-marker".into()));
+                sample.cast_bytes = Err(sqlx::Error::Decode("private-error-marker".into()));
+                let expected_class = if metadata.is_some_and(|m| !m[0]) {
+                    "null"
+                } else {
+                    "other_decode"
+                };
+                let compatibility = if metadata.is_some() {
+                    ("false", "true")
+                } else {
+                    ("not_evaluated", "not_evaluated")
+                };
+                assert_sample_fields(
+                    &username_sample_summary(Some(sample)),
+                    &[
+                        ("str_compatible", compatibility.0),
+                        ("bytes_compatible", compatibility.1),
+                        ("bytes_equal", "not_evaluated"),
+                        ("utf8_valid", "not_evaluated"),
+                        ("username_valid", "not_evaluated"),
+                        ("str_error_class", expected_class),
+                    ],
+                );
+            }
+        }
+
+        #[test]
+        fn username_sample_strict_utf8_and_username_dependencies() {
+            let invalid = [0xff];
+            for (bytes, utf8, valid) in [
+                (invalid.as_slice(), "false", "not_evaluated"),
+                (b"bad name".as_slice(), "true", "false"),
+            ] {
+                assert_sample_fields(
+                    &username_sample_summary(Some(sample_evidence(bytes))),
+                    &[("utf8_valid", utf8), ("username_valid", valid)],
+                );
+            }
+            let mut sample = sample_evidence(b"private-user-marker");
+            sample.original_bytes = Ok(b"different-private-marker");
+            assert_sample_fields(
+                &username_sample_summary(Some(sample)),
+                &[("bytes_equal", "false")],
+            );
+        }
+
+        #[test]
+        fn username_sample_unknown_errors_are_closed_and_success_is_none() {
+            for (result, class) in [
+                (
+                    Err(sqlx::Error::ColumnDecode {
+                        index: "private-column-marker".into(),
+                        source: "private-error-marker".into(),
+                    }),
+                    "other_decode",
+                ),
+                (
+                    Err(sqlx::Error::ColumnNotFound("private-column-marker".into())),
+                    "column_access",
+                ),
+                (
+                    Err(sqlx::Error::Protocol("private-error-marker".into())),
+                    "other",
+                ),
+                (Ok("private-user-marker"), "none"),
+            ] {
+                let mut sample = sample_evidence(b"private-user-marker");
+                sample.metadata = Some([true, true, true, true]);
+                sample.original_str = result;
+                assert_sample_fields(
+                    &username_sample_summary(Some(sample)),
+                    &[("str_error_class", class)],
+                );
+            }
+        }
+
+        fn version_class(version: &Result<Option<i32>, ControllerError>) -> &'static str {
+            match version {
+                Ok(None) => "none",
+                Ok(Some(1)) => "v1",
+                Ok(Some(2)) => "v2",
+                Ok(Some(3)) => "v3",
+                Ok(Some(_)) => "unsupported",
+                Err(_) => "unreadable",
+            }
+        }
+
+        fn error_class(error: &ControllerError) -> &'static str {
+            // Exact matching only; never return a slice of the input error.
+            const DATA_CODES: &[&str] = &[
+                "transaction.begin",
+                "transaction.end",
+                "meta.read",
+                "meta.decode",
+                "meta.singleton",
+                "users.read",
+                "users.decode",
+                "users.username",
+                "boolean.read",
+                "boolean.decode",
+                "schema_meta.initialized",
+                "users.active",
+                "users.is_admin",
+                "users.must_change_password",
+                "sessions.revoked",
+                "roles.builtin",
+                "roles.archived",
+                "device_groups.archived",
+                "devices.archived",
+                "devices.read",
+                "devices.decode",
+                "devices.state",
+                "role_permissions.read",
+                "role_permissions.decode",
+                "role_permissions.permission",
+                "grants.length_read",
+                "grants.json_length",
+                "grants.read",
+                "grants.decode",
+                "grants.role_presence",
+                "grants.group_presence",
+                "grants.device_presence",
+                "grants.json",
+                "grants.fields",
+                "reference.read",
+                "sessions",
+                "role_permissions",
+                "group_members",
+                "grants",
+                "admission_decisions",
+                "audit_events",
+            ];
+            const PREFLIGHT_CODES: &[&str] = &[
+                "version",
+                "meta.read",
+                "meta.decode",
+                "meta.singleton",
+                "shape",
+                "check.whitelist",
+                "foreign_keys",
+                "data",
+                "column.read",
+                "column.count",
+                "column.v2_old",
+                "counter.query",
+                "counter.read",
+                "username.encoding_read",
+                "username.encoding",
+                "username.collision_read",
+                "username.collision",
+            ];
+            if let ControllerError::Config(message) = error {
+                for (prefix, codes) in [
+                    ("identity data ", DATA_CODES),
+                    ("legacy preflight ", PREFLIGHT_CODES),
+                ] {
+                    if let Some(suffix) = message.strip_prefix(prefix) {
+                        return codes
+                            .iter()
+                            .copied()
+                            .find(|code| *code == suffix)
+                            .unwrap_or("unclassified");
+                    }
+                }
+                if message.starts_with("negative identity column ")
+                    && IDENTITY_COLUMNS.iter().any(|(table, column, _, _)| {
+                        message == &format!("negative identity column {table}.{column}")
+                    })
+                {
+                    return "negative_value";
+                }
+            }
+            let shape = legacy_diagnostic_shape_code(error).0;
+            if shape == "shape_read_error" {
+                "unclassified"
+            } else {
+                shape
+            }
+        }
+
+        fn column_bitmap(columns: &[Result<bool, ControllerError>; 11]) -> String {
+            columns
+                .iter()
+                .map(|column| match column {
+                    Ok(true) => 'O',
+                    Ok(false) => 'T',
+                    Err(_) => 'U',
+                })
+                .collect()
+        }
+
+        // Input must be a complete, validated production shape result, never a
+        // best-effort name enumeration. No trusted result means all unknown.
+        fn check_bitmap(checks: Result<&[(&str, &str)], &ControllerError>) -> String {
+            let Ok(checks) = checks else {
+                return "UUUUU".into();
+            };
+            let mut bitmap = ['A'; 5];
+            for &(table, name) in checks {
+                let Some(index) = LEGACY_CHECK_DROPS
+                    .iter()
+                    .position(|&(t, n, _)| (t, n) == (table, name))
+                else {
+                    return "UUUUU".into();
+                };
+                if bitmap[index] == 'P' {
+                    return "UUUUU".into();
+                }
+                bitmap[index] = 'P';
+            }
+            bitmap.iter().collect()
+        }
+
+        #[derive(Default)]
+        struct Observation {
+            stages: Vec<&'static str>,
+            error: Option<&'static str>,
+            checks: Option<Vec<(&'static str, &'static str)>>,
+        }
+
+        struct DiagnosticProbe<P> {
+            inner: P,
+            observation: Mutex<Observation>,
+        }
+
+        impl<P> DiagnosticProbe<P> {
+            fn new(inner: P) -> Self {
+                Self {
+                    inner,
+                    observation: Mutex::new(Observation::default()),
+                }
+            }
+
+            async fn record<T>(
+                &self,
+                stage: &'static str,
+                future: impl std::future::Future<Output = Result<T, ControllerError>>,
+            ) -> Result<T, ControllerError> {
+                // Record before polling the delegated read. Preserve its error
+                // before production preflight replaces it with a broader code.
+                self.observation.lock().unwrap().stages.push(stage);
+                let result = future.await;
+                if let Err(error) = &result {
+                    self.observation.lock().unwrap().error = Some(error_class(error));
+                }
+                result
+            }
+        }
+
+        impl<P: LegacyPreflightProbe + Sync> LegacyPreflightProbe for DiagnosticProbe<P> {
+            async fn read_legacy_meta(&self) -> Result<Vec<(i8, i32)>, ControllerError> {
+                self.record("meta", self.inner.read_legacy_meta()).await
+            }
+            async fn legacy_shape(
+                &self,
+                version: i32,
+            ) -> Result<Vec<(&'static str, &'static str)>, ControllerError> {
+                let result = self.record("shape", self.inner.legacy_shape(version)).await;
+                if let Ok(checks) = &result {
+                    self.observation.lock().unwrap().checks = Some(checks.clone());
+                }
+                result
+            }
+            async fn no_foreign_keys(&self) -> Result<(), ControllerError> {
+                self.record("fk", self.inner.no_foreign_keys()).await
+            }
+            async fn identity_rows(&self, version: i32) -> Result<(), ControllerError> {
+                self.record("data", self.inner.identity_rows(version)).await
+            }
+            async fn column_status(&self, version: i32) -> Result<Vec<bool>, ControllerError> {
+                self.record("columns", self.inner.column_status(version))
+                    .await
+            }
+            async fn negative(&self, query: &'static str) -> Result<bool, ControllerError> {
+                self.record("negative", self.inner.negative(query)).await
+            }
+            async fn username_encoding(&self) -> Result<(), ControllerError> {
+                self.record("encoding", self.inner.username_encoding())
+                    .await
+            }
+            async fn username_collision(&self) -> Result<(), ControllerError> {
+                self.record("collision", self.inner.username_collision())
+                    .await
+            }
+        }
+
+        #[test]
+        fn readonly_diagnostic_version_and_errors_are_closed_classes() {
+            for (input, expected) in [
+                (Ok(None), "none"),
+                (Ok(Some(1)), "v1"),
+                (Ok(Some(2)), "v2"),
+                (Ok(Some(3)), "v3"),
+                (Ok(Some(99)), "unsupported"),
+                (
+                    Err(ControllerError::Config("private-marker".into())),
+                    "unreadable",
+                ),
+            ] {
+                assert_eq!(version_class(&input), expected);
+            }
+            for code in [
+                "users.username",
+                "transaction.begin",
+                "transaction.end",
+                "grants.json",
+                "meta.singleton",
+                "users.active",
+                "audit_events",
+            ] {
+                assert_eq!(
+                    error_class(&ControllerError::Config(format!("identity data {code}"))),
+                    code
+                );
+                assert_eq!(
+                    error_class(&ControllerError::Config(format!(
+                        "identity data {code} private-marker"
+                    ))),
+                    "unclassified"
+                );
+            }
+            assert_eq!(
+                error_class(&ControllerError::Config("private-marker".into())),
+                "unclassified"
+            );
+            assert_eq!(
+                error_class(&ControllerError::InvalidArgument),
+                "unclassified"
+            );
+        }
+
+        #[test]
+        fn readonly_diagnostic_bitmaps_preserve_order_and_fail_closed() {
+            let columns = std::array::from_fn(|index| match index % 3 {
+                0 => Ok(true),
+                1 => Ok(false),
+                _ => Err(ControllerError::Config("private-marker".into())),
+            });
+            assert_eq!(column_bitmap(&columns), "OTUOTUOTUOT");
+            assert_eq!(IDENTITY_COLUMNS.len(), 11);
+            assert_eq!(LEGACY_CHECK_DROPS.len(), 5);
+            for (index, &(table, name, _)) in LEGACY_CHECK_DROPS.iter().enumerate() {
+                let mut expected = ['A'; 5];
+                expected[index] = 'P';
+                assert_eq!(
+                    check_bitmap(Ok(&[(table, name)])),
+                    expected.iter().collect::<String>()
+                );
+                assert_eq!(check_bitmap(Ok(&[(table, name), (table, name)])), "UUUUU");
+            }
+            assert_eq!(check_bitmap(Ok(&[])), "AAAAA");
+            assert_eq!(check_bitmap(Ok(&[("private-marker", "unknown")])), "UUUUU");
+            assert_eq!(
+                check_bitmap(Err(&ControllerError::InvalidArgument)),
+                "UUUUU"
+            );
+            // The production reader rejects NULL, unknown, duplicate and invalid clauses.
+            for rows in [
+                vec![(None, None, None)],
+                vec![(
+                    Some("users".into()),
+                    Some("unknown".into()),
+                    Some("1".into()),
+                )],
+                vec![(
+                    Some("schema_meta".into()),
+                    Some("chk_schema_singleton".into()),
+                    None,
+                )],
+            ] {
+                let result = validate_legacy_check_metadata(&rows);
+                assert_eq!(check_bitmap(result.as_deref()), "UUUUU");
+            }
+        }
+
+        #[test]
+        fn readonly_diagnostic_static_entrypoint_has_only_read_paths() {
+            // Static source evidence only: no physical connection or DB behavior proof.
+            let module = include_str!("db.rs")
+                .split_once("    mod readonly_preflight_diagnostic {").unwrap().1
+                .split_once("    #[derive(Clone, Copy, Debug, PartialEq, Eq)]\n    enum DiagnosticTokenClass").unwrap().0;
+            let entry = module.split_once(
+                "\n        async fn mysql_failed_upgrade_readonly_preflight_diagnostic()",
+            );
+            assert!(entry.is_some(), "missing new ignored diagnostic entrypoint");
+            let entry = entry.unwrap().1;
+            for required in [
+                "read_version(&db)",
+                "read_column(&db, table, column)",
+                "classify_identity_column(table, column, &actual)",
+                "preflight_legacy_with_probe(&probe, version)",
+                "check_identity_schema(&db)",
+                "diagnostic_complete=true",
+            ] {
+                assert!(entry.contains(required), "missing read path: {required}");
+            }
+            assert!(entry.contains("let db = DbPool(readonly_diagnostic_pool().await)"));
+            let helper = module
+                .split_once("\n        async fn readonly_diagnostic_pool() -> sqlx::MySqlPool {")
+                .expect("missing shared guarded pool helper")
+                .1
+                .split_once("\n        #[tokio::test]")
+                .unwrap()
+                .0;
+            let sample = module
+                .split_once("\n        async fn mysql_username_decode_readonly_sample() {")
+                .expect("missing independent ignored username sample")
+                .1
+                .split_once("\n        // Read-only diagnostic entrypoint;")
+                .unwrap()
+                .0;
+            for required in [
+                "readonly_diagnostic_pool().await",
+                "SELECT username AS original, CAST(username AS BINARY) AS raw_bytes FROM users ORDER BY id LIMIT 1",
+                "row.try_get_raw(\"original\")",
+                "!raw.is_null()",
+                "!info.is_null()",
+                "<str as sqlx::Type<sqlx::MySql>>::compatible(&info)",
+                "<[u8] as sqlx::Type<sqlx::MySql>>::compatible(&info)",
+                "row.try_get::<&str, _>(\"original\")",
+                "row.try_get::<&[u8], _>(\"original\")",
+                "row.try_get::<&[u8], _>(\"raw_bytes\")",
+                "username_sample_summary(sample)",
+                "pool.close().await",
+            ] {
+                assert!(
+                    sample.contains(required),
+                    "missing bounded sample path: {required}"
+                );
+            }
+            assert_eq!(sample.matches("sqlx::query(").count(), 1);
+            let hook = helper
+                .split_once(".after_connect(")
+                .unwrap()
+                .1
+                .split_once(".connect(&db_url)")
+                .unwrap()
+                .0;
+            for required in [
+                "SELECT DATABASE()",
+                "SELECT VERSION()",
+                "SHOW GRANTS",
+                "validate_schema_metadata_grants(&grants, &expected)",
+                "8.0.46",
+            ] {
+                assert!(
+                    hook.contains(required),
+                    "missing physical connection guard: {required}"
+                );
+            }
+            assert!(helper.contains(".max_connections(1)"));
+            for required in [
+                "actual.as_deref() != Some(expected.as_str())",
+                "version.as_deref() != Some(\"8.0.46\")",
+                "diagnostic_connection_rejected",
+                "diagnostic_connect_failed",
+            ] {
+                assert!(
+                    helper.contains(required),
+                    "missing fail-closed guard: {required}"
+                );
+            }
+            for forbidden in [
+                "run_identity_test_migration",
+                "upgrade_",
+                "fixture_",
+                ".execute(",
+                ".alter(",
+                ".drop_known_check(",
+                ".cas_version(",
+                "LegacyUpgradeProbe",
+                "println!(\"{error}",
+                "println!(\"{error:?}",
+                "try_get_unchecked",
+                "from_utf8_lossy",
+                "unsafe",
+            ] {
+                for source in [entry, helper, sample] {
+                    assert!(!source.contains(forbidden), "unexpected path: {forbidden}");
+                }
+            }
+        }
+
+        struct ReadonlyFake {
+            version: i32,
+            fault: Option<&'static str>,
+        }
+        impl ReadonlyFake {
+            fn gate(&self, stage: &str) -> Result<(), ControllerError> {
+                if self.fault == Some(stage) {
+                    Err(ControllerError::Config(
+                        "identity data users.username".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        impl LegacyPreflightProbe for ReadonlyFake {
+            async fn read_legacy_meta(&self) -> Result<Vec<(i8, i32)>, ControllerError> {
+                self.gate("meta")?;
+                Ok(vec![(1, self.version)])
+            }
+            async fn legacy_shape(
+                &self,
+                _: i32,
+            ) -> Result<Vec<(&'static str, &'static str)>, ControllerError> {
+                self.gate("shape")?;
+                Ok(LEGACY_CHECK_ORDER.to_vec())
+            }
+            async fn no_foreign_keys(&self) -> Result<(), ControllerError> {
+                self.gate("fk")
+            }
+            async fn identity_rows(&self, _: i32) -> Result<(), ControllerError> {
+                self.gate("data")
+            }
+            async fn column_status(&self, _: i32) -> Result<Vec<bool>, ControllerError> {
+                self.gate("columns")?;
+                Ok(vec![self.version == 1; 11])
+            }
+            async fn negative(&self, _: &'static str) -> Result<bool, ControllerError> {
+                self.gate("negative")?;
+                Ok(false)
+            }
+            async fn username_encoding(&self) -> Result<(), ControllerError> {
+                self.gate("encoding")
+            }
+            async fn username_collision(&self) -> Result<(), ControllerError> {
+                self.gate("collision")
+            }
+        }
+
+        #[tokio::test]
+        async fn readonly_diagnostic_decorator_tracks_real_preflight_order_and_stops() {
+            for version in [1, 2] {
+                let mut stages = vec!["meta", "shape", "fk", "data", "columns"];
+                if version == 1 {
+                    stages.extend(["negative"; 10]);
+                }
+                stages.extend(["encoding", "collision"]);
+                let good = DiagnosticProbe::new(ReadonlyFake {
+                    version,
+                    fault: None,
+                });
+                let result = preflight_legacy_with_probe(&good, version).await.unwrap();
+                assert_eq!(result.old_columns, [version == 1; 11]);
+                assert_eq!(good.observation.lock().unwrap().stages, stages);
+                for (index, &stage) in stages.iter().enumerate() {
+                    if index > 0 && stages[index - 1] == stage {
+                        continue;
+                    }
+                    let bad = DiagnosticProbe::new(ReadonlyFake {
+                        version,
+                        fault: Some(stage),
+                    });
+                    let error = preflight_legacy_with_probe(&bad, version)
+                        .await
+                        .err()
+                        .unwrap();
+                    let observation = bad.observation.lock().unwrap();
+                    assert_eq!(observation.stages, stages[..=index]);
+                    assert_eq!(observation.error, Some("users.username"));
+                    if stage == "data" {
+                        assert_eq!(
+                            error.to_string(),
+                            legacy_preflight_error("data").to_string()
+                        );
+                    }
+                }
+            }
+        }
+        async fn readonly_diagnostic_pool() -> sqlx::MySqlPool {
+            let db_url = std::env::var("RSETUP_TEST_DATABASE_URL")
+                .unwrap_or_else(|_| panic!("diagnostic_env_url_missing"));
+            let expected = std::env::var("RSETUP_EXPECTED_DATABASE")
+                .unwrap_or_else(|_| panic!("diagnostic_env_database_missing"));
+            assert!(!db_url.is_empty(), "diagnostic_env_url_empty");
+            assert!(!expected.is_empty(), "diagnostic_env_database_empty");
+            sqlx::mysql::MySqlPoolOptions::new()
+                .max_connections(1)
+                .after_connect(move |connection, _meta| {
+                    let expected = expected.clone();
+                    Box::pin(async move {
+                        let rejected =
+                            || sqlx::Error::Protocol("diagnostic_connection_rejected".into());
+                        let actual: Option<String> = sqlx::query_scalar("SELECT DATABASE()")
+                            .fetch_one(&mut *connection)
+                            .await
+                            .map_err(|_| rejected())?;
+                        if actual.as_deref() != Some(expected.as_str()) {
+                            return Err(rejected());
+                        }
+                        let version: Option<String> = sqlx::query_scalar("SELECT VERSION()")
+                            .fetch_one(&mut *connection)
+                            .await
+                            .map_err(|_| rejected())?;
+                        if version.as_deref() != Some("8.0.46") {
+                            return Err(sqlx::Error::Protocol("diagnostic_wrong_engine".into()));
+                        }
+                        let rows = sqlx::query("SHOW GRANTS")
+                            .fetch_all(&mut *connection)
+                            .await
+                            .map_err(|_| rejected())?;
+                        let grants = rows
+                            .iter()
+                            .map(|row| row.try_get::<Option<String>, _>(0).map_err(|_| rejected()))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        validate_schema_metadata_grants(&grants, &expected)
+                            .map_err(|_| rejected())?;
+                        Ok(())
+                    })
+                })
+                .connect(&db_url)
+                .await
+                .unwrap_or_else(|_| panic!("diagnostic_connect_failed"))
+        }
+
+        #[tokio::test]
+        #[ignore = "manual one-row SELECT-only MySQL 8.0.46 sample; parent approval and review required"]
+        async fn mysql_username_decode_readonly_sample() {
+            use sqlx::{TypeInfo, ValueRef};
+
+            let pool = readonly_diagnostic_pool().await;
+            let row = sqlx::query("SELECT username AS original, CAST(username AS BINARY) AS raw_bytes FROM users ORDER BY id LIMIT 1")
+                .fetch_optional(&pool)
+                .await
+                .unwrap_or_else(|_| panic!("diagnostic_sample_query_failed"));
+            let sample = row.as_ref().map(|row| UsernameSample {
+                metadata: row.try_get_raw("original").ok().map(|raw| {
+                    let info = raw.type_info();
+                    [
+                        !raw.is_null(),
+                        !info.is_null(),
+                        <str as sqlx::Type<sqlx::MySql>>::compatible(&info),
+                        <[u8] as sqlx::Type<sqlx::MySql>>::compatible(&info),
+                    ]
+                }),
+                original_str: row.try_get::<&str, _>("original"),
+                original_bytes: row.try_get::<&[u8], _>("original"),
+                cast_bytes: row.try_get::<&[u8], _>("raw_bytes"),
+            });
+            let summary = username_sample_summary(sample);
+            pool.close().await;
+            println!("{summary}");
+        }
+
+        // Read-only diagnostic entrypoint; separate from the old None/meta0 probe.
+        #[tokio::test]
+        #[ignore = "manual SELECT-only MySQL 8.0.46 preflight; parent approval and review required"]
+        async fn mysql_failed_upgrade_readonly_preflight_diagnostic() {
+            let db = DbPool(readonly_diagnostic_pool().await);
+            let version = read_version(&db).await;
+            println!("version_class={}", version_class(&version));
+            // Independent observation, not an atomic snapshot with preflight.
+            let mut columns = std::array::from_fn(|_| Err(ControllerError::InvalidArgument));
+            for (index, &(table, column, _, _)) in IDENTITY_COLUMNS.iter().enumerate() {
+                columns[index] = read_column(&db, table, column)
+                    .await
+                    .and_then(|actual| classify_identity_column(table, column, &actual));
+            }
+            println!("old_columns={}", column_bitmap(&columns));
+            let (stage, status, class, checks) = match version {
+                Ok(Some(version @ (1 | 2))) => {
+                    let probe = DiagnosticProbe::new(db.clone());
+                    let result = preflight_legacy_with_probe(&probe, version).await;
+                    let observation = probe.observation.lock().unwrap();
+                    let checks = check_bitmap(
+                        observation
+                            .checks
+                            .as_deref()
+                            .ok_or(&ControllerError::InvalidArgument),
+                    );
+                    match result {
+                        Ok(_) => ("complete", "passed", "none", checks),
+                        Err(error) => (
+                            observation.stages.last().copied().unwrap_or("meta"),
+                            "failed",
+                            observation.error.unwrap_or_else(|| error_class(&error)),
+                            checks,
+                        ),
+                    }
+                }
+                Ok(Some(3)) => match check_identity_schema(&db).await {
+                    // The production v3 ready gate rejects every CHECK.
+                    Ok(()) => ("complete", "passed", "none", "AAAAA".into()),
+                    Err(error) => ("ready", "failed", error_class(&error), "UUUUU".into()),
+                },
+                Ok(None | Some(_)) => ("meta", "not_applicable", "none", "UUUUU".into()),
+                Err(_) => ("meta", "failed", "version_unreadable", "UUUUU".into()),
+            };
+            println!("known_checks={checks}");
+            println!("preflight_stage={stage} preflight_status={status} error_class={class}");
+            db.0.close().await;
+            println!("diagnostic_complete=true");
+            assert!(status != "failed", "diagnostic_preflight_failed");
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum DiagnosticTokenClass {
+        ParenOpen,
+        ParenClose,
+        Operator,
+        KnownIdentifier,
+        KnownStringLiteral,
+        Keyword,
+        Other,
+        End,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct DiagnosticTokenDiff {
+        observed_tokens_parseable: bool,
+        expected_tokens_parseable: bool,
+        observed_token_count: Option<u8>,
+        expected_token_count: Option<u8>,
+        first_mismatch_token_index: Option<u16>,
+        first_mismatch_token_class: Option<DiagnosticTokenClass>,
+        expected_class: Option<DiagnosticTokenClass>,
+    }
+
+    impl DiagnosticTokenClass {
+        fn code(&self) -> &'static str {
+            match self {
+                Self::ParenOpen => "paren/open",
+                Self::ParenClose => "paren/close",
+                Self::Operator => "operator",
+                Self::KnownIdentifier => "known_identifier",
+                Self::KnownStringLiteral => "known_string_literal",
+                Self::Keyword => "keyword",
+                Self::Other => "other",
+                Self::End => "end",
+            }
+        }
+    }
+
+    fn diagnostic_token_class(token: Option<&str>) -> DiagnosticTokenClass {
+        match token {
+            None => DiagnosticTokenClass::End,
+            Some("(") => DiagnosticTokenClass::ParenOpen,
+            Some(")") => DiagnosticTokenClass::ParenClose,
+            Some("=" | ",") => DiagnosticTokenClass::Operator,
+            Some(
+                "singleton" | "admission_state" | "review_decision" | "source_kind" | "role_id"
+                | "permissions" | "scope_kind" | "scope_group_id" | "scope_device_id",
+            ) => DiagnosticTokenClass::KnownIdentifier,
+            Some("'role'" | "'direct'" | "'all'" | "'group'" | "'device'") => {
+                DiagnosticTokenClass::KnownStringLiteral
+            }
+            Some("and" | "or" | "is" | "not" | "null" | "in") => DiagnosticTokenClass::Keyword,
+            Some(_) => DiagnosticTokenClass::Other,
+        }
+    }
+
+    fn diagnostic_token_diff(observed: &str, expected: &str) -> DiagnosticTokenDiff {
+        let observed_tokens = legacy_check_tokens(observed);
+        let expected_tokens = legacy_check_tokens(expected);
+        let observed_token_count = observed_tokens
+            .as_ref()
+            .map(|tokens| tokens.len().min(255) as u8);
+        let expected_token_count = expected_tokens
+            .as_ref()
+            .map(|tokens| tokens.len().min(255) as u8);
+        let mismatch = observed_tokens
+            .as_ref()
+            .zip(expected_tokens.as_ref())
+            .and_then(|(observed, expected)| {
+                (0..observed.len().max(expected.len()))
+                    .find(|&index| observed.get(index) != expected.get(index))
+                    .and_then(|index| {
+                        let mismatch_index = u16::try_from(index).ok()?;
+                        Some((
+                            mismatch_index,
+                            diagnostic_token_class(observed.get(index).map(String::as_str)),
+                            diagnostic_token_class(expected.get(index).map(String::as_str)),
+                        ))
+                    })
+            });
+        DiagnosticTokenDiff {
+            observed_tokens_parseable: observed_tokens.is_some(),
+            expected_tokens_parseable: expected_tokens.is_some(),
+            observed_token_count,
+            expected_token_count,
+            first_mismatch_token_index: mismatch.as_ref().map(|(index, _, _)| *index),
+            first_mismatch_token_class: mismatch.as_ref().map(|(_, class, _)| *class),
+            expected_class: mismatch.map(|(_, _, class)| class),
+        }
+    }
+
+    #[test]
+    fn grant_token_diff_ignores_outer_parentheses_but_detects_reordered_tokens() {
+        let expected = "(source_kind = 'role')";
+        assert_eq!(
+            diagnostic_token_diff("(((source_kind = 'role')))", expected),
+            DiagnosticTokenDiff {
+                observed_tokens_parseable: true,
+                expected_tokens_parseable: true,
+                observed_token_count: Some(3),
+                expected_token_count: Some(3),
+                first_mismatch_token_index: None,
+                first_mismatch_token_class: None,
+                expected_class: None,
+            }
+        );
+        assert_eq!(
+            diagnostic_token_diff("(role_id = source_kind)", "(source_kind = role_id)"),
+            DiagnosticTokenDiff {
+                observed_tokens_parseable: true,
+                expected_tokens_parseable: true,
+                observed_token_count: Some(3),
+                expected_token_count: Some(3),
+                first_mismatch_token_index: Some(0),
+                first_mismatch_token_class: Some(DiagnosticTokenClass::KnownIdentifier),
+                expected_class: Some(DiagnosticTokenClass::KnownIdentifier),
+            }
+        );
+    }
+
+    #[test]
+    fn grant_token_diff_reports_unparseable_without_guessing_mismatch() {
+        assert_eq!(
+            diagnostic_token_diff("(source_kind = 'ro\\'le')", "(source_kind = 'role')"),
+            DiagnosticTokenDiff {
+                observed_tokens_parseable: false,
+                expected_tokens_parseable: true,
+                observed_token_count: None,
+                expected_token_count: Some(3),
+                first_mismatch_token_index: None,
+                first_mismatch_token_class: None,
+                expected_class: None,
+            }
+        );
+    }
+
+    #[test]
+    fn grant_token_diff_classifies_only_fixed_categories_and_end() {
+        assert_eq!(
+            diagnostic_token_diff("('rogue')", "('role')"),
+            DiagnosticTokenDiff {
+                observed_tokens_parseable: true,
+                expected_tokens_parseable: true,
+                observed_token_count: Some(1),
+                expected_token_count: Some(1),
+                first_mismatch_token_index: Some(0),
+                first_mismatch_token_class: Some(DiagnosticTokenClass::Other),
+                expected_class: Some(DiagnosticTokenClass::KnownStringLiteral),
+            }
+        );
+        assert_eq!(
+            diagnostic_token_diff("(source_kind)", "(source_kind = 'role')"),
+            DiagnosticTokenDiff {
+                observed_tokens_parseable: true,
+                expected_tokens_parseable: true,
+                observed_token_count: Some(1),
+                expected_token_count: Some(3),
+                first_mismatch_token_index: Some(1),
+                first_mismatch_token_class: Some(DiagnosticTokenClass::End),
+                expected_class: Some(DiagnosticTokenClass::Operator),
+            }
+        );
+    }
+
+    #[test]
+    fn grant_token_diff_bounds_counts_and_classifies_parentheses_keywords() {
+        let many = "source_kind ".repeat(300);
+        let capped = diagnostic_token_diff(&many, &many);
+        assert_eq!(capped.observed_token_count, Some(255));
+        assert_eq!(capped.expected_token_count, Some(255));
+        assert_eq!(capped.first_mismatch_token_index, None);
+
+        let open = diagnostic_token_diff("source_kind = (role_id)", "source_kind = role_id");
+        assert_eq!(open.first_mismatch_token_index, Some(2));
+        assert_eq!(
+            open.first_mismatch_token_class,
+            Some(DiagnosticTokenClass::ParenOpen)
+        );
+        assert_eq!(
+            open.expected_class,
+            Some(DiagnosticTokenClass::KnownIdentifier)
+        );
+
+        let close = diagnostic_token_diff(
+            "source_kind = (role_id) OR role_id",
+            "source_kind = (role_id OR role_id)",
+        );
+        assert_eq!(close.first_mismatch_token_index, Some(4));
+        assert_eq!(
+            close.first_mismatch_token_class,
+            Some(DiagnosticTokenClass::ParenClose)
+        );
+        assert_eq!(close.expected_class, Some(DiagnosticTokenClass::Keyword));
+    }
+
+    // Test-only: compare restored metadata to the original fixed 0001 declaration.
+    // The returned summary never contains tokens or CHECK text.
+    fn fixed_grant_check_token_diff(index: usize, stored: &str) -> Option<DiagnosticTokenDiff> {
+        if !matches!(index, 3 | 4) {
+            return None;
+        }
+        let (table, name, _) = LEGACY_CHECK_DROPS[index];
+        let declared = ddl_parts_from(MIGRATION, table)
+            .into_iter()
+            .find(|part| part.starts_with(&format!("CONSTRAINT {name} CHECK ")))?;
+        let expression = declared.split_once("CHECK ")?.1;
+        let restored = stored.replace("\\'", "'");
+        Some(diagnostic_token_diff(&restored, expression))
+    }
+
+    #[test]
+    fn grant_token_diff_only_uses_two_fixed_declared_checks() {
+        let stored = "((`source_kind` = _utf8mb4\\'role\\' AND `role_id` IS NOT NULL AND `permissions` IS NULL) OR (`source_kind` = _utf8mb4\\'direct\\' AND `role_id` IS NULL AND `permissions` IS NOT NULL))";
+        let diff = fixed_grant_check_token_diff(3, stored).expect("fixed source CHECK");
+        assert!(diff.observed_tokens_parseable);
+        assert!(diff.expected_tokens_parseable);
+        assert_eq!(diff.first_mismatch_token_index, None);
+        assert_eq!(fixed_grant_check_token_diff(0, stored), None);
+        assert_eq!(fixed_grant_check_token_diff(1, stored), None);
+        assert_eq!(fixed_grant_check_token_diff(2, stored), None);
+        assert_eq!(fixed_grant_check_token_diff(5, stored), None);
+
+        let scope = "((`scope_kind` = _utf8mb4\\'all\\' AND `scope_group_id` IS NULL AND `scope_device_id` IS NULL) OR (`scope_kind` = _utf8mb4\\'group\\' AND `scope_group_id` IS NOT NULL AND `scope_device_id` IS NULL) OR (`scope_kind` = _utf8mb4\\'device\\' AND `scope_group_id` IS NULL AND `scope_device_id` IS NOT NULL))";
+        let scope_diff = fixed_grant_check_token_diff(4, scope).expect("fixed scope CHECK");
+        assert!(scope_diff.observed_tokens_parseable);
+        assert!(scope_diff.expected_tokens_parseable);
+        assert_eq!(scope_diff.first_mismatch_token_index, None);
+    }
+
+    #[test]
+    fn grant_token_diff_output_stays_inside_check_mismatch_gate() {
+        let diagnostic = include_str!("db.rs")
+            .split_once("\n    async fn mysql_preserved_v1_legacy_select_gates_diagnostic()")
+            .unwrap()
+            .1
+            .split_once("\n    #[test]\n    fn decode_snapshot_rejects_invalid_pairs")
+            .unwrap()
+            .0;
+        let check_guard = diagnostic
+            .find("if code == \"check_unavailable_or_incompatible\"")
+            .unwrap();
+        let mismatch_guard = diagnostic.find("Some(index @ (3 | 4))").unwrap();
+        let probe = diagnostic
+            .find("fixed_grant_check_escape_probe(index, stored)")
+            .unwrap();
+        let token_diff = diagnostic
+            .find("fixed_grant_check_token_diff(index, stored)")
+            .expect("missing token diff");
+        let output = diagnostic
+            .find("observed_tokens_parseable={}")
+            .expect("missing fixed output");
+        assert!(
+            check_guard < mismatch_guard
+                && mismatch_guard < probe
+                && probe < token_diff
+                && token_diff < output
+        );
+        assert!(diagnostic.contains("first_mismatch_token_class={:?}"));
+        assert!(diagnostic.contains("expected_class={:?}"));
+        let wrapped_probe = diagnostic
+            .find("fixed_wrapped_grant_probe(index, stored)")
+            .expect("missing fixed wrapped-candidate probe");
+        let wrapped_output = diagnostic
+            .find("wrapped_candidate_exact_bytes={} wrapped_candidate_tokens_equal={}")
+            .expect("missing wrapped-candidate booleans");
+        assert!(mismatch_guard < wrapped_probe && wrapped_probe < wrapped_output);
+    }
+
+    // Diagnostic only: full fixed candidates for the atom-wrapping hypothesis.
+    // They are never accepted by the production CHECK validator.
+    fn fixed_wrapped_grant_candidate(index: usize) -> Option<&'static str> {
+        match index {
+            3 => Some(concat!(
+                "(((`source_kind` = _utf8mb4'role') AND (`role_id` IS NOT NULL) AND (`permissions` IS NULL)) OR ",
+                "((`source_kind` = _utf8mb4'direct') AND (`role_id` IS NULL) AND (`permissions` IS NOT NULL)))",
+            )),
+            4 => Some(concat!(
+                "(((`scope_kind` = _utf8mb4'all') AND (`scope_group_id` IS NULL) AND (`scope_device_id` IS NULL)) OR ",
+                "((`scope_kind` = _utf8mb4'group') AND (`scope_group_id` IS NOT NULL) AND (`scope_device_id` IS NULL)) OR ",
+                "((`scope_kind` = _utf8mb4'device') AND (`scope_group_id` IS NULL) AND (`scope_device_id` IS NOT NULL)))",
+            )),
+            _ => None,
+        }
+    }
+
+    fn fixed_wrapped_grant_probe(index: usize, stored: &str) -> Option<(bool, bool)> {
+        let candidate = fixed_wrapped_grant_candidate(index)?;
+        let restored = stored.replace("\\'", "'");
+        Some((
+            stored == candidate.replace('\'', "\\'"),
+            legacy_check_tokens(&restored)
+                .zip(legacy_check_tokens(candidate))
+                .is_some_and(|(observed, expected)| observed == expected),
+        ))
+    }
+
+    #[test]
+    fn fixed_wrapped_grant_candidates_match_only_declared_atom_layouts() {
+        // Compare against the original 0001 tokens using fixed atom widths and
+        // explicit AND/OR positions, never arbitrary parenthesis removal.
+        for (index, groups, count) in [
+            (3, &[&[3, 4, 3][..], &[3, 3, 4][..]][..], 41),
+            (4, &[&[3, 3, 3][..], &[3, 4, 3][..], &[3, 3, 4][..]][..], 61),
+        ] {
+            let (table, name, _) = LEGACY_CHECK_DROPS[index];
+            let declared = ddl_parts_from(MIGRATION, table)
+                .into_iter()
+                .find(|part| part.starts_with(&format!("CONSTRAINT {name} CHECK ")))
+                .expect("fixed 0001 CHECK");
+            let original =
+                legacy_check_tokens(declared.split_once("CHECK ").unwrap().1).expect("0001 tokens");
+            assert_eq!(original.len(), if index == 3 { 29 } else { 43 });
+            let candidate = fixed_wrapped_grant_candidate(index).expect("fixed candidate");
+            let observed = legacy_check_tokens(candidate).expect("fixed candidate tokens");
+            assert_eq!(observed.len(), count);
+            let mut expected_wrapped = Vec::new();
+            let mut cursor = 0;
+            for (group_index, atoms) in groups.iter().enumerate() {
+                assert_eq!(original[cursor], "(");
+                expected_wrapped.push(original[cursor].clone());
+                cursor += 1;
+                for (atom_index, &width) in atoms.iter().enumerate() {
+                    expected_wrapped.push("(".to_owned());
+                    expected_wrapped.extend(original[cursor..cursor + width].iter().cloned());
+                    cursor += width;
+                    expected_wrapped.push(")".to_owned());
+                    if atom_index + 1 < atoms.len() {
+                        assert_eq!(original[cursor], "and");
+                        expected_wrapped.push(original[cursor].clone());
+                        cursor += 1;
+                    }
+                }
+                assert_eq!(original[cursor], ")");
+                expected_wrapped.push(original[cursor].clone());
+                cursor += 1;
+                if group_index + 1 < groups.len() {
+                    assert_eq!(original[cursor], "or");
+                    expected_wrapped.push(original[cursor].clone());
+                    cursor += 1;
+                }
+            }
+            assert_eq!(cursor, original.len());
+            assert_eq!(observed, expected_wrapped);
+            assert_eq!(
+                fixed_wrapped_grant_probe(index, &candidate.replace('\'', "\\'")),
+                Some((true, true))
+            );
+            assert_eq!(fixed_wrapped_grant_probe(0, candidate), None);
+            assert_eq!(fixed_wrapped_grant_probe(1, candidate), None);
+            assert_eq!(fixed_wrapped_grant_probe(2, candidate), None);
+            assert_eq!(fixed_wrapped_grant_probe(5, candidate), None);
+        }
+    }
+
+    #[test]
+    fn fixed_wrapped_grant_probe_rejects_literal_column_connective_and_paren_mutations() {
+        for index in [3, 4] {
+            let candidate = fixed_wrapped_grant_candidate(index).expect("fixed candidate");
+            let escaped = candidate.replace('\'', "\\'");
+            let (literals, columns): (&[&str], &[&str]) = if index == 3 {
+                (
+                    &["role", "direct"],
+                    &["source_kind", "role_id", "permissions"],
+                )
+            } else {
+                (
+                    &["all", "group", "device"],
+                    &["scope_kind", "scope_group_id", "scope_device_id"],
+                )
+            };
+            for literal in literals {
+                let needle = format!("\\'{literal}\\'");
+                for (offset, _) in escaped.match_indices(&needle) {
+                    let mut changed = escaped.clone();
+                    changed.replace_range(offset..offset + needle.len(), "\\'rogue\\'");
+                    assert_eq!(
+                        fixed_wrapped_grant_probe(index, &changed),
+                        Some((false, false))
+                    );
+                }
+            }
+            for column in columns {
+                let needle = format!("`{column}`");
+                for (offset, _) in escaped.match_indices(&needle) {
+                    let mut changed = escaped.clone();
+                    changed.replace_range(offset..offset + needle.len(), "`rogue`");
+                    assert_eq!(
+                        fixed_wrapped_grant_probe(index, &changed),
+                        Some((false, false))
+                    );
+                }
+            }
+            for (needle, replacement) in [(" AND ", " OR "), (" OR ", " AND ")] {
+                for (offset, _) in escaped.match_indices(needle) {
+                    let mut changed = escaped.clone();
+                    changed.replace_range(offset..offset + needle.len(), replacement);
+                    assert_eq!(
+                        fixed_wrapped_grant_probe(index, &changed),
+                        Some((false, false))
+                    );
+                }
+            }
+            let extra_atom_parens = escaped
+                .replacen("(((", "((((", 1)
+                .replacen(") AND ", ")) AND ", 1);
+            assert_eq!(
+                fixed_wrapped_grant_probe(index, &extra_atom_parens),
+                Some((false, false))
+            );
+            assert_eq!(
+                fixed_wrapped_grant_probe(index, &format!("({escaped})")),
+                Some((false, true))
+            );
+            assert_eq!(
+                fixed_wrapped_grant_probe(index, candidate),
+                Some((false, true))
+            );
+        }
+    }
+
+    // Test-only observation shape; no metadata text is retained in printable fields.
+    #[derive(Debug)]
+    struct GrantFormatObservation {
+        stored_len: usize,
+        candidate_len: usize,
+        leading_parens: usize,
+        trailing_parens: usize,
+        ascii_whitespace: usize,
+        backticks: usize,
+        wrapped_matches: [bool; 5],
+        enforced: &'static str,
+    }
+
+    // Compare the complete synthetic spelling, permitting case changes only in
+    // fixed SQL keywords. All literal/identifier bytes and inner spaces remain exact.
+    fn fixed_keyword_case_match(observed: &str, expected: &str) -> bool {
+        let observed = observed.as_bytes();
+        let expected = expected.as_bytes();
+        if observed.len() != expected.len() {
+            return false;
+        }
+        let mut offset = 0;
+        while offset < expected.len() {
+            if expected[offset].is_ascii_alphabetic() {
+                let end = offset
+                    + expected[offset..]
+                        .iter()
+                        .take_while(|byte| byte.is_ascii_alphabetic())
+                        .count();
+                let word = &expected[offset..end];
+                let keyword = [b"AND".as_slice(), b"OR", b"IS", b"NOT", b"NULL"].contains(&word);
+                if (keyword && !observed[offset..end].eq_ignore_ascii_case(word))
+                    || (!keyword && observed[offset..end] != *word)
+                {
+                    return false;
+                }
+                offset = end;
+            } else {
+                if observed[offset] != expected[offset] {
+                    return false;
+                }
+                offset += 1;
+            }
+        }
+        true
+    }
+
+    fn diagnostic_enforced_code(enforced: Option<&str>) -> &'static str {
+        match enforced {
+            Some("YES") => "yes",
+            Some("NO") => "no",
+            _ => "unknown",
+        }
+    }
+
+    fn grant_format_observation(
+        index: usize,
+        stored: &str,
+        enforced: Option<&str>,
+    ) -> Option<GrantFormatObservation> {
+        let literals: &[&str] = match index {
+            3 => &["role", "direct"],
+            4 => &["all", "group", "device"],
+            _ => return None,
+        };
+        let candidate = fixed_wrapped_grant_candidate(index)?.replace('\'', "\\'");
+        let bytes = stored.as_bytes();
+        let leading_parens = stored
+            .trim_ascii_start()
+            .bytes()
+            .take_while(|&b| b == b'(')
+            .count();
+        let trailing_parens = stored
+            .trim_ascii_end()
+            .bytes()
+            .rev()
+            .take_while(|&b| b == b')')
+            .count();
+        let ascii_whitespace = bytes
+            .iter()
+            .filter(|byte| byte.is_ascii_whitespace())
+            .count();
+        let backticks = bytes.iter().filter(|&&byte| byte == b'`').count();
+        let pair_count = bytes.windows(2).filter(|pair| *pair == b"\\'").count();
+        let slash_count = bytes.iter().filter(|&&byte| byte == b'\\').count();
+        if bytes.len() >= 4096
+            || candidate.len() >= 4096
+            || leading_parens > 8
+            || trailing_parens > 8
+            || ascii_whitespace > 255
+            || pair_count != 2 * literals.len()
+            || slash_count != pair_count
+            || stored.matches("_utf8mb4").count() != literals.len()
+            || literals.iter().any(|literal| {
+                let anchor = format!("_utf8mb4\\'{literal}\\'");
+                stored.matches(&anchor).count() != 1
+            })
+        {
+            return None;
+        }
+        let stored_trimmed = stored.trim_ascii();
+        let wrapped_matches = std::array::from_fn(|layers| {
+            let wrapped = format!("{}{}{}", "(".repeat(layers), candidate, ")".repeat(layers));
+            fixed_keyword_case_match(stored_trimmed, &wrapped)
+        });
+        Some(GrantFormatObservation {
+            stored_len: bytes.len(),
+            candidate_len: candidate.len(),
+            leading_parens,
+            trailing_parens,
+            ascii_whitespace,
+            backticks,
+            wrapped_matches,
+            enforced: diagnostic_enforced_code(enforced),
+        })
+    }
+
+    #[test]
+    fn grant_format_observation_does_not_emit_check_fingerprint() {
+        let source = include_str!("db.rs");
+        let probe = source
+            .split_once("struct GrantFormatObservation {")
+            .unwrap()
+            .1
+            .split_once("    // Compare the complete synthetic spelling")
+            .unwrap()
+            .0;
+        let helper = source
+            .split_once("fn grant_format_observation(")
+            .unwrap()
+            .1
+            .split_once(
+                "    #[test]\n    fn grant_format_observation_does_not_emit_check_fingerprint",
+            )
+            .unwrap()
+            .0;
+        let diagnostic = source
+            .split_once("\n    async fn mysql_preserved_v1_legacy_select_gates_diagnostic()")
+            .unwrap()
+            .1
+            .split_once("    #[test]\n    fn decode_snapshot_rejects_invalid_pairs")
+            .unwrap()
+            .0;
+        assert!(!probe.contains("sha256"));
+        assert!(!helper.contains("Sha256"));
+        assert!(!diagnostic.contains("stored_sha256"));
+        assert!(diagnostic.contains("row.try_get::<Option<String>, _>(\"enforced\")"));
+        assert!(diagnostic.contains(".unwrap_or(None)"));
+    }
+
+    #[test]
+    fn grant_format_observation_accepts_only_fixed_synthetic_anchors() {
+        for (index, literal_count, slash_count) in [(3, 2, 4), (4, 3, 6)] {
+            let candidate = fixed_wrapped_grant_candidate(index).unwrap();
+            let stored = candidate.replace('\'', "\\'");
+            let observed = grant_format_observation(index, &stored, Some("YES"))
+                .expect("synthetic readback must be observable");
+            assert_eq!(observed.stored_len, stored.len());
+            assert_eq!(observed.candidate_len, stored.len());
+            assert_eq!(observed.leading_parens, 3);
+            assert_eq!(observed.trailing_parens, 3);
+            assert_eq!(
+                observed.ascii_whitespace,
+                stored.bytes().filter(u8::is_ascii_whitespace).count()
+            );
+            assert_eq!(
+                observed.backticks,
+                stored.bytes().filter(|&byte| byte == b'`').count()
+            );
+            assert_eq!(observed.wrapped_matches, [true, false, false, false, false]);
+            assert_eq!(observed.enforced, "yes");
+            assert_eq!(stored.matches("_utf8mb4").count(), literal_count);
+            assert_eq!(
+                stored.bytes().filter(|&byte| byte == b'\\').count(),
+                slash_count
+            );
+            assert_eq!(
+                grant_format_observation(index, &stored, Some("NO"))
+                    .unwrap()
+                    .enforced,
+                "no"
+            );
+            assert_eq!(
+                grant_format_observation(index, &stored, None)
+                    .unwrap()
+                    .enforced,
+                "unknown"
+            );
+            assert_eq!(
+                grant_format_observation(index, &stored, Some("YES"))
+                    .unwrap()
+                    .enforced
+                    .to_string(),
+                "yes"
+            );
+            assert_eq!(
+                grant_format_observation(index, &stored, Some("NO"))
+                    .unwrap()
+                    .enforced
+                    .to_string(),
+                "no"
+            );
+            for value in [None, Some("MAYBE"), Some("yes"), Some("")] {
+                assert_eq!(
+                    grant_format_observation(index, &stored, value)
+                        .unwrap()
+                        .enforced,
+                    "unknown"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn grant_format_observation_distinguishes_wrapping_and_keyword_case() {
+        let stored = fixed_wrapped_grant_candidate(3)
+            .unwrap()
+            .replace('\'', "\\'");
+        for layers in 1..=4 {
+            let wrapped = format!(
+                " \t{}{}{}\n",
+                "(".repeat(layers),
+                stored,
+                ")".repeat(layers)
+            );
+            let observed = grant_format_observation(3, &wrapped, Some("YES")).unwrap();
+            assert!(observed.wrapped_matches[layers]);
+            assert_eq!(
+                observed.wrapped_matches.iter().filter(|&&hit| hit).count(),
+                1
+            );
+        }
+        let case_only = stored.replace(" AND ", " and ");
+        assert!(
+            grant_format_observation(3, &case_only, Some("YES"))
+                .unwrap()
+                .wrapped_matches[0]
+        );
+        let literal_changed = stored.replace("\\'role\\'", "\\'ROLE\\'");
+        assert!(grant_format_observation(3, &literal_changed, Some("YES")).is_none());
+        let inner_space = stored.replacen(" AND ", "  AND ", 1);
+        assert_eq!(
+            grant_format_observation(3, &inner_space, Some("YES"))
+                .unwrap()
+                .wrapped_matches,
+            [false; 5]
+        );
+    }
+
+    #[test]
+    fn grant_format_observation_rejects_anchor_and_bound_mutations() {
+        for index in [3, 4] {
+            let stored = fixed_wrapped_grant_candidate(index)
+                .unwrap()
+                .replace('\'', "\\'");
+            for changed in [
+                stored.replacen("_utf8mb4", "_latin1", 1),
+                stored.replacen("_utf8mb4", "", 1),
+                stored.replacen("\\'", "'", 1),
+                stored.replacen("\\'", "\\\\'", 1),
+                format!("{stored}\\x"),
+                format!("{}{}", " ".repeat(256), stored),
+                format!("{}{}{}", "(".repeat(9), stored, ")".repeat(9)),
+                "X".repeat(4096),
+            ] {
+                assert!(grant_format_observation(index, &changed, Some("YES")).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn diagnostic_session_mode_flags_are_only_fixed_booleans() {
+        assert_eq!(
+            diagnostic_session_mode_flags(Some("STRICT_TRANS_TABLES"), Some("utf8mb4")),
+            (Some(true), Some(true))
+        );
+        assert_eq!(
+            diagnostic_session_mode_flags(
+                Some("NO_BACKSLASH_ESCAPES,STRICT_TRANS_TABLES"),
+                Some("latin1")
+            ),
+            (Some(false), Some(false))
+        );
+        assert_eq!(diagnostic_session_mode_flags(None, None), (None, None));
+    }
+
+    fn diagnostic_session_mode_flags(
+        mode: Option<&str>,
+        charset: Option<&str>,
+    ) -> (Option<bool>, Option<bool>) {
+        (
+            mode.map(|mode| {
+                !mode
+                    .split(',')
+                    .any(|flag| flag.trim_ascii() == "NO_BACKSLASH_ESCAPES")
+            }),
+            charset.map(|charset| charset == "utf8mb4"),
+        )
+    }
+
+    #[test]
+    fn grant_format_observation_read_path_stays_inside_existing_ignored_shape_failure() {
+        let source = include_str!("db.rs");
+        let diagnostic = source
+            .split_once("\n    async fn mysql_preserved_v1_legacy_select_gates_diagnostic()")
+            .unwrap()
+            .1
+            .split_once("\n    #[test]\n    fn decode_snapshot_rejects_invalid_pairs")
+            .unwrap()
+            .0;
+        let gate = diagnostic
+            .find("if code == \"check_unavailable_or_incompatible\"")
+            .unwrap();
+        let clause = diagnostic
+            .find("CAST(cc.check_clause AS CHAR) AS check_clause")
+            .unwrap();
+        let enforced = diagnostic
+            .find("CAST(tc.enforced AS CHAR) AS enforced")
+            .unwrap();
+        let flag_mode = diagnostic.find("SELECT @@SESSION.sql_mode").unwrap();
+        let flag_charset = diagnostic
+            .find("SELECT @@SESSION.character_set_connection")
+            .unwrap();
+        let mismatch = diagnostic.find("Some(index @ (3 | 4))").unwrap();
+        let observation = diagnostic
+            .find("grant_format_observation(index, stored")
+            .unwrap();
+        let panic = diagnostic
+            .find("panic!(\"diagnostic_shape_{code} table_index={table_index:?}\")")
+            .unwrap();
+        let acquire = diagnostic[gate..]
+            .find("db.0.acquire()")
+            .expect("CHECK failure branch must acquire one connection")
+            + gate;
+        let check_read = diagnostic
+            .find("CAST(cc.check_clause AS CHAR) AS check_clause")
+            .unwrap();
+        assert!(gate < acquire && acquire < flag_mode && flag_mode < flag_charset);
+        assert!(flag_charset < check_read && check_read == clause && clause < enforced);
+        let sample =
+            &diagnostic[acquire..check_read + diagnostic[check_read..].find(".await;").unwrap()];
+        assert_eq!(sample.matches("db.0.acquire()").count(), 1);
+        assert_eq!(sample.matches("&mut *connection").count(), 3);
+        assert!(!sample.contains("&db.0"));
+        assert!(diagnostic[check_read..].contains("drop(connection);"));
+        assert!(enforced < mismatch && mismatch < observation && observation < panic);
+        assert!(!diagnostic.contains("println!(\"{stored}"));
+    }
+
+    type DiagnosticCheckRow = Result<(Option<String>, Option<String>, Option<String>), ()>;
+    type DiagnosticEnforcedCheckRow = Result<
+        (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ),
+        (),
+    >;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct GrantCheckEscapeProbe {
+        candidate_equal: bool,
+        backslash_quote_pair_count: u8,
+        total_backslash_count: u8,
+        restored_tokens_equal: bool,
+    }
+
+    // Diagnostic only: these are the two full, previously known unescaped
+    // MySQL readbacks, not a new rule for accepting legacy CHECK metadata.
+    fn fixed_grant_check_escape_probe(index: usize, stored: &str) -> Option<GrantCheckEscapeProbe> {
+        let unescaped = match index {
+            3 => {
+                "((`source_kind` = _utf8mb4'role' AND `role_id` IS NOT NULL AND `permissions` IS NULL) OR (`source_kind` = _utf8mb4'direct' AND `role_id` IS NULL AND `permissions` IS NOT NULL))"
+            }
+            4 => {
+                "((`scope_kind` = _utf8mb4'all' AND `scope_group_id` IS NULL AND `scope_device_id` IS NULL) OR (`scope_kind` = _utf8mb4'group' AND `scope_group_id` IS NOT NULL AND `scope_device_id` IS NULL) OR (`scope_kind` = _utf8mb4'device' AND `scope_group_id` IS NULL AND `scope_device_id` IS NOT NULL))"
+            }
+            _ => return None,
+        };
+        let (table, name, _) = LEGACY_CHECK_DROPS[index];
+        let declared = ddl_parts_from(MIGRATION, table)
+            .into_iter()
+            .find(|part| part.starts_with(&format!("CONSTRAINT {name} CHECK ")))
+            .and_then(|part| {
+                part.split_once("CHECK ")
+                    .map(|(_, expression)| expression.to_owned())
+            });
+        let restored = stored.replace("\\'", "'");
+        let restored_tokens_equal = declared
+            .as_deref()
+            .and_then(|expression| {
+                legacy_check_tokens(&restored).zip(legacy_check_tokens(expression))
+            })
+            .is_some_and(|(actual, expected)| actual == expected);
+        let bytes = stored.as_bytes();
+        Some(GrantCheckEscapeProbe {
+            candidate_equal: stored == unescaped.replace('\'', "\\'"),
+            backslash_quote_pair_count: bytes
+                .windows(2)
+                .filter(|pair| *pair == b"\\'")
+                .count()
+                .min(255) as u8,
+            total_backslash_count: bytes.iter().filter(|&&byte| byte == b'\\').count().min(255)
+                as u8,
+            restored_tokens_equal,
+        })
+    }
+
+    #[test]
+    fn grant_check_escape_probe_matches_only_fully_escaped_fixed_readbacks() {
+        for (index, unescaped, quote_pairs) in [
+            (
+                3,
+                "((`source_kind` = _utf8mb4'role' AND `role_id` IS NOT NULL AND `permissions` IS NULL) OR (`source_kind` = _utf8mb4'direct' AND `role_id` IS NULL AND `permissions` IS NOT NULL))",
+                4,
+            ),
+            (
+                4,
+                "((`scope_kind` = _utf8mb4'all' AND `scope_group_id` IS NULL AND `scope_device_id` IS NULL) OR (`scope_kind` = _utf8mb4'group' AND `scope_group_id` IS NOT NULL AND `scope_device_id` IS NULL) OR (`scope_kind` = _utf8mb4'device' AND `scope_group_id` IS NULL AND `scope_device_id` IS NOT NULL))",
+                6,
+            ),
+        ] {
+            let escaped = unescaped.replace('\'', "\\'");
+            assert_eq!(
+                fixed_grant_check_escape_probe(index, &escaped),
+                Some(GrantCheckEscapeProbe {
+                    candidate_equal: true,
+                    backslash_quote_pair_count: quote_pairs,
+                    total_backslash_count: quote_pairs,
+                    restored_tokens_equal: true,
+                })
+            );
+            assert_eq!(fixed_grant_check_escape_probe(1, &escaped), None);
+            assert_eq!(fixed_grant_check_escape_probe(2, &escaped), None);
+        }
+    }
+
+    #[test]
+    fn grant_check_escape_probe_distinguishes_literal_and_escape_mutations() {
+        let unescaped = "((`source_kind` = _utf8mb4'role' AND `role_id` IS NOT NULL AND `permissions` IS NULL) OR (`source_kind` = _utf8mb4'direct' AND `role_id` IS NULL AND `permissions` IS NOT NULL))";
+        assert_eq!(
+            fixed_grant_check_escape_probe(3, unescaped),
+            Some(GrantCheckEscapeProbe {
+                candidate_equal: false,
+                backslash_quote_pair_count: 0,
+                total_backslash_count: 0,
+                restored_tokens_equal: true,
+            })
+        );
+        let escaped = unescaped.replace('\'', "\\'");
+        assert_eq!(
+            fixed_grant_check_escape_probe(3, &escaped.replace("role", "rogue")),
+            Some(GrantCheckEscapeProbe {
+                candidate_equal: false,
+                backslash_quote_pair_count: 4,
+                total_backslash_count: 4,
+                restored_tokens_equal: false,
+            })
+        );
+        assert_eq!(
+            fixed_grant_check_escape_probe(3, &escaped.replacen("\\'role", "'role", 1)),
+            Some(GrantCheckEscapeProbe {
+                candidate_equal: false,
+                backslash_quote_pair_count: 3,
+                total_backslash_count: 3,
+                restored_tokens_equal: true,
+            })
+        );
+        assert_eq!(
+            fixed_grant_check_escape_probe(3, &escaped.replacen("\\'role", "\\\\'role", 1)),
+            Some(GrantCheckEscapeProbe {
+                candidate_equal: false,
+                backslash_quote_pair_count: 4,
+                total_backslash_count: 5,
+                restored_tokens_equal: false,
+            })
+        );
+        let scope = "((`scope_kind` = _utf8mb4'all' AND `scope_group_id` IS NULL AND `scope_device_id` IS NULL) OR (`scope_kind` = _utf8mb4'group' AND `scope_group_id` IS NOT NULL AND `scope_device_id` IS NULL) OR (`scope_kind` = _utf8mb4'device' AND `scope_group_id` IS NULL AND `scope_device_id` IS NOT NULL))";
+        assert_eq!(
+            fixed_grant_check_escape_probe(
+                4,
+                &scope.replace("'group'", "'groups'").replace('\'', "\\'")
+            ),
+            Some(GrantCheckEscapeProbe {
+                candidate_equal: false,
+                backslash_quote_pair_count: 6,
+                total_backslash_count: 6,
+                restored_tokens_equal: false,
+            })
+        );
+    }
+
+    // Only emit compiled-in CHECK indices and fixed classifications, never metadata bytes.
+    fn legacy_diagnostic_check_classifications(
+        rows: &[DiagnosticCheckRow],
+    ) -> Vec<(Option<usize>, &'static str)> {
+        let mut seen = [false; 5];
+        rows.iter()
+            .map(|row| {
+                let Ok((table, name, clause)) = row else {
+                    return (None, "decode_failed");
+                };
+                let Some(index) =
+                    LEGACY_CHECK_DROPS
+                        .iter()
+                        .position(|&(known_table, known_name, _)| {
+                            table.as_deref() == Some(known_table)
+                                && name.as_deref() == Some(known_name)
+                        })
+                else {
+                    return (None, "unknown_or_duplicate");
+                };
+                if seen[index] {
+                    return (Some(index), "unknown_or_duplicate");
+                }
+                seen[index] = true;
+                let (table, name, _) = LEGACY_CHECK_DROPS[index];
+                let Some(stored) = clause.as_deref() else {
+                    return (Some(index), "missing_clause");
+                };
+                let declared = ddl_parts_from(MIGRATION, table)
+                    .into_iter()
+                    .find(|part| part.starts_with(&format!("CONSTRAINT {name} CHECK ")))
+                    .and_then(|part| {
+                        part.split_once("CHECK ")
+                            .map(|(_, expression)| expression.to_owned())
+                    });
+                let Some(declared) = declared else {
+                    return (Some(index), "literal_escape_or_other_mismatch");
+                };
+                let valid = validate_legacy_check_metadata(&[(
+                    Some(table.to_owned()),
+                    Some(name.to_owned()),
+                    Some(stored.to_owned()),
+                )])
+                .is_ok();
+                let token_equal = legacy_check_tokens(stored)
+                    .zip(legacy_check_tokens(&declared))
+                    .is_some_and(|(stored, expected)| stored == expected);
+                let classification = if valid && token_equal {
+                    "token_equal"
+                } else if valid && check_clause_matches(table, name, stored, &declared) {
+                    "known_mysql_spelling"
+                } else {
+                    "literal_escape_or_other_mismatch"
+                };
+                (Some(index), classification)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn legacy_diagnostic_check_mapper_rejects_unknown_and_duplicate() {
+        let known = (
+            Some("schema_meta".to_owned()),
+            Some("chk_schema_singleton".to_owned()),
+            Some("(singleton = 1)".to_owned()),
+        );
+        assert_eq!(
+            legacy_diagnostic_check_classifications(&[
+                Ok((
+                    Some("unknown".into()),
+                    Some("unknown".into()),
+                    known.2.clone()
+                )),
+                Ok(known.clone()),
+                Ok(known),
+            ]),
+            vec![
+                (None, "unknown_or_duplicate"),
+                (Some(0), "token_equal"),
+                (Some(0), "unknown_or_duplicate"),
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_diagnostic_check_mapper_distinguishes_mismatch_from_token_equality() {
+        assert_eq!(
+            legacy_diagnostic_check_classifications(&[
+                Ok((
+                    Some("schema_meta".into()),
+                    Some("chk_schema_singleton".into()),
+                    Some("(singleton = 2)".into()),
+                )),
+                Ok((
+                    Some("grants".into()),
+                    Some("chk_grants_source".into()),
+                    None
+                )),
+                Err(()),
+            ]),
+            vec![
+                (Some(0), "literal_escape_or_other_mismatch"),
+                (Some(3), "missing_clause"),
+                (None, "decode_failed"),
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_diagnostic_check_mapper_preserves_exact_known_mysql_spelling_boundary() {
+        let observed = "(`admission_state` in (_utf8mb4\\'PENDING\\',_utf8mb4\\'APPROVED\\',_utf8mb4\\'REVOKED\\'))";
+        let altered = observed.replace("PENDING", "PEND ING");
+        let rows = [
+            Ok((
+                Some("devices".into()),
+                Some("chk_devices_state".into()),
+                Some(observed.into()),
+            )),
+            Ok((
+                Some("grants".into()),
+                Some("chk_grants_source".into()),
+                Some(altered),
+            )),
+        ];
+        assert_eq!(
+            legacy_diagnostic_check_classifications(&rows),
+            vec![
+                (Some(1), "known_mysql_spelling"),
+                (Some(3), "literal_escape_or_other_mismatch"),
+            ]
+        );
+    }
+
+    // Diagnostic output may only contain codes and indices from compiled-in lists.
+    fn legacy_diagnostic_shape_code(error: &ControllerError) -> (&'static str, Option<usize>) {
+        let ControllerError::Config(message) = error else {
+            return ("shape_read_error", None);
+        };
+        if message == "identity schema has missing or unexpected tables; manual inspection required"
+        {
+            return ("table_set", None);
+        }
+        if message == "legacy CHECK metadata unavailable or incompatible" {
+            return ("check_unavailable_or_incompatible", None);
+        }
+        for (prefix, code) in [
+            ("migration incompatible table charset ", "table_charset"),
+            ("migration incompatible column names in ", "column_set"),
+            ("migration missing column ", "column_set"),
+            ("migration incompatible column ", "column_shape"),
+            ("migration incompatible default ", "column_default"),
+            (
+                "migration incompatible character metadata ",
+                "column_charset",
+            ),
+            ("migration incompatible index order ", "index_order"),
+            ("migration incompatible index set in ", "index_set"),
+            ("migration incompatible index ", "index_set"),
+        ] {
+            if let Some(suffix) = message.strip_prefix(prefix) {
+                let index = TABLES.iter().position(|(table, _, _)| {
+                    suffix == *table
+                        || suffix
+                            .strip_prefix(table)
+                            .is_some_and(|rest| rest.starts_with('.'))
+                });
+                return (code, index);
+            }
+        }
+        ("shape_read_error", None)
+    }
+
+    #[test]
+    fn legacy_diagnostic_mapper_redacts_errors_and_uses_static_table_indices() {
+        assert_eq!(
+            legacy_diagnostic_shape_code(&ControllerError::Config(
+                "migration incompatible default grants.revision secret-marker".into()
+            )),
+            ("column_default", Some(8))
+        );
+        assert_eq!(
+            legacy_diagnostic_shape_code(&ControllerError::Config(
+                "legacy CHECK metadata unavailable or incompatible".into()
+            )),
+            ("check_unavailable_or_incompatible", None)
+        );
+        assert_eq!(
+            legacy_diagnostic_shape_code(&ControllerError::Config(
+                "migration incompatible column users.username: got sensitive-marker".into()
+            )),
+            ("column_shape", Some(1))
+        );
+        assert_eq!(
+            legacy_diagnostic_shape_code(&ControllerError::Config(
+                "unknown sensitive-marker".into()
+            )),
+            ("shape_read_error", None)
+        );
+    }
+
+    #[test]
+    fn legacy_diagnostic_rechecks_identity_engine_and_grants_on_every_physical_connection() {
+        // No live DB here: this guards the hook's placement and read-only queries,
+        // not a runtime reconnect or a physical server identity proof.
+        let diagnostic = include_str!("db.rs")
+            .split_once("\n    async fn mysql_preserved_v1_legacy_select_gates_diagnostic()")
+            .unwrap()
+            .1
+            .split_once("\n    #[test]\n    fn decode_snapshot_rejects_invalid_pairs")
+            .unwrap()
+            .0;
+        let hook_start = diagnostic.find(".after_connect(").expect("missing hook");
+        let connect = diagnostic.find(".connect(&db_url)").unwrap();
+        assert!(hook_start < connect);
+        let hook = &diagnostic[hook_start..connect];
+        let database = hook.find("SELECT DATABASE()").unwrap();
+        let version = hook.find("SELECT VERSION()").unwrap();
+        let grants = hook.find("SHOW GRANTS").unwrap();
+        let validate = hook.find("validate_schema_metadata_grants(").unwrap();
+        assert!(database < version && version < grants && grants < validate);
+        assert!(hook.contains("&mut *connection"));
+        assert!(hook.contains("diagnostic_wrong_engine"));
+        assert!(hook.contains("diagnostic_connection_rejected"));
+        assert!(hook.contains("8.0.46"));
+    }
+
+    #[test]
+    fn legacy_diagnostic_counts_five_checks_before_validating_shape() {
+        let diagnostic = include_str!("db.rs")
+            .split_once("\n    async fn mysql_preserved_v1_legacy_select_gates_diagnostic()")
+            .unwrap()
+            .1
+            .split_once("\n    #[test]\n    fn decode_snapshot_rejects_invalid_pairs")
+            .unwrap()
+            .0;
+        let count = diagnostic
+            .find("information_schema.table_constraints WHERE table_schema = DATABASE() AND constraint_type = 'CHECK'")
+            .expect("missing read-only CHECK count");
+        let five = diagnostic.find("check_count == 5").unwrap();
+        let shape = diagnostic.find("validate_legacy_shape(&db, 1)").unwrap();
+        assert!(count < five && five < shape);
+        assert!(diagnostic.contains("diagnostic_check_count_not_five"));
+        assert!(diagnostic.contains("diagnostic_check_count_read_failed"));
+    }
+
+    #[tokio::test]
+    #[ignore = "manual SELECT-only diagnostic; parent must verify isolated preserved MySQL target"]
+    async fn mysql_preserved_v1_legacy_select_gates_diagnostic() {
+        let db_url = std::env::var("RSETUP_TEST_DATABASE_URL")
+            .unwrap_or_else(|_| panic!("diagnostic_env_url_missing"));
+        let expected = std::env::var("RSETUP_EXPECTED_DATABASE")
+            .unwrap_or_else(|_| panic!("diagnostic_env_database_missing"));
+        assert!(!db_url.is_empty(), "diagnostic_env_url_empty");
+        assert!(!expected.is_empty(), "diagnostic_env_database_empty");
+        let hook_expected = expected.clone();
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(1)
+            .after_connect(move |connection, _meta| {
+                let expected = hook_expected.clone();
+                Box::pin(async move {
+                    let diagnostic_connection_rejected =
+                        || sqlx::Error::Protocol("diagnostic_connection_rejected".into());
+                    let actual: Option<String> = sqlx::query_scalar("SELECT DATABASE()")
+                        .fetch_one(&mut *connection)
+                        .await
+                        .map_err(|_| diagnostic_connection_rejected())?;
+                    if actual.as_deref() != Some(expected.as_str()) {
+                        return Err(diagnostic_connection_rejected());
+                    }
+                    let version: Option<String> = sqlx::query_scalar("SELECT VERSION()")
+                        .fetch_one(&mut *connection)
+                        .await
+                        .map_err(|_| diagnostic_connection_rejected())?;
+                    if version.as_deref() != Some("8.0.46") {
+                        return Err(sqlx::Error::Protocol("diagnostic_wrong_engine".into()));
+                    }
+                    let rows = sqlx::query("SHOW GRANTS")
+                        .fetch_all(&mut *connection)
+                        .await
+                        .map_err(|_| diagnostic_connection_rejected())?;
+                    let grants = rows
+                        .iter()
+                        .map(|row| {
+                            row.try_get::<Option<String>, _>(0)
+                                .map_err(|_| diagnostic_connection_rejected())
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    validate_schema_metadata_grants(&grants, &expected)
+                        .map_err(|_| diagnostic_connection_rejected())?;
+                    Ok(())
+                })
+            })
+            .connect(&db_url)
+            .await
+            .unwrap_or_else(|_| panic!("diagnostic_connect_failed"));
+        let mut connection = pool
+            .acquire()
+            .await
+            .unwrap_or_else(|_| panic!("diagnostic_identity_connection_failed"));
+        let actual: Option<String> = sqlx::query_scalar("SELECT DATABASE()")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap_or_else(|_| panic!("diagnostic_identity_read_failed"));
+        assert!(
+            actual.as_deref() == Some(expected.as_str()),
+            "diagnostic_identity_mismatch"
+        );
+        assert!(
+            require_schema_metadata_privilege(&mut connection, &expected)
+                .await
+                .is_ok(),
+            "diagnostic_grants_failed"
+        );
+        drop(connection);
+
+        let db = DbPool(pool);
+        let version = read_version(&db)
+            .await
+            .unwrap_or_else(|_| panic!("diagnostic_version_read_failed"));
+        assert!(version.is_none(), "diagnostic_version_not_none");
+        let table_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE()",
+        )
+        .fetch_one(&db.0)
+        .await
+        .unwrap_or_else(|_| panic!("diagnostic_table_count_read_failed"));
+        assert!(
+            table_count == 11 && TABLES.len() == 11,
+            "diagnostic_table_count_not_eleven"
+        );
+        let schema_meta_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_meta")
+            .fetch_one(&db.0)
+            .await
+            .unwrap_or_else(|_| panic!("diagnostic_schema_meta_read_failed"));
+        assert!(schema_meta_rows == 0, "diagnostic_schema_meta_not_empty");
+        let check_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.table_constraints WHERE table_schema = DATABASE() AND constraint_type = 'CHECK'",
+        )
+        .fetch_one(&db.0)
+        .await
+        .unwrap_or_else(|_| panic!("diagnostic_check_count_read_failed"));
+        assert!(check_count == 5, "diagnostic_check_count_not_five");
+
+        if let Err(error) = validate_legacy_shape(&db, 1).await {
+            let (code, table_index) = legacy_diagnostic_shape_code(&error);
+            if code == "check_unavailable_or_incompatible" {
+                // One checked physical session for both variables and CHECK metadata.
+                // A failed read aborts this sample; never reborrow a replacement session.
+                let mut connection =
+                    db.0.acquire()
+                        .await
+                        .unwrap_or_else(|_| panic!("diagnostic_check_connection_failed"));
+                let mode: Option<String> = sqlx::query_scalar("SELECT @@SESSION.sql_mode")
+                    .fetch_one(&mut *connection)
+                    .await
+                    .unwrap_or_else(|_| panic!("diagnostic_session_mode_read_failed"));
+                let charset: Option<String> =
+                    sqlx::query_scalar("SELECT @@SESSION.character_set_connection")
+                        .fetch_one(&mut *connection)
+                        .await
+                        .unwrap_or_else(|_| panic!("diagnostic_session_charset_read_failed"));
+                let rows = sqlx::query("SELECT CAST(tc.table_name AS CHAR) AS table_name, CAST(tc.constraint_name AS CHAR) AS constraint_name, CAST(cc.check_clause AS CHAR) AS check_clause, CAST(tc.enforced AS CHAR) AS enforced FROM information_schema.table_constraints tc LEFT JOIN information_schema.check_constraints cc ON cc.constraint_schema=tc.constraint_schema AND cc.constraint_name=tc.constraint_name WHERE tc.table_schema=DATABASE() AND tc.constraint_type='CHECK'")
+                    .fetch_all(&mut *connection)
+                    .await;
+                drop(connection);
+                match rows {
+                    Ok(rows) => {
+                        let (backslash_mode_safe, charset_utf8mb4) =
+                            diagnostic_session_mode_flags(mode.as_deref(), charset.as_deref());
+                        let fixed_flag = |flag| match flag {
+                            Some(true) => "true",
+                            Some(false) => "false",
+                            None => "unknown",
+                        };
+                        println!(
+                            "diagnostic_not_no_backslash_escapes={} diagnostic_charset_utf8mb4={}",
+                            fixed_flag(backslash_mode_safe),
+                            fixed_flag(charset_utf8mb4)
+                        );
+                        let decoded: Vec<DiagnosticEnforcedCheckRow> = rows
+                            .iter()
+                            .map(|row| {
+                                Ok((
+                                    row.try_get::<Option<String>, _>("table_name")
+                                        .map_err(|_| ())?,
+                                    row.try_get::<Option<String>, _>("constraint_name")
+                                        .map_err(|_| ())?,
+                                    row.try_get::<Option<String>, _>("check_clause")
+                                        .map_err(|_| ())?,
+                                    row.try_get::<Option<String>, _>("enforced").unwrap_or(None),
+                                ))
+                            })
+                            .collect();
+                        println!("diagnostic_check_rows={}", decoded.len());
+                        let classifications: Vec<DiagnosticCheckRow> = decoded
+                            .iter()
+                            .map(|row| match row {
+                                Ok((table, name, clause, _)) => {
+                                    Ok((table.clone(), name.clone(), clause.clone()))
+                                }
+                                Err(_) => Err(()),
+                            })
+                            .collect();
+                        for ((index, classification), row) in
+                            legacy_diagnostic_check_classifications(&classifications)
+                                .into_iter()
+                                .zip(decoded.iter())
+                        {
+                            println!("check_index={index:?} classification={classification}");
+                            if let (
+                                Some(index @ (3 | 4)),
+                                "literal_escape_or_other_mismatch",
+                                Ok((_, _, Some(stored), enforced)),
+                            ) = (index, classification, row)
+                            {
+                                if let Some(probe) = fixed_grant_check_escape_probe(index, stored) {
+                                    println!(
+                                        "check_index={index} candidate_equal={} backslash_quote_pair_count={} total_backslash_count={} restored_tokens_equal={}",
+                                        probe.candidate_equal,
+                                        probe.backslash_quote_pair_count,
+                                        probe.total_backslash_count,
+                                        probe.restored_tokens_equal,
+                                    );
+                                    if let Some(diff) = fixed_grant_check_token_diff(index, stored)
+                                    {
+                                        println!(
+                                            "check_index={index} observed_tokens_parseable={} expected_tokens_parseable={} observed_token_count={:?} expected_token_count={:?} first_mismatch_token_index={:?} first_mismatch_token_class={:?} expected_class={:?}",
+                                            diff.observed_tokens_parseable,
+                                            diff.expected_tokens_parseable,
+                                            diff.observed_token_count,
+                                            diff.expected_token_count,
+                                            diff.first_mismatch_token_index,
+                                            diff.first_mismatch_token_class
+                                                .map(|class| class.code()),
+                                            diff.expected_class.map(|class| class.code()),
+                                        );
+                                    }
+                                    if let Some((exact_bytes, tokens_equal)) =
+                                        fixed_wrapped_grant_probe(index, stored)
+                                    {
+                                        println!(
+                                            "check_index={index} wrapped_candidate_exact_bytes={} wrapped_candidate_tokens_equal={}",
+                                            exact_bytes, tokens_equal,
+                                        );
+                                    }
+                                    if let Some(observation) =
+                                        grant_format_observation(index, stored, enforced.as_deref())
+                                    {
+                                        println!(
+                                            "check_index={index} enforced={} stored_len={} candidate_len={} leading_parens={} trailing_parens={} ascii_whitespace={} backticks={} wrapped_layers_0_to_4={:?}",
+                                            observation.enforced,
+                                            observation.stored_len,
+                                            observation.candidate_len,
+                                            observation.leading_parens,
+                                            observation.trailing_parens,
+                                            observation.ascii_whitespace,
+                                            observation.backticks,
+                                            observation.wrapped_matches,
+                                        );
+                                    } else {
+                                        println!(
+                                            "check_index={index} enforced={} grant_format_observation=unknown",
+                                            diagnostic_enforced_code(enforced.as_deref())
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => println!("diagnostic_check_metadata_read_failed"),
+                }
+            }
+            panic!("diagnostic_shape_{code} table_index={table_index:?}");
+        }
+        assert!(
+            require_no_identity_foreign_keys(&db).await.is_ok(),
+            "diagnostic_fk_unavailable_or_nonempty"
+        );
+        for (index, &(table, column, _, _)) in IDENTITY_COLUMNS.iter().enumerate() {
+            let actual = read_column(&db, table, column).await.unwrap_or_else(|_| {
+                panic!("diagnostic_old_column_read_failed identity_index={index}")
+            });
+            let old = classify_identity_column(table, column, &actual).unwrap_or_else(|_| {
+                panic!("diagnostic_old_column_shape_failed identity_index={index}")
+            });
+            assert!(old, "diagnostic_old_column_target identity_index={index}");
+        }
+        println!("legacy_select_gates_ok");
+    }
+
     #[test]
     fn decode_snapshot_rejects_invalid_pairs_even_when_values_are_known() {
         for (state, decision) in [
@@ -3278,6 +5715,7 @@ mod tests {
         version: i32,
         columns: [bool; 11],
         checks: Vec<(&'static str, &'static str)>,
+        check_sample: Option<(String, Option<String>, String)>,
         events: Vec<String>,
         fault_gate: Option<&'static str>,
         fail_ddl_at: Option<(usize, bool)>,
@@ -3296,6 +5734,7 @@ mod tests {
                 version,
                 columns: [version == 1; 11],
                 checks: LEGACY_CHECK_ORDER.to_vec(),
+                check_sample: None,
                 events: Vec::new(),
                 fault_gate: None,
                 fail_ddl_at: None,
@@ -3344,7 +5783,19 @@ mod tests {
             _: i32,
         ) -> Result<Vec<(&'static str, &'static str)>, ControllerError> {
             self.gate("shape")?;
-            Ok(self.0.lock().unwrap().checks.clone())
+            let state = self.0.lock().unwrap();
+            if let Some((version, enforced, clause)) = &state.check_sample {
+                validate_legacy_check_metadata_with_version(
+                    &[(
+                        Some("grants".into()),
+                        Some("chk_grants_source".into()),
+                        Some(clause.clone()),
+                        enforced.clone(),
+                    )],
+                    Ok(Some(version)),
+                )?;
+            }
+            Ok(state.checks.clone())
         }
         async fn no_foreign_keys(&self) -> Result<(), ControllerError> {
             self.gate("fk")
@@ -4494,6 +6945,7 @@ mod tests {
                         | "index_name"
                         | "constraint_name"
                         | "check_clause"
+                        | "enforced"
                         | "data_type"
                         | "column_type"
                         | "is_nullable"
@@ -4504,8 +6956,8 @@ mod tests {
                 string_columns += 1;
             }
         }
-        assert_eq!(queries, 14);
-        assert_eq!(string_columns, 19);
+        assert_eq!(queries, 15);
+        assert_eq!(string_columns, 23);
     }
 
     #[test]
@@ -5203,6 +7655,296 @@ mod tests {
                 .iter()
                 .any(|part| part.contains("chk_devices_state"))
         );
+    }
+
+    #[test]
+    fn mysql_8046_grant_readbacks_require_fixed_original_and_enforcement() {
+        for (index, name) in [(3, "chk_grants_source"), (4, "chk_grants_scope")] {
+            let expected = ddl_parts_from(MIGRATION, "grants")
+                .into_iter()
+                .find(|part| part.starts_with(&format!("CONSTRAINT {name} CHECK ")))
+                .unwrap();
+            assert!(expected.contains("CHECK (("));
+            let stored = fixed_wrapped_grant_candidate(index)
+                .unwrap()
+                .replace('\'', "\\'");
+            assert!(mysql_8046_grant_clause(
+                "grants",
+                name,
+                &stored,
+                expected.split_once("CHECK ").unwrap().1
+            ));
+            assert!(!mysql_8046_grant_clause(
+                "grants",
+                name,
+                &stored,
+                &expected
+                    .split_once("CHECK ")
+                    .unwrap()
+                    .1
+                    .replacen("AND", "OR", 1)
+            ));
+            assert!(
+                validate_legacy_check_metadata(&[(
+                    Some("grants".into()),
+                    Some(name.into()),
+                    Some(stored.clone())
+                )])
+                .is_err(),
+                "old permission must stay closed for {name}"
+            );
+            assert_eq!(
+                validate_legacy_check_metadata_with_version(
+                    &[(
+                        Some("grants".into()),
+                        Some(name.into()),
+                        Some(stored),
+                        Some("YES".into())
+                    )],
+                    Ok(Some("8.0.46"))
+                )
+                .unwrap(),
+                vec![("grants", name)]
+            );
+        }
+    }
+
+    #[test]
+    fn mysql_8046_grants_compatibility_has_no_token_whitespace_or_metadata_fallback() {
+        let accepts = |clause: String,
+                       version: Result<Option<&str>, ()>,
+                       enforced: Option<&str>,
+                       table: &str,
+                       name: &str| {
+            validate_legacy_check_metadata_with_version(
+                &[(
+                    Some(table.into()),
+                    Some(name.into()),
+                    Some(clause),
+                    enforced.map(str::to_owned),
+                )],
+                version,
+            )
+            .is_ok()
+        };
+        for (index, name) in [(3, "chk_grants_source"), (4, "chk_grants_scope")] {
+            let stored = fixed_wrapped_grant_candidate(index)
+                .unwrap()
+                .replace('\'', "\\'");
+            assert!(accepts(
+                stored
+                    .replace(" AND ", " aNd ")
+                    .replace(" OR ", " Or ")
+                    .replace(" IS ", " is ")
+                    .replace(" NOT ", " nOt ")
+                    .replace(" NULL", " nUlL"),
+                Ok(Some("8.0.46")),
+                Some("YES"),
+                "grants",
+                name
+            ));
+            for version in [
+                Ok(None),
+                Ok(Some("8.0.45")),
+                Ok(Some("8.0.47")),
+                Ok(Some("8.0.11-TiDB-v8.0.46")),
+                Err(()),
+            ] {
+                assert!(!accepts(
+                    stored.clone(),
+                    version,
+                    Some("YES"),
+                    "grants",
+                    name
+                ));
+            }
+            for enforced in [None, Some("NO"), Some("yes"), Some("UNKNOWN"), Some("")] {
+                assert!(!accepts(
+                    stored.clone(),
+                    Ok(Some("8.0.46")),
+                    enforced,
+                    "grants",
+                    name
+                ));
+            }
+            assert!(!accepts(
+                stored.clone(),
+                Ok(Some("8.0.46")),
+                Some("YES"),
+                "devices",
+                name
+            ));
+            assert!(!accepts(
+                stored.clone(),
+                Ok(Some("8.0.46")),
+                Some("YES"),
+                "grants",
+                "chk_devices_state"
+            ));
+            let literals = if index == 3 {
+                &["role", "direct"][..]
+            } else {
+                &["all", "group", "device"][..]
+            };
+            for literal in literals {
+                let needle = format!("\\'{literal}\\'");
+                for (offset, _) in stored.match_indices(&needle) {
+                    let mut changed = stored.clone();
+                    changed.replace_range(
+                        offset + 2..offset + 2 + literal.len(),
+                        &literal.to_ascii_uppercase(),
+                    );
+                    assert!(!accepts(
+                        changed,
+                        Ok(Some("8.0.46")),
+                        Some("YES"),
+                        "grants",
+                        name
+                    ));
+                }
+            }
+            let columns = if index == 3 {
+                &["source_kind", "role_id", "permissions"][..]
+            } else {
+                &["scope_kind", "scope_group_id", "scope_device_id"][..]
+            };
+            for column in columns {
+                let needle = format!("`{column}`");
+                for (offset, _) in stored.match_indices(&needle) {
+                    let mut changed = stored.clone();
+                    changed.replace_range(
+                        offset + 1..offset + 1 + column.len(),
+                        &column.to_ascii_uppercase(),
+                    );
+                    assert!(!accepts(
+                        changed,
+                        Ok(Some("8.0.46")),
+                        Some("YES"),
+                        "grants",
+                        name
+                    ));
+                }
+            }
+            for (needle, replacement) in [
+                (" AND ", " OR "),
+                (" OR ", " AND "),
+                (" IS NOT NULL", " IS NULL"),
+                (" IS NULL", " IS NOT NULL"),
+                ("_utf8mb4", "_latin1"),
+                ("_utf8mb4", ""),
+                ("\\'", "'"),
+                ("\\'", "\\\\'"),
+                ("`", ""),
+                (" = ", " != "),
+            ] {
+                if stored.contains(needle) {
+                    assert!(
+                        !accepts(
+                            stored.replacen(needle, replacement, 1),
+                            Ok(Some("8.0.46")),
+                            Some("YES"),
+                            "grants",
+                            name
+                        ),
+                        "{name}: {needle}"
+                    );
+                }
+            }
+            for changed in [
+                format!(" {stored}"),
+                format!("{stored} "),
+                stored.replacen(" AND ", "  AND ", 1),
+                stored.replacen(" AND ", " AND  ", 1),
+                format!("({stored})"),
+                stored.replacen("(((", "((((", 1),
+                format!("{stored} OR 1=1"),
+                stored.replacen("`", "`X", 1),
+                stored.replacen("\\'", "\\'x", 1),
+            ] {
+                assert!(!accepts(
+                    changed,
+                    Ok(Some("8.0.46")),
+                    Some("YES"),
+                    "grants",
+                    name
+                ));
+            }
+            let row = (
+                Some("grants".into()),
+                Some(name.into()),
+                Some(stored),
+                Some("YES".into()),
+            );
+            for invalid in [
+                (None, row.1.clone(), row.2.clone(), row.3.clone()),
+                (row.0.clone(), None, row.2.clone(), row.3.clone()),
+                (row.0.clone(), row.1.clone(), None, row.3.clone()),
+                (row.0.clone(), row.1.clone(), row.2.clone(), None),
+            ] {
+                assert!(
+                    validate_legacy_check_metadata_with_version(&[invalid], Ok(Some("8.0.46")))
+                        .is_err()
+                );
+            }
+            assert!(
+                validate_legacy_check_metadata_with_version(
+                    &[row.clone(), row],
+                    Ok(Some("8.0.46"))
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn grant_metadata_reader_keeps_version_enforcement_and_clauses_on_one_connection() {
+        let source = include_str!("db.rs")
+            .split_once("\nasync fn read_column(")
+            .unwrap()
+            .0;
+        assert!(
+            source.contains("async fn read_legacy_checks_for_table("),
+            "expected a held-connection legacy CHECK reader"
+        );
+        let reader = source
+            .split_once("async fn read_legacy_checks_for_table(")
+            .unwrap()
+            .1;
+        assert_eq!(reader.matches("db.0.acquire()").count(), 1);
+        assert!(reader.contains("CAST(VERSION() AS CHAR)"));
+        assert!(reader.contains("CAST(tc.enforced AS CHAR) AS enforced"));
+        assert!(reader.contains(".bind(table).fetch_all(&mut *connection)"));
+        assert!(reader.contains(".fetch_one(&mut *connection)"));
+        assert!(reader.contains("validate_legacy_check_metadata_with_version"));
+        assert!(reader.contains("if version == \"8.0.46\""));
+    }
+
+    #[tokio::test]
+    async fn injected_grant_metadata_proof_blocks_upgrade_before_first_ddl() {
+        for (version, enforced, tamper) in [
+            ("8.0.46", Some("YES"), true),
+            ("8.0.45", Some("YES"), false),
+            ("8.0.46", Some("NO"), false),
+        ] {
+            let fake = LegacyUpgradeFake::new(1);
+            let stored = fixed_wrapped_grant_candidate(3)
+                .unwrap()
+                .replace('\'', "\\'");
+            fake.0.lock().unwrap().check_sample = Some((
+                version.into(),
+                enforced.map(str::to_owned),
+                if tamper {
+                    stored.replacen("`role_id`", "`rogue_id`", 1)
+                } else {
+                    stored
+                },
+            ));
+            assert!(upgrade_legacy_with_probe(&fake, 1).await.is_err());
+            assert!(
+                fake.writes().is_empty(),
+                "invalid CHECK must block before DDL"
+            );
+        }
     }
 
     #[test]
