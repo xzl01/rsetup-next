@@ -1,0 +1,21 @@
+const messages: Record<string, string> = {
+  'app.title': 'Rsetup Controller',
+  'app.foundation': '中控基础工作台',
+  'app.notConnected': '尚未连接业务服务',
+  'nav.skip': '跳至主要内容',
+  'language.label': '语言',
+  'button.primary': '主要操作',
+  'button.secondary': '次要操作',
+  'button.danger': '危险操作',
+  'button.loading': '处理中',
+  'field.label': '示例输入',
+  'field.hint': '输入内容会在切换语言时保留',
+  'field.error': '请检查输入内容',
+  'notice.title': '基础组件展示',
+  'notice.body': '此工作台仅展示基础组件，尚未连接业务服务。',
+  'state.loading': '正在加载',
+  'state.empty': '暂无内容',
+  'state.error': '无法加载内容',
+  'state.retry': '重试',
+};
+export default messages;

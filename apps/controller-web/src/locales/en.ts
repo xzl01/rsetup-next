@@ -1,0 +1,21 @@
+const messages: Record<string, string> = {
+  'app.title': 'Rsetup Controller',
+  'app.foundation': 'Controller foundation workspace',
+  'app.notConnected': 'Business services are not connected',
+  'nav.skip': 'Skip to main content',
+  'language.label': 'Language',
+  'button.primary': 'Primary action',
+  'button.secondary': 'Secondary action',
+  'button.danger': 'Dangerous action',
+  'button.loading': 'Working',
+  'field.label': 'Sample input',
+  'field.hint': 'Your input is preserved when switching languages',
+  'field.error': 'Please check your input',
+  'notice.title': 'Foundation component showcase',
+  'notice.body': 'This workspace only demonstrates foundation components. Business services are not connected.',
+  'state.loading': 'Loading',
+  'state.empty': 'No content yet',
+  'state.error': 'Unable to load content',
+  'state.retry': 'Retry',
+};
+export default messages;
