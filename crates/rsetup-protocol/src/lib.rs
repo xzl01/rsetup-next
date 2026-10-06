@@ -4,5 +4,6 @@
 //! 与 ring Ed25519 签/验薄封装；不含 Protobuf codec、网络、设备 DB。
 //! 其交付不构成任何握手步骤，更不构成握手完成。
 
+pub mod ed25519;
 pub mod frame;
 pub mod sig;
