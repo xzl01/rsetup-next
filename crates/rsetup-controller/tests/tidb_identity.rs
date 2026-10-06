@@ -31,6 +31,15 @@ async fn fresh_v3_single_authorized_tidb_case() {
 }
 
 #[tokio::test]
+#[ignore = "one independently backed-up isolated disposable EMPTY TiDB dev DB; never run without operator confirmation"]
+async fn admission_missing_actor_is_atomic_on_fresh_v3_tidb() {
+    let db = common::required_fresh_identity_db().await;
+    common::run_explicit_identity_test_command("upgrade");
+    common::assert_actor_fixture_v3_without_check_or_fk(&db).await;
+    common::admission_missing_actor_is_atomic(&db).await;
+}
+
+#[tokio::test]
 #[ignore = "one independently backed-up isolated disposable EMPTY TiDB dev DB; runner and FK visibility review required"]
 async fn tidb_legacy_v1_to_v3_positive_single_case() {
     common::assert_legacy_fixture_upgrades_to_v3(
@@ -55,6 +64,50 @@ async fn tidb_legacy_v2_to_v3_positive_single_case() {
 async fn tidb_legacy_mixed_v1_to_v3_positive_single_case() {
     common::assert_legacy_fixture_upgrades_to_v3("mixed-v1", common::ExpectedIdentityEngine::TiDb)
         .await;
+}
+
+#[tokio::test]
+#[ignore = "one independently backed-up isolated disposable EMPTY tidb dev DB; never run without operator confirmation"]
+async fn admission_actor_permissions_are_atomic_on_fresh_v3_tidb() {
+    let db = common::required_fresh_identity_db().await;
+    common::run_explicit_identity_test_command("upgrade");
+    common::assert_fresh_v3_is_check_and_fk_free(&db).await;
+    common::admission_actor_permissions_are_atomic(&db).await;
+}
+
+#[tokio::test]
+#[ignore = "one independently backed-up isolated disposable EMPTY tidb dev DB; never run without operator confirmation"]
+async fn admission_polluted_combinations_are_readonly_rejected_on_fresh_v3_tidb() {
+    let db = common::required_fresh_identity_db().await;
+    common::run_explicit_identity_test_command("upgrade");
+    common::assert_fresh_v3_is_check_and_fk_free(&db).await;
+    common::admission_polluted_combinations_are_readonly_rejected(&db).await;
+}
+
+#[tokio::test]
+#[ignore = "one independently backed-up isolated disposable EMPTY TiDB dev DB; lock observation capability required"]
+async fn admission_deactivation_holds_guard_cas_waits_then_denied_on_fresh_v3_tidb() {
+    let db = common::required_fresh_identity_db().await;
+    common::run_explicit_identity_test_command("upgrade");
+    common::assert_fresh_v3_is_check_and_fk_free(&db).await;
+    common::admission_deactivation_holds_guard_cas_waits_then_denied(
+        &db,
+        common::ExpectedIdentityEngine::TiDb,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "one independently backed-up isolated disposable EMPTY TiDB dev DB; lock observation capability required"]
+async fn admission_cas_commits_before_deactivation_then_new_cas_denied_on_fresh_v3_tidb() {
+    let db = common::required_fresh_identity_db().await;
+    common::run_explicit_identity_test_command("upgrade");
+    common::assert_fresh_v3_is_check_and_fk_free(&db).await;
+    common::admission_cas_commits_before_deactivation_then_new_cas_denied(
+        &db,
+        common::ExpectedIdentityEngine::TiDb,
+    )
+    .await;
 }
 
 mod common;
@@ -130,19 +183,10 @@ async fn bootstrap_twice_preserves_password_and_emits_once() {
 #[tokio::test]
 #[ignore = "one independently backed-up isolated disposable empty test DB and operator authorization required"]
 async fn concurrent_bootstraps_create_one_admin_and_emit_once() {
-    let db = fresh_v2().await;
-    let sink = RecordingSecretSink::default();
-    let (a, b) = tokio::join!(bootstrap_admin(&db, &sink), bootstrap_admin(&db, &sink));
-    a.unwrap();
-    b.unwrap();
-    let admins: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM users WHERE username = 'admin' AND is_admin = TRUE",
-    )
-    .fetch_one(&db.0)
-    .await
-    .unwrap();
-    assert_eq!(admins, 1);
-    assert_eq!(sink.emissions().len(), 1);
+    let db = common::required_fresh_identity_db().await;
+    common::run_explicit_identity_test_command("upgrade");
+    common::assert_fresh_v3_is_check_and_fk_free(&db).await;
+    common::concurrent_bootstraps_emit_once(&db).await;
 }
 
 #[tokio::test]
@@ -167,7 +211,9 @@ async fn empty_users_do_not_reset_initialized_marker() {
 #[tokio::test]
 #[ignore = "one independently backed-up isolated disposable empty test DB and operator authorization required"]
 async fn bootstrap_failure_is_not_retried_after_commit() {
-    let db = fresh_v2().await;
+    let db = common::required_fresh_identity_db().await;
+    common::run_explicit_identity_test_command("upgrade");
+    common::assert_fresh_v3_is_check_and_fk_free(&db).await;
     common::bootstrap_failure_does_not_reinitialize(&db).await;
 }
 
@@ -281,6 +327,8 @@ async fn identity_unsigned_high_half_round_trip() {
 #[tokio::test]
 #[ignore = "one independently backed-up isolated disposable empty test DB and operator authorization required"]
 async fn admission_cas_persists_history_and_audit_atomically() {
-    let db = fresh_v2().await;
+    let db = common::required_fresh_identity_db().await;
+    common::run_explicit_identity_test_command("upgrade");
+    common::assert_fresh_v3_is_check_and_fk_free(&db).await;
     common::admission_cas_scenarios(&db).await;
 }

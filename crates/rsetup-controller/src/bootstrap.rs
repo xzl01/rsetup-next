@@ -12,11 +12,13 @@ pub async fn bootstrap_admin(
 ) -> Result<(), ControllerError> {
     let (secret, hash) = generate_secret()?;
     let mut tx = db.0.begin().await?;
-    let initialized: bool =
-        sqlx::query_scalar("SELECT initialized FROM schema_meta WHERE singleton = 1 FOR UPDATE")
-            .fetch_one(&mut *tx)
-            .await?;
-    if initialized {
+    crate::integrity::lock_integrity_guard(&mut tx).await?;
+    let initialized_raw: i64 = sqlx::query_scalar(
+        "SELECT CAST(initialized AS SIGNED) FROM schema_meta WHERE singleton = 1 FOR UPDATE",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if parse_initialized(initialized_raw)? {
         tx.commit().await?;
         return Ok(());
     }
@@ -37,6 +39,16 @@ pub async fn bootstrap_admin(
     sink.emit("admin", &secret)
 }
 
+fn parse_initialized(raw: i64) -> Result<bool, ControllerError> {
+    match raw {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(ControllerError::Config(
+            "identity data meta.initialized".into(),
+        )),
+    }
+}
+
 fn generate_secret() -> Result<(String, String), ControllerError> {
     let mut entropy = [0u8; 32];
     OsRng.fill_bytes(&mut entropy);
@@ -49,6 +61,25 @@ fn generate_secret() -> Result<(String, String), ControllerError> {
 mod tests {
     use super::*;
     use argon2::{Argon2, PasswordHash, PasswordVerifier};
+
+    #[test]
+    fn bootstrap_initialized_accepts_exact_boolean_values() {
+        assert!(!parse_initialized(0).unwrap());
+        assert!(parse_initialized(1).unwrap());
+    }
+
+    #[test]
+    fn bootstrap_initialized_rejects_invalid_values_without_echoing_them() {
+        for raw in [2, -1, i64::MIN, i64::MAX] {
+            let error = parse_initialized(raw).unwrap_err();
+            assert!(matches!(error, ControllerError::Config(_)));
+            assert_eq!(
+                error.to_string(),
+                "configuration: identity data meta.initialized"
+            );
+            assert!(!error.to_string().contains(&raw.to_string()));
+        }
+    }
 
     #[test]
     fn bootstrap_secret_has_entropy_and_argon2id_hash() {
