@@ -99,6 +99,81 @@ fn validate_meta_count(count: usize, expected_version: Option<i32>) -> Result<()
     }
 }
 
+type GuardRows = Result<Vec<Result<(i8, i32), sqlx::Error>>, sqlx::Error>;
+type ActorColumns = (
+    Result<i64, sqlx::Error>,
+    Result<i64, sqlx::Error>,
+    Result<i64, sqlx::Error>,
+);
+
+fn validate_guard_rows(rows: GuardRows) -> Result<(), ControllerError> {
+    let rows = rows.map_err(|_| scan_error("meta.guard"))?;
+    if rows.len() != 1 || !matches!(rows[0], Ok((1, 3))) {
+        return Err(scan_error("meta.guard"));
+    }
+    Ok(())
+}
+
+pub(crate) async fn lock_integrity_guard(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+) -> Result<(), ControllerError> {
+    let rows = sqlx::query(
+        "SELECT singleton,schema_version FROM schema_meta ORDER BY singleton FOR UPDATE",
+    )
+    .fetch_all(&mut **tx)
+    .await
+    .map(|rows| {
+        rows.into_iter()
+            .map(|row| Ok((row.try_get("singleton")?, row.try_get("schema_version")?)))
+            .collect()
+    });
+    validate_guard_rows(rows)
+}
+
+fn validate_actor_row(
+    row: Result<Option<ActorColumns>, sqlx::Error>,
+) -> Result<(), ControllerError> {
+    let (active, is_admin, must_change_password) = row
+        .map_err(|_| scan_error("actor.read"))?
+        .ok_or(ControllerError::NotFound)?;
+    let active = raw_bool(
+        active.map_err(|_| scan_error("actor.decode"))?,
+        "actor.boolean",
+    )?;
+    let is_admin = raw_bool(
+        is_admin.map_err(|_| scan_error("actor.decode"))?,
+        "actor.boolean",
+    )?;
+    let must_change_password = raw_bool(
+        must_change_password.map_err(|_| scan_error("actor.decode"))?,
+        "actor.boolean",
+    )?;
+    if !active || !is_admin || must_change_password {
+        return Err(ControllerError::PermissionDenied);
+    }
+    Ok(())
+}
+
+pub(crate) async fn require_active_admin(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    actor: [u8; 16],
+) -> Result<(), ControllerError> {
+    let row = sqlx::query("SELECT CAST(active AS SIGNED) AS active,CAST(is_admin AS SIGNED) AS is_admin,CAST(must_change_password AS SIGNED) AS must_change_password FROM users WHERE id = ? FOR UPDATE")
+        .bind(actor.as_slice())
+        .fetch_optional(&mut **tx)
+        .await
+        .map(|row| {
+            row.map(|row| {
+                (
+                    row.try_get("active"),
+                    row.try_get("is_admin"),
+                    row.try_get("must_change_password"),
+                )
+            })
+        });
+    validate_actor_row(row)
+}
+
 pub async fn check_identity_data(db: &DbPool) -> Result<(), ControllerError> {
     validate_identity_rows(db, true).await
 }
@@ -458,6 +533,67 @@ fn valid_permission(permission: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn guard_requires_exactly_one_v3_singleton_and_fails_closed_on_decode_or_read() {
+        assert!(validate_guard_rows(Ok(vec![Ok((1, 3))])).is_ok());
+        for rows in [
+            Ok(vec![]),
+            Ok(vec![Ok((1, 3)), Ok((2, 3))]),
+            Ok(vec![Ok((0, 3))]),
+            Ok(vec![Ok((2, 3))]),
+            Ok(vec![Ok((1, 2))]),
+            Ok(vec![Ok((1, 4))]),
+            Ok(vec![Err(sqlx::Error::RowNotFound)]),
+            Err(sqlx::Error::RowNotFound),
+        ] {
+            assert_eq!(
+                validate_guard_rows(rows).unwrap_err().to_string(),
+                "configuration: identity data meta.guard"
+            );
+        }
+    }
+
+    #[test]
+    fn actor_requires_existing_active_admin_with_changed_password() {
+        assert_eq!(
+            validate_actor_row(Ok(None)).unwrap_err().to_string(),
+            "not found"
+        );
+        assert!(validate_actor_row(Ok(Some((Ok(1), Ok(1), Ok(0))))).is_ok());
+        for columns in [(0, 1, 0), (1, 0, 0), (1, 1, 1)] {
+            assert_eq!(
+                validate_actor_row(Ok(Some((Ok(columns.0), Ok(columns.1), Ok(columns.2)))))
+                    .unwrap_err()
+                    .to_string(),
+                "permission denied"
+            );
+        }
+    }
+
+    #[test]
+    fn actor_invalid_boolean_decode_and_read_fail_closed_without_raw_values() {
+        for columns in [(2, 1, 0), (1, -1, 0), (1, 1, 2)] {
+            assert_eq!(
+                validate_actor_row(Ok(Some((Ok(columns.0), Ok(columns.1), Ok(columns.2)))))
+                    .unwrap_err()
+                    .to_string(),
+                "configuration: identity data actor.boolean"
+            );
+        }
+        assert_eq!(
+            validate_actor_row(Ok(Some((Err(sqlx::Error::RowNotFound), Ok(1), Ok(0)))))
+                .unwrap_err()
+                .to_string(),
+            "configuration: identity data actor.decode"
+        );
+        assert_eq!(
+            validate_actor_row(Err(sqlx::Error::RowNotFound))
+                .unwrap_err()
+                .to_string(),
+            "configuration: identity data actor.read"
+        );
+    }
 
     #[test]
     fn application_shapes_reject_invalid_combinations() {

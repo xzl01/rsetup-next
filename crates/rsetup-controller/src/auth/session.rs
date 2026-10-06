@@ -14,6 +14,86 @@ pub fn token_digest(raw: &[u8]) -> [u8; 32] {
     sha2::Sha256::digest(raw).into()
 }
 
+fn hmac_sha256(key: &[u8; 32], domain: &[u8], payload: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for i in 0..32 {
+        ipad[i] ^= key[i];
+        opad[i] ^= key[i];
+    }
+
+    let mut inner = sha2::Sha256::new();
+    inner.update(ipad);
+    inner.update(domain);
+    inner.update(payload);
+    let inner_hash = inner.finalize();
+
+    let mut outer = sha2::Sha256::new();
+    outer.update(opad);
+    outer.update(inner_hash);
+    outer.finalize().into()
+}
+
+fn constant_time_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut diff = 0u8;
+    for i in 0..32 {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+const ALIAS_DOMAIN: &[u8] = b"rsetup-session-id-v1";
+const CURSOR_DOMAIN: &[u8] = b"rsetup-session-cursor-v1";
+
+pub struct SessionAliasKey {
+    secret: [u8; 32],
+}
+
+impl Default for SessionAliasKey {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SessionAliasKey {
+    pub fn new() -> Self {
+        use rand::RngCore;
+        let mut secret = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut secret);
+        Self { secret }
+    }
+
+    #[cfg(test)]
+    pub fn from_test_bytes(secret: [u8; 32]) -> Self {
+        Self { secret }
+    }
+
+    pub fn alias(&self, digest: &[u8; 32]) -> String {
+        let mac = hmac_sha256(&self.secret, ALIAS_DOMAIN, digest);
+        hex::encode(mac)
+    }
+
+    pub fn matches(&self, digest: &[u8; 32], id: &str) -> bool {
+        if id.len() != 64 {
+            return false;
+        }
+        if !id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return false;
+        }
+        let expected_mac = hmac_sha256(&self.secret, ALIAS_DOMAIN, digest);
+        let mut actual_mac = [0u8; 32];
+        if hex::decode_to_slice(id, &mut actual_mac).is_err() {
+            return false;
+        }
+        constant_time_eq_32(&expected_mac, &actual_mac)
+    }
+
+    pub fn sign_cursor(&self, payload: &[u8]) -> [u8; 32] {
+        hmac_sha256(&self.secret, CURSOR_DOMAIN, payload)
+    }
+}
+
 const INSERT_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 struct SessionState {
@@ -93,6 +173,13 @@ impl SessionClock {
     }
     pub fn remove(&self, digest: &[u8; 32]) {
         self.state.lock().unwrap().deadlines.remove(digest);
+    }
+    pub fn is_live(&self, digest: &[u8; 32], now: Instant) -> bool {
+        let state = self.state.lock().unwrap();
+        match state.deadlines.get(digest) {
+            Some(&(idle, absolute)) => now < idle && now < absolute,
+            None => false,
+        }
     }
 }
 
@@ -254,5 +341,117 @@ mod tests {
         assert!(clock.check(digest, &clock.epoch, start + 2 * IDLE).is_ok());
         clock.remove(&digest);
         assert!(!clock.state.lock().unwrap().deadlines.contains_key(&digest));
+    }
+
+    #[test]
+    fn alias_key_generates_stable_lowercase_hex_and_rejects_raw_digest_exposure() {
+        let key = SessionAliasKey::from_test_bytes([7; 32]);
+        let digest = token_digest(b"fixture-not-a-cookie");
+        let alias = key.alias(&digest);
+        assert_eq!(alias.len(), 64);
+        assert!(
+            alias
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "alias must be lowercase hex"
+        );
+        assert_ne!(
+            alias,
+            hex::encode(digest),
+            "alias must never expose raw digest hex"
+        );
+        let same_alias = key.alias(&digest);
+        assert_eq!(
+            alias, same_alias,
+            "same key and digest must yield identical alias"
+        );
+
+        let other_digest = token_digest(b"other-digest");
+        let other_alias = key.alias(&other_digest);
+        assert_ne!(
+            alias, other_alias,
+            "different digests must yield different aliases"
+        );
+
+        let other_key = SessionAliasKey::from_test_bytes([8; 32]);
+        assert_ne!(
+            other_key.alias(&digest),
+            alias,
+            "different process keys must yield different aliases"
+        );
+    }
+
+    #[test]
+    fn alias_matches_verifies_correct_alias_and_rejects_invalid_or_foreign_ids() {
+        let key = SessionAliasKey::from_test_bytes([7; 32]);
+        let digest = token_digest(b"fixture-not-a-cookie");
+        let alias = key.alias(&digest);
+
+        assert!(key.matches(&digest, &alias));
+        assert!(!key.matches(&token_digest(b"other"), &alias));
+
+        // Format checks: rejecting uppercase, malformed hex, wrong lengths
+        let upper_alias = alias.to_ascii_uppercase();
+        assert!(!key.matches(&digest, &upper_alias));
+        assert!(!key.matches(&digest, ""));
+        assert!(!key.matches(&digest, &alias[..63]));
+        assert!(!key.matches(&digest, &format!("{alias}0")));
+        let mut malformed = alias.clone();
+        malformed.replace_range(0..1, "g");
+        assert!(!key.matches(&digest, &malformed));
+
+        // Foreign key
+        let foreign_key = SessionAliasKey::from_test_bytes([8; 32]);
+        assert!(!foreign_key.matches(&digest, &alias));
+    }
+
+    #[test]
+    fn domain_separation_between_session_alias_and_cursor_signature() {
+        let key = SessionAliasKey::from_test_bytes([7; 32]);
+        let digest = token_digest(b"fixture-payload");
+        let alias = key.alias(&digest);
+        let cursor_mac = key.sign_cursor(&digest);
+        assert_ne!(
+            alias,
+            hex::encode(cursor_mac),
+            "cursor mac and session alias must have distinct domain separation"
+        );
+    }
+
+    #[test]
+    fn clock_is_live_peeks_without_extending_idle_and_honors_deadlines() {
+        let clock = SessionClock::new();
+        let t0 = Instant::now();
+        let digest = token_digest(b"clock-peek-session");
+
+        assert!(
+            !clock.is_live(&digest, t0),
+            "non-existent session cannot be live"
+        );
+
+        clock.insert(digest, t0);
+        // Just before idle boundary
+        assert!(clock.is_live(&digest, t0 + IDLE - Duration::from_nanos(1)));
+        // Exactly at idle boundary (should be expired, not live)
+        assert!(!clock.is_live(&digest, t0 + IDLE));
+        // After idle boundary
+        assert!(!clock.is_live(&digest, t0 + IDLE + Duration::from_secs(1)));
+
+        // Verify peek did not extend idle time:
+        // inserting another session at t0 + IDLE/2 and checking is_live doesn't renew
+        let digest2 = token_digest(b"clock-peek-idle-not-renewed");
+        clock.insert(digest2, t0);
+        let mid = t0 + Duration::from_secs(15 * 60);
+        assert!(clock.is_live(&digest2, mid));
+        // If is_live renewed, it would be live at t0 + IDLE + Duration::from_secs(10).
+        // Since is_live must NOT renew, at t0 + IDLE it must be expired:
+        assert!(!clock.is_live(&digest2, t0 + IDLE));
+
+        // Removal reflects immediately
+        let digest3 = token_digest(b"clock-peek-removed");
+        clock.insert(digest3, t0);
+        assert!(clock.is_live(&digest3, t0));
+        clock.remove(&digest3);
+        assert!(!clock.is_live(&digest3, t0));
     }
 }

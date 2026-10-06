@@ -2624,7 +2624,7 @@ fn next_snapshot(
     })
 }
 
-fn system_fallback_time_evidence() -> String {
+pub(crate) fn system_fallback_time_evidence() -> String {
     static CLOCK_EPOCH: std::sync::OnceLock<uuid::Uuid> = std::sync::OnceLock::new();
     let wall = chrono::Utc::now().to_rfc3339();
     serde_json::json!({
@@ -2640,7 +2640,9 @@ fn system_fallback_time_evidence() -> String {
     .to_string()
 }
 
-fn next_event_seq(counter: &std::sync::atomic::AtomicU64) -> Result<u64, ControllerError> {
+pub(crate) fn next_event_seq(
+    counter: &std::sync::atomic::AtomicU64,
+) -> Result<u64, ControllerError> {
     counter
         .fetch_update(
             std::sync::atomic::Ordering::Relaxed,
@@ -2679,6 +2681,10 @@ impl AdmissionStore for DbPool {
         static PROCESS_EPOCH: OnceLock<uuid::Uuid> = OnceLock::new();
         static EVENT_SEQ: AtomicU64 = AtomicU64::new(0);
         let mut tx = self.0.begin().await?;
+        crate::integrity::lock_integrity_guard(&mut tx).await?;
+        if let Some(actor) = actor_id {
+            crate::integrity::require_active_admin(&mut tx, actor).await?;
+        }
         let row = sqlx::query("SELECT admission_state, review_decision, revision FROM devices WHERE public_key = ? FOR UPDATE")
             .bind(public_key.as_slice()).fetch_optional(&mut *tx).await?.ok_or(ControllerError::NotFound)?;
         let current = decode_snapshot(

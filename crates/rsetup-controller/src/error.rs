@@ -4,8 +4,12 @@ pub enum ControllerError {
     InvalidArgument,
     #[error("revision conflict")]
     RevisionConflict,
+    #[error("permission denied")]
+    PermissionDenied,
     #[error("not found")]
     NotFound,
+    #[error("resource exhausted")]
+    ResourceExhausted,
     #[error("configuration: {0}")]
     Config(String),
     #[error("identity schema not ready: found {found:?}, required {required}")]
