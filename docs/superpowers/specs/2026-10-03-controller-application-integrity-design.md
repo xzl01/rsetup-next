@@ -100,6 +100,12 @@ JSON 字面量 `null` 不等于 SQL NULL；空数组、非数组、非字符串�
 
 ## 7. 验收与完成边界
 
+### Task4 observer 补充（2026-10-03，仅 offline 批准）
+
+用户已选择 `task4_observer_design_approval='批准方案及限定离线实现'`；后续 Task4 并发采用**两条原 writer 业务参与连接 A/B + 一条独立 observer 连接 O**，不把三连接冒称原两连接自观察验收。参见[正式 observer 规格](</home/aghost/workspace/rsetup-next/.worktrees/controller-v1-01-identity/docs/superpowers/specs/2026-10-03-controller-task4-isolated-observer-design.md>)及[详细实施计划](</home/aghost/workspace/rsetup-next/.worktrees/controller-v1-01-identity/docs/superpowers/plans/2026-10-03-controller-task4-isolated-observer.md>)。保留原历史决定、其他任务与生产API、writer权限/parser/callers及全部门禁；只替代Task4测试侧的A自观察约束。MySQL三表SELECT/TiDB PROCESS跨会话元数据风险已知悉；账号权限由操作者另准备，新凭据读取、真实DB、GRANT、reset均另批。有效传输策略/当前窗口TiDB拓扑不能确认即fail-closed，不补造TLS或同集群sysvar。无O凭据可完成offline-ready，但Task4真库验收仍未完成；live任一例失败停两库。
+
+### 原专题验收要求（保留）
+
 - 纯测试：完整五规则正反矩阵、JSON null/SQL NULL、非法状态组合、未知权限与revision溢出；源文件扫描只能辅助防回归，不替代真实行为证据。
 - 两引擎独立实测：新空库→v3、v1→v3、v2→v3、旧 CHECK 确实缺失/已知子集的等价元数据读回、非事务中断重试、非法数据在首次 DDL 前无损拒绝、重复升级、只读启动拒旧版本；同名 CHECK 被篡改为非法新表达式在首次 DDL 前拒绝，证明 0 DDL、原版本与数据不变。无 CHECK 且数据合法的旧库允许升级；无法在真实引擎制造的元数据缺失/不可比较反例以 probe/纯比较器验证，明确标记证据类型而不冒称实测。MySQL与TiDB分别记录精确版本、实际用例数与失败数。
 - 明确证明数据库没有 CHECK/FK，但受控应用写入仍拒绝非法值/悬空actor；审计写失败回滚设备/历史/epoch；bootstrap 并发只一个账号与一次输出。

@@ -164,6 +164,8 @@ otherwise -> refuse
 
 ## Task 4: 现有写入口的事务保护
 
+> **2026-10-03 补充，仅 offline 批准：** 用户选择 `task4_observer_design_approval='批准方案及限定离线实现'`。原Step4“两连接”保留为历史业务参与者决定，现明确为**两条原writer参与连接A/B + 独立observer O**；A不再自观察，生产CAS/API和writer/migration parser及旧callers不改。执行[observer正式规格](</home/aghost/workspace/rsetup-next/.worktrees/controller-v1-01-identity/docs/superpowers/specs/2026-10-03-controller-task4-isolated-observer-design.md>)与[细分实施计划O1–O7](</home/aghost/workspace/rsetup-next/.worktrees/controller-v1-01-identity/docs/superpowers/plans/2026-10-03-controller-task4-isolated-observer.md>)。本次只允许离线实现/审查，账号权限由操作者另准备；新凭据读取、所有真实DB/reset/GRANT另批。无O凭据可达offline-ready，不标Task4完成；live首失败停两库。原Step5提交要求对本次observer增量由父协调代理统一负责，实施者不得stage/commit，ignored工具不强制入库；其他任务及历史决定不变。
+
 **Files:** 修改src/{integrity.rs,db.rs,bootstrap.rs,error.rs}与三测试文件。
 
 **Interfaces:** 新增内部函数：
