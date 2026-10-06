@@ -4,6 +4,7 @@ members = [
     "crates/rsetup-core",
     "crates/rsetup-app",
     "crates/rsetup-controller",
+    "crates/rsetup-protocol",
 ]
 exclude = ["apps/desktop/src-tauri"]
 
@@ -18,6 +19,7 @@ repository = "https://github.com/xzl01/rsetup-next"
 argon2 = "0.5"
 hex = "0.4"
 rand = "0.8"
+ring = "0.17"
 sqlx = { version = "0.8", default-features = false, features = ["mysql", "runtime-tokio", "tls-rustls", "chrono", "uuid"] }
 tower = { version = "0.5", features = ["util"] }
 anyhow = "1.0"
