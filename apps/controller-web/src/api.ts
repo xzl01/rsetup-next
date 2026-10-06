@@ -117,6 +117,11 @@ export async function get<T>(path: string, options?: { signal?: AbortSignal }): 
     throw localError(isAborted(error, signal) ? 'REQUEST_ABORTED' : 'NETWORK_ERROR')
   }
 
+  return unwrap<T>(response, signal)
+}
+
+/** Unpack a same-origin /api/v1 JSON envelope; never echoes raw server content. */
+async function unwrap<T>(response: Response, signal?: AbortSignal): Promise<ApiResponse<T>> {
   const contentType = response.headers.get('Content-Type') ?? ''
   if (!/^application\/(?:json|[a-z0-9.+-]+\+json)(?:\s*;|\s*$)/i.test(contentType)) {
     throw localError('INVALID_API_RESPONSE', response.status)
@@ -152,4 +157,29 @@ export async function get<T>(path: string, options?: { signal?: AbortSignal }): 
     ...(retryAfter !== null && retryAfter.length <= 256 && !/[\u0000-\u001f\u007f-\u009f]/.test(retryAfter)
       ? { retryAfter } : {}),
   })
+}
+
+function validCsrfToken(token: string): boolean {
+  return /^[A-Za-z0-9_-]{1,256}$/.test(token)
+}
+
+export async function post<T>(path: string, payload: unknown,
+  options?: { signal?: AbortSignal; csrfToken?: string }): Promise<ApiResponse<T>> {
+  const url = safePath(path)
+  const signal = options?.signal
+  if (options?.csrfToken !== undefined && !validCsrfToken(options.csrfToken)) {
+    throw localError('INVALID_API_PATH')
+  }
+  const headers: Record<string, string> = { 'Content-Type': 'application/json', Accept: 'application/json' }
+  if (options?.csrfToken !== undefined) headers['X-CSRF-Token'] = options.csrfToken
+  let response: Response
+  try {
+    response = await fetch(url, {
+      method: 'POST', credentials: 'same-origin', redirect: 'error',
+      headers, body: JSON.stringify(payload), signal,
+    })
+  } catch (error) {
+    throw localError(isAborted(error, signal) ? 'REQUEST_ABORTED' : 'NETWORK_ERROR')
+  }
+  return unwrap<T>(response, signal)
 }

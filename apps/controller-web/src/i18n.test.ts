@@ -9,7 +9,17 @@ const preferenceKey = 'rsetup.controller.locale';
 const keys = ['app.title', 'app.foundation', 'app.notConnected', 'nav.skip', 'language.label',
   'button.primary', 'button.secondary', 'button.danger', 'button.loading',
   'field.label', 'field.hint', 'field.error', 'notice.title', 'notice.body',
-  'state.loading', 'state.empty', 'state.error', 'state.retry'];
+  'state.loading', 'state.empty', 'state.error', 'state.retry',
+  'auth.checking', 'auth.error.generic', 'errors.generic',
+  'auth.error.invalidCredentials', 'auth.error.authRequired', 'auth.error.rateLimited',
+  'auth.error.passwordChangeRequired', 'auth.error.denied',
+  'auth.login.title', 'auth.username.label', 'auth.username.hint', 'auth.password.label',
+  'auth.login.submit', 'auth.logout.label', 'auth.passwordChange.title', 'auth.passwordChange.forced',
+  'auth.currentPassword.label', 'auth.newPassword.label', 'auth.newPassword.hint',
+  'auth.passwordChange.submit', 'auth.signedIn.heading',
+  'auth.sessions.title', 'auth.sessions.current', 'auth.sessions.created',
+  'auth.sessions.revoke', 'auth.sessions.revokeOthers', 'auth.sessions.loadMore',
+  'auth.sessions.empty'];
 
 afterEach(() => {
   vi.restoreAllMocks();
