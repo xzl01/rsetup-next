@@ -2,7 +2,12 @@ pub mod auth;
 pub mod bootstrap;
 pub mod config;
 pub mod db;
+pub mod devices;
 pub mod error;
+pub mod http_api;
+pub mod http_auth;
+pub mod http_live;
+pub mod http_security;
 pub mod integrity;
 pub mod model;
 
@@ -13,6 +18,7 @@ pub use db::{
     run_identity_test_migration,
 };
 pub use error::ControllerError;
+pub use http_auth::{AppState, HttpAuthState, build_http_router};
 pub use integrity::{validate_device_fields, validate_grant_fields, validate_singleton_ids};
 pub use model::{AdmissionSnapshot, AdmissionState, ReviewDecision};
 
