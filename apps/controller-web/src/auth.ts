@@ -1,14 +1,17 @@
 import { ref, type Ref } from 'vue'
 import { ApiError, get, post } from './api'
 
-/** Identity fields as returned by /auth/me and /auth/login. */
+/** Identity fields as returned by /auth/me and /auth/login (user_public projection). */
 export interface AuthUser {
+  /** Canonical lowercase standard UUIDv4 string, as emitted by the /api/v1 projection. */
+  id: string
   username: string
   display_name?: string
   must_change_password: boolean
   is_admin?: boolean
   active?: boolean
-  revision?: string
+  /** Canonical decimal string (e.g. "1"); never a JSON number. */
+  revision: string
 }
 
 export type AuthStatus = 'checking' | 'signed_out' | 'force_password' | 'signed_in' | 'error'
@@ -70,12 +73,23 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+// Full lowercase standard UUIDv4 with RFC 4122 variant bits (8/9/a/b): version nibble fixed to 4.
+// A JSON number or any other casing/format fails the typeof + regex pair.
+const USER_ID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
+// Canonical decimal string for revision: no empty, no sign, no fraction, no exponent, no leading
+// zero (so "0" is valid but "01" is not); a JSON number fails the typeof check. No Number/parseInt.
+const DECIMAL_STRING = /^(0|[1-9][0-9]*)$/
+
 // get/post validate only the envelope (data passes through as T), so identity fields are re-checked here
-// at runtime. Missing/wrong shape → INVALID_API_RESPONSE; the caller clears identity/CSRF and never enters
+// at runtime — including the business id (UUIDv4) and revision (decimal string) contract.
+// Missing/wrong shape → INVALID_API_RESPONSE; the caller clears identity/CSRF and never enters
 // signed_in/force_password.
 function assertIdentityShape(data: unknown): void {
   if (!isPlainObject(data) || !isPlainObject(data.user)) throw invalidShape()
+  if (typeof data.user.id !== 'string' || !USER_ID_V4.test(data.user.id)) throw invalidShape()
   if (typeof data.user.username !== 'string' || data.user.username.length === 0) throw invalidShape()
+  if (typeof data.user.revision !== 'string' || !DECIMAL_STRING.test(data.user.revision)) throw invalidShape()
   if (typeof data.user.must_change_password !== 'boolean') throw invalidShape()
   if (typeof data.csrf_token !== 'string' || data.csrf_token.length === 0) throw invalidShape()
 }

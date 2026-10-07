@@ -92,8 +92,8 @@ expect(document.documentElement.lang).toBe('en');
 
 - [ ] 可编译stub先返回未解包值，写RED：
 ```ts
-vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({data:{revision:'18446744073709551615'},request_id:'r1'}),{status:200})));
-expect(await get<{revision:string}>('/devices')).toEqual({data:{revision:'18446744073709551615'},requestId:'r1'});
+vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({data:{revision:'18446744073709551615'},request_id:'e5f6a7b8-c9d0-4e1f-8a2b-4c5d6e7f8091'}),{status:200})));
+expect(await get<{revision:string}>('/devices')).toEqual({data:{revision:'18446744073709551615'},requestId:'e5f6a7b8-c9d0-4e1f-8a2b-4c5d6e7f8091'});
 ```
 - [ ] 最小GET实现；固定GET/credentials=same-origin/redirect=error/Accept；只有path和signal可传，App不消费API以避免真实请求。
 - [ ] 路径校验RED→GREEN：`https://example.invalid/a`、`//example.invalid`、`/../other`、`/%2e%2e/other`、反斜杠、控制字符、fragment均在fetch前拒绝。合法query保留；不要让URL规范化逃出/api/v1。

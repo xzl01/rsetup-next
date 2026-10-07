@@ -3,14 +3,39 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 
 import App from './App.vue';
 
+// Contract identity (2026-10-07 HTTP ID design): the /api/v1 user_public projection carries a
+// canonical lowercase UUIDv4 id and a decimal-string revision; display_name is a future optional
+// field, not part of the current projection — so the UI must fall back to username ('admin').
+const USER_ID = '01234567-89ab-4cde-8f01-234567890abc';
+const CONTRACT_USER = {
+  id: USER_ID,
+  username: 'admin',
+  active: true,
+  is_admin: true,
+  must_change_password: false,
+  revision: '1',
+};
+
+// Normal simulated HTTP packets carry contract request_ids (UUIDv4); api.ts still only validates
+// a non-empty bounded string for request_id — that runtime policy is intentionally unchanged.
+const RID_ME = '123e4567-e89b-42d3-a456-426614174000';
+const RID_ME_2 = '345a6789-fa2c-44d6-b678-648836396222';
+const RID_LOGIN = '234f5678-e91b-43c5-a567-537725285111';
+const RID_PW = '456b789a-0b3d-45e7-c789-759947407333';
+const RID_LOGOUT = '567c89ab-1c4e-46f8-d89a-86aa58518444';
+const RID_LIST = '89afbcde-4f7b-49cb-8bcd-b9dd8b84b777';
+const RID_REVOKE = '9abcfdef-5a8c-4adc-9cde-c0ee9c95c888';
+const RID_ERR = '678d9abc-2d5f-47a9-e9ab-97bb69629555';
+const RID_NULL = '789eabcd-3e6a-48ba-fabc-a8cc7a73a666';
+
 const ME_DATA = {
-  user: { username: 'admin', display_name: 'Sam', must_change_password: false, is_admin: true, active: true, revision: '1' },
+  user: CONTRACT_USER,
   csrf_token: 'mem-token',
   authz_epoch: '7',
 };
 
 const FORCE_ME_DATA = {
-  user: { username: 'admin', display_name: 'Sam', must_change_password: true, is_admin: true, active: true, revision: '1' },
+  user: { ...CONTRACT_USER, must_change_password: true },
   csrf_token: 'force-token',
   authz_epoch: '7',
 };
@@ -24,10 +49,10 @@ function fetchForMe(meResponse: Response, loginResponse?: (init?: RequestInit) =
   const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = String(input);
     if (url.includes('/auth/me')) return meResponse;
-    if (url.includes('/auth/login')) return loginResponse ? loginResponse(init) : jsonResponse({ data: { user: { username: 'admin', must_change_password: false }, csrf_token: 'login-token' }, request_id: 'rl' });
-    if (url.includes('/auth/password')) return passwordResponse ? passwordResponse(init) : jsonResponse({ data: { changed: true }, request_id: 'rp' });
-    if (url.includes('/auth/logout')) return jsonResponse({ data: { logged_out: true }, request_id: 'ro' });
-    if (url.includes('/auth/sessions')) return jsonResponse({ data: { items: [], next_cursor: null }, request_id: 'rs' });
+    if (url.includes('/auth/login')) return loginResponse ? loginResponse(init) : jsonResponse({ data: { user: CONTRACT_USER, csrf_token: 'login-token' }, request_id: RID_LOGIN });
+    if (url.includes('/auth/password')) return passwordResponse ? passwordResponse(init) : jsonResponse({ data: { changed: true }, request_id: RID_PW });
+    if (url.includes('/auth/logout')) return jsonResponse({ data: { logged_out: true }, request_id: RID_LOGOUT });
+    if (url.includes('/auth/sessions')) return jsonResponse({ data: { items: [], next_cursor: null }, request_id: RID_LIST });
     throw new TypeError(`unexpected fetch ${url}`);
   });
   vi.stubGlobal('fetch', fetcher);
@@ -59,9 +84,9 @@ test('checking state: mount triggers exactly one GET /auth/me and shows a safe w
 });
 
 test('signed_in state: no forms, shows user and logout; logout returns to the login form, no device data surface', async () => {
-  fetchForMe(jsonResponse({ data: ME_DATA, request_id: 'r1' }));
+  fetchForMe(jsonResponse({ data: ME_DATA, request_id: RID_ME }));
   render(App);
-  await vi.waitFor(() => expect(screen.getByRole('status').textContent).toContain('Sam'));
+  await vi.waitFor(() => expect(screen.getByRole('status').textContent).toContain('admin'));
   expect(screen.queryByRole('form')).toBeNull();
   expect(screen.getByRole('button', { name: '退出登录' })).toBeTruthy();
   await fireEvent.click(screen.getByRole('button', { name: '退出登录' }));
@@ -73,9 +98,9 @@ test('signed_in state: no forms, shows user and logout; logout returns to the lo
 
 test('force_password after login: only password change and logout are offered', async () => {
   fetchForMe(
-    new Response(JSON.stringify({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: 'r' }),
+    new Response(JSON.stringify({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: RID_ERR }),
       { status: 401, headers: { 'Content-Type': 'application/json' } }),
-    () => jsonResponse({ data: { user: { username: 'admin', must_change_password: true }, csrf_token: 't' }, request_id: 'rl' }),
+    () => jsonResponse({ data: { user: { ...CONTRACT_USER, must_change_password: true }, csrf_token: 't' }, request_id: RID_LOGIN }),
   );
   render(App);
   await vi.waitFor(() => expect(screen.getByRole('form')).toBeTruthy());
@@ -92,10 +117,10 @@ test('login form: submit posts credentials, error uses the safe mapped message, 
   let call = 0;
   const fetcher = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit): Promise<Response> => {
     const url = String(input);
-    if (url.includes('/auth/me')) return jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: 'r' }, 401);
+    if (url.includes('/auth/me')) return jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: RID_ERR }, 401);
     call += 1;
-    if (call === 1) return jsonResponse({ error: { code: 'INVALID_CREDENTIALS', message_key: 'errors.invalidCredentials' }, request_id: 'rl' }, 401);
-    return jsonResponse({ data: { user: { username: 'admin', must_change_password: false }, csrf_token: 't' }, request_id: 'rl2' });
+    if (call === 1) return jsonResponse({ error: { code: 'INVALID_CREDENTIALS', message_key: 'errors.invalidCredentials' }, request_id: RID_ERR }, 401);
+    return jsonResponse({ data: { user: CONTRACT_USER, csrf_token: 't' }, request_id: RID_LOGIN });
   });
   vi.stubGlobal('fetch', fetcher);
   render(App);
@@ -118,12 +143,12 @@ test('signed_in state: csrf/session stay in memory only, never in localStorage (
     const url = String(input);
     if (url.includes('/auth/me')) {
       me += 1;
-      return jsonResponse({ data: { ...ME_DATA, csrf_token: me === 1 ? 'old' : 'new' }, request_id: `rm${me}` });
+      return jsonResponse({ data: { ...ME_DATA, csrf_token: me === 1 ? 'old' : 'new' }, request_id: me === 1 ? RID_ME : RID_ME_2 });
     }
-    return jsonResponse({ data: null, request_id: 'r' });
+    return jsonResponse({ data: null, request_id: RID_NULL });
   }));
   render(App);
-  await vi.waitFor(() => expect(screen.getByRole('status').textContent).toContain('Sam'));
+  await vi.waitFor(() => expect(screen.getByRole('status').textContent).toContain('admin'));
   // 已登录视图无表单；改密成功→清 token→me() 重建会话的完整路径由 auth.test.ts 的
   // changePassword 用例锁定；这里只锁定 App 视图映射与敏感数据不落存储。
   expect(screen.queryByRole('form')).toBeNull();
@@ -162,10 +187,10 @@ test('login submit clears the password field on both failed and successful attem
   let call = 0;
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
     const url = String(input);
-    if (url.includes('/auth/me')) return jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: 'r' }, 401);
+    if (url.includes('/auth/me')) return jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: RID_ERR }, 401);
     call += 1;
-    if (call === 1) return jsonResponse({ error: { code: 'INVALID_CREDENTIALS', message_key: 'errors.invalidCredentials' }, request_id: 'rl' }, 401);
-    return jsonResponse({ data: { user: { username: 'admin', must_change_password: false }, csrf_token: 't' }, request_id: 'rl2' });
+    if (call === 1) return jsonResponse({ error: { code: 'INVALID_CREDENTIALS', message_key: 'errors.invalidCredentials' }, request_id: RID_ERR }, 401);
+    return jsonResponse({ data: { user: CONTRACT_USER, csrf_token: 't' }, request_id: RID_LOGIN });
   }));
   render(App);
   await vi.waitFor(() => expect(screen.getByRole('form')).toBeTruthy());
@@ -188,19 +213,19 @@ test('logout network failure shows the error state with retry, never signed_out'
     const url = String(input);
     if (url.includes('/auth/me')) {
       me += 1;
-      return jsonResponse({ data: { ...ME_DATA, csrf_token: me === 1 ? 'first' : 'second' }, request_id: `rm${me}` });
+      return jsonResponse({ data: { ...ME_DATA, csrf_token: me === 1 ? 'first' : 'second' }, request_id: me === 1 ? RID_ME : RID_ME_2 });
     }
     if (url.includes('/auth/logout')) throw new TypeError('offline');
     throw new TypeError(`unexpected fetch ${url}`);
   }));
   render(App);
-  await vi.waitFor(() => expect(screen.getByRole('status').textContent).toContain('Sam'));
+  await vi.waitFor(() => expect(screen.getByRole('status').textContent).toContain('admin'));
   await fireEvent.click(screen.getByRole('button', { name: '退出登录' }));
   await vi.waitFor(() => expect(screen.getByRole('status').textContent).toContain('无法完成操作，请稍后重试'));
   expect(screen.queryByRole('form')).toBeNull();
   expect(screen.getByRole('button', { name: '重试' })).toBeTruthy();
   await fireEvent.click(screen.getByRole('button', { name: '重试' }));
-  await vi.waitFor(() => expect(screen.getByRole('status').textContent).toContain('Sam'));
+  await vi.waitFor(() => expect(screen.getByRole('status').textContent).toContain('admin'));
   expect(me).toBe(2);
 });
 
@@ -210,9 +235,9 @@ test('logout network failure shows the error state with retry, never signed_out'
 test('force_password: wrong old password (400 INVALID_ARGUMENT) keeps the form, shows the fixed local alert, never the raw server message, never success', async () => {
   const RAW = 'SYNTHETIC-RAW-WRONG-OLD-PASSWORD-XYZ';
   const fetcher = fetchForMe(
-    jsonResponse({ data: FORCE_ME_DATA, request_id: 'r1' }),
+    jsonResponse({ data: FORCE_ME_DATA, request_id: RID_ME }),
     undefined,
-    () => jsonResponse({ error: { code: 'INVALID_ARGUMENT', message_key: 'errors.invalidArgument', params: { detail: RAW } }, request_id: 'rp' }, 400),
+    () => jsonResponse({ error: { code: 'INVALID_ARGUMENT', message_key: 'errors.invalidArgument', params: { detail: RAW } }, request_id: RID_ERR }, 400),
   );
   render(App);
   await vi.waitFor(() => expect(screen.getByRole('heading', { name: '修改密码' })).toBeTruthy());
@@ -248,7 +273,7 @@ test('force_password: network failure on submit is an unknown outcome — error 
     const url = String(input);
     if (url.includes('/auth/me')) {
       me += 1;
-      return jsonResponse({ data: FORCE_ME_DATA, request_id: `rm${me}` });
+      return jsonResponse({ data: FORCE_ME_DATA, request_id: me === 1 ? RID_ME : RID_ME_2 });
     }
     if (url.includes('/auth/password')) throw new TypeError('offline');
     throw new TypeError(`unexpected fetch ${url}`);
@@ -290,16 +315,16 @@ describe('signed_in session management UI (Task 5)', () => {
     let sessionsFetchCount = 0;
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
       const url = String(input);
-      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r1' });
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME });
       if (url.includes('/auth/sessions')) {
         sessionsFetchCount++;
-        return jsonResponse({ data: SESSIONS_MOCK, request_id: 'r_sess' });
+        return jsonResponse({ data: SESSIONS_MOCK, request_id: RID_LIST });
       }
       throw new TypeError(`unexpected fetch ${url}`);
     }));
 
     render(App);
-    await vi.waitFor(() => expect(screen.getByRole('status').textContent).toContain('Sam'));
+    await vi.waitFor(() => expect(screen.getByRole('status').textContent).toContain('admin'));
     await vi.waitFor(() => expect(screen.getByRole('heading', { name: '登录会话' })).toBeTruthy());
 
     expect(sessionsFetchCount).toBe(1);
@@ -326,10 +351,10 @@ describe('signed_in session management UI (Task 5)', () => {
     let sessionsFetched = false;
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
       const url = String(input);
-      if (url.includes('/auth/me')) return jsonResponse({ data: FORCE_ME_DATA, request_id: 'r1' });
+      if (url.includes('/auth/me')) return jsonResponse({ data: FORCE_ME_DATA, request_id: RID_ME });
       if (url.includes('/auth/sessions')) {
         sessionsFetched = true;
-        return jsonResponse({ data: SESSIONS_MOCK, request_id: 'r_sess' });
+        return jsonResponse({ data: SESSIONS_MOCK, request_id: RID_LIST });
       }
       throw new TypeError(`unexpected fetch ${url}`);
     }));
@@ -348,16 +373,16 @@ describe('signed_in session management UI (Task 5)', () => {
     let listCount = 0;
     const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       const url = String(input);
-      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r1' });
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME });
       if (url.includes('/auth/sessions?limit=50')) {
         listCount++;
-        return jsonResponse({ data: SESSIONS_MOCK, request_id: `r_list_${listCount}` });
+        return jsonResponse({ data: SESSIONS_MOCK, request_id: RID_LIST });
       }
       if (url.includes(`/auth/sessions/${'2'.repeat(64)}/revoke`)) {
         const headers = (init?.headers ?? {}) as Record<string, string>;
         expect(headers['X-CSRF-Token']).toBe('mem-token');
         expect(JSON.parse(init?.body as string)).toEqual({});
-        return jsonResponse({ data: { revoked: true }, request_id: 'r_rev' });
+        return jsonResponse({ data: { revoked: true }, request_id: RID_REVOKE });
       }
       throw new TypeError(`unexpected fetch ${url}`);
     });
@@ -372,19 +397,19 @@ describe('signed_in session management UI (Task 5)', () => {
     await fireEvent.click(revokeButtons[1]!);
 
     await vi.waitFor(() => expect(listCount).toBe(2));
-    expect(screen.getByRole('status').textContent).toContain('Sam');
+    expect(screen.getByRole('status').textContent).toContain('admin');
     expect(screen.queryByRole('form')).toBeNull();
   });
 
   test('revoking current session transitions to signed_out (login form)', async () => {
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       const url = String(input);
-      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r1' });
-      if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_MOCK, request_id: 'r_list' });
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME });
+      if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_MOCK, request_id: RID_LIST });
       if (url.includes(`/auth/sessions/${'1'.repeat(64)}/revoke`)) {
         const headers = (init?.headers ?? {}) as Record<string, string>;
         expect(headers['X-CSRF-Token']).toBe('mem-token');
-        return jsonResponse({ data: { revoked: true }, request_id: 'r_rev_self' });
+        return jsonResponse({ data: { revoked: true }, request_id: RID_REVOKE });
       }
       throw new TypeError(`unexpected fetch ${url}`);
     }));
@@ -411,12 +436,12 @@ describe('signed_in session management UI (Task 5)', () => {
     };
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
       const url = String(input);
-      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r1' });
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME });
       if (url.includes('/auth/sessions')) {
         call++;
-        if (call === 1) return jsonResponse({ data: SESSIONS_MOCK, request_id: 'r_p1' });
+        if (call === 1) return jsonResponse({ data: SESSIONS_MOCK, request_id: RID_LIST });
         expect(url).toContain(`cursor=${'c'.repeat(132)}`);
-        return jsonResponse({ data: PAGE_2, request_id: 'r_p2' });
+        return jsonResponse({ data: PAGE_2, request_id: RID_LIST });
       }
       throw new TypeError(`unexpected fetch ${url}`);
     }));
@@ -439,13 +464,13 @@ describe('signed_in session management UI (Task 5)', () => {
     let sessionsFetchCount = 0;
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
       const url = String(input);
-      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r_me' });
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME });
       if (url.includes('/auth/sessions')) {
         sessionsFetchCount++;
         if (sessionsFetchCount === 1) {
-          return jsonResponse({ error: { code: 'NOT_READY', message_key: 'errors.notReady' }, request_id: 'r_503' }, 503);
+          return jsonResponse({ error: { code: 'NOT_READY', message_key: 'errors.notReady' }, request_id: RID_ERR }, 503);
         }
-        return jsonResponse({ data: SESSIONS_MOCK, request_id: 'r_sess' });
+        return jsonResponse({ data: SESSIONS_MOCK, request_id: RID_LIST });
       }
       throw new TypeError(`unexpected fetch ${url}`);
     }));
@@ -475,8 +500,8 @@ describe('signed_in session management UI (Task 5)', () => {
 
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
       const url = String(input);
-      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r_me' });
-      if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_MOCK, request_id: 'r_sess' });
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME });
+      if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_MOCK, request_id: RID_LIST });
       if (url.includes(`/auth/sessions/${'2'.repeat(64)}/revoke`)) {
         revokeCalls++;
         return deferredRevokeGate;
@@ -497,11 +522,11 @@ describe('signed_in session management UI (Task 5)', () => {
     expect(targetRevokeBtn.getAttribute('aria-busy')).toBe('true');
 
     // 模拟服务端返回 500 / 503 失败
-    deferredRevokeResolve(jsonResponse({ error: { code: 'NOT_READY', message_key: 'errors.notReady' }, request_id: 'r_fail' }, 503));
+    deferredRevokeResolve(jsonResponse({ error: { code: 'NOT_READY', message_key: 'errors.notReady' }, request_id: RID_ERR }, 503));
 
     // 出现错误提示，不伪称成功，保持 signed_in
     await vi.waitFor(() => expect(screen.getByText('无法完成操作，请稍后重试')).toBeTruthy());
-    expect(screen.getByRole('status').textContent).toContain('Sam');
+    expect(screen.getByRole('status').textContent).toContain('admin');
     expect(screen.getByText('2026-10-05T11:00:00Z')).toBeTruthy();
   });
 });

@@ -76,11 +76,11 @@ afterEach(() => vi.unstubAllGlobals())
 
 describe('authenticated post', () => {
   it('locks transport: relative /api/v1 URL, same-origin credentials, redirect error, JSON body', async () => {
-    const fetcher = fakeFetch(jsonResponse({ data: { user: { username: 'admin' }, csrf_token: 'tok-1' }, request_id: 'r1' }))
+    const fetcher = fakeFetch(jsonResponse({ data: { user: { username: 'admin' }, csrf_token: 'tok-1' }, request_id: '234f5678-e91b-43c5-a567-537725285111' }))
     const signal = new AbortController().signal
     const result = await post('/auth/login', { username: 'admin', password: 'synthetic-only' },
       { signal, method: 'GET', credentials: 'include', headers: { Authorization: 'bad' }, baseURL: 'https://example.invalid' } as { signal: AbortSignal })
-    expect(result).toEqual({ data: { user: { username: 'admin' }, csrf_token: 'tok-1' }, requestId: 'r1' })
+    expect(result).toEqual({ data: { user: { username: 'admin' }, csrf_token: 'tok-1' }, requestId: '234f5678-e91b-43c5-a567-537725285111' })
     expect(fetcher).toHaveBeenCalledOnce()
     expect(fetcher.mock.calls[0]?.[0]).toBe('/api/v1/auth/login')
     // toMatchObject：实现按现有 get 模式以 `signal` 展开，避免 exact-match 对 undefined own 属性的分歧
@@ -93,7 +93,7 @@ describe('authenticated post', () => {
   })
 
   it('sends X-CSRF-Token only when a valid token is provided', async () => {
-    const fetcher = vi.fn(async (): Promise<Response> => jsonResponse({ data: { changed: true }, request_id: 'r2' }))
+    const fetcher = vi.fn(async (): Promise<Response> => jsonResponse({ data: { changed: true }, request_id: '456b789a-0b3d-45e7-c789-759947407333' }))
     vi.stubGlobal('fetch', fetcher)
     await post('/auth/password', { current_password: 'a', new_password: 'b' }, { csrfToken: 'tok-9_-Z' })
     expect(fetcher.mock.calls[0]?.[1]).toMatchObject({
@@ -109,13 +109,13 @@ describe('authenticated post', () => {
 
   it.each([null, {}, { message: '中文与 unicode', nested: { ok: 1 } }, [1, 'two']])(
     'serializes any JSON-serializable payload %j', async (payload) => {
-    const fetcher = fakeFetch(jsonResponse({ data: true, request_id: 'r' }))
+    const fetcher = fakeFetch(jsonResponse({ data: true, request_id: 'e5f6a7b8-c9d0-4e1f-8a2b-4c5d6e7f8091' }))
     await post('/auth/logout', payload)
     expect(JSON.parse((fetcher.mock.calls[0]?.[1] as RequestInit).body as string)).toEqual(payload)
   })
 
   it('rejects an invalid csrfToken before calling fetch', async () => {
-    const fetcher = fakeFetch(jsonResponse({ data: true, request_id: 'r' }))
+    const fetcher = fakeFetch(jsonResponse({ data: true, request_id: 'e5f6a7b8-c9d0-4e1f-8a2b-4c5d6e7f8091' }))
     await expect(post('/auth/logout', {}, { csrfToken: 'bad\x00token' }))
       .rejects.toMatchObject({ code: 'INVALID_API_PATH', messageKey: 'errors.invalidPath' })
     expect(fetcher).not.toHaveBeenCalled()
@@ -125,31 +125,31 @@ describe('authenticated post', () => {
     'https://example.invalid/a', '//example.invalid', '/../x', '/%2e%2e/x', '/a\\b',
     '/a#frag', '/a\nx', '/%252f/x',
   ])('rejects unsafe path %s before calling fetch', async (path) => {
-    const fetcher = fakeFetch(jsonResponse({ data: true, request_id: 'r' }))
+    const fetcher = fakeFetch(jsonResponse({ data: true, request_id: 'e5f6a7b8-c9d0-4e1f-8a2b-4c5d6e7f8091' }))
     await expect(post(path, {})).rejects.toMatchObject({ code: 'INVALID_API_PATH' })
     expect(fetcher).not.toHaveBeenCalled()
   })
 
   it('accepts ordinary api paths', async () => {
-    const fetcher = fakeFetch(jsonResponse({ data: true, request_id: 'ok' }))
-    await expect(post('auth/login', {})).resolves.toEqual({ data: true, requestId: 'ok' })
+    const fetcher = fakeFetch(jsonResponse({ data: true, request_id: 'e5f6a7b8-c9d0-4e1f-8a2b-4c5d6e7f8091' }))
+    await expect(post('auth/login', {})).resolves.toEqual({ data: true, requestId: 'e5f6a7b8-c9d0-4e1f-8a2b-4c5d6e7f8091' })
     expect(fetcher.mock.calls[0]?.[0]).toBe('/api/v1/auth/login')
   })
 
   it('preserves validated structured 401 errors without exposing server extras', async () => {
-    const fetcher = fakeFetch(jsonResponse({ error: { code: 'INVALID_CREDENTIALS', message_key: 'errors.invalidCredentials' }, request_id: 'r1', message: '<img src=x onerror=alert(1)>' }, 401))
+    const fetcher = fakeFetch(jsonResponse({ error: { code: 'INVALID_CREDENTIALS', message_key: 'errors.invalidCredentials' }, request_id: '678d9abc-2d5f-47a9-e9ab-97bb69629555', message: '<img src=x onerror=alert(1)>' }, 401))
     let caught: unknown
     try { await post('/auth/login', { username: 'a', password: 'b' }) } catch (error) { caught = error }
     expect(caught).toBeInstanceOf(ApiError)
-    expect(caught).toMatchObject({ code: 'INVALID_CREDENTIALS', messageKey: 'errors.invalidCredentials', status: 401, requestId: 'r1', message: 'API request failed' })
+    expect(caught).toMatchObject({ code: 'INVALID_CREDENTIALS', messageKey: 'errors.invalidCredentials', status: 401, requestId: '678d9abc-2d5f-47a9-e9ab-97bb69629555', message: 'API request failed' })
     expect(fetcher).toHaveBeenCalledOnce()
   })
 
   it('preserves 429 with Retry-After and 503 NOT_READY for upper-layer retry decisions', async () => {
-    const fetcher = fakeFetch(jsonResponse({ error: { code: 'RATE_LIMITED', message_key: 'errors.rateLimited', params: { attempts: 5 } }, request_id: 'r1' }, 429, { 'Retry-After': '30' }))
+    const fetcher = fakeFetch(jsonResponse({ error: { code: 'RATE_LIMITED', message_key: 'errors.rateLimited', params: { attempts: 5 } }, request_id: '678d9abc-2d5f-47a9-e9ab-97bb69629555' }, 429, { 'Retry-After': '30' }))
     await expect(post('/auth/login', { username: 'a', password: 'b' }))
       .rejects.toMatchObject({ code: 'RATE_LIMITED', status: 429, retryAfter: '30', params: { attempts: 5 } })
-    fakeFetch(jsonResponse({ error: { code: 'NOT_READY', message_key: 'errors.notReady' }, request_id: 'r2' }, 503))
+    fakeFetch(jsonResponse({ error: { code: 'NOT_READY', message_key: 'errors.notReady' }, request_id: '678d9abc-2d5f-47a9-e9ab-97bb69629555' }, 503))
     await expect(post('/auth/me', null))
       .rejects.toMatchObject({ code: 'NOT_READY', status: 503, messageKey: 'errors.notReady' })
   })
@@ -292,12 +292,13 @@ export async function post<T>(path: string, payload: unknown,
 
 ```ts
 export interface AuthUser {
+  id: string           // 完整小写标准 UUIDv4 字符串（user_public 投影）
   username: string
   display_name?: string
   must_change_password: boolean
   is_admin?: boolean
   active?: boolean
-  revision?: string
+  revision: string     // 规范十进制字符串，不经 Number/parseInt
 }
 export type AuthStatus = 'checking' | 'signed_out' | 'force_password' | 'signed_in' | 'error'
 export type AuthErrorCode =
@@ -322,7 +323,7 @@ export function authErrorKey(code: string): string   // 错误码 → i18n key �
 状态机规则（全部由测试锁定）：
 - 初始 `status='checking'`，`user/csrfToken/authzEpoch/errorCode` 均为 `null`；`createAuth()` 不发请求。
 - **代际守卫（四操作通用）**：`let gen=0`，每个公开操作开头 `const mine=++gen`；任何对共享状态的写入前若 `mine!==gen` 则整段丢弃（迟到的旧 `me` 200/401、旧 `logout` 等不可覆盖更新的 login；短暂状态判定有歧义时宁可保守 `error`，不猜服务端权限）。
-- **运行时 shape 守卫（me/login 的 data 通用，TS 接口不替代运行时校验）**：`get/post` 仅校验 envelope、`data` 一律 `as T` 透传，故响应返回后必须校验：`data.user` 是普通对象、`username` 非空 string、`must_change_password` **严格 boolean**（`typeof==='boolean'`，缺失/字符串 `'true'` 均不合格）、`csrf_token` 非空 string；`me` 另要求 `authz_epoch` 为规范十进制字符串（`/^\d+$/`）。缺/错一律抛固定 `ApiError('INVALID_API_RESPONSE')`，并清本地 `user/csrfToken/authzEpoch`、进入 `error`——**不进入** `signed_in`/`force_password`（后端合同须恒发布尔，见末尾接口风险 1）。
+- **运行时 shape 守卫（me/login 的 data 通用，TS 接口不替代运行时校验）**：`get/post` 仅校验 envelope、`data` 一律 `as T` 透传，故响应返回后必须校验：`data.user` 是普通对象、`id` 为完整小写标准 UUIDv4 字符串（版本位 4、RFC 4122 变体位 8/9/a/b；缺失/number/短串/非 v4/非小写/错误变体均不合格）、`username` 非空 string、`revision` 为规范十进制字符串（`/^(0|[1-9]\d*)$/`，排除空串/符号/小数/指数/前导零/JSON number，不经 `Number`/`parseInt`）、`must_change_password` **严格 boolean**（`typeof==='boolean'`，缺失/字符串 `'true'` 均不合格）、`csrf_token` 非空 string；`me` 另要求 `authz_epoch` 为规范十进制字符串（`/^\d+$/`）。缺/错一律抛固定 `ApiError('INVALID_API_RESPONSE')`，并清本地 `user/csrfToken/authzEpoch`、进入 `error`——**不进入** `signed_in`/`force_password`（后端合同须恒发布尔，见末尾接口风险 1）。
 - `refresh()`：先置 `checking`；`GET /auth/me` 成功且**过 shape 守卫** → `must_change_password===false` 时 `signed_in`，否则 `force_password`，并把 `user/csrfToken/authzEpoch` 存入内存（`authz_epoch` 保持十进制字符串）。shape 守卫不过 → 清秘密 + `error`+`INVALID_API_RESPONSE`。仅 `status===401` 的 `ApiError` → `signed_out` 且 `user=null, csrfToken=null, errorCode=null`。其他任何 `ApiError`（含 429/503/403/`INVALID_API_RESPONSE`）与网络/中断 → `error`，`errorCode` 按映射填入（未知 code → `'OTHER'`），**不自动重试**。
 - `login()`：置 `checking`；`post('/auth/login', {username,password})`（**不传 csrfToken**）。成功（200，`data={user,csrf_token}`）且**过 shape 守卫**（免 `authz_epoch` 检查）→ 存 user 与 csrfToken（内存）；`user.must_change_password===true` → `force_password`，否则 `signed_in`；返回 `true`。shape 守卫不过 → 清秘密 + `error`+`INVALID_API_RESPONSE`，返回 `false`。`INVALID_CREDENTIALS`/`AUTH_REQUIRED` → `signed_out` + `errorCode`；`RATE_LIMITED` → `error` + `errorCode='RATE_LIMITED'`（UI 展示安全限速文案）；其余 → `error`；返回 `false`。
 - `changePassword()`：需 `csrfToken`；`post('/auth/password', {current_password,new_password}, {csrfToken})`。成功（`data.changed===true`）→ 清 `csrfToken/user`，随后**立即调用 `refresh()` 重建真实状态**（规格 A-02：改密撤销全部会话；refresh 收到 401 → `signed_out`）；返回 `true`。失败且为 401 `AUTH_REQUIRED`（会话本身已失效）→ 清内存秘密、`signed_out`、`errorCode=null`。**其余 4xx 显式错误**（如 401 `INVALID_CREDENTIALS` 旧密码错、403 `CSRF_INVALID`、429 `RATE_LIMITED`——服务端明确未执行改密）→ 保持先前状态（`signed_in`/`force_password`），`errorCode` 按映射，返回 `false`。**结果未知/可能已执行**（网络 `NETWORK_ERROR`、中断 `REQUEST_ABORTED`、无效响应 `INVALID_API_RESPONSE`、5xx）→ **不得恢复 priorStatus 或旧 csrf**：清 `csrfToken/user/authzEpoch`，`status='error'`（提示"改密结果未知，请重新登录"），`errorCode` 按映射，返回 `false`。
@@ -351,8 +352,20 @@ export function authErrorKey(_code: string): string {
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createAuth, authErrorKey } from './auth'
 
+// 契约身份（2026-10-07 HTTP ID 设计）：user.id 为固定合成小写 UUIDv4、revision 为十进制字符串；
+// display_name 是未来可选字段，不属于当前 user_public 正常投影。
+const USER_ID = '01234567-89ab-4cde-8f01-234567890abc'
+const CONTRACT_USER = {
+  id: USER_ID,
+  username: 'admin',
+  active: true,
+  is_admin: true,
+  must_change_password: false,
+  revision: '1',
+}
+
 const ME_DATA = {
-  user: { username: 'admin', display_name: 'Sam', must_change_password: false, is_admin: true, active: true, revision: '1' },
+  user: CONTRACT_USER,
   csrf_token: 'mem-only-token',
   authz_epoch: '7',
 }
@@ -387,8 +400,8 @@ describe('auth store state machine', () => {
 
   it('refresh: 200 me → signed_in with in-memory csrf and epoch, nothing written to localStorage', async () => {
     fakeFetch((url) => url.includes('/auth/me')
-      ? jsonResponse({ data: ME_DATA, request_id: 'r1' })
-      : jsonResponse({ data: null, request_id: 'r0' }))
+      ? jsonResponse({ data: ME_DATA, request_id: '123e4567-e89b-42d3-a456-426614174000' })
+      : jsonResponse({ data: null, request_id: '789eabcd-3e6a-48ba-fabc-a8cc7a73a666' }))
     const store = createAuth()
     await store.refresh()
     expect(store.status.value).toBe('signed_in')
@@ -401,8 +414,8 @@ describe('auth store state machine', () => {
 
   it('refresh: me with must_change_password=true → force_password', async () => {
     fakeFetch((url) => url.includes('/auth/me')
-      ? jsonResponse({ data: { ...ME_DATA, user: { ...ME_DATA.user, must_change_password: true } }, request_id: 'r1' })
-      : jsonResponse({ data: null, request_id: 'r0' }))
+      ? jsonResponse({ data: { ...ME_DATA, user: { ...ME_DATA.user, must_change_password: true } }, request_id: '123e4567-e89b-42d3-a456-426614174000' })
+      : jsonResponse({ data: null, request_id: '789eabcd-3e6a-48ba-fabc-a8cc7a73a666' }))
     const store = createAuth()
     await store.refresh()
     expect(store.status.value).toBe('force_password')
@@ -410,8 +423,8 @@ describe('auth store state machine', () => {
 
   it('refresh: only 401 maps to signed_out; errorCode cleared', async () => {
     fakeFetch((url) => url.includes('/auth/me')
-      ? jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: 'r1' }, 401)
-      : jsonResponse({ data: null, request_id: 'r0' }))
+      ? jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: '678d9abc-2d5f-47a9-e9ab-97bb69629555' }, 401)
+      : jsonResponse({ data: null, request_id: '789eabcd-3e6a-48ba-fabc-a8cc7a73a666' }))
     const store = createAuth()
     await store.refresh()
     expect(store.status.value).toBe('signed_out')
@@ -430,15 +443,15 @@ describe('auth store state machine', () => {
 
   it('refresh: 503 NOT_READY and 429 → error with mapped code (upper layer may retry)', async () => {
     fakeFetch((url) => url.includes('/auth/me')
-      ? jsonResponse({ error: { code: 'NOT_READY', message_key: 'errors.notReady' }, request_id: 'r' }, 503)
-      : jsonResponse({ data: null, request_id: 'r0' }))
+      ? jsonResponse({ error: { code: 'NOT_READY', message_key: 'errors.notReady' }, request_id: '678d9abc-2d5f-47a9-e9ab-97bb69629555' }, 503)
+      : jsonResponse({ data: null, request_id: '789eabcd-3e6a-48ba-fabc-a8cc7a73a666' }))
     const store = createAuth()
     await store.refresh()
     expect(store.status.value).toBe('error')
     expect(store.errorCode.value).toBe('OTHER') // NOT_READY 未列入专属映射 → 安全通用文案
     fakeFetch((url) => url.includes('/auth/me')
-      ? jsonResponse({ error: { code: 'RATE_LIMITED', message_key: 'errors.rateLimited' }, request_id: 'r' }, 429, { 'Retry-After': '30' })
-      : jsonResponse({ data: null, request_id: 'r0' }))
+      ? jsonResponse({ error: { code: 'RATE_LIMITED', message_key: 'errors.rateLimited' }, request_id: '678d9abc-2d5f-47a9-e9ab-97bb69629555' }, 429, { 'Retry-After': '30' })
+      : jsonResponse({ data: null, request_id: '789eabcd-3e6a-48ba-fabc-a8cc7a73a666' }))
     await store.refresh()
     expect(store.status.value).toBe('error')
     expect(store.errorCode.value).toBe('RATE_LIMITED')
@@ -446,8 +459,8 @@ describe('auth store state machine', () => {
 
   it('login: success stores in-memory csrf, no X-CSRF-Token sent, no localStorage write', async () => {
     const fetcher = fakeFetch((url) => url.includes('/auth/login')
-      ? jsonResponse({ data: { user: { username: 'admin', must_change_password: false }, csrf_token: 'tok-2' }, request_id: 'r' })
-      : jsonResponse({ data: null, request_id: 'r0' }))
+      ? jsonResponse({ data: { user: CONTRACT_USER, csrf_token: 'tok-2' }, request_id: '234f5678-e91b-43c5-a567-537725285111' })
+      : jsonResponse({ data: null, request_id: '789eabcd-3e6a-48ba-fabc-a8cc7a73a666' }))
     const store = createAuth()
     await expect(store.login('admin', 'synthetic-only')).resolves.toBe(true)
     expect(store.status.value).toBe('signed_in')
@@ -462,8 +475,8 @@ describe('auth store state machine', () => {
 
   it('login: success with must_change_password=true → force_password (no device data surface)', async () => {
     fakeFetch((url) => url.includes('/auth/login')
-      ? jsonResponse({ data: { user: { username: 'admin', must_change_password: true }, csrf_token: 'tok-3' }, request_id: 'r' })
-      : jsonResponse({ data: null, request_id: 'r0' }))
+      ? jsonResponse({ data: { user: { ...CONTRACT_USER, must_change_password: true }, csrf_token: 'tok-3' }, request_id: '234f5678-e91b-43c5-a567-537725285111' })
+      : jsonResponse({ data: null, request_id: '789eabcd-3e6a-48ba-fabc-a8cc7a73a666' }))
     const store = createAuth()
     await store.login('admin', 'synthetic-only')
     expect(store.status.value).toBe('force_password')
@@ -475,8 +488,8 @@ describe('auth store state machine', () => {
     ['RATE_LIMITED', 429, 'error'],
   ])('login: %s → status %s with mapped errorCode', async (code, status, expected) => {
     fakeFetch((url) => url.includes('/auth/login')
-      ? jsonResponse({ error: { code, message_key: 'errors.x' }, request_id: 'r' }, status)
-      : jsonResponse({ data: null, request_id: 'r0' }))
+      ? jsonResponse({ error: { code, message_key: 'errors.x' }, request_id: '678d9abc-2d5f-47a9-e9ab-97bb69629555' }, status)
+      : jsonResponse({ data: null, request_id: '789eabcd-3e6a-48ba-fabc-a8cc7a73a666' }))
     const store = createAuth()
     await expect(store.login('admin', 'wrong')).resolves.toBe(false)
     expect(store.status.value).toBe(expected)
@@ -497,15 +510,15 @@ describe('auth store state machine', () => {
       if (url.includes('/auth/me')) {
         phase += 1
         return phase === 1
-          ? jsonResponse({ data: ME_DATA, request_id: 'r1' })
-          : jsonResponse({ data: { ...ME_DATA, csrf_token: 'new-token' }, request_id: 'r2' })
+          ? jsonResponse({ data: ME_DATA, request_id: '123e4567-e89b-42d3-a456-426614174000' })
+          : jsonResponse({ data: { ...ME_DATA, csrf_token: 'new-token' }, request_id: '345a6789-fa2c-44d6-b678-648836396222' })
       }
       if (url.includes('/auth/password')) {
         const initHeaders = (init?.headers ?? {}) as Record<string, string>
         expect(initHeaders['X-CSRF-Token']).toBe('mem-only-token')
-        return jsonResponse({ data: { changed: true }, request_id: 'r3' })
+        return jsonResponse({ data: { changed: true }, request_id: '456b789a-0b3d-45e7-c789-759947407333' })
       }
-      return jsonResponse({ data: null, request_id: 'r0' })
+      return jsonResponse({ data: null, request_id: '789eabcd-3e6a-48ba-fabc-a8cc7a73a666' })
     })
     const store = createAuth()
     await store.refresh()
@@ -518,11 +531,11 @@ describe('auth store state machine', () => {
   it('changePassword: 401 keeps prior signed_in/force_password state and sets errorCode, no me call', async () => {
     let meCalls = 0
     fakeFetch((url) => {
-      if (url.includes('/auth/me')) { meCalls += 1; return jsonResponse({ data: ME_DATA, request_id: 'r1' }) }
+      if (url.includes('/auth/me')) { meCalls += 1; return jsonResponse({ data: ME_DATA, request_id: '123e4567-e89b-42d3-a456-426614174000' }) }
       if (url.includes('/auth/password')) {
-        return jsonResponse({ error: { code: 'INVALID_CREDENTIALS', message_key: 'errors.invalidCredentials' }, request_id: 'r' }, 401)
+        return jsonResponse({ error: { code: 'INVALID_CREDENTIALS', message_key: 'errors.invalidCredentials' }, request_id: '678d9abc-2d5f-47a9-e9ab-97bb69629555' }, 401)
       }
-      return jsonResponse({ data: null, request_id: 'r0' })
+      return jsonResponse({ data: null, request_id: '789eabcd-3e6a-48ba-fabc-a8cc7a73a666' })
     })
     const store = createAuth()
     await store.refresh()
@@ -535,11 +548,11 @@ describe('auth store state machine', () => {
 
   it('changePassword: 401 AUTH_REQUIRED (session itself revoked) → signed_out, secrets cleared, errorCode null', async () => {
     fakeFetch((url) => {
-      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r1' })
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: '123e4567-e89b-42d3-a456-426614174000' })
       if (url.includes('/auth/password')) {
-        return jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: 'r' }, 401)
+        return jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: '678d9abc-2d5f-47a9-e9ab-97bb69629555' }, 401)
       }
-      return jsonResponse({ data: null, request_id: 'r0' })
+      return jsonResponse({ data: null, request_id: '789eabcd-3e6a-48ba-fabc-a8cc7a73a666' })
     })
     const store = createAuth()
     await store.refresh()
@@ -553,9 +566,9 @@ describe('auth store state machine', () => {
 
   it('logout: posts empty JSON with CSRF when present, clears all in-memory state, ends signed_out', async () => {
     const fetcher = fakeFetch((url) => {
-      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r1' })
-      if (url.includes('/auth/logout')) return jsonResponse({ data: { logged_out: true }, request_id: 'r' })
-      return jsonResponse({ data: null, request_id: 'r0' })
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: '123e4567-e89b-42d3-a456-426614174000' })
+      if (url.includes('/auth/logout')) return jsonResponse({ data: { logged_out: true }, request_id: '567c89ab-1c4e-46f8-d89a-86aa58518444' })
+      return jsonResponse({ data: null, request_id: '789eabcd-3e6a-48ba-fabc-a8cc7a73a666' })
     })
     const store = createAuth()
     await store.refresh()
@@ -571,8 +584,8 @@ describe('auth store state machine', () => {
 
   it('refresh: me missing must_change_password (not a boolean) → error INVALID_API_RESPONSE, never signed_in/force_password', async () => {
     fakeFetch((url) => url.includes('/auth/me')
-      ? jsonResponse({ data: { user: { username: 'admin' }, csrf_token: 't', authz_epoch: '1' }, request_id: 'r1' })
-      : jsonResponse({ data: null, request_id: 'r0' }))
+      ? jsonResponse({ data: { user: { username: 'admin' }, csrf_token: 't', authz_epoch: '1' }, request_id: '123e4567-e89b-42d3-a456-426614174000' })
+      : jsonResponse({ data: null, request_id: '789eabcd-3e6a-48ba-fabc-a8cc7a73a666' }))
     const store = createAuth()
     await store.refresh()
     expect(store.status.value).toBe('error')
@@ -583,8 +596,8 @@ describe('auth store state machine', () => {
 
   it('login: success response missing csrf_token → error INVALID_API_RESPONSE, no usable signed_in', async () => {
     fakeFetch((url) => url.includes('/auth/login')
-      ? jsonResponse({ data: { user: { username: 'admin', must_change_password: false } }, request_id: 'r' })
-      : jsonResponse({ data: null, request_id: 'r0' }))
+      ? jsonResponse({ data: { user: { username: 'admin', must_change_password: false } }, request_id: '234f5678-e91b-43c5-a567-537725285111' })
+      : jsonResponse({ data: null, request_id: '789eabcd-3e6a-48ba-fabc-a8cc7a73a666' }))
     const store = createAuth()
     await expect(store.login('admin', 'synthetic-only')).resolves.toBe(false)
     expect(store.status.value).toBe('error')
@@ -595,9 +608,9 @@ describe('auth store state machine', () => {
 
   it('changePassword: network failure (server may have executed) → clears secrets + error, never restores priorStatus or old csrf', async () => {
     fakeFetch((url) => {
-      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r1' })
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: '123e4567-e89b-42d3-a456-426614174000' })
       if (url.includes('/auth/password')) throw new TypeError('offline')
-      return jsonResponse({ data: null, request_id: 'r0' })
+      return jsonResponse({ data: null, request_id: '789eabcd-3e6a-48ba-fabc-a8cc7a73a666' })
     })
     const store = createAuth()
     await store.refresh()
@@ -610,9 +623,9 @@ describe('auth store state machine', () => {
 
   it('logout: POST network failure → error NETWORK_ERROR, not signed_out (server revocation unconfirmed)', async () => {
     fakeFetch((url) => {
-      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r1' })
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: '123e4567-e89b-42d3-a456-426614174000' })
       if (url.includes('/auth/logout')) throw new TypeError('offline')
-      return jsonResponse({ data: null, request_id: 'r0' })
+      return jsonResponse({ data: null, request_id: '789eabcd-3e6a-48ba-fabc-a8cc7a73a666' })
     })
     const store = createAuth()
     await store.refresh()
@@ -627,13 +640,13 @@ describe('auth store state machine', () => {
     const gateA = new Promise<Response>((r) => { resolveA = r })
     fakeFetch((url) => {
       if (url.includes('/auth/me')) return gateA
-      if (url.includes('/auth/login')) return jsonResponse({ data: { user: { username: 'admin', must_change_password: false }, csrf_token: 'tok-new' }, request_id: 'r' })
-      return jsonResponse({ data: null, request_id: 'r0' })
+      if (url.includes('/auth/login')) return jsonResponse({ data: { user: CONTRACT_USER, csrf_token: 'tok-new' }, request_id: '234f5678-e91b-43c5-a567-537725285111' })
+      return jsonResponse({ data: null, request_id: '789eabcd-3e6a-48ba-fabc-a8cc7a73a666' })
     })
     const store = createAuth()
     const refreshing = store.refresh()
     await store.login('admin', 'synthetic-only')
-    resolveA(jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: 'r' }, 401))
+    resolveA(jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: '678d9abc-2d5f-47a9-e9ab-97bb69629555' }, 401))
     await refreshing
     expect(store.status.value).toBe('signed_in')
     expect(store.csrfToken.value).toBe('tok-new')
@@ -642,13 +655,13 @@ describe('auth store state machine', () => {
     const gateB = new Promise<Response>((r) => { resolveB = r })
     fakeFetch((url) => {
       if (url.includes('/auth/me')) return gateB
-      if (url.includes('/auth/login')) return jsonResponse({ data: { user: { username: 'admin', must_change_password: false }, csrf_token: 'tok-2' }, request_id: 'r' })
-      return jsonResponse({ data: null, request_id: 'r0' })
+      if (url.includes('/auth/login')) return jsonResponse({ data: { user: CONTRACT_USER, csrf_token: 'tok-2' }, request_id: '234f5678-e91b-43c5-a567-537725285111' })
+      return jsonResponse({ data: null, request_id: '789eabcd-3e6a-48ba-fabc-a8cc7a73a666' })
     })
     const store2 = createAuth()
     const refreshing2 = store2.refresh()
     await store2.login('admin', 'synthetic-only')
-    resolveB(jsonResponse({ data: { user: { username: 'admin', must_change_password: false }, csrf_token: 'stale-csrf', authz_epoch: '3' }, request_id: 'r' }))
+    resolveB(jsonResponse({ data: { user: CONTRACT_USER, csrf_token: 'stale-csrf', authz_epoch: '3' }, request_id: '345a6789-fa2c-44d6-b678-648836396222' }))
     await refreshing2
     expect(store2.status.value).toBe('signed_in')
     expect(store2.csrfToken.value).toBe('tok-2')
@@ -677,12 +690,13 @@ import { ref, type Ref } from 'vue'
 import { ApiError, get, post } from './api'
 
 export interface AuthUser {
+  id: string           // 完整小写标准 UUIDv4 字符串（user_public 投影）
   username: string
   display_name?: string
   must_change_password: boolean
   is_admin?: boolean
   active?: boolean
-  revision?: string
+  revision: string     // 规范十进制字符串，不经 Number/parseInt
 }
 export type AuthStatus = 'checking' | 'signed_out' | 'force_password' | 'signed_in' | 'error'
 export type AuthErrorCode =
@@ -722,11 +736,19 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-// Runtime shape guard: get/post validate only the envelope (data passes through as T), so identity fields are
-// re-checked here; missing/wrong shape → INVALID_API_RESPONSE, caller clears identity/CSRF, never signed_in.
+// Full lowercase standard UUIDv4 (version 4, RFC 4122 variant 8/9/a/b); JSON number or other casing fails.
+const USER_ID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+// Canonical decimal string: no empty/sign/fraction/exponent/leading-zero; JSON number fails typeof. No Number/parseInt.
+const DECIMAL_STRING = /^(0|[1-9][0-9]*)$/
+
+// Runtime shape guard: get/post validate only the envelope (data passes through as T), so identity fields
+// (incl. business id UUIDv4 and decimal-string revision) are re-checked here; missing/wrong shape →
+// INVALID_API_RESPONSE, caller clears identity/CSRF, never signed_in.
 function assertIdentityShape(data: unknown): void {
   if (!isPlainObject(data) || !isPlainObject(data.user)) throw invalidShape()
+  if (typeof data.user.id !== 'string' || !USER_ID_V4.test(data.user.id)) throw invalidShape()
   if (typeof data.user.username !== 'string' || data.user.username.length === 0) throw invalidShape()
+  if (typeof data.user.revision !== 'string' || !DECIMAL_STRING.test(data.user.revision)) throw invalidShape()
   if (typeof data.user.must_change_password !== 'boolean') throw invalidShape()
   if (typeof data.csrf_token !== 'string' || data.csrf_token.length === 0) throw invalidShape()
 }
@@ -961,8 +983,20 @@ import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 
 import App from './App.vue';
 
+// 契约身份（2026-10-07 HTTP ID 设计）：user.id 为固定合成小写 UUIDv4、revision 为十进制字符串；
+// display_name 是未来可选字段，不属于当前 user_public 正常投影，UI 回退显示 username。
+const USER_ID = '01234567-89ab-4cde-8f01-234567890abc';
+const CONTRACT_USER = {
+  id: USER_ID,
+  username: 'admin',
+  active: true,
+  is_admin: true,
+  must_change_password: false,
+  revision: '1',
+};
+
 const ME_DATA = {
-  user: { username: 'admin', display_name: 'Sam', must_change_password: false, is_admin: true, active: true, revision: '1' },
+  user: CONTRACT_USER,
   csrf_token: 'mem-token',
   authz_epoch: '7',
 };
@@ -976,9 +1010,9 @@ function fetchForMe(meResponse: Response, loginResponse?: (init?: RequestInit) =
   const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = String(input);
     if (url.includes('/auth/me')) return meResponse;
-    if (url.includes('/auth/login')) return loginResponse ? loginResponse(init) : jsonResponse({ data: { user: { username: 'admin', must_change_password: false }, csrf_token: 'login-token' }, request_id: 'rl' });
-    if (url.includes('/auth/password')) return passwordResponse ? passwordResponse(init) : jsonResponse({ data: { changed: true }, request_id: 'rp' });
-    if (url.includes('/auth/logout')) return jsonResponse({ data: { logged_out: true }, request_id: 'ro' });
+    if (url.includes('/auth/login')) return loginResponse ? loginResponse(init) : jsonResponse({ data: { user: CONTRACT_USER, csrf_token: 'login-token' }, request_id: '234f5678-e91b-43c5-a567-537725285111' });
+    if (url.includes('/auth/password')) return passwordResponse ? passwordResponse(init) : jsonResponse({ data: { changed: true }, request_id: '456b789a-0b3d-45e7-c789-759947407333' });
+    if (url.includes('/auth/logout')) return jsonResponse({ data: { logged_out: true }, request_id: '567c89ab-1c4e-46f8-d89a-86aa58518444' });
     throw new TypeError(`unexpected fetch ${url}`);
   });
   vi.stubGlobal('fetch', fetcher);
@@ -1009,9 +1043,9 @@ test('checking state: mount triggers exactly one GET /auth/me and shows a safe w
 });
 
 test('signed_in state: no forms, shows user and logout; logout returns to the login form, no device data surface', async () => {
-  fetchForMe(jsonResponse({ data: ME_DATA, request_id: 'r1' }));
+  fetchForMe(jsonResponse({ data: ME_DATA, request_id: '123e4567-e89b-42d3-a456-426614174000' }));
   render(App);
-  await vi.waitFor(() => expect(screen.getByRole('status').textContent).toContain('Sam'));
+  await vi.waitFor(() => expect(screen.getByRole('status').textContent).toContain('admin'));
   expect(screen.queryByRole('form')).toBeNull();
   expect(screen.getByRole('button', { name: '退出登录' })).toBeTruthy();
   await fireEvent.click(screen.getByRole('button', { name: '退出登录' }));
@@ -1023,9 +1057,9 @@ test('signed_in state: no forms, shows user and logout; logout returns to the lo
 
 test('force_password after login: only password change and logout are offered', async () => {
   fetchForMe(
-    new Response(JSON.stringify({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: 'r' }),
+    new Response(JSON.stringify({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: '678d9abc-2d5f-47a9-e9ab-97bb69629555' }),
       { status: 401, headers: { 'Content-Type': 'application/json' } }),
-    () => jsonResponse({ data: { user: { username: 'admin', must_change_password: true }, csrf_token: 't' }, request_id: 'rl' }),
+    () => jsonResponse({ data: { user: { ...CONTRACT_USER, must_change_password: true }, csrf_token: 't' }, request_id: '234f5678-e91b-43c5-a567-537725285111' }),
   );
   render(App);
   await vi.waitFor(() => expect(screen.getByRole('form')).toBeTruthy());
@@ -1042,10 +1076,10 @@ test('login form: submit posts credentials, error uses the safe mapped message, 
   let call = 0;
   const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = String(input);
-    if (url.includes('/auth/me')) return jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: 'r' }, 401);
+    if (url.includes('/auth/me')) return jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: '678d9abc-2d5f-47a9-e9ab-97bb69629555' }, 401);
     call += 1;
-    if (call === 1) return jsonResponse({ error: { code: 'INVALID_CREDENTIALS', message_key: 'errors.invalidCredentials' }, request_id: 'rl' }, 401);
-    return jsonResponse({ data: { user: { username: 'admin', must_change_password: false }, csrf_token: 't' }, request_id: 'rl2' });
+    if (call === 1) return jsonResponse({ error: { code: 'INVALID_CREDENTIALS', message_key: 'errors.invalidCredentials' }, request_id: '678d9abc-2d5f-47a9-e9ab-97bb69629555' }, 401);
+    return jsonResponse({ data: { user: CONTRACT_USER, csrf_token: 't' }, request_id: '234f5678-e91b-43c5-a567-537725285111' });
   });
   vi.stubGlobal('fetch', fetcher);
   render(App);
@@ -1068,12 +1102,12 @@ test('signed_in state: csrf/session stay in memory only, never in localStorage (
     const url = String(input);
     if (url.includes('/auth/me')) {
       me += 1;
-      return jsonResponse({ data: { ...ME_DATA, csrf_token: me === 1 ? 'old' : 'new' }, request_id: `rm${me}` });
+      return jsonResponse({ data: { ...ME_DATA, csrf_token: me === 1 ? 'old' : 'new' }, request_id: me === 1 ? '123e4567-e89b-42d3-a456-426614174000' : '345a6789-fa2c-44d6-b678-648836396222' });
     }
-    return jsonResponse({ data: null, request_id: 'r' });
+    return jsonResponse({ data: null, request_id: '789eabcd-3e6a-48ba-fabc-a8cc7a73a666' });
   }));
   render(App);
-  await vi.waitFor(() => expect(screen.getByRole('status').textContent).toContain('Sam'));
+  await vi.waitFor(() => expect(screen.getByRole('status').textContent).toContain('admin'));
   // 已登录视图无表单；改密成功→清 token→me() 重建会话的完整路径由 auth.test.ts 的
   // changePassword 用例锁定；这里只锁定 App 视图映射与敏感数据不落存储。
   expect(screen.queryByRole('form')).toBeNull();
@@ -1290,7 +1324,7 @@ onMounted(() => { void auth.refresh(); });
 
 ## 接口风险（回讯要点）
 
-1. **`GET /auth/me` 的 `user` 字段集**：规格 §4 只写 `user,csrf_token,authz_epoch`，未列 `user` 字段。前端按最小集 `username` + `must_change_password` 读取，其余（`display_name/is_admin/active/revision`）按可选处理（未知字段忽略、缺失可选字段不炸）。**门禁已内置（Task 2 运行时 shape 守卫）**：`must_change_password` 缺/非严格 boolean、`username` 空、`csrf_token` 空、`authz_epoch` 非规范十进制字符串 → 一律 `INVALID_API_RESPONSE` + 清本地身份/CSRF + `error`，**不存在**"缺 `must_change_password` 时误入 `signed_in`"的路径。**后端合同仍待联调确认**：后端须恒发布尔 `must_change_password` 且恒给 `csrf_token`/`authz_epoch` 字段；若后端可能省略，前端会保守落 `error`（用户需重试/刷新），不会静默放行。
+1. **`GET /auth/me` 的 `user` 字段集**：规格 §4 只写 `user,csrf_token,authz_epoch`，未列 `user` 字段。前端按最小集 `id` + `username` + `revision` + `must_change_password` 读取，其余（`display_name/is_admin/active`）按可选处理（未知字段忽略、缺失可选字段不炸）。**门禁已内置（Task 2 运行时 shape 守卫）**：`id` 缺/非完整小写 UUIDv4（版本位 4、RFC 4122 变体位）、`revision` 缺/非规范十进制字符串、`must_change_password` 缺/非严格 boolean、`username` 空、`csrf_token` 空、`authz_epoch` 非规范十进制字符串 → 一律 `INVALID_API_RESPONSE` + 清本地身份/CSRF + `error`，**不存在**"缺 `must_change_password` 时误入 `signed_in`"的路径。**后端合同仍待联调确认**：后端须恒发布尔 `must_change_password` 且恒给 `csrf_token`/`authz_epoch` 字段（`user_public` 投影恒给 UUIDv4 `id` 与十进制字符串 `revision`）；若后端可能省略，前端会保守落 `error`（用户需重试/刷新），不会静默放行。
 2. **CSRF token 传输位置**：前端假设 login/me 的 `csrf_token` 在 **data body**（非 header/非 cookie）。若后端改为 header，Task 2 的 `applyMe/login` 需一处小改（消费 `post/get` 返回的 headers），测试需加 header 断言。
 3. **401 语义边界**：规格允许 401 携带 `AUTH_REQUIRED` 或 `INVALID_CREDENTIALS`；前端把**任何 401**（含 `/auth/me` 上的）统一视为未登录。若后端在“session 有效但账号被停用”时也回 401，前端会静默回到登录页——语义可接受但需联调确认不会把 `PERMISSION_DENIED` 场景误标 401。
 4. **`POST /auth/me` 之外的错误码**：前端未为 `NOT_READY/STORAGE_UNAVAILABLE/RESOURCE_EXHAUSTED(503)` 建立专属文案，一律 `errors.generic` + 重试按钮；若产品要求 503 专属文案，只需加 i18n key 与映射，不动状态机。

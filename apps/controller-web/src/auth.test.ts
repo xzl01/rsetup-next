@@ -1,8 +1,33 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createAuth, authErrorKey } from './auth'
 
+// Contract identity (2026-10-07 HTTP ID design): user.id is a fixed synthetic canonical lowercase
+// UUIDv4 (RFC 4122 variant) and revision a decimal string, exactly as the /api/v1 user_public
+// projection emits them. display_name is a future optional field, not part of the current projection.
+const USER_ID = '01234567-89ab-4cde-8f01-234567890abc'
+const CONTRACT_USER = {
+  id: USER_ID,
+  username: 'admin',
+  active: true,
+  is_admin: true,
+  must_change_password: false,
+  revision: '1',
+}
+
+// Normal simulated HTTP packets carry contract request_ids (UUIDv4). api.ts still only validates a
+// non-empty bounded string for request_id — that runtime policy is intentionally unchanged.
+const RID_ME = '123e4567-e89b-42d3-a456-426614174000'
+const RID_ME_2 = '345a6789-fa2c-44d6-b678-648836396222'
+const RID_LOGIN = '234f5678-e91b-43c5-a567-537725285111'
+const RID_PW = '456b789a-0b3d-45e7-c789-759947407333'
+const RID_LOGOUT = '567c89ab-1c4e-46f8-d89a-86aa58518444'
+const RID_LIST = '89afbcde-4f7b-49cb-8bcd-b9dd8b84b777'
+const RID_REVOKE = '9abcfdef-5a8c-4adc-9cde-c0ee9c95c888'
+const RID_ERR = '678d9abc-2d5f-47a9-e9ab-97bb69629555'
+const RID_NULL = '789eabcd-3e6a-48ba-fabc-a8cc7a73a666'
+
 const ME_DATA = {
-  user: { username: 'admin', display_name: 'Sam', must_change_password: false, is_admin: true, active: true, revision: '1' },
+  user: CONTRACT_USER,
   csrf_token: 'mem-only-token',
   authz_epoch: '7',
 }
@@ -41,12 +66,14 @@ describe('auth store state machine', () => {
 
   it('refresh: 200 me → signed_in with in-memory csrf and epoch, nothing written to localStorage', async () => {
     fakeFetch((url) => url.includes('/auth/me')
-      ? jsonResponse({ data: ME_DATA, request_id: 'r1' })
-      : jsonResponse({ data: null, request_id: 'r0' }))
+      ? jsonResponse({ data: ME_DATA, request_id: RID_ME })
+      : jsonResponse({ data: null, request_id: RID_NULL }))
     const store = createAuth()
     await store.refresh()
     expect(store.status.value).toBe('signed_in')
     expect(store.user.value?.username).toBe('admin')
+    // 契约字段原样可读：id 为 UUIDv4 字符串、revision 保持十进制字符串（不经 Number/parseInt）
+    expect(store.user.value).toMatchObject({ id: USER_ID, revision: '1' })
     expect(store.csrfToken.value).toBe('mem-only-token')
     expect(store.authzEpoch.value).toBe('7')
     expect(localStorageJoined()).not.toContain('mem-only-token')
@@ -54,8 +81,8 @@ describe('auth store state machine', () => {
 
   it('refresh: me with must_change_password=true → force_password', async () => {
     fakeFetch((url) => url.includes('/auth/me')
-      ? jsonResponse({ data: { ...ME_DATA, user: { ...ME_DATA.user, must_change_password: true } }, request_id: 'r1' })
-      : jsonResponse({ data: null, request_id: 'r0' }))
+      ? jsonResponse({ data: { ...ME_DATA, user: { ...ME_DATA.user, must_change_password: true } }, request_id: RID_ME })
+      : jsonResponse({ data: null, request_id: RID_NULL }))
     const store = createAuth()
     await store.refresh()
     expect(store.status.value).toBe('force_password')
@@ -63,8 +90,8 @@ describe('auth store state machine', () => {
 
   it('refresh: only 401 maps to signed_out; errorCode cleared', async () => {
     fakeFetch((url) => url.includes('/auth/me')
-      ? jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: 'r1' }, 401)
-      : jsonResponse({ data: null, request_id: 'r0' }))
+      ? jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: RID_ERR }, 401)
+      : jsonResponse({ data: null, request_id: RID_NULL }))
     const store = createAuth()
     await store.refresh()
     expect(store.status.value).toBe('signed_out')
@@ -83,15 +110,15 @@ describe('auth store state machine', () => {
 
   it('refresh: 503 NOT_READY and 429 → error with mapped code (upper layer may retry)', async () => {
     fakeFetch((url) => url.includes('/auth/me')
-      ? jsonResponse({ error: { code: 'NOT_READY', message_key: 'errors.notReady' }, request_id: 'r' }, 503)
-      : jsonResponse({ data: null, request_id: 'r0' }))
+      ? jsonResponse({ error: { code: 'NOT_READY', message_key: 'errors.notReady' }, request_id: RID_ERR }, 503)
+      : jsonResponse({ data: null, request_id: RID_NULL }))
     const store = createAuth()
     await store.refresh()
     expect(store.status.value).toBe('error')
     expect(store.errorCode.value).toBe('OTHER') // NOT_READY 未列入专属映射 → 安全通用文案
     fakeFetch((url) => url.includes('/auth/me')
-      ? jsonResponse({ error: { code: 'RATE_LIMITED', message_key: 'errors.rateLimited' }, request_id: 'r' }, 429, { 'Retry-After': '30' })
-      : jsonResponse({ data: null, request_id: 'r0' }))
+      ? jsonResponse({ error: { code: 'RATE_LIMITED', message_key: 'errors.rateLimited' }, request_id: RID_ERR }, 429, { 'Retry-After': '30' })
+      : jsonResponse({ data: null, request_id: RID_NULL }))
     await store.refresh()
     expect(store.status.value).toBe('error')
     expect(store.errorCode.value).toBe('RATE_LIMITED')
@@ -99,11 +126,13 @@ describe('auth store state machine', () => {
 
   it('login: success stores in-memory csrf, no X-CSRF-Token sent, no localStorage write', async () => {
     const fetcher = fakeFetch((url) => url.includes('/auth/login')
-      ? jsonResponse({ data: { user: { username: 'admin', must_change_password: false }, csrf_token: 'tok-2' }, request_id: 'r' })
-      : jsonResponse({ data: null, request_id: 'r0' }))
+      ? jsonResponse({ data: { user: CONTRACT_USER, csrf_token: 'tok-2' }, request_id: RID_LOGIN })
+      : jsonResponse({ data: null, request_id: RID_NULL }))
     const store = createAuth()
     await expect(store.login('admin', 'synthetic-only')).resolves.toBe(true)
     expect(store.status.value).toBe('signed_in')
+    // 契约字段原样可读：id 为 UUIDv4 字符串、revision 保持十进制字符串
+    expect(store.user.value).toMatchObject({ id: USER_ID, revision: '1' })
     expect(store.csrfToken.value).toBe('tok-2')
     const init = fetcher.mock.calls[0]?.[1] as { headers: Record<string, string>; body: string; method: string }
     expect(init.method).toBe('POST')
@@ -114,8 +143,8 @@ describe('auth store state machine', () => {
 
   it('login: success with must_change_password=true → force_password (no device data surface)', async () => {
     fakeFetch((url) => url.includes('/auth/login')
-      ? jsonResponse({ data: { user: { username: 'admin', must_change_password: true }, csrf_token: 'tok-3' }, request_id: 'r' })
-      : jsonResponse({ data: null, request_id: 'r0' }))
+      ? jsonResponse({ data: { user: { ...CONTRACT_USER, must_change_password: true }, csrf_token: 'tok-3' }, request_id: RID_LOGIN })
+      : jsonResponse({ data: null, request_id: RID_NULL }))
     const store = createAuth()
     await store.login('admin', 'synthetic-only')
     expect(store.status.value).toBe('force_password')
@@ -127,8 +156,8 @@ describe('auth store state machine', () => {
     ['RATE_LIMITED', 429, 'error'],
   ])('login: %s → status %s with mapped errorCode', async (code, status, expected) => {
     fakeFetch((url) => url.includes('/auth/login')
-      ? jsonResponse({ error: { code, message_key: 'errors.x' }, request_id: 'r' }, status)
-      : jsonResponse({ data: null, request_id: 'r0' }))
+      ? jsonResponse({ error: { code, message_key: 'errors.x' }, request_id: RID_ERR }, status)
+      : jsonResponse({ data: null, request_id: RID_NULL }))
     const store = createAuth()
     await expect(store.login('admin', 'wrong')).resolves.toBe(false)
     expect(store.status.value).toBe(expected)
@@ -147,11 +176,11 @@ describe('auth store state machine', () => {
   // user/csrf — every other signed_out path already clears the epoch.
   it('login: 401 after a successful me clears stale authzEpoch (epoch 7 → null) and ends signed_out', async () => {
     fakeFetch((url) => {
-      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r1' })
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
       if (url.includes('/auth/login')) {
-        return jsonResponse({ error: { code: 'INVALID_CREDENTIALS', message_key: 'errors.invalidCredentials' }, request_id: 'r' }, 401)
+        return jsonResponse({ error: { code: 'INVALID_CREDENTIALS', message_key: 'errors.invalidCredentials' }, request_id: RID_ERR }, 401)
       }
-      return jsonResponse({ data: null, request_id: 'r0' })
+      return jsonResponse({ data: null, request_id: RID_NULL })
     })
     const store = createAuth()
     await store.refresh()
@@ -171,15 +200,15 @@ describe('auth store state machine', () => {
       if (url.includes('/auth/me')) {
         phase += 1
         return phase === 1
-          ? jsonResponse({ data: ME_DATA, request_id: 'r1' })
-          : jsonResponse({ data: { ...ME_DATA, csrf_token: 'new-token' }, request_id: 'r2' })
+          ? jsonResponse({ data: ME_DATA, request_id: RID_ME })
+          : jsonResponse({ data: { ...ME_DATA, csrf_token: 'new-token' }, request_id: RID_ME_2 })
       }
       if (url.includes('/auth/password')) {
         const initHeaders = (init?.headers ?? {}) as Record<string, string>
         expect(initHeaders['X-CSRF-Token']).toBe('mem-only-token')
-        return jsonResponse({ data: { changed: true }, request_id: 'r3' })
+        return jsonResponse({ data: { changed: true }, request_id: RID_PW })
       }
-      return jsonResponse({ data: null, request_id: 'r0' })
+      return jsonResponse({ data: null, request_id: RID_NULL })
     })
     const store = createAuth()
     await store.refresh()
@@ -194,11 +223,11 @@ describe('auth store state machine', () => {
   it('changePassword: 400 INVALID_ARGUMENT (wrong old password) keeps prior signed_in/force_password state and sets errorCode, no me call', async () => {
     let meCalls = 0
     fakeFetch((url) => {
-      if (url.includes('/auth/me')) { meCalls += 1; return jsonResponse({ data: ME_DATA, request_id: 'r1' }) }
+      if (url.includes('/auth/me')) { meCalls += 1; return jsonResponse({ data: ME_DATA, request_id: RID_ME }) }
       if (url.includes('/auth/password')) {
-        return jsonResponse({ error: { code: 'INVALID_ARGUMENT', message_key: 'errors.invalidArgument' }, request_id: 'r' }, 400)
+        return jsonResponse({ error: { code: 'INVALID_ARGUMENT', message_key: 'errors.invalidArgument' }, request_id: RID_ERR }, 400)
       }
-      return jsonResponse({ data: null, request_id: 'r0' })
+      return jsonResponse({ data: null, request_id: RID_NULL })
     })
     const store = createAuth()
     await store.refresh()
@@ -212,11 +241,11 @@ describe('auth store state machine', () => {
 
   it('changePassword: 401 AUTH_REQUIRED (session itself revoked) → signed_out, secrets cleared, errorCode null', async () => {
     fakeFetch((url) => {
-      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r1' })
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
       if (url.includes('/auth/password')) {
-        return jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: 'r' }, 401)
+        return jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: RID_ERR }, 401)
       }
-      return jsonResponse({ data: null, request_id: 'r0' })
+      return jsonResponse({ data: null, request_id: RID_NULL })
     })
     const store = createAuth()
     await store.refresh()
@@ -235,11 +264,11 @@ describe('auth store state machine', () => {
   it('changePassword: any legit 401 (e.g. INVALID_CREDENTIALS) on /auth/password → signed_out, secrets cleared, no me call', async () => {
     let meCalls = 0
     fakeFetch((url) => {
-      if (url.includes('/auth/me')) { meCalls += 1; return jsonResponse({ data: ME_DATA, request_id: 'r1' }) }
+      if (url.includes('/auth/me')) { meCalls += 1; return jsonResponse({ data: ME_DATA, request_id: RID_ME }) }
       if (url.includes('/auth/password')) {
-        return jsonResponse({ error: { code: 'INVALID_CREDENTIALS', message_key: 'errors.invalidCredentials' }, request_id: 'r' }, 401)
+        return jsonResponse({ error: { code: 'INVALID_CREDENTIALS', message_key: 'errors.invalidCredentials' }, request_id: RID_ERR }, 401)
       }
-      return jsonResponse({ data: null, request_id: 'r0' })
+      return jsonResponse({ data: null, request_id: RID_NULL })
     })
     const store = createAuth()
     await store.refresh()
@@ -254,9 +283,9 @@ describe('auth store state machine', () => {
 
   it('logout: posts empty JSON with CSRF when present, clears all in-memory state, ends signed_out', async () => {
     const fetcher = fakeFetch((url) => {
-      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r1' })
-      if (url.includes('/auth/logout')) return jsonResponse({ data: { logged_out: true }, request_id: 'r' })
-      return jsonResponse({ data: null, request_id: 'r0' })
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
+      if (url.includes('/auth/logout')) return jsonResponse({ data: { logged_out: true }, request_id: RID_LOGOUT })
+      return jsonResponse({ data: null, request_id: RID_NULL })
     })
     const store = createAuth()
     await store.refresh()
@@ -278,8 +307,8 @@ describe('auth store state machine', () => {
     ['string', { user: { username: 'admin', must_change_password: 'true' }, csrf_token: 't' }],
   ])('login: must_change_password %s → error INVALID_API_RESPONSE, never signed_in', async (_label, data) => {
     fakeFetch((url) => url.includes('/auth/login')
-      ? jsonResponse({ data, request_id: 'r' })
-      : jsonResponse({ data: null, request_id: 'r0' }))
+      ? jsonResponse({ data, request_id: RID_LOGIN })
+      : jsonResponse({ data: null, request_id: RID_NULL }))
     const store = createAuth()
     await expect(store.login('admin', 'synthetic-only')).resolves.toBe(false)
     expect(store.status.value).toBe('error')
@@ -294,8 +323,8 @@ describe('auth store state machine', () => {
     ['missing', { user: ME_DATA.user, csrf_token: ME_DATA.csrf_token }],
   ])('refresh: me authz_epoch %s → error INVALID_API_RESPONSE, never signed_in', async (_label, data) => {
     fakeFetch((url) => url.includes('/auth/me')
-      ? jsonResponse({ data, request_id: 'r1' })
-      : jsonResponse({ data: null, request_id: 'r0' }))
+      ? jsonResponse({ data, request_id: RID_ME })
+      : jsonResponse({ data: null, request_id: RID_NULL }))
     const store = createAuth()
     await store.refresh()
     expect(store.status.value).toBe('error')
@@ -311,10 +340,66 @@ describe('auth store state machine', () => {
     ['empty', { user: { username: '', must_change_password: false }, csrf_token: 't', authz_epoch: '1' }],
   ])('refresh: me username %s → error INVALID_API_RESPONSE, never signed_in', async (_label, data) => {
     fakeFetch((url) => url.includes('/auth/me')
-      ? jsonResponse({ data, request_id: 'r1' })
-      : jsonResponse({ data: null, request_id: 'r0' }))
+      ? jsonResponse({ data, request_id: RID_ME })
+      : jsonResponse({ data: null, request_id: RID_NULL }))
     const store = createAuth()
     await store.refresh()
+    expect(store.status.value).toBe('error')
+    expect(store.errorCode.value).toBe('INVALID_API_RESPONSE')
+    expect(store.user.value).toBeNull()
+    expect(store.csrfToken.value).toBeNull()
+    expect(store.authzEpoch.value).toBeNull()
+  })
+
+  // ---- ID/revision contract (2026-10-07 HTTP ID design, §2 矩阵行 1–2) ----
+  // user.id 必须是完整小写 UUIDv4（版本位 4、RFC 4122 变体位 8/9/a/b），user.revision 必须是
+  // 规范十进制字符串（排除空串/符号/小数/指数/前导零/JSON number）。/auth/login 与 /auth/me 在
+  // 接受身份与 CSRF 前都校验；失败统一 INVALID_API_RESPONSE 并清身份/CSRF/epoch。
+  // 每个负例只在完整合法投影上改动恰好一个字段，拒绝必然归因于该字段。
+  function contractUser(over: Record<string, unknown> = {}): Record<string, unknown> {
+    const copy: Record<string, unknown> = { ...CONTRACT_USER, ...over }
+    if (over.id === undefined && over.__dropId) delete copy.id
+    if (over.revision === undefined && over.__dropRevision) delete copy.revision
+    delete copy.__dropId
+    delete copy.__dropRevision
+    return copy
+  }
+
+  const ID_REVISION_NEGATIVES: Array<[string, Record<string, unknown>]> = [
+    ['user.id missing', contractUser({ __dropId: true })],
+    ['user.id number', contractUser({ id: 42 })],
+    ['user.id short string', contractUser({ id: '01234567-89ab-4cde-8f01-2345' })],
+    ['user.id non-v4', contractUser({ id: '01234567-89ab-5cde-8f01-234567890abc' })],
+    ['user.id non-lowercase', contractUser({ id: '01234567-89AB-4CDE-8F01-234567890ABC' })],
+    ['user.id wrong variant', contractUser({ id: '01234567-89ab-4cde-cf01-234567890abc' })],
+    ['user.revision missing', contractUser({ __dropRevision: true })],
+    ['user.revision number', contractUser({ revision: 1 })],
+    ['user.revision empty string', contractUser({ revision: '' })],
+    ['user.revision signed', contractUser({ revision: '-1' })],
+    ['user.revision decimal', contractUser({ revision: '1.5' })],
+    ['user.revision exponent', contractUser({ revision: '1e3' })],
+    ['user.revision leading zero', contractUser({ revision: '01' })],
+  ]
+
+  it.each(ID_REVISION_NEGATIVES)('refresh: me %s → error INVALID_API_RESPONSE, never signed_in', async (_label, user) => {
+    fakeFetch((url) => url.includes('/auth/me')
+      ? jsonResponse({ data: { user, csrf_token: 'mem-only-token', authz_epoch: '7' }, request_id: RID_ME })
+      : jsonResponse({ data: null, request_id: RID_NULL }))
+    const store = createAuth()
+    await store.refresh()
+    expect(store.status.value).toBe('error')
+    expect(store.errorCode.value).toBe('INVALID_API_RESPONSE')
+    expect(store.user.value).toBeNull()
+    expect(store.csrfToken.value).toBeNull()
+    expect(store.authzEpoch.value).toBeNull()
+  })
+
+  it.each(ID_REVISION_NEGATIVES)('login: %s → error INVALID_API_RESPONSE, never signed_in/force_password', async (_label, user) => {
+    fakeFetch((url) => url.includes('/auth/login')
+      ? jsonResponse({ data: { user, csrf_token: 'tok-2' }, request_id: RID_LOGIN })
+      : jsonResponse({ data: null, request_id: RID_NULL }))
+    const store = createAuth()
+    await expect(store.login('admin', 'synthetic-only')).resolves.toBe(false)
     expect(store.status.value).toBe('error')
     expect(store.errorCode.value).toBe('INVALID_API_RESPONSE')
     expect(store.user.value).toBeNull()
@@ -325,9 +410,9 @@ describe('auth store state machine', () => {
   // M4: logout 200 non-JSON / bad envelope → error INVALID_API_RESPONSE, not signed_out.
   it('logout: POST 200 non-JSON → error INVALID_API_RESPONSE, not signed_out', async () => {
     fakeFetch((url) => {
-      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r1' })
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
       if (url.includes('/auth/logout')) return new Response('<html>not json</html>', { status: 200, headers: { 'Content-Type': 'text/html' } })
-      return jsonResponse({ data: null, request_id: 'r0' })
+      return jsonResponse({ data: null, request_id: RID_NULL })
     })
     const store = createAuth()
     await store.refresh()
@@ -340,9 +425,9 @@ describe('auth store state machine', () => {
   // M5: changePassword 200 but changed missing → error INVALID_API_RESPONSE, clear user+csrf, no phantom signed_in.
   it('changePassword: 200 but changed missing → error INVALID_API_RESPONSE, clears user+csrf, never phantom signed_in', async () => {
     fakeFetch((url) => {
-      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r1' })
-      if (url.includes('/auth/password')) return jsonResponse({ data: {}, request_id: 'r3' })
-      return jsonResponse({ data: null, request_id: 'r0' })
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
+      if (url.includes('/auth/password')) return jsonResponse({ data: {}, request_id: RID_PW })
+      return jsonResponse({ data: null, request_id: RID_NULL })
     })
     const store = createAuth()
     await store.refresh()
@@ -361,11 +446,11 @@ describe('auth store state machine', () => {
       if (url.includes('/auth/me')) {
         meCalls += 1
         return meCalls === 1
-          ? jsonResponse({ data: ME_DATA, request_id: 'r1' })
-          : jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: 'r2' }, 401)
+          ? jsonResponse({ data: ME_DATA, request_id: RID_ME })
+          : jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: RID_ERR }, 401)
       }
-      if (url.includes('/auth/password')) return jsonResponse({ data: { changed: true }, request_id: 'r3' })
-      return jsonResponse({ data: null, request_id: 'r0' })
+      if (url.includes('/auth/password')) return jsonResponse({ data: { changed: true }, request_id: RID_PW })
+      return jsonResponse({ data: null, request_id: RID_NULL })
     })
     const store = createAuth()
     await store.refresh()
@@ -380,8 +465,8 @@ describe('auth store state machine', () => {
   // I1 baseline (plan): refresh me missing must_change_password.
   it('refresh: me missing must_change_password (not a boolean) → error INVALID_API_RESPONSE, never signed_in/force_password', async () => {
     fakeFetch((url) => url.includes('/auth/me')
-      ? jsonResponse({ data: { user: { username: 'admin' }, csrf_token: 't', authz_epoch: '1' }, request_id: 'r1' })
-      : jsonResponse({ data: null, request_id: 'r0' }))
+      ? jsonResponse({ data: { user: { username: 'admin' }, csrf_token: 't', authz_epoch: '1' }, request_id: RID_ME })
+      : jsonResponse({ data: null, request_id: RID_NULL }))
     const store = createAuth()
     await store.refresh()
     expect(store.status.value).toBe('error')
@@ -393,8 +478,8 @@ describe('auth store state machine', () => {
   // I1 baseline (plan): login success response missing csrf_token.
   it('login: success response missing csrf_token → error INVALID_API_RESPONSE, no usable signed_in', async () => {
     fakeFetch((url) => url.includes('/auth/login')
-      ? jsonResponse({ data: { user: { username: 'admin', must_change_password: false } }, request_id: 'r' })
-      : jsonResponse({ data: null, request_id: 'r0' }))
+      ? jsonResponse({ data: { user: { username: 'admin', must_change_password: false } }, request_id: RID_LOGIN })
+      : jsonResponse({ data: null, request_id: RID_NULL }))
     const store = createAuth()
     await expect(store.login('admin', 'synthetic-only')).resolves.toBe(false)
     expect(store.status.value).toBe('error')
@@ -406,9 +491,9 @@ describe('auth store state machine', () => {
   // I3 baseline (plan): changePassword network failure clears secrets, never restores prior.
   it('changePassword: network failure (server may have executed) → clears secrets + error, never restores priorStatus or old csrf', async () => {
     fakeFetch((url) => {
-      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r1' })
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
       if (url.includes('/auth/password')) throw new TypeError('offline')
-      return jsonResponse({ data: null, request_id: 'r0' })
+      return jsonResponse({ data: null, request_id: RID_NULL })
     })
     const store = createAuth()
     await store.refresh()
@@ -422,9 +507,9 @@ describe('auth store state machine', () => {
   // I2 baseline (plan): logout network failure → error NETWORK_ERROR, not signed_out.
   it('logout: POST network failure → error NETWORK_ERROR, not signed_out (server revocation unconfirmed)', async () => {
     fakeFetch((url) => {
-      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r1' })
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
       if (url.includes('/auth/logout')) throw new TypeError('offline')
-      return jsonResponse({ data: null, request_id: 'r0' })
+      return jsonResponse({ data: null, request_id: RID_NULL })
     })
     const store = createAuth()
     await store.refresh()
@@ -440,13 +525,13 @@ describe('auth store state machine', () => {
     const gateA = new Promise<Response>((r) => { resolveA = r })
     fakeFetch((url) => {
       if (url.includes('/auth/me')) return gateA
-      if (url.includes('/auth/login')) return jsonResponse({ data: { user: { username: 'admin', must_change_password: false }, csrf_token: 'tok-new' }, request_id: 'r' })
-      return jsonResponse({ data: null, request_id: 'r0' })
+      if (url.includes('/auth/login')) return jsonResponse({ data: { user: CONTRACT_USER, csrf_token: 'tok-new' }, request_id: RID_LOGIN })
+      return jsonResponse({ data: null, request_id: RID_NULL })
     })
     const store = createAuth()
     const refreshing = store.refresh()
     await store.login('admin', 'synthetic-only')
-    resolveA(jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: 'r' }, 401))
+    resolveA(jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: RID_ERR }, 401))
     await refreshing
     expect(store.status.value).toBe('signed_in')
     expect(store.csrfToken.value).toBe('tok-new')
@@ -455,13 +540,13 @@ describe('auth store state machine', () => {
     const gateB = new Promise<Response>((r) => { resolveB = r })
     fakeFetch((url) => {
       if (url.includes('/auth/me')) return gateB
-      if (url.includes('/auth/login')) return jsonResponse({ data: { user: { username: 'admin', must_change_password: false }, csrf_token: 'tok-2' }, request_id: 'r' })
-      return jsonResponse({ data: null, request_id: 'r0' })
+      if (url.includes('/auth/login')) return jsonResponse({ data: { user: CONTRACT_USER, csrf_token: 'tok-2' }, request_id: RID_LOGIN })
+      return jsonResponse({ data: null, request_id: RID_NULL })
     })
     const store2 = createAuth()
     const refreshing2 = store2.refresh()
     await store2.login('admin', 'synthetic-only')
-    resolveB(jsonResponse({ data: { user: { username: 'admin', must_change_password: false }, csrf_token: 'stale-csrf', authz_epoch: '3' }, request_id: 'r' }))
+    resolveB(jsonResponse({ data: { user: CONTRACT_USER, csrf_token: 'stale-csrf', authz_epoch: '3' }, request_id: RID_ME_2 }))
     await refreshing2
     expect(store2.status.value).toBe('signed_in')
     expect(store2.csrfToken.value).toBe('tok-2')
@@ -473,13 +558,13 @@ describe('auth store state machine', () => {
     const gateLogout = new Promise<Response>((r) => { resolveLogout = r })
     fakeFetch((url) => {
       if (url.includes('/auth/logout')) return gateLogout
-      if (url.includes('/auth/login')) return jsonResponse({ data: { user: { username: 'admin', must_change_password: false }, csrf_token: 'tok-after' }, request_id: 'r' })
-      return jsonResponse({ data: null, request_id: 'r0' })
+      if (url.includes('/auth/login')) return jsonResponse({ data: { user: CONTRACT_USER, csrf_token: 'tok-after' }, request_id: RID_LOGIN })
+      return jsonResponse({ data: null, request_id: RID_NULL })
     })
     const store = createAuth()
     const loggingOut = store.logout()
     await expect(store.login('admin', 'synthetic-only')).resolves.toBe(true)
-    resolveLogout(jsonResponse({ data: { logged_out: true }, request_id: 'r' }))
+    resolveLogout(jsonResponse({ data: { logged_out: true }, request_id: RID_LOGOUT }))
     await expect(loggingOut).resolves.toBeUndefined()
     expect(store.status.value).toBe('signed_in')
     expect(store.csrfToken.value).toBe('tok-after')
@@ -491,8 +576,8 @@ describe('auth store state machine', () => {
     const gateLogout = new Promise<Response>((_resolve, reject) => { settleLogout = reject })
     fakeFetch((url) => {
       if (url.includes('/auth/logout')) return gateLogout
-      if (url.includes('/auth/login')) return jsonResponse({ data: { user: { username: 'admin', must_change_password: false }, csrf_token: 'tok-after' }, request_id: 'r' })
-      return jsonResponse({ data: null, request_id: 'r0' })
+      if (url.includes('/auth/login')) return jsonResponse({ data: { user: CONTRACT_USER, csrf_token: 'tok-after' }, request_id: RID_LOGIN })
+      return jsonResponse({ data: null, request_id: RID_NULL })
     })
     const store = createAuth()
     const loggingOut = store.logout()
@@ -525,9 +610,9 @@ describe('auth store state machine', () => {
 
     it('listSessions: sends GET /auth/sessions?limit=50 with credentials same-origin, updates sessions and next_cursor without reading localStorage/cookies', async () => {
       const fetcher = fakeFetch((url) => {
-        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r1' })
-        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: 'r2' })
-        return jsonResponse({ data: null, request_id: 'r0' })
+        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
+        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: RID_LIST })
+        return jsonResponse({ data: null, request_id: RID_NULL })
       })
       const store = createAuth()
       await store.refresh()
@@ -554,10 +639,10 @@ describe('auth store state machine', () => {
         next_cursor: null,
       }
       const fetcher = fakeFetch((url) => {
-        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r1' })
-        if (url.includes('/auth/sessions?limit=50&cursor=')) return jsonResponse({ data: PAGE_2, request_id: 'r3' })
-        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: 'r2' })
-        return jsonResponse({ data: null, request_id: 'r0' })
+        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
+        if (url.includes('/auth/sessions?limit=50&cursor=')) return jsonResponse({ data: PAGE_2, request_id: RID_LIST })
+        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: RID_LIST })
+        return jsonResponse({ data: null, request_id: RID_NULL })
       })
       const store = createAuth()
       await store.refresh()
@@ -577,9 +662,9 @@ describe('auth store state machine', () => {
 
     it('listSessions: rejects invalid session items shape (missing id / non-boolean current / non-string created_time)', async () => {
       fakeFetch((url) => {
-        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r1' })
-        if (url.includes('/auth/sessions')) return jsonResponse({ data: { items: [{ id: 123, current: 'true' }], next_cursor: null }, request_id: 'r' })
-        return jsonResponse({ data: null, request_id: 'r0' })
+        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
+        if (url.includes('/auth/sessions')) return jsonResponse({ data: { items: [{ id: 123, current: 'true' }], next_cursor: null }, request_id: RID_LIST })
+        return jsonResponse({ data: null, request_id: RID_NULL })
       })
       const store = createAuth()
       await store.refresh()
@@ -592,7 +677,7 @@ describe('auth store state machine', () => {
     it('revokeSession: revoking another session sends POST /auth/sessions/{id}/revoke with memory CSRF and empty JSON {}, stays signed_in and refreshes session list', async () => {
       let listCalled = 0
       const fetcher = fakeFetch((url, init) => {
-        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r1' })
+        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
         if (url.includes('/auth/sessions?limit=50')) {
           listCalled++
           return jsonResponse({ data: { items: [{ id: VALID_ID_1, current: true, created_time: '2026-10-05T00:00:00Z' }], next_cursor: null }, request_id: `r_list_${listCalled}` })
@@ -601,9 +686,9 @@ describe('auth store state machine', () => {
           const headers = (init?.headers ?? {}) as Record<string, string>
           expect(headers['X-CSRF-Token']).toBe('mem-only-token')
           expect(JSON.parse(init?.body as string)).toEqual({})
-          return jsonResponse({ data: { revoked: true }, request_id: 'r_rev' })
+          return jsonResponse({ data: { revoked: true }, request_id: RID_REVOKE })
         }
-        return jsonResponse({ data: null, request_id: 'r0' })
+        return jsonResponse({ data: null, request_id: RID_NULL })
       })
       const store = createAuth()
       await store.refresh()
@@ -623,14 +708,14 @@ describe('auth store state machine', () => {
 
     it('revokeSession: revoking current session (id matching current) succeeds, clears in-memory state and transitions to signed_out', async () => {
       fakeFetch((url, init) => {
-        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r1' })
-        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: 'r2' })
+        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
+        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: RID_LIST })
         if (url.includes(`/auth/sessions/${VALID_ID_1}/revoke`)) {
           const headers = (init?.headers ?? {}) as Record<string, string>
           expect(headers['X-CSRF-Token']).toBe('mem-only-token')
-          return jsonResponse({ data: { revoked: true }, request_id: 'r_rev_self' })
+          return jsonResponse({ data: { revoked: true }, request_id: RID_REVOKE })
         }
-        return jsonResponse({ data: null, request_id: 'r0' })
+        return jsonResponse({ data: null, request_id: RID_NULL })
       })
       const store = createAuth()
       await store.refresh()
@@ -649,7 +734,7 @@ describe('auth store state machine', () => {
     it('revokeOthers: sends POST /auth/sessions/revoke-others with memory CSRF and empty JSON {}, stays signed_in and refreshes session list', async () => {
       let listCalled = 0
       const fetcher = fakeFetch((url, init) => {
-        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r1' })
+        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
         if (url.includes('/auth/sessions?limit=50')) {
           listCalled++
           return jsonResponse({ data: { items: [{ id: VALID_ID_1, current: true, created_time: '2026-10-05T00:00:00Z' }], next_cursor: null }, request_id: `r_list_${listCalled}` })
@@ -658,9 +743,9 @@ describe('auth store state machine', () => {
           const headers = (init?.headers ?? {}) as Record<string, string>
           expect(headers['X-CSRF-Token']).toBe('mem-only-token')
           expect(JSON.parse(init?.body as string)).toEqual({})
-          return jsonResponse({ data: { revoked_count: 3 }, request_id: 'r_rev_others' })
+          return jsonResponse({ data: { revoked_count: 3 }, request_id: RID_REVOKE })
         }
-        return jsonResponse({ data: null, request_id: 'r0' })
+        return jsonResponse({ data: null, request_id: RID_NULL })
       })
       const store = createAuth()
       await store.refresh()
@@ -679,10 +764,10 @@ describe('auth store state machine', () => {
 
     it('revokeSession: 401 response clears local identity and transitions to signed_out', async () => {
       fakeFetch((url) => {
-        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r1' })
-        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: 'r2' })
-        if (url.includes('/auth/sessions/')) return jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: 'r_err' }, 401)
-        return jsonResponse({ data: null, request_id: 'r0' })
+        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
+        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: RID_LIST })
+        if (url.includes('/auth/sessions/')) return jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: RID_ERR }, 401)
+        return jsonResponse({ data: null, request_id: RID_NULL })
       })
       const store = createAuth()
       await store.refresh()
@@ -698,10 +783,10 @@ describe('auth store state machine', () => {
 
     it('revokeSession: 503 / network error does NOT claim success, keeps signed_in, sets sessionsError, does not clear current session', async () => {
       fakeFetch((url) => {
-        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r1' })
-        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: 'r2' })
+        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
+        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: RID_LIST })
         if (url.includes('/auth/sessions/')) throw new TypeError('offline')
-        return jsonResponse({ data: null, request_id: 'r0' })
+        return jsonResponse({ data: null, request_id: RID_NULL })
       })
       const store = createAuth()
       await store.refresh()
@@ -723,12 +808,12 @@ describe('auth store state machine', () => {
       fakeFetch((url) => {
         if (url.includes('/auth/me')) {
           meCalls++
-          if (meCalls === 1) return jsonResponse({ data: ME_DATA, request_id: 'r_me_1' })
+          if (meCalls === 1) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
           return slowMeGate
         }
-        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: 'r_list' })
-        if (url.includes(`/auth/sessions/${VALID_ID_1}/revoke`)) return jsonResponse({ data: { revoked: true }, request_id: 'r_rev' })
-        return jsonResponse({ data: null, request_id: 'r0' })
+        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: RID_LIST })
+        if (url.includes(`/auth/sessions/${VALID_ID_1}/revoke`)) return jsonResponse({ data: { revoked: true }, request_id: RID_REVOKE })
+        return jsonResponse({ data: null, request_id: RID_NULL })
       })
 
       const store = createAuth()
@@ -746,7 +831,7 @@ describe('auth store state machine', () => {
       expect(store.csrfToken.value).toBeNull()
 
       // The slow refresh resolves with 200 OK ME_DATA
-      resolveSlowMe(jsonResponse({ data: ME_DATA, request_id: 'r_me_2' }))
+      resolveSlowMe(jsonResponse({ data: ME_DATA, request_id: RID_ME_2 }))
       await pendingRefresh
 
       // Must STAY signed_out, not resurrected to signed_in!
@@ -763,13 +848,13 @@ describe('auth store state machine', () => {
       fakeFetch((url) => {
         if (url.includes('/auth/me')) {
           meCalls++
-          if (meCalls === 1) return jsonResponse({ data: ME_DATA, request_id: 'r_me_1' })
+          if (meCalls === 1) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
           // Second me() call after unknown session revocation: fails with 503
-          return jsonResponse({ error: { code: 'NOT_READY', message_key: 'errors.notReady' }, request_id: 'r_me_err' }, 503)
+          return jsonResponse({ error: { code: 'NOT_READY', message_key: 'errors.notReady' }, request_id: RID_ERR }, 503)
         }
-        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: 'r_list' })
-        if (url.includes(`/auth/sessions/${UNKNOWN_SESSION_ID}/revoke`)) return jsonResponse({ data: { revoked: true }, request_id: 'r_rev' })
-        return jsonResponse({ data: null, request_id: 'r0' })
+        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: RID_LIST })
+        if (url.includes(`/auth/sessions/${UNKNOWN_SESSION_ID}/revoke`)) return jsonResponse({ data: { revoked: true }, request_id: RID_REVOKE })
+        return jsonResponse({ data: null, request_id: RID_NULL })
       })
 
       const store = createAuth()
@@ -794,12 +879,12 @@ describe('auth store state machine', () => {
       fakeFetch((url) => {
         if (url.includes('/auth/me')) {
           meCalls++
-          if (meCalls === 1) return jsonResponse({ data: ME_DATA, request_id: 'r_me_1' })
-          return jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: 'r_me_401' }, 401)
+          if (meCalls === 1) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
+          return jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: RID_ERR }, 401)
         }
-        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: 'r_list' })
-        if (url.includes(`/auth/sessions/${UNKNOWN_SESSION_ID}/revoke`)) return jsonResponse({ data: { revoked: true }, request_id: 'r_rev' })
-        return jsonResponse({ data: null, request_id: 'r0' })
+        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: RID_LIST })
+        if (url.includes(`/auth/sessions/${UNKNOWN_SESSION_ID}/revoke`)) return jsonResponse({ data: { revoked: true }, request_id: RID_REVOKE })
+        return jsonResponse({ data: null, request_id: RID_NULL })
       })
 
       const store = createAuth()
@@ -822,7 +907,7 @@ describe('auth store state machine', () => {
       const slowListGate = new Promise<Response>((r) => { resolveSlowList = r })
       let listCalls = 0
       fakeFetch((url) => {
-        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r_me' })
+        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
         if (url.includes('/auth/sessions?limit=50')) {
           listCalls++
           if (listCalls === 1) return slowListGate
@@ -831,10 +916,10 @@ describe('auth store state machine', () => {
               items: [{ id: '9'.repeat(64), current: true, created_time: '2026-10-05T09:00:00Z' }],
               next_cursor: null,
             },
-            request_id: 'r_list_new',
+            request_id: RID_LIST,
           })
         }
-        return jsonResponse({ data: null, request_id: 'r0' })
+        return jsonResponse({ data: null, request_id: RID_NULL })
       })
 
       const store = createAuth()
@@ -849,7 +934,7 @@ describe('auth store state machine', () => {
       expect(store.sessions.value[0].id).toBe('9'.repeat(64))
 
       // Now slow list call 1 resolves with SESSIONS_PAGE_1 (2 items)
-      resolveSlowList(jsonResponse({ data: SESSIONS_PAGE_1, request_id: 'r_list_slow' }))
+      resolveSlowList(jsonResponse({ data: SESSIONS_PAGE_1, request_id: RID_LIST }))
       await p1
 
       // Must retain call 2's session list, NOT overwritten by call 1
@@ -860,10 +945,10 @@ describe('auth store state machine', () => {
     // I-3: logout/401 必须清除 sessions 和 sessionsNextCursor
     it('I-3: logout clears sessions and sessionsNextCursor', async () => {
       fakeFetch((url) => {
-        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r_me' })
-        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: 'r_list' })
-        if (url.includes('/auth/logout')) return jsonResponse({ data: { logged_out: true }, request_id: 'r_logout' })
-        return jsonResponse({ data: null, request_id: 'r0' })
+        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
+        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: RID_LIST })
+        if (url.includes('/auth/logout')) return jsonResponse({ data: { logged_out: true }, request_id: RID_LOGOUT })
+        return jsonResponse({ data: null, request_id: RID_NULL })
       })
 
       const store = createAuth()
@@ -882,11 +967,11 @@ describe('auth store state machine', () => {
       fakeFetch((url) => {
         if (url.includes('/auth/me')) {
           meCalls++
-          if (meCalls === 1) return jsonResponse({ data: ME_DATA, request_id: 'r_me' })
-          return jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: 'r_401' }, 401)
+          if (meCalls === 1) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
+          return jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: RID_ERR }, 401)
         }
-        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: 'r_list' })
-        return jsonResponse({ data: null, request_id: 'r0' })
+        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: RID_LIST })
+        return jsonResponse({ data: null, request_id: RID_NULL })
       })
 
       const store = createAuth()
@@ -904,17 +989,17 @@ describe('auth store state machine', () => {
     // Minor: cursor 必须恰好 132 位小写 hex
     it('Minor: assertSessionsListShape rejects next_cursor that is not 132 lowercase hex', async () => {
       fakeFetch((url) => {
-        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r_me' })
+        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
         if (url.includes('/auth/sessions?limit=50')) {
           return jsonResponse({
             data: {
               items: [{ id: VALID_ID_1, current: true, created_time: '2026-10-05T00:00:00Z' }],
               next_cursor: 'not-132-hex',
             },
-            request_id: 'r_bad_cur',
+            request_id: RID_LIST,
           })
         }
-        return jsonResponse({ data: null, request_id: 'r0' })
+        return jsonResponse({ data: null, request_id: RID_NULL })
       })
 
       const store = createAuth()
@@ -928,10 +1013,10 @@ describe('auth store state machine', () => {
     // Minor: revoked_count 必须是非负整数（不能是小数或负数或非数字）
     it('Minor: revokeOthers rejects revoked_count that is not a non-negative integer (e.g. float 1.5)', async () => {
       fakeFetch((url) => {
-        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r_me' })
-        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: 'r_list' })
-        if (url.includes('/auth/sessions/revoke-others')) return jsonResponse({ data: { revoked_count: 1.5 }, request_id: 'r_float' })
-        return jsonResponse({ data: null, request_id: 'r0' })
+        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
+        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: RID_LIST })
+        if (url.includes('/auth/sessions/revoke-others')) return jsonResponse({ data: { revoked_count: 1.5 }, request_id: RID_REVOKE })
+        return jsonResponse({ data: null, request_id: RID_NULL })
       })
 
       const store = createAuth()
@@ -954,10 +1039,10 @@ describe('auth store state machine', () => {
         next_cursor: null,
       }
       fakeFetch((url) => {
-        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r_me' })
-        if (url.includes('/auth/sessions?limit=50&cursor=')) return jsonResponse({ data: PAGE_2_DUP, request_id: 'r_p2' })
-        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: 'r_p1' })
-        return jsonResponse({ data: null, request_id: 'r0' })
+        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
+        if (url.includes('/auth/sessions?limit=50&cursor=')) return jsonResponse({ data: PAGE_2_DUP, request_id: RID_LIST })
+        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: RID_LIST })
+        return jsonResponse({ data: null, request_id: RID_NULL })
       })
 
       const store = createAuth()
@@ -976,10 +1061,10 @@ describe('auth store state machine', () => {
     it('sessionsLoading: revoking current session, unknown session 401 reconcile, and unknown session 503 reconcile all reset sessionsLoading to false', async () => {
       // 1. Current session revocation
       fakeFetch((url) => {
-        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r_me' })
-        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: 'r_list' })
-        if (url.includes(`/auth/sessions/${VALID_ID_1}/revoke`)) return jsonResponse({ data: { revoked: true }, request_id: 'r_rev' })
-        return jsonResponse({ data: null, request_id: 'r0' })
+        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
+        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: RID_LIST })
+        if (url.includes(`/auth/sessions/${VALID_ID_1}/revoke`)) return jsonResponse({ data: { revoked: true }, request_id: RID_REVOKE })
+        return jsonResponse({ data: null, request_id: RID_NULL })
       })
       const store1 = createAuth()
       await store1.refresh()
@@ -995,12 +1080,12 @@ describe('auth store state machine', () => {
       fakeFetch((url) => {
         if (url.includes('/auth/me')) {
           meCalls++
-          if (meCalls === 1) return jsonResponse({ data: ME_DATA, request_id: 'r_me' })
-          return jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: 'r_me_401' }, 401)
+          if (meCalls === 1) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
+          return jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: RID_ERR }, 401)
         }
-        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: 'r_list' })
-        if (url.includes(`/auth/sessions/${UNKNOWN_ID}/revoke`)) return jsonResponse({ data: { revoked: true }, request_id: 'r_rev' })
-        return jsonResponse({ data: null, request_id: 'r0' })
+        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: RID_LIST })
+        if (url.includes(`/auth/sessions/${UNKNOWN_ID}/revoke`)) return jsonResponse({ data: { revoked: true }, request_id: RID_REVOKE })
+        return jsonResponse({ data: null, request_id: RID_NULL })
       })
       const store2 = createAuth()
       await store2.refresh()
@@ -1016,12 +1101,12 @@ describe('auth store state machine', () => {
       fakeFetch((url) => {
         if (url.includes('/auth/me')) {
           meCalls++
-          if (meCalls === 1) return jsonResponse({ data: ME_DATA, request_id: 'r_me' })
-          return jsonResponse({ error: { code: 'NOT_READY', message_key: 'errors.notReady' }, request_id: 'r_me_503' }, 503)
+          if (meCalls === 1) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
+          return jsonResponse({ error: { code: 'NOT_READY', message_key: 'errors.notReady' }, request_id: RID_ERR }, 503)
         }
-        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: 'r_list' })
-        if (url.includes(`/auth/sessions/${UNKNOWN_ID}/revoke`)) return jsonResponse({ data: { revoked: true }, request_id: 'r_rev' })
-        return jsonResponse({ data: null, request_id: 'r0' })
+        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: RID_LIST })
+        if (url.includes(`/auth/sessions/${UNKNOWN_ID}/revoke`)) return jsonResponse({ data: { revoked: true }, request_id: RID_REVOKE })
+        return jsonResponse({ data: null, request_id: RID_NULL })
       })
       const store3 = createAuth()
       await store3.refresh()
@@ -1042,13 +1127,13 @@ describe('auth store state machine', () => {
       let listCalls = 0
 
       fakeFetch((url) => {
-        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r_me' })
+        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
         if (url.includes('/auth/sessions?limit=50')) {
           listCalls++
           if (listCalls === 1) return slowOpGate // first listSessions is slow
           return fastOpGate // second listSessions or fast op
         }
-        return jsonResponse({ data: null, request_id: 'r0' })
+        return jsonResponse({ data: null, request_id: RID_NULL })
       })
 
       const store = createAuth()
@@ -1064,14 +1149,14 @@ describe('auth store state machine', () => {
       expect(store.sessionsLoading.value).toBe(true)
 
       // Request 1 finishes while Request 2 is still pending
-      resolveSlowOp(jsonResponse({ data: SESSIONS_PAGE_1, request_id: 'r_p1' }))
+      resolveSlowOp(jsonResponse({ data: SESSIONS_PAGE_1, request_id: RID_LIST }))
       await p1
 
       // Request 2 is still in-flight: sessionsLoading MUST still be true!
       expect(store.sessionsLoading.value).toBe(true)
 
       // Now Request 2 finishes
-      resolveFastOp(jsonResponse({ data: SESSIONS_PAGE_1, request_id: 'r_p2' }))
+      resolveFastOp(jsonResponse({ data: SESSIONS_PAGE_1, request_id: RID_LIST }))
       await p2
       expect(store.sessionsLoading.value).toBe(false)
     })
@@ -1085,14 +1170,14 @@ describe('auth store state machine', () => {
       let revokeCalls = 0
 
       fakeFetch((url) => {
-        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: 'r_me' })
-        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: 'r_list' })
+        if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
+        if (url.includes('/auth/sessions?limit=50')) return jsonResponse({ data: SESSIONS_PAGE_1, request_id: RID_LIST })
         if (url.includes('/auth/sessions/') && url.includes('/revoke')) {
           revokeCalls++
           if (revokeCalls === 1) return slowRevokeGate
           return fastRevokeGate
         }
-        return jsonResponse({ data: null, request_id: 'r0' })
+        return jsonResponse({ data: null, request_id: RID_NULL })
       })
 
       const store = createAuth()
@@ -1107,14 +1192,14 @@ describe('auth store state machine', () => {
       expect(store.sessionsLoading.value).toBe(true)
 
       // p1 finishes
-      resolveSlowRevoke(jsonResponse({ data: { revoked: true }, request_id: 'r_rev_slow' }))
+      resolveSlowRevoke(jsonResponse({ data: { revoked: true }, request_id: RID_REVOKE }))
       await p1
 
       // p2 is still in-flight: sessionsLoading must remain true
       expect(store.sessionsLoading.value).toBe(true)
 
       // p2 finishes
-      resolveFastRevoke(jsonResponse({ data: { revoked_count: 1 }, request_id: 'r_rev_others_fast' }))
+      resolveFastRevoke(jsonResponse({ data: { revoked_count: 1 }, request_id: RID_REVOKE }))
       await p2
       expect(store.sessionsLoading.value).toBe(false)
     })
