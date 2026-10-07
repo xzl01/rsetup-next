@@ -20,7 +20,7 @@
 ### 响应投影
 
 - Device最低投影为device_id/display_name/effective_permissions；具device.read时增加descriptor、admission_state、review_decision、connection_state（online/offline）、control_health/data_health（starting/healthy/degraded/offline，判定规则见05 §7）、capabilities、revision。
-- status响应为snapshot（null或03的DeviceStatus语义投影）、received_time（TimeEvidence）、freshness（unknown/fresh/stale/error）与age_ms。Protobuf64位字段映射十进制字符串，原始板端毫秒值不强转成中控参考时间；无样本age_ms=null。error保留最后好样本时同时返回last_error，不把其age清零。
+- status响应为snapshot（null或03的DeviceStatus语义投影）、received_time（TimeEvidence）、freshness（unknown/fresh/stale/error）与age_ms。age_ms为Counter/null，非空时是规范无符号64位十进制字符串；Protobuf64位字段同样映射十进制字符串，原始板端毫秒值不强转成中控参考时间；无样本age_ms=null。error保留最后好样本时同时返回last_error，不把其age清零。received_time.quality只描述中控接收时间参考；板端采样质量来自snapshot.clock_quality（observed/clock_unstable），偏差估计按05校验，不能用中控的ntp_valid/system_fallback/stale替代板端质量。
 - MainTask含id、operation、state、outcome、revision、created_time、view_scope与按state分组的counts。SubTask含id、device_id、state、reason_code、revision及授权可见的result_evidence；不暴露execution_token或token摘要。
 - Capabilities和TaskRecord的HTTP投影保留03语义，64位版本映射Counter；创建/取消响应不能通过这些投影绕过01的可见性。
 
