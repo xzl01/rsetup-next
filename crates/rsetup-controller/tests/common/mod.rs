@@ -421,7 +421,7 @@ pub async fn negative_fixture_prevents_all_alters(index: usize) {
         .unwrap();
     assert_eq!(value, -1, "original {table}.{column} must survive");
     for &(name, field, _, _) in &NEGATIVE_FIXTURES {
-        let shape: String = sqlx::query_scalar("SELECT column_type FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?")
+        let shape: String = sqlx::query_scalar("SELECT CAST(column_type AS CHAR) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?")
             .bind(name).bind(field).fetch_one(&db.0).await.unwrap();
         assert_eq!(
             shape.to_ascii_lowercase(),

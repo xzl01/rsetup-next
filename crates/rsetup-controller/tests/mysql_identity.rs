@@ -240,7 +240,7 @@ async fn migration_does_not_repair_missing_table() {
 #[ignore = "one independently backed-up isolated disposable empty test DB and operator authorization required"]
 async fn migration_rejects_wrong_named_table_before_bootstrap() {
     let db = fresh_v2().await;
-    sqlx::query("ALTER TABLE role_permissions MODIFY COLUMN permission VARCHAR(128) NULL")
+    sqlx::query("ALTER TABLE role_permissions MODIFY COLUMN permission VARCHAR(127) NOT NULL")
         .execute(&db.0)
         .await
         .unwrap();
@@ -278,7 +278,7 @@ async fn invalid_stored_usernames_prevent_all_alters() {
                 .await
                 .unwrap();
         assert_eq!(version, 1);
-        let column_type: String = sqlx::query_scalar("SELECT column_type FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'schema_meta' AND column_name = 'authz_epoch'")
+        let column_type: String = sqlx::query_scalar("SELECT CAST(column_type AS CHAR) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'schema_meta' AND column_name = 'authz_epoch'")
             .fetch_one(&db.0).await.unwrap();
         assert_eq!(column_type.to_ascii_lowercase(), "bigint");
         sqlx::query("DELETE FROM users WHERE id = ?")
