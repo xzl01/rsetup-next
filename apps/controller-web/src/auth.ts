@@ -75,14 +75,27 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 
 // Full lowercase standard UUIDv4 with RFC 4122 variant bits (8/9/a/b): version nibble fixed to 4.
 // A JSON number or any other casing/format fails the typeof + regex pair.
-const USER_ID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+// End anchor `(?![\s\S])` instead of `$`: a bare `$` admits a trailing '\n' on some engines/flags,
+// so '…426614174000\n' would be accepted; the lookahead is exact end-of-string, engine-independent.
+const USER_ID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}(?![\s\S])/
 
 // Canonical decimal string for revision: no empty, no sign, no fraction, no exponent, no leading
 // zero (so "0" is valid but "01" is not); a JSON number fails the typeof check. No Number/parseInt.
-const DECIMAL_STRING = /^(0|[1-9][0-9]*)$/
+// Same `(?![\s\S])` end anchor as USER_ID_V4 (a bare `$` would admit '1\n' on some engines/flags).
+const DECIMAL_STRING = /^(0|[1-9][0-9]*)(?![\s\S])/
+
+// Spec 02 §1: Revision/Counter are unsigned 64-bit decimal strings. The regex admits unbounded
+// digit runs, so bound them losslessly (no Number/parseInt — no precision loss): after
+// DECIMAL_STRING the value has no leading zeros, so numeric order is length order, then
+// lexicographic order at equal length.
+const U64_MAX_DECIMAL = '18446744073709551615'
+function isU64Decimal(value: string): boolean {
+  return value.length < U64_MAX_DECIMAL.length ||
+    (value.length === U64_MAX_DECIMAL.length && value <= U64_MAX_DECIMAL)
+}
 
 // get/post validate only the envelope (data passes through as T), so identity fields are re-checked here
-// at runtime — including the business id (UUIDv4) and revision (decimal string) contract.
+// at runtime — including the business id (UUIDv4) and revision (u64-bounded decimal string) contract.
 // Missing/wrong shape → INVALID_API_RESPONSE; the caller clears identity/CSRF and never enters
 // signed_in/force_password.
 function assertIdentityShape(data: unknown): void {
@@ -90,6 +103,7 @@ function assertIdentityShape(data: unknown): void {
   if (typeof data.user.id !== 'string' || !USER_ID_V4.test(data.user.id)) throw invalidShape()
   if (typeof data.user.username !== 'string' || data.user.username.length === 0) throw invalidShape()
   if (typeof data.user.revision !== 'string' || !DECIMAL_STRING.test(data.user.revision)) throw invalidShape()
+  if (!isU64Decimal(data.user.revision)) throw invalidShape()
   if (typeof data.user.must_change_password !== 'boolean') throw invalidShape()
   if (typeof data.csrf_token !== 'string' || data.csrf_token.length === 0) throw invalidShape()
 }

@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createAuth, authErrorKey } from './auth'
 
@@ -19,12 +21,13 @@ const CONTRACT_USER = {
 const RID_ME = '123e4567-e89b-42d3-a456-426614174000'
 const RID_ME_2 = '345a6789-fa2c-44d6-b678-648836396222'
 const RID_LOGIN = '234f5678-e91b-43c5-a567-537725285111'
-const RID_PW = '456b789a-0b3d-45e7-c789-759947407333'
-const RID_LOGOUT = '567c89ab-1c4e-46f8-d89a-86aa58518444'
+const RID_PW = '456b789a-0b3d-45e7-8789-759947407333'
+const RID_LOGOUT = '567c89ab-1c4e-46f8-a89a-86aa58518444'
 const RID_LIST = '89afbcde-4f7b-49cb-8bcd-b9dd8b84b777'
+const RID_LIST_2 = 'b21c5a6d-8e3f-4c7a-9d42-6f8e1b3c5d77'
 const RID_REVOKE = '9abcfdef-5a8c-4adc-9cde-c0ee9c95c888'
-const RID_ERR = '678d9abc-2d5f-47a9-e9ab-97bb69629555'
-const RID_NULL = '789eabcd-3e6a-48ba-fabc-a8cc7a73a666'
+const RID_ERR = '678d9abc-2d5f-47a9-99ab-97bb69629555'
+const RID_NULL = '789eabcd-3e6a-48ba-babc-a8cc7a73a666'
 
 const ME_DATA = {
   user: CONTRACT_USER,
@@ -302,9 +305,11 @@ describe('auth store state machine', () => {
   // ---- Required risk tests from the independent rereview (M1–M7) ----
 
   // M1: login success user missing / string must_change_password → error INVALID_API_RESPONSE, never signed_in.
+  // 复审修正（2026-10-07）：背景投影补全合法 id/revision，负例只破坏目标字段——否则 1dc8930 之后
+  // 这些负例会先被 id 守卫拒绝，删掉 must_change_password 子句测试仍绿，失去独立覆盖。
   it.each([
-    ['missing', { user: { username: 'admin' }, csrf_token: 't' }],
-    ['string', { user: { username: 'admin', must_change_password: 'true' }, csrf_token: 't' }],
+    ['missing', { user: { id: USER_ID, username: 'admin', revision: '1' }, csrf_token: 't' }],
+    ['string', { user: { id: USER_ID, username: 'admin', must_change_password: 'true', revision: '1' }, csrf_token: 't' }],
   ])('login: must_change_password %s → error INVALID_API_RESPONSE, never signed_in', async (_label, data) => {
     fakeFetch((url) => url.includes('/auth/login')
       ? jsonResponse({ data, request_id: RID_LOGIN })
@@ -335,9 +340,10 @@ describe('auth store state machine', () => {
   })
 
   // M-C: me user missing username (or empty) → error INVALID_API_RESPONSE, never signed_in.
+  // 复审修正（2026-10-07）：背景投影补全合法 id/revision（display_name 为类型允许的可选字段，原语义保留）。
   it.each([
-    ['missing', { user: { display_name: 'Sam', must_change_password: false }, csrf_token: 't', authz_epoch: '1' }],
-    ['empty', { user: { username: '', must_change_password: false }, csrf_token: 't', authz_epoch: '1' }],
+    ['missing', { user: { id: USER_ID, display_name: 'Sam', must_change_password: false, revision: '1' }, csrf_token: 't', authz_epoch: '1' }],
+    ['empty', { user: { id: USER_ID, username: '', must_change_password: false, revision: '1' }, csrf_token: 't', authz_epoch: '1' }],
   ])('refresh: me username %s → error INVALID_API_RESPONSE, never signed_in', async (_label, data) => {
     fakeFetch((url) => url.includes('/auth/me')
       ? jsonResponse({ data, request_id: RID_ME })
@@ -353,8 +359,9 @@ describe('auth store state machine', () => {
 
   // ---- ID/revision contract (2026-10-07 HTTP ID design, §2 矩阵行 1–2) ----
   // user.id 必须是完整小写 UUIDv4（版本位 4、RFC 4122 变体位 8/9/a/b），user.revision 必须是
-  // 规范十进制字符串（排除空串/符号/小数/指数/前导零/JSON number）。/auth/login 与 /auth/me 在
-  // 接受身份与 CSRF 前都校验；失败统一 INVALID_API_RESPONSE 并清身份/CSRF/epoch。
+  // 规范十进制字符串（排除空串/符号/小数/指数/前导零/JSON number），且按规格 02 §1 的无符号
+  // 64 位上限拒绝溢出；UUID/revision 带尾部 '\n' 同样拒绝（$ 尾锚对换行的容许不随引擎独立，显式锁死）。/auth/login
+  // 与 /auth/me 在接受身份与 CSRF 前都校验；失败统一 INVALID_API_RESPONSE 并清身份/CSRF/epoch。
   // 每个负例只在完整合法投影上改动恰好一个字段，拒绝必然归因于该字段。
   function contractUser(over: Record<string, unknown> = {}): Record<string, unknown> {
     const copy: Record<string, unknown> = { ...CONTRACT_USER, ...over }
@@ -379,6 +386,12 @@ describe('auth store state machine', () => {
     ['user.revision decimal', contractUser({ revision: '1.5' })],
     ['user.revision exponent', contractUser({ revision: '1e3' })],
     ['user.revision leading zero', contractUser({ revision: '01' })],
+    // 规格 02 §1：Revision 为无符号 64 位 —— 2^64 溢出须拒绝；u64 最大值的原样接收见下方正例。
+    ['user.revision u64 overflow (2^64)', contractUser({ revision: '18446744073709551616' })],
+    // 尾部换行锁定：$ 锚点对尾部换行的语义不随引擎/flags 独立（如 m 标志即松），guard 改用
+    // (?![\s\S]) 尾锚后 '值\n' 必须显式拒绝；此两例锁住该行为。
+    ['user.id trailing newline', contractUser({ id: USER_ID + '\n' })],
+    ['user.revision trailing newline', contractUser({ revision: '1\n' })],
   ]
 
   it.each(ID_REVISION_NEGATIVES)('refresh: me %s → error INVALID_API_RESPONSE, never signed_in', async (_label, user) => {
@@ -405,6 +418,32 @@ describe('auth store state machine', () => {
     expect(store.user.value).toBeNull()
     expect(store.csrfToken.value).toBeNull()
     expect(store.authzEpoch.value).toBeNull()
+  })
+
+  // 规格 02 §1：Revision/Counter 为无符号 64 位十进制字符串。u64 最大值必须被原样接收——wire 值
+  // 不经 Number/parseInt，store 中保留的仍是同一个字符串（无精度损失）；2^64 溢出拒绝由上方
+  // 'u64 overflow (2^64)' 负例锁定（login/me 两入口）。
+  const U64_MAX_REVISION = '18446744073709551615'
+
+  it.each([
+    ['me', '/auth/me', RID_ME],
+    ['login', '/auth/login', RID_LOGIN],
+  ])('revision = u64 max: %s 接受并原样保留十进制字符串（无精度损失）', async (_entry, path, rid) => {
+    const user = contractUser({ revision: U64_MAX_REVISION })
+    const data = _entry === 'me'
+      ? { user, csrf_token: 'mem-only-token', authz_epoch: '7' }
+      : { user, csrf_token: 'tok-2' }
+    fakeFetch((url) => url.includes(path)
+      ? jsonResponse({ data, request_id: rid })
+      : jsonResponse({ data: null, request_id: RID_NULL }))
+    const store = createAuth()
+    if (_entry === 'me') {
+      await store.refresh()
+    } else {
+      await expect(store.login('admin', 'synthetic-only')).resolves.toBe(true)
+    }
+    expect(store.status.value).toBe('signed_in')
+    expect(store.user.value?.revision).toBe(U64_MAX_REVISION) // 原样字符串，未经 Number/parseInt 失真
   })
 
   // M4: logout 200 non-JSON / bad envelope → error INVALID_API_RESPONSE, not signed_out.
@@ -463,9 +502,10 @@ describe('auth store state machine', () => {
   })
 
   // I1 baseline (plan): refresh me missing must_change_password.
+  // 复审修正（2026-10-07）：背景投影补全合法 id/revision，负例只破坏 must_change_password 字段。
   it('refresh: me missing must_change_password (not a boolean) → error INVALID_API_RESPONSE, never signed_in/force_password', async () => {
     fakeFetch((url) => url.includes('/auth/me')
-      ? jsonResponse({ data: { user: { username: 'admin' }, csrf_token: 't', authz_epoch: '1' }, request_id: RID_ME })
+      ? jsonResponse({ data: { user: { id: USER_ID, username: 'admin', revision: '1' }, csrf_token: 't', authz_epoch: '1' }, request_id: RID_ME })
       : jsonResponse({ data: null, request_id: RID_NULL }))
     const store = createAuth()
     await store.refresh()
@@ -476,9 +516,10 @@ describe('auth store state machine', () => {
   })
 
   // I1 baseline (plan): login success response missing csrf_token.
+  // 复审修正（2026-10-07）：背景投影补全合法 id/revision，负例只破坏 csrf_token 字段。
   it('login: success response missing csrf_token → error INVALID_API_RESPONSE, no usable signed_in', async () => {
     fakeFetch((url) => url.includes('/auth/login')
-      ? jsonResponse({ data: { user: { username: 'admin', must_change_password: false } }, request_id: RID_LOGIN })
+      ? jsonResponse({ data: { user: { id: USER_ID, username: 'admin', must_change_password: false, revision: '1' } }, request_id: RID_LOGIN })
       : jsonResponse({ data: null, request_id: RID_NULL }))
     const store = createAuth()
     await expect(store.login('admin', 'synthetic-only')).resolves.toBe(false)
@@ -680,7 +721,8 @@ describe('auth store state machine', () => {
         if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
         if (url.includes('/auth/sessions?limit=50')) {
           listCalled++
-          return jsonResponse({ data: { items: [{ id: VALID_ID_1, current: true, created_time: '2026-10-05T00:00:00Z' }], next_cursor: null }, request_id: `r_list_${listCalled}` })
+          // 正常模拟 HTTP 包：request_id 用完整 UUIDv4 契约常量（首次/后续列表各一个固定值）。
+          return jsonResponse({ data: { items: [{ id: VALID_ID_1, current: true, created_time: '2026-10-05T00:00:00Z' }], next_cursor: null }, request_id: listCalled === 1 ? RID_LIST : RID_LIST_2 })
         }
         if (url.includes(`/auth/sessions/${VALID_ID_2}/revoke`)) {
           const headers = (init?.headers ?? {}) as Record<string, string>
@@ -737,7 +779,8 @@ describe('auth store state machine', () => {
         if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
         if (url.includes('/auth/sessions?limit=50')) {
           listCalled++
-          return jsonResponse({ data: { items: [{ id: VALID_ID_1, current: true, created_time: '2026-10-05T00:00:00Z' }], next_cursor: null }, request_id: `r_list_${listCalled}` })
+          // 正常模拟 HTTP 包：request_id 用完整 UUIDv4 契约常量（首次/后续列表各一个固定值）。
+          return jsonResponse({ data: { items: [{ id: VALID_ID_1, current: true, created_time: '2026-10-05T00:00:00Z' }], next_cursor: null }, request_id: listCalled === 1 ? RID_LIST : RID_LIST_2 })
         }
         if (url.includes('/auth/sessions/revoke-others')) {
           const headers = (init?.headers ?? {}) as Record<string, string>
@@ -1203,5 +1246,81 @@ describe('auth store state machine', () => {
       await p2
       expect(store.sessionsLoading.value).toBe(false)
     })
+  })
+})
+
+// ---- Fixture contract (2026-10-07 复审独立静态扫描) ----
+// 正常模拟 HTTP 包的 request_id 必须是完整 RFC4122 UUIDv4。1dc8930 在"声称正常"的常量中混入了
+// 变体位 c/d/e/f 的值（RID_PW/RID_LOGOUT/RID_ERR/RID_NULL）以及 session-list 的 r_list_${n} 短值。
+// 本扫描独立于状态机测试，对 4 个范围内的 fixture 源逐值检查：
+//   1) 顶层 RID_*/USER_ID 常量本身必须是 UUIDv4；
+//   2) 每个 request_id 值表达式中的字符串/模板字面量必须是 UUIDv4（或属于刻意畸形负例白名单）；
+//   3) request_id 引用的 RID_*/USER_ID 标识符必须是本文件已定义的契约常量。
+// api.ts 的运行时策略（非空有界字符串）保持原样；api 层测试文件（api/post/proxy）刻意用短值
+// 检验该宽松策略，不在本契约内。
+describe('fixture contract: canonical request_id values', () => {
+  const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
+  // 测试命令约定在应用根目录执行（npm 脚本在 apps/controller-web 下运行），故以 cwd 相对路径读源文件；
+  // vitest 下 import.meta.url 非 file: scheme，不能直接 fileURLToPath。
+  const FIXTURE_FILES: Array<[string, string]> = [
+    ['auth.test.ts', 'src/auth.test.ts'],
+    ['App.test.ts', 'src/App.test.ts'],
+    ['plans/2026-10-03-controller-web-auth.md', '../../docs/superpowers/plans/2026-10-03-controller-web-auth.md'],
+    ['plans/2026-10-03-controller-web-foundation.md', '../../docs/superpowers/plans/2026-10-03-controller-web-foundation.md'],
+  ]
+
+  // 计划文档中刻意检验畸形 envelope 的负例字面量（api 层策略，非身份 fixture 契约值）。
+  const ALLOWED_MALFORMED = new Set(['r1', 'r', ''])
+
+  // 取 request_id 值表达式：到第一个顶层（不在 '...' / `...` 内）的 , } ) 为止。
+  function valueRegion(rest: string): string {
+    let quote: string | null = null
+    for (let i = 0; i < rest.length; i += 1) {
+      const ch = rest[i]
+      if (quote === null) {
+        if (ch === "'" || ch === '`') quote = ch
+        else if (ch === ',' || ch === '}' || ch === ')') return rest.slice(0, i)
+      } else if (ch === quote) {
+        quote = null
+      }
+    }
+    return rest
+  }
+
+  function scanSource(source: string, label: string): string[] {
+    const violations: string[] = []
+    const constants = new Map<string, string>()
+    for (const def of source.matchAll(/const (RID_[A-Z0-9_]+|USER_ID)\s*=\s*'([^']*)'/g)) {
+      constants.set(def[1], def[2])
+      if (!UUID_V4.test(def[2])) {
+        violations.push(`${label}: const ${def[1]} = '${def[2]}' is not a full RFC4122 UUIDv4`)
+      }
+    }
+    source.split('\n').forEach((line, lineIndex) => {
+      for (const key of line.matchAll(/request_id["']?\s*:/g)) {
+        const region = valueRegion(line.slice(key.index + key[0].length))
+        for (const literal of region.matchAll(/'([^']*)'|`([^`]*)`/g)) {
+          const isTemplate = literal[2] !== undefined
+          const content = (isTemplate ? literal[2] : literal[1]) ?? ''
+          if (isTemplate && content.includes('${')) {
+            violations.push(`${label}:${lineIndex + 1}: request_id template \`${content}\` is dynamic, not a static contract value`)
+          } else if (!UUID_V4.test(content) && !ALLOWED_MALFORMED.has(content)) {
+            violations.push(`${label}:${lineIndex + 1}: request_id literal '${content}' is not a full RFC4122 UUIDv4`)
+          }
+        }
+        for (const reference of region.matchAll(/\b(RID_[A-Z0-9_]+|USER_ID)\b/g)) {
+          if (!constants.has(reference[1])) {
+            violations.push(`${label}:${lineIndex + 1}: request_id ${reference[1]} is not a fixture constant of this file`)
+          }
+        }
+      }
+    })
+    return violations
+  }
+
+  it.each(FIXTURE_FILES)('%s: every fixture request_id is a full RFC4122 UUIDv4', (label, relPath) => {
+    const source = readFileSync(join(process.cwd(), relPath), 'utf8')
+    expect(scanSource(source, label)).toEqual([])
   })
 })

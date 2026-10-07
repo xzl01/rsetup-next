@@ -21,12 +21,12 @@ const CONTRACT_USER = {
 const RID_ME = '123e4567-e89b-42d3-a456-426614174000';
 const RID_ME_2 = '345a6789-fa2c-44d6-b678-648836396222';
 const RID_LOGIN = '234f5678-e91b-43c5-a567-537725285111';
-const RID_PW = '456b789a-0b3d-45e7-c789-759947407333';
-const RID_LOGOUT = '567c89ab-1c4e-46f8-d89a-86aa58518444';
+const RID_PW = '456b789a-0b3d-45e7-8789-759947407333';
+const RID_LOGOUT = '567c89ab-1c4e-46f8-a89a-86aa58518444';
 const RID_LIST = '89afbcde-4f7b-49cb-8bcd-b9dd8b84b777';
 const RID_REVOKE = '9abcfdef-5a8c-4adc-9cde-c0ee9c95c888';
-const RID_ERR = '678d9abc-2d5f-47a9-e9ab-97bb69629555';
-const RID_NULL = '789eabcd-3e6a-48ba-fabc-a8cc7a73a666';
+const RID_ERR = '678d9abc-2d5f-47a9-99ab-97bb69629555';
+const RID_NULL = '789eabcd-3e6a-48ba-babc-a8cc7a73a666';
 
 const ME_DATA = {
   user: CONTRACT_USER,
