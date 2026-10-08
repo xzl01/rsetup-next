@@ -31,9 +31,11 @@ function fakeAuthStore(
 describe('client router hash synchronization & guards', () => {
   beforeEach(() => {
     window.location.hash = ''
+    vi.restoreAllMocks()
   })
   afterEach(() => {
     window.location.hash = ''
+    vi.restoreAllMocks()
   })
 
   it('redirects unauthenticated users to login and updates hash', () => {
@@ -180,6 +182,99 @@ describe('client router hash synchronization & guards', () => {
     router.cleanup()
   })
 
+  const adminSubRoutes: Array<{
+    name:
+      | 'admin-approvals'
+      | 'admin-groups'
+      | 'admin-users'
+      | 'admin-roles'
+      | 'admin-grants'
+      | 'admin-audit'
+      | 'admin-system'
+    hash: string
+  }> = [
+    { name: 'admin-approvals', hash: '#/admin/approvals' },
+    { name: 'admin-groups', hash: '#/admin/groups' },
+    { name: 'admin-users', hash: '#/admin/users' },
+    { name: 'admin-roles', hash: '#/admin/roles' },
+    { name: 'admin-grants', hash: '#/admin/grants' },
+    { name: 'admin-audit', hash: '#/admin/audit' },
+    { name: 'admin-system', hash: '#/admin/system' },
+  ]
+
+  describe.each(adminSubRoutes)(
+    'parameterized 7 admin subroutes $name',
+    ({ name, hash }) => {
+      beforeEach(() => {
+        window.location.hash = ''
+      })
+      afterEach(() => {
+        window.location.hash = ''
+      })
+
+      it(`allows admin to access ${name} via navigate and hashchange`, () => {
+        const auth = fakeAuthStore({
+          id: '323e4567-e89b-42d3-a456-426614174002',
+          username: 'admin',
+          must_change_password: false,
+          is_admin: true,
+          revision: '3',
+        })
+        const router = createRouter(auth)
+
+        // 1. Programmatic navigate
+        router.navigate({ name })
+        expect(router.currentRoute.value).toEqual({ name })
+        expect(window.location.hash).toBe(hash)
+
+        // 2. Hashchange navigation: test in a fresh router instance starting from hash
+        router.cleanup()
+        window.location.hash = hash
+        const router2 = createRouter(auth)
+        expect(router2.currentRoute.value).toEqual({ name })
+        expect(window.location.hash).toBe(hash)
+        router2.cleanup()
+      })
+
+      it(`blocks non-admin from accessing ${name} via navigate and hashchange, falling back via replaceState`, () => {
+        const auth = fakeAuthStore({
+          id: '223e4567-e89b-42d3-a456-426614174001',
+          username: 'operator',
+          must_change_password: false,
+          is_admin: false,
+          revision: '2',
+        })
+        window.location.hash = ''
+        const replaceSpy = vi.spyOn(window.history, 'replaceState')
+        const router = createRouter(auth)
+        replaceSpy.mockClear()
+
+        // 1. Hashchange direct navigation blocked
+        replaceSpy.mockClear()
+        window.location.hash = hash
+        window.dispatchEvent(new HashChangeEvent('hashchange'))
+        expect(router.currentRoute.value).toEqual({ name: 'devices' })
+        expect(window.location.hash).toBe('#/devices')
+        expect(replaceSpy).toHaveBeenCalledWith(null, '', '#/devices')
+
+        // 2. Programmatic navigate blocked when originating from another route
+        router.navigate({ name: 'tasks' })
+        expect(router.currentRoute.value).toEqual({ name: 'tasks' })
+        expect(window.location.hash).toBe('#/tasks')
+        replaceSpy.mockClear()
+
+        router.navigate({ name })
+        expect(router.currentRoute.value).toEqual({ name: 'devices' })
+        expect(window.location.hash).toBe('#/devices')
+        // Guard redirect should replaceState rather than pushing history
+        expect(replaceSpy).toHaveBeenCalledWith(null, '', '#/devices')
+
+        replaceSpy.mockRestore()
+        router.cleanup()
+      })
+    }
+  )
+
   it('handles window hashchange event and cleans up listener on cleanup', () => {
     const auth = fakeAuthStore({
       id: '323e4567-e89b-42d3-a456-426614174002',
@@ -311,6 +406,51 @@ describe('client router hash synchronization & guards', () => {
       expect(router.currentRoute.value).toEqual({ name: 'devices' })
       expect(window.location.hash).toBe('#/devices')
 
+      router.cleanup()
+    })
+
+    it('normalizes malformed hash using history.replaceState to prevent back-navigation traps', () => {
+      const auth = fakeAuthStore(adminUser)
+      const replaceSpy = vi.spyOn(window.history, 'replaceState')
+      const router = createRouter(auth)
+      replaceSpy.mockClear()
+
+      // Malformed device detail hash triggers automatic fallback to devices
+      window.location.hash = '#/devices/INVALID_HEX64_NOT_CANONICAL'
+      window.dispatchEvent(new HashChangeEvent('hashchange'))
+
+      expect(router.currentRoute.value).toEqual({ name: 'devices' })
+      expect(window.location.hash).toBe('#/devices')
+      // Must use replaceState instead of pushing a new history entry
+      expect(replaceSpy).toHaveBeenCalledWith(null, '', '#/devices')
+
+      replaceSpy.mockClear()
+
+      // Malformed task detail hash triggers automatic fallback to tasks
+      window.location.hash = '#/tasks/INVALID-UUID'
+      window.dispatchEvent(new HashChangeEvent('hashchange'))
+
+      expect(router.currentRoute.value).toEqual({ name: 'tasks' })
+      expect(window.location.hash).toBe('#/tasks')
+      expect(replaceSpy).toHaveBeenCalledWith(null, '', '#/tasks')
+
+      replaceSpy.mockRestore()
+      router.cleanup()
+    })
+
+    it('preserves history push on deliberate user navigation via router.navigate', () => {
+      const auth = fakeAuthStore(adminUser)
+      const replaceSpy = vi.spyOn(window.history, 'replaceState')
+      const router = createRouter(auth)
+      replaceSpy.mockClear()
+
+      // Deliberate user navigate to tasks should update location.hash (which pushes history) and not call replaceState
+      router.navigate({ name: 'tasks' })
+      expect(router.currentRoute.value).toEqual({ name: 'tasks' })
+      expect(window.location.hash).toBe('#/tasks')
+      expect(replaceSpy).not.toHaveBeenCalled()
+
+      replaceSpy.mockRestore()
       router.cleanup()
     })
   })

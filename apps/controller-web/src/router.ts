@@ -131,15 +131,24 @@ export function createRouter(auth: AuthStore): AppRouter {
     return target
   }
 
+  function syncHash(targetHash: string, replace: boolean = false): void {
+    if (typeof window === 'undefined') return
+    if (window.location.hash !== targetHash) {
+      if (replace && typeof window.history !== 'undefined' && typeof window.history.replaceState === 'function') {
+        window.history.replaceState(null, '', targetHash)
+      } else {
+        window.location.hash = targetHash
+      }
+    }
+  }
+
   function navigate(target: AppRoute): void {
     const allowed = guardRoute(target)
     currentRoute.value = allowed
     const targetHash = formatRouteToHash(allowed)
-    // 只有当计算出的目标 hash 与当前 window.location.hash 不一致时，才更新 window.location.hash
-    // 特别是在 status === checking 时，如果当前已有 hash 且匹配 target，绝不触发多余的 hash 更新
-    if (typeof window !== 'undefined' && window.location.hash !== targetHash) {
-      window.location.hash = targetHash
-    }
+    const isRedirect = JSON.stringify(target) !== JSON.stringify(allowed)
+    // 守卫重定向或纠错使用 replaceState，正常主动导航更新 location.hash (push)
+    syncHash(targetHash, isRedirect)
   }
 
   function onHashChange() {
@@ -151,14 +160,27 @@ export function createRouter(auth: AuthStore): AppRouter {
       if (window.location.hash === canonicalHash) {
         return
       }
+      // 地址栏是畸形 Hash 但解析结果相同（例如在 /devices 时访问 /devices/INVALID 或 /unknown）：
+      // 纠错重定向回 canonicalHash，必须使用 replaceState 避免后退陷阱
+      syncHash(canonicalHash, true)
+      return
     }
-    navigate(routeFromHash)
+    const allowed = guardRoute(routeFromHash)
+    currentRoute.value = allowed
+    const targetHash = formatRouteToHash(allowed)
+    const isRedirect = window.location.hash !== targetHash
+    // hashchange 下的 URL 规范化/守卫纠错使用 replaceState，保留已有合法 Hash 不动
+    syncHash(targetHash, isRedirect)
   }
 
   if (typeof window !== 'undefined') {
     window.addEventListener('hashchange', onHashChange)
     const initial = window.location.hash ? parseHash(window.location.hash) : resolveInitialRoute(auth.user.value)
-    navigate(initial)
+    const allowed = guardRoute(initial)
+    currentRoute.value = allowed
+    const targetHash = formatRouteToHash(allowed)
+    const isRedirect = window.location.hash !== targetHash
+    syncHash(targetHash, isRedirect)
   }
 
   // 监听认证状态动态变更（例如撤权、登出、强制改密、成功登录）
@@ -166,20 +188,28 @@ export function createRouter(auth: AuthStore): AppRouter {
     if (newStatus === 'checking') {
       return
     }
+    const updateAuthRoute = (target: AppRoute) => {
+      const allowed = guardRoute(target)
+      currentRoute.value = allowed
+      const targetHash = formatRouteToHash(allowed)
+      // 认证状态变更引起的路由修正属于自动守卫重定向，使用 replaceState
+      syncHash(targetHash, true)
+    }
+
     if (newStatus === 'signed_in') {
       // 检查当前路由是否受权限守卫许可（例如非管理员访问 admin 路由或已登录用户在 login/password）
-      navigate(currentRoute.value)
+      updateAuthRoute(currentRoute.value)
       return
     } else if (newStatus === 'force_password') {
-      navigate({ name: 'password' })
+      updateAuthRoute({ name: 'password' })
       return
     } else if (newStatus === 'signed_out') {
       if (currentRoute.value.name !== 'login') {
-        navigate({ name: 'login' })
+        updateAuthRoute({ name: 'login' })
       }
       return
     }
-    navigate(currentRoute.value)
+    updateAuthRoute(currentRoute.value)
   })
 
   function cleanup() {
