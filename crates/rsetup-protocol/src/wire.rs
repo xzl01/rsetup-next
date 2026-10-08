@@ -56,6 +56,10 @@ pub enum WireError {
     InvalidPingStatusCode(i32),
     #[error("ping response must have empty error_message and metadata")]
     InvalidPingResponseFields,
+    #[error("trace_id cannot be zero")]
+    InvalidTraceId,
+    #[error("non-response packet cannot carry status_code ({status_code}) or error_message")]
+    UnexpectedResponseFields { status_code: i32 },
 }
 
 pub fn validate_business_version(v: u32) -> Result<(), WireError> {
@@ -68,8 +72,18 @@ pub fn validate_business_version(v: u32) -> Result<(), WireError> {
 
 /// 结构合法性；最终 512KiB 整包校验必须在获审 codec 的实际 wire 边界进行
 pub fn validate_packet(packet: &TunnelPacket) -> Result<(), WireError> {
+    if packet.trace_id == 0 {
+        return Err(WireError::InvalidTraceId);
+    }
     if packet.kind == PacketType::Unknown {
         return Err(WireError::InvalidPacketType);
+    }
+    if packet.kind != PacketType::Response
+        && (packet.status_code != 0 || !packet.error_message.is_empty())
+    {
+        return Err(WireError::UnexpectedResponseFields {
+            status_code: packet.status_code,
+        });
     }
     if packet.action.is_empty() {
         return Err(WireError::ActionEmpty);
@@ -96,11 +110,15 @@ pub fn validate_packet(packet: &TunnelPacket) -> Result<(), WireError> {
             _ => return Err(WireError::InvalidAction),
         }
     } else {
-        // 普通业务 action 必须是由小写字母/数字/点分隔的合法动作，不得为 tunnel. 前缀
-        if packet
-            .action
-            .chars()
-            .any(|c| !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != '.')
+        // 普通业务 action 必须是由点分隔的段组成，每段非空且仅含小写字母或数字，不得为 tunnel. 前缀
+        if packet.action.starts_with('.')
+            || packet.action.ends_with('.')
+            || packet.action.split('.').any(|seg| {
+                seg.is_empty()
+                    || seg
+                        .chars()
+                        .any(|c| !c.is_ascii_lowercase() && !c.is_ascii_digit())
+            })
         {
             return Err(WireError::InvalidAction);
         }

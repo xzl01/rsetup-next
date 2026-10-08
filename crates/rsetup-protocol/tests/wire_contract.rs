@@ -103,6 +103,63 @@ fn validates_business_action_format_and_length() {
         validate_packet(&invalid_chars_action),
         Err(WireError::InvalidAction)
     );
+
+    // 点段边界测试：前缀点、后缀点、连续点、仅点
+    let dot_start_action = TunnelPacket {
+        trace_id: 1,
+        kind: PacketType::Request,
+        action: ".device.status".to_string(),
+        status_code: 0,
+        error_message: String::new(),
+        payload: vec![],
+        metadata: BTreeMap::new(),
+    };
+    assert_eq!(
+        validate_packet(&dot_start_action),
+        Err(WireError::InvalidAction)
+    );
+
+    let dot_end_action = TunnelPacket {
+        trace_id: 1,
+        kind: PacketType::Request,
+        action: "device.status.".to_string(),
+        status_code: 0,
+        error_message: String::new(),
+        payload: vec![],
+        metadata: BTreeMap::new(),
+    };
+    assert_eq!(
+        validate_packet(&dot_end_action),
+        Err(WireError::InvalidAction)
+    );
+
+    let consecutive_dots_action = TunnelPacket {
+        trace_id: 1,
+        kind: PacketType::Request,
+        action: "device..status".to_string(),
+        status_code: 0,
+        error_message: String::new(),
+        payload: vec![],
+        metadata: BTreeMap::new(),
+    };
+    assert_eq!(
+        validate_packet(&consecutive_dots_action),
+        Err(WireError::InvalidAction)
+    );
+
+    let only_dot_action = TunnelPacket {
+        trace_id: 1,
+        kind: PacketType::Request,
+        action: ".".to_string(),
+        status_code: 0,
+        error_message: String::new(),
+        payload: vec![],
+        metadata: BTreeMap::new(),
+    };
+    assert_eq!(
+        validate_packet(&only_dot_action),
+        Err(WireError::InvalidAction)
+    );
 }
 
 #[test]
@@ -400,4 +457,137 @@ fn validates_ping_requests_and_responses() {
         validate_packet(&ping_resp_with_meta),
         Err(WireError::InvalidPingResponseFields)
     );
+}
+
+#[test]
+fn rejects_zero_trace_id() {
+    let zero_trace = TunnelPacket {
+        trace_id: 0,
+        kind: PacketType::Request,
+        action: "device.status.get".to_string(),
+        status_code: 0,
+        error_message: String::new(),
+        payload: vec![],
+        metadata: BTreeMap::new(),
+    };
+    assert_eq!(validate_packet(&zero_trace), Err(WireError::InvalidTraceId));
+
+    let zero_trace_ping = TunnelPacket {
+        trace_id: 0,
+        kind: PacketType::Request,
+        action: "tunnel.ping".to_string(),
+        status_code: 0,
+        error_message: String::new(),
+        payload: vec![0u8; PING_NONCE_LEN],
+        metadata: BTreeMap::new(),
+    };
+    assert_eq!(
+        validate_packet(&zero_trace_ping),
+        Err(WireError::InvalidTraceId)
+    );
+}
+
+#[test]
+fn rejects_non_response_packet_with_response_fields() {
+    // Request with status_code != 0
+    let req_with_status = TunnelPacket {
+        trace_id: 1,
+        kind: PacketType::Request,
+        action: "device.status.get".to_string(),
+        status_code: 500,
+        error_message: String::new(),
+        payload: vec![],
+        metadata: BTreeMap::new(),
+    };
+    assert_eq!(
+        validate_packet(&req_with_status),
+        Err(WireError::UnexpectedResponseFields { status_code: 500 })
+    );
+
+    // Request with non-empty error_message
+    let req_with_err_msg = TunnelPacket {
+        trace_id: 1,
+        kind: PacketType::Request,
+        action: "device.status.get".to_string(),
+        status_code: 0,
+        error_message: "boom".to_string(),
+        payload: vec![],
+        metadata: BTreeMap::new(),
+    };
+    assert_eq!(
+        validate_packet(&req_with_err_msg),
+        Err(WireError::UnexpectedResponseFields { status_code: 0 })
+    );
+
+    // Event with status_code
+    let event_with_status = TunnelPacket {
+        trace_id: 1,
+        kind: PacketType::Event,
+        action: "telemetry.metric".to_string(),
+        status_code: 1,
+        error_message: String::new(),
+        payload: vec![],
+        metadata: BTreeMap::new(),
+    };
+    assert_eq!(
+        validate_packet(&event_with_status),
+        Err(WireError::UnexpectedResponseFields { status_code: 1 })
+    );
+
+    // System with error_message
+    let system_with_err = TunnelPacket {
+        trace_id: 1,
+        kind: PacketType::System,
+        action: "tunnel.kick".to_string(),
+        status_code: 0,
+        error_message: "kicked".to_string(),
+        payload: vec![],
+        metadata: BTreeMap::new(),
+    };
+    assert_eq!(
+        validate_packet(&system_with_err),
+        Err(WireError::UnexpectedResponseFields { status_code: 0 })
+    );
+
+    // Ping request with status_code != 0
+    let ping_req_with_status = TunnelPacket {
+        trace_id: 1,
+        kind: PacketType::Request,
+        action: "tunnel.ping".to_string(),
+        status_code: 400,
+        error_message: String::new(),
+        payload: vec![0u8; PING_NONCE_LEN],
+        metadata: BTreeMap::new(),
+    };
+    assert_eq!(
+        validate_packet(&ping_req_with_status),
+        Err(WireError::UnexpectedResponseFields { status_code: 400 })
+    );
+
+    // Ping request with non-empty error_message
+    let ping_req_with_err = TunnelPacket {
+        trace_id: 1,
+        kind: PacketType::Request,
+        action: "tunnel.ping".to_string(),
+        status_code: 0,
+        error_message: "fail".to_string(),
+        payload: vec![0u8; PING_NONCE_LEN],
+        metadata: BTreeMap::new(),
+    };
+    assert_eq!(
+        validate_packet(&ping_req_with_err),
+        Err(WireError::UnexpectedResponseFields { status_code: 0 })
+    );
+
+    // Valid Response with status_code and error_message should be OK
+    let valid_response = TunnelPacket {
+        trace_id: 1,
+        kind: PacketType::Response,
+        action: "device.status.get".to_string(),
+        status_code: 500,
+        error_message: "server error".to_string(),
+        payload: vec![],
+        metadata: BTreeMap::new(),
+    };
+    assert!(validate_packet(&valid_response).is_ok());
 }
