@@ -31,7 +31,7 @@ Identity Task 2 的仓储可先按现有 v3 编写并用类型/查询测试，�
 
 ## 4. 任务持久执行、证据与失败收敛
 
-预览固定设备清单并校验 1..=1024；提交事务原子校验预览 token、规范小写 UUIDv4 `Idempotency-Key`、当前账号与逐设备权限，使用唯一幂等键返回原任务，不因重试扩大目标。设备唯一操作锁竞争失败的目标记 `failed/DEVICE_BUSY`，不放入等待队列；事务内禁止网络。调度在有限槽位下重验准入、权限、控制流、能力、boot、期限与锁，prepare 返回票据保留 `boot_id`/`valid_for_ms`。prepare 后重新核验 `authz_epoch` 与锁，短事务提交 `dispatching` 意图及执行证据摘要；仅事务提交成功后，在事务外由当前进程至多一次发送 execute。发送结果超时/断线不能直接断定未执行。
+预览固定设备清单并校验 1..=1024；首次提交事务原子校验预览 token、规范小写 UUIDv4 `Idempotency-Key`、当前账号与逐设备权限。**相同 actor、相同 key、相同 preview 请求的重放须先命中已持久幂等记录返回原任务，即使预览已消费或过期；不同内容返回 409，不能再次消费预览或扩大目标。**首次提交才消费预览，设备唯一操作锁竞争失败的目标记 `failed/DEVICE_BUSY`，不放入等待队列；事务内禁止网络。调度在有限槽位下重验准入、权限、控制流、能力、boot、期限与锁，prepare 返回票据保留 `boot_id`/`valid_for_ms`。prepare 后重新核验 `authz_epoch` 与锁，短事务提交 `dispatching` 意图及执行证据摘要；仅事务提交成功后，在事务外由当前进程至多一次发送 execute。发送结果超时/断线不能直接断定未执行。
 
 板端任务按**已认证** controller 公钥与 sub_task_id 联合键去重；raw Protobuf 解码未获批时，类型化领域核心可以测试，但原始字节入口必须失败关闭，不以自定义编码器或固定业务 bytes 伪造互通。journal 首次初始化生成并可靠持久化 UUID `journal_epoch`，普通 agent 重启沿用，丢失/损坏重建才更换并上报 `JOURNAL_LOST`；`pre_boot_id` 在 `accepted` 即落盘。每次状态提交执行同目录临时文件写入→文件 `sync_all`→原子 rename→父目录 `sync_all`；rename 前确定失败与提交结果未知分开分类。仅可靠 `accepted` 可以答已接收；`attempted` 未可靠持久化前 OS 调用次数必须为零；提交不明断流待查，不返回伪未执行或虚假终态。测试使用 fake OS，宿主机真实 reboot 次数始终为零。重复同 ID 同请求返回持久记录，变更载荷同 ID 冲突；日志满拒绝新任务，不淘汰旧去重记录。
 
