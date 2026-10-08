@@ -1,5 +1,5 @@
-use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -137,22 +137,28 @@ mod tests {
         let role_operator_id = uuid::Uuid::new_v4();
 
         let mut roles = HashMap::new();
-        roles.insert(role_viewer_id, RoleRecord {
-            id: role_viewer_id,
-            name: "viewer".into(),
-            builtin: true,
-            archived: false,
-            revision: 1,
-            permissions: vec![Permission::DeviceRead, Permission::DeviceStatusRead],
-        });
-        roles.insert(role_operator_id, RoleRecord {
-            id: role_operator_id,
-            name: "operator".into(),
-            builtin: true,
-            archived: false,
-            revision: 1,
-            permissions: vec![Permission::DeviceReboot],
-        });
+        roles.insert(
+            role_viewer_id,
+            RoleRecord {
+                id: role_viewer_id,
+                name: "viewer".into(),
+                builtin: true,
+                archived: false,
+                revision: 1,
+                permissions: vec![Permission::DeviceRead, Permission::DeviceStatusRead],
+            },
+        );
+        roles.insert(
+            role_operator_id,
+            RoleRecord {
+                id: role_operator_id,
+                name: "operator".into(),
+                builtin: true,
+                archived: false,
+                revision: 1,
+                permissions: vec![Permission::DeviceReboot],
+            },
+        );
 
         // Grant 1: user has viewer role on Device A only
         // Grant 2: user has operator role on Device B only
@@ -176,11 +182,17 @@ mod tests {
         let perms_a = evaluate_grants(user, dev_a, &grants, &roles, &HashSet::new());
         assert!(perms_a.contains(&Permission::DeviceRead));
         assert!(perms_a.contains(&Permission::DeviceStatusRead));
-        assert!(!perms_a.contains(&Permission::DeviceReboot), "Device A must not inherit Device B reboot role");
+        assert!(
+            !perms_a.contains(&Permission::DeviceReboot),
+            "Device A must not inherit Device B reboot role"
+        );
 
         let perms_b = evaluate_grants(user, dev_b, &grants, &roles, &HashSet::new());
         assert!(perms_b.contains(&Permission::DeviceReboot));
-        assert!(!perms_b.contains(&Permission::DeviceRead), "Device B must not inherit Device A viewer role");
+        assert!(
+            !perms_b.contains(&Permission::DeviceRead),
+            "Device B must not inherit Device A viewer role"
+        );
     }
 
     #[test]
@@ -215,7 +227,10 @@ mod tests {
         let mut in_group = HashSet::new();
         in_group.insert(group_id);
         let perms_in = evaluate_grants(user, dev, &grants, &HashMap::new(), &in_group);
-        assert_eq!(perms_in, HashSet::from([Permission::DeviceRead, Permission::DeviceReboot]));
+        assert_eq!(
+            perms_in,
+            HashSet::from([Permission::DeviceRead, Permission::DeviceReboot])
+        );
     }
 
     #[test]
@@ -228,22 +243,28 @@ mod tests {
         let missing_role_id = uuid::Uuid::new_v4();
 
         let mut roles = HashMap::new();
-        roles.insert(active_role_id, RoleRecord {
-            id: active_role_id,
-            name: "active".into(),
-            builtin: false,
-            archived: false,
-            revision: 1,
-            permissions: vec![Permission::DeviceRead],
-        });
-        roles.insert(archived_role_id, RoleRecord {
-            id: archived_role_id,
-            name: "archived".into(),
-            builtin: false,
-            archived: true,
-            revision: 2,
-            permissions: vec![Permission::DeviceReboot],
-        });
+        roles.insert(
+            active_role_id,
+            RoleRecord {
+                id: active_role_id,
+                name: "active".into(),
+                builtin: false,
+                archived: false,
+                revision: 1,
+                permissions: vec![Permission::DeviceRead],
+            },
+        );
+        roles.insert(
+            archived_role_id,
+            RoleRecord {
+                id: archived_role_id,
+                name: "archived".into(),
+                builtin: false,
+                archived: true,
+                revision: 2,
+                permissions: vec![Permission::DeviceReboot],
+            },
+        );
 
         let grants = vec![
             GrantRecord {
@@ -278,7 +299,10 @@ mod tests {
 
         // Valid user gets active role + direct perms, but NOT archived or missing role
         let perms = evaluate_grants(user, dev, &grants, &roles, &HashSet::new());
-        assert_eq!(perms, HashSet::from([Permission::DeviceRead, Permission::DeviceStatusRead]));
+        assert_eq!(
+            perms,
+            HashSet::from([Permission::DeviceRead, Permission::DeviceStatusRead])
+        );
         assert!(!perms.contains(&Permission::DeviceReboot));
 
         // Different user / attacker receives empty set (cannot escalate or inherit other users' grants)
@@ -315,10 +339,22 @@ mod tests {
 
     #[test]
     fn permission_parse_and_serde() {
-        assert_eq!(Permission::parse("device.read"), Some(Permission::DeviceRead));
-        assert_eq!(Permission::parse("device.status.read"), Some(Permission::DeviceStatusRead));
-        assert_eq!(Permission::parse("device.reboot"), Some(Permission::DeviceReboot));
-        assert_eq!(Permission::parse("device.task.read"), Some(Permission::DeviceTaskRead));
+        assert_eq!(
+            Permission::parse("device.read"),
+            Some(Permission::DeviceRead)
+        );
+        assert_eq!(
+            Permission::parse("device.status.read"),
+            Some(Permission::DeviceStatusRead)
+        );
+        assert_eq!(
+            Permission::parse("device.reboot"),
+            Some(Permission::DeviceReboot)
+        );
+        assert_eq!(
+            Permission::parse("device.task.read"),
+            Some(Permission::DeviceTaskRead)
+        );
         assert_eq!(Permission::parse("invalid.perm"), None);
 
         assert_eq!(Permission::DeviceRead.as_str(), "device.read");
