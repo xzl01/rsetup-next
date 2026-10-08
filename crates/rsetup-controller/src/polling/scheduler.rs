@@ -9,12 +9,19 @@ struct ScheduledDevice {
 #[derive(Debug)]
 pub struct PollScheduler {
     period: Duration,
+    tick_cadence: Duration,
+    last_tick: Instant,
     overloaded: bool,
     devices: Vec<ScheduledDevice>,
 }
 
 impl PollScheduler {
-    pub fn new(origin: Instant, period: Duration, devices: Vec<[u8; 32]>) -> Self {
+    pub fn new(
+        origin: Instant,
+        period: Duration,
+        tick_cadence: Duration,
+        devices: Vec<[u8; 32]>,
+    ) -> Self {
         let n = devices.len();
         let scheduled = devices
             .into_iter()
@@ -38,6 +45,8 @@ impl PollScheduler {
 
         Self {
             period,
+            tick_cadence,
+            last_tick: origin,
             overloaded: false,
             devices: scheduled,
         }
@@ -52,6 +61,12 @@ impl PollScheduler {
     }
 
     pub fn due(&mut self, now: Instant) -> Vec<[u8; 32]> {
+        if now < self.last_tick || self.tick_cadence.is_zero() {
+            return Vec::new();
+        }
+        let paused = now.duration_since(self.last_tick) > self.tick_cadence;
+        self.last_tick = now;
+
         let mut ready = Vec::new();
         let is_zero_period = self.period.is_zero();
         let period_nanos = self.period.as_nanos();
@@ -68,14 +83,14 @@ impl PollScheduler {
             let elapsed = now.duration_since(next_due);
 
             if is_zero_period {
-                if !self.overloaded {
+                if !self.overloaded && !paused {
                     ready.push(dev.id);
                 }
                 dev.next_due = None;
                 continue;
             }
 
-            if self.overloaded || elapsed >= self.period {
+            if self.overloaded || paused || elapsed >= self.period {
                 // Overloaded or pause recovery: skip overdue cycles without burst/backlog, preserving phase
                 let missed_cycles = (elapsed.as_nanos() / period_nanos) + 1;
                 let advance = Self::mul_duration_u128(self.period, missed_cycles);
@@ -115,10 +130,115 @@ mod tests {
     }
 
     #[test]
+    fn five_second_pause_does_not_burst() {
+        let origin = Instant::now();
+        let mut s = PollScheduler::new(
+            origin,
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+            make_test_devices(1024),
+        );
+        let now = origin.checked_add(Duration::from_secs(5)).unwrap();
+        assert!(
+            s.due(now).is_empty(),
+            "paused tick cannot replay past phases"
+        );
+    }
+
+    #[test]
+    fn exact_period_pause_does_not_burst() {
+        let origin = Instant::now();
+        let mut s = PollScheduler::new(
+            origin,
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+            make_test_devices(1024),
+        );
+        let now = origin.checked_add(Duration::from_secs(10)).unwrap();
+        assert!(s.due(now).is_empty(), "missed period cannot flood one tick");
+    }
+
+    #[test]
+    fn five_second_pause_recovers_next_full_cycle_without_burst() {
+        let origin = Instant::now();
+        let mut s = PollScheduler::new(
+            origin,
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+            make_test_devices(1024),
+        );
+        let paused = origin.checked_add(Duration::from_secs(5)).unwrap();
+        assert!(s.due(paused).is_empty());
+        let mut seen = std::collections::HashSet::new();
+        for tick in 1..=100 {
+            let at = paused
+                .checked_add(Duration::from_millis(tick * 100))
+                .unwrap();
+            let batch = s.due(at);
+            assert!(batch.len() <= 11);
+            for id in batch {
+                assert!(seen.insert(id), "duplicate device in recovery period");
+            }
+        }
+        assert_eq!(seen.len(), 1024);
+        assert_eq!(s.backlog(), 0);
+    }
+
+    #[test]
+    fn exact_period_pause_recovers_next_full_cycle_without_burst() {
+        let origin = Instant::now();
+        let mut s = PollScheduler::new(
+            origin,
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+            make_test_devices(1024),
+        );
+        let paused = origin.checked_add(Duration::from_secs(10)).unwrap();
+        assert!(s.due(paused).is_empty());
+        let mut seen = std::collections::HashSet::new();
+        for tick in 1..=100 {
+            let at = paused
+                .checked_add(Duration::from_millis(tick * 100))
+                .unwrap();
+            let batch = s.due(at);
+            assert!(batch.len() <= 11);
+            for id in batch {
+                assert!(seen.insert(id), "duplicate device in recovery period");
+            }
+        }
+        assert_eq!(seen.len(), 1024);
+        assert_eq!(s.backlog(), 0);
+    }
+
+    #[test]
+    fn one_second_cadence_with_sixty_second_period_is_not_starved() {
+        let origin = Instant::now();
+        let mut s = PollScheduler::new(
+            origin,
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+            make_test_devices(60),
+        );
+        let mut seen = std::collections::HashSet::new();
+        for tick in 0..60 {
+            let at = origin.checked_add(Duration::from_secs(tick)).unwrap();
+            for id in s.due(at) {
+                assert!(seen.insert(id));
+            }
+        }
+        assert_eq!(seen.len(), 60);
+    }
+
+    #[test]
     fn overdue_after_pause_skips_without_backlog_and_keeps_distribution() {
         let origin = Instant::now();
         let devices = make_test_devices(1024);
-        let mut scheduler = PollScheduler::new(origin, Duration::from_secs(10), devices);
+        let mut scheduler = PollScheduler::new(
+            origin,
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+            devices,
+        );
 
         let pause_now = origin
             .checked_add(Duration::from_secs(30))
@@ -159,7 +279,12 @@ mod tests {
     fn normal_tick_due_emits_ready_devices_without_starvation() {
         let origin = Instant::now();
         let devices = make_test_devices(1024);
-        let mut scheduler = PollScheduler::new(origin, Duration::from_secs(10), devices);
+        let mut scheduler = PollScheduler::new(
+            origin,
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+            devices,
+        );
 
         // 正常到期下发测试：在首个 100ms tick，严格分配到该窗口的设备必须正常 emit，绝不能因跳轮逻辑误判而饿死
         let first_tick = origin.checked_add(Duration::from_millis(100)).unwrap();
@@ -175,7 +300,12 @@ mod tests {
     fn overload_skips_without_backlog_or_phase_collapse() {
         let origin = Instant::now();
         let devices = make_test_devices(1024);
-        let mut scheduler = PollScheduler::new(origin, Duration::from_secs(10), devices);
+        let mut scheduler = PollScheduler::new(
+            origin,
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+            devices,
+        );
 
         let pause_now = origin
             .checked_add(Duration::from_secs(30))
@@ -220,9 +350,14 @@ mod tests {
     fn duplicate_due_call_in_same_cycle_does_not_double_emit() {
         let origin = Instant::now();
         let devices = make_test_devices(100);
-        let mut scheduler = PollScheduler::new(origin, Duration::from_secs(10), devices);
+        let mut scheduler = PollScheduler::new(
+            origin,
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+            devices,
+        );
 
-        let tick = origin.checked_add(Duration::from_millis(500)).unwrap();
+        let tick = origin.checked_add(Duration::from_millis(100)).unwrap();
         let batch1 = scheduler.due(tick);
         assert!(!batch1.is_empty());
 
@@ -239,13 +374,19 @@ mod tests {
         let origin = Instant::now();
 
         // 空设备
-        let mut empty_scheduler = PollScheduler::new(origin, Duration::from_secs(10), Vec::new());
+        let mut empty_scheduler = PollScheduler::new(
+            origin,
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+            Vec::new(),
+        );
         assert!(empty_scheduler.due(origin).is_empty());
         assert_eq!(empty_scheduler.backlog(), 0);
 
-        // 零周期
+        // 零周期在正 cadence 下只单发一次
         let devices = make_test_devices(10);
-        let mut zero_scheduler = PollScheduler::new(origin, Duration::ZERO, devices);
+        let mut zero_scheduler =
+            PollScheduler::new(origin, Duration::ZERO, Duration::from_millis(100), devices);
         let first = zero_scheduler.due(origin);
         assert_eq!(first.len(), 10);
         assert_eq!(zero_scheduler.backlog(), 0);
@@ -253,5 +394,41 @@ mod tests {
         // 重复调用不双发也不 panic
         let second = zero_scheduler.due(origin);
         assert!(second.is_empty());
+    }
+
+    #[test]
+    fn zero_cadence_fails_closed() {
+        let origin = Instant::now();
+        let devices = make_test_devices(10);
+        let mut scheduler =
+            PollScheduler::new(origin, Duration::from_secs(10), Duration::ZERO, devices);
+        assert!(scheduler.due(origin).is_empty());
+        let next_tick = origin.checked_add(Duration::from_secs(1)).unwrap();
+        assert!(scheduler.due(next_tick).is_empty());
+    }
+
+    #[test]
+    fn reversed_now_fails_closed_without_replaying_past_cycle() {
+        let origin = Instant::now();
+        let devices = make_test_devices(1024);
+        let mut scheduler = PollScheduler::new(
+            origin,
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+            devices,
+        );
+
+        let tick1 = origin.checked_add(Duration::from_millis(100)).unwrap();
+        let batch1 = scheduler.due(tick1);
+        assert!(!batch1.is_empty());
+
+        // 倒退时间：now < last_tick
+        let past = origin;
+        assert!(scheduler.due(past).is_empty());
+
+        // 倒退后恢复正常推进：tick2 = tick1 + 100ms
+        let tick2 = tick1.checked_add(Duration::from_millis(100)).unwrap();
+        let batch2 = scheduler.due(tick2);
+        assert!(!batch2.is_empty());
     }
 }
