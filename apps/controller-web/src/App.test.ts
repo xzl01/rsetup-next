@@ -70,17 +70,24 @@ afterEach(() => {
   document.documentElement.removeAttribute('lang');
 });
 
-test('checking state: mount triggers exactly one GET /auth/me and shows a safe waiting status', () => {
+test('checking state: mount triggers exactly one GET /auth/me and shows a safe waiting status without rendering protected content', () => {
+  window.location.hash = '#/tasks';
   // 永不 resolve 的 fetch：状态在断言期间确定停留在 checking，无异步竞态。
   const fetcher = vi.fn((_input: RequestInfo | URL) => new Promise<Response>(() => {}));
   vi.stubGlobal('fetch', fetcher);
   render(App);
   expect(screen.getByRole('status').textContent).toContain('正在检查登录状态');
   expect(screen.queryByRole('form')).toBeNull();
+  // 保护内容绝不被渲染
+  expect(screen.queryByRole('heading', { name: '已登录' })).toBeNull();
+  expect(screen.queryByText('尚未连接业务服务')).toBeNull();
+  expect(screen.queryByRole('heading', { name: '登录会话' })).toBeNull();
   // 密码框按可访问 label 查询：钉住的 dom-accessibility-api 0.5.x 不把 type=password 映射为 textbox 角色。
   expect(screen.queryByLabelText('密码')).toBeNull();
   expect(fetcher).toHaveBeenCalledOnce();
   expect(String(fetcher.mock.calls[0]?.[0])).toContain('/api/v1/auth/me');
+  // hash 路由未被强行修改为 login
+  expect(window.location.hash).toBe('#/tasks');
 });
 
 test('signed_in state: no forms, shows user and logout; logout returns to the login form, no device data surface', async () => {
@@ -137,6 +144,61 @@ test('login form: submit posts credentials, error uses the safe mapped message, 
   expect(screen.queryByRole('form')).toBeNull();
 });
 
+test('login in-flight checking state does NOT unmount LoginView; deferred 401 preserves username, clears password, and shows button loading without leak', async () => {
+  let deferredLoginResolve!: (r: Response) => void;
+  const deferredLoginPromise = new Promise<Response>((r) => {
+    deferredLoginResolve = r;
+  });
+
+  const fetcher = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit): Promise<Response> => {
+    const url = String(input);
+    if (url.includes('/auth/me')) {
+      return jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: RID_ERR }, 401);
+    }
+    if (url.includes('/auth/login')) {
+      return deferredLoginPromise;
+    }
+    throw new TypeError(`unexpected fetch ${url}`);
+  });
+  vi.stubGlobal('fetch', fetcher);
+
+  render(App);
+  await vi.waitFor(() => expect(screen.getByRole('form')).toBeTruthy());
+
+  await fireEvent.update(screen.getByRole('textbox', { name: '用户名' }), 'testuser');
+  await fireEvent.update(screen.getByLabelText('密码') as HTMLInputElement, 'sensitive_pass_123');
+
+  const submitButton = screen.getByRole('button', { name: '登录' });
+  await fireEvent.click(submitButton);
+
+  // RED 断言：在 login in-flight 阶段（auth.status === 'checking'），LoginView 不得被卸载成全页 AppNotice！
+  // 表单依然存在在文档中
+  expect(screen.queryByRole('form')).not.toBeNull();
+  expect(screen.getByRole('heading', { name: '登录' })).toBeTruthy();
+  // 全局 checking notice 不应该取代登录表单
+  expect(screen.queryByText('正在检查登录状态')).toBeNull();
+
+  // 按钮处于 loading 状态（aria-busy="true" 或包含处理中）
+  expect(submitButton.getAttribute('aria-busy')).toBe('true');
+
+  // 口令内容绝不泄露到 DOM 其他文本区域
+  expect(document.body.textContent).not.toContain('sensitive_pass_123');
+
+  // 现在 resolve 401 INVALID_CREDENTIALS
+  deferredLoginResolve(
+    jsonResponse({ error: { code: 'INVALID_CREDENTIALS', message_key: 'errors.invalidCredentials' }, request_id: RID_ERR }, 401)
+  );
+
+  // 等待 401 处理完成
+  await vi.waitFor(() => expect(screen.getByRole('alert').textContent).toContain('用户名或密码不正确'));
+
+  // 401 后：用户名保留、密码清空、按钮 loading 恢复
+  expect((screen.getByRole('textbox', { name: '用户名' }) as HTMLInputElement).value).toBe('testuser');
+  expect((screen.getByLabelText('密码') as HTMLInputElement).value).toBe('');
+  expect(submitButton.getAttribute('aria-busy')).toBe('false');
+  expect(document.body.textContent).not.toContain('sensitive_pass_123');
+});
+
 test('signed_in state: csrf/session stay in memory only, never in localStorage (changePassword 成功路径已由 auth.test.ts 锁定)', async () => {
   let me = 0;
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
@@ -181,6 +243,29 @@ test('language switch translates the auth page and accessible names without re-f
   expect(document.documentElement.lang).toBe('en');
   expect(localStorage.getItem('rsetup.controller.locale')).toBe('en');
   expect(fetcher).toHaveBeenCalledOnce();
+});
+
+test('skip-link keyboard activation focuses main element without clobbering existing hash route', async () => {
+  window.location.hash = '#/sessions';
+  fetchForMe(jsonResponse({ data: ME_DATA, request_id: RID_ME }));
+  render(App);
+
+  await vi.waitFor(() => expect(screen.getByRole('heading', { name: '登录会话' })).toBeTruthy());
+  expect(window.location.hash).toBe('#/sessions');
+
+  const skipLink = screen.getByRole('link', { name: '跳至主要内容' });
+  const mainElement = screen.getByRole('main');
+
+  // Trigger keyboard activation (Enter key on skip link)
+  await fireEvent.keyDown(skipLink, { key: 'Enter', code: 'Enter' });
+  await fireEvent.click(skipLink);
+
+  // Assert main element received focus
+  expect(document.activeElement).toBe(mainElement);
+
+  // Assert current route hash is NOT wiped or replaced by #main-content
+  expect(window.location.hash).toBe('#/sessions');
+  expect(screen.getByRole('heading', { name: '登录会话' })).toBeTruthy();
 });
 
 test('login submit clears the password field on both failed and successful attempts', async () => {
@@ -303,6 +388,12 @@ test('force_password: network failure on submit is an unknown outcome — error 
 });
 
 describe('signed_in session management UI (Task 5)', () => {
+  beforeEach(() => {
+    window.location.hash = '#/sessions';
+  });
+  afterEach(() => {
+    window.location.hash = '';
+  });
   const SESSIONS_MOCK = {
     items: [
       { id: '1'.repeat(64), current: true, created_time: '2026-10-05T10:00:00Z' },

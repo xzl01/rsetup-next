@@ -46,6 +46,94 @@ describe('client router hash synchronization & guards', () => {
     router.cleanup()
   })
 
+  it('preserves bookmarked route on initial mount when status is checking, without rewriting hash to login', () => {
+    window.location.hash = '#/tasks'
+    const auth = fakeAuthStore(null, 'checking')
+    const router = createRouter(auth)
+    expect(window.location.hash).toBe('#/tasks')
+    expect(router.currentRoute.value).toEqual({ name: 'tasks' })
+    router.cleanup()
+  })
+
+  it('preserves bookmarked canonical hex64 device route on initial mount when status is checking', () => {
+    const validHex64 = '0123456789abcdef'.repeat(4)
+    window.location.hash = `#/devices/${validHex64}`
+    const auth = fakeAuthStore(null, 'checking')
+    const router = createRouter(auth)
+    expect(window.location.hash).toBe(`#/devices/${validHex64}`)
+    expect(router.currentRoute.value).toEqual({
+      name: 'device-detail',
+      params: { id: validHex64 },
+    })
+    router.cleanup()
+  })
+
+  it('restores bookmarked route upon refresh success and redirects on 401 or force_password', async () => {
+    window.location.hash = '#/tasks'
+    const auth = fakeAuthStore(null, 'checking')
+    const router = createRouter(auth)
+    expect(router.currentRoute.value).toEqual({ name: 'tasks' })
+
+    // Case 1: refresh succeeds with signed_in
+    auth.user.value = {
+      id: '323e4567-e89b-42d3-a456-426614174002',
+      username: 'admin',
+      must_change_password: false,
+      is_admin: true,
+      revision: '3',
+    }
+    auth.status.value = 'signed_in'
+    await (new Promise((resolve) => setTimeout(resolve, 0)))
+    expect(router.currentRoute.value).toEqual({ name: 'tasks' })
+    expect(window.location.hash).toBe('#/tasks')
+
+    // Case 2: status changes to force_password -> redirects to password
+    auth.user.value = {
+      ...auth.user.value,
+      must_change_password: true,
+    }
+    auth.status.value = 'force_password'
+    await (new Promise((resolve) => setTimeout(resolve, 0)))
+    expect(router.currentRoute.value).toEqual({ name: 'password' })
+    expect(window.location.hash).toBe('#/password')
+
+    // Case 3: status changes to signed_out -> redirects to login
+    auth.user.value = null
+    auth.status.value = 'signed_out'
+    await (new Promise((resolve) => setTimeout(resolve, 0)))
+    expect(router.currentRoute.value).toEqual({ name: 'login' })
+    expect(window.location.hash).toBe('#/login')
+
+    router.cleanup()
+  })
+
+  it('redirects signed_in users visiting login or password routes back to devices', () => {
+    const auth = fakeAuthStore({
+      id: '323e4567-e89b-42d3-a456-426614174002',
+      username: 'admin',
+      must_change_password: false,
+      is_admin: false,
+      revision: '1',
+    }, 'signed_in')
+    const router = createRouter(auth)
+
+    router.navigate({ name: 'login' })
+    expect(router.currentRoute.value).toEqual({ name: 'devices' })
+    expect(window.location.hash).toBe('#/devices')
+
+    router.navigate({ name: 'password' })
+    expect(router.currentRoute.value).toEqual({ name: 'devices' })
+    expect(window.location.hash).toBe('#/devices')
+
+    // Hash change to #/login also redirected
+    window.location.hash = '#/login'
+    window.dispatchEvent(new HashChangeEvent('hashchange'))
+    expect(router.currentRoute.value).toEqual({ name: 'devices' })
+    expect(window.location.hash).toBe('#/devices')
+
+    router.cleanup()
+  })
+
   it('strictly forces users with must_change_password to password view', () => {
     const auth = fakeAuthStore({
       id: '123e4567-e89b-42d3-a456-426614174000',
@@ -153,6 +241,11 @@ describe('client router hash synchronization & guards', () => {
         params: { id: validHex64 },
       })
 
+      // Programmatic navigate with invalid id also fails closed
+      router.navigate({ name: 'device-detail', params: { id: 'invalid-id' } })
+      expect(router.currentRoute.value).toEqual({ name: 'devices' })
+      expect(window.location.hash).toBe('#/devices')
+
       // Uppercase hex64 fails closed (spec requires lowercase hex64)
       const upperHex64 = '0123456789ABCDEF'.repeat(4)
       window.location.hash = `#/devices/${upperHex64}`
@@ -177,6 +270,11 @@ describe('client router hash synchronization & guards', () => {
         name: 'task-detail',
         params: { id: validTaskUuid },
       })
+
+      // Programmatic navigate with invalid task id also fails closed
+      router.navigate({ name: 'task-detail', params: { id: 'invalid-task' } })
+      expect(router.currentRoute.value).toEqual({ name: 'tasks' })
+      expect(window.location.hash).toBe('#/tasks')
 
       // Non-v4 UUID (version 1) or uppercase fails closed
       const nonV4Uuid = 'a1234567-e89b-12d3-a456-426614174099'

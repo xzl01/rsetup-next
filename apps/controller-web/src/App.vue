@@ -7,18 +7,19 @@ import PasswordView from './views/PasswordView.vue'
 import SessionsView from './views/SessionsView.vue'
 import { createI18n, type Locale } from './i18n'
 import { createAuth } from './auth'
-import { createRouter } from './router'
+import { createRouter, type AppRoute } from './router'
 
 const { locale, t, setLocale } = createI18n()
 const auth = createAuth()
 const router = createRouter(auth)
 
 const busy = ref(false)
+const sessionChecked = ref(false)
 
 watch(
-  () => auth.status.value,
-  (newStatus) => {
-    if (newStatus === 'signed_in') {
+  () => [auth.status.value, router.currentRoute.value.name] as const,
+  ([newStatus, routeName]) => {
+    if (newStatus === 'signed_in' && routeName === 'sessions') {
       void auth.listSessions()
     }
   },
@@ -27,6 +28,18 @@ watch(
 
 function changeLocale(event: Event) {
   setLocale((event.target as HTMLSelectElement).value as Locale)
+}
+
+function handleSkipLink(event: Event) {
+  event.preventDefault()
+  const main = document.getElementById('main-content')
+  if (main) {
+    main.focus()
+  }
+}
+
+function navigateTo(route: AppRoute) {
+  router.navigate(route)
 }
 
 async function submitLogout() {
@@ -39,8 +52,21 @@ async function submitLogout() {
   }
 }
 
-onMounted(() => {
-  void auth.refresh()
+async function retryRefresh() {
+  sessionChecked.value = false
+  try {
+    await auth.refresh()
+  } finally {
+    sessionChecked.value = true
+  }
+}
+
+onMounted(async () => {
+  try {
+    await auth.refresh()
+  } finally {
+    sessionChecked.value = true
+  }
 })
 
 onUnmounted(() => {
@@ -49,7 +75,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <a class="skip-link" href="#main-content">{{ t('nav.skip') }}</a>
+  <a class="skip-link" href="#main-content" @click.prevent="handleSkipLink" @keydown.enter.prevent="handleSkipLink">{{ t('nav.skip') }}</a>
   <header class="app-header">
     <h1>{{ t('app.title') }}</h1>
     <label for="app-language">{{ t('language.label') }}</label>
@@ -59,7 +85,7 @@ onUnmounted(() => {
     </select>
   </header>
   <main id="main-content" class="app-main" tabindex="-1">
-    <template v-if="auth.status.value === 'checking'">
+    <template v-if="!sessionChecked && auth.status.value === 'checking'">
       <AppNotice :tone-label="locale === 'en' ? 'Status' : '状态'"
         :title="t('state.loading')">
         <span>{{ t('auth.checking') }}</span>
@@ -69,7 +95,7 @@ onUnmounted(() => {
       <AppNotice :tone-label="locale === 'en' ? 'Status' : '状态'"
         :title="t('state.error')">
         <span>{{ t('auth.error.generic') }}</span>
-        <BaseButton class="auth-retry" :loading-label="t('button.loading')" @click="() => void auth.refresh()">
+        <BaseButton class="auth-retry" :loading-label="t('button.loading')" @click="retryRefresh">
           {{ t('state.retry') }}
         </BaseButton>
       </AppNotice>
@@ -83,8 +109,24 @@ onUnmounted(() => {
     <section v-else class="auth-signed-in">
       <h2>{{ t('auth.signedIn.heading') }}</h2>
       <p role="status">{{ auth.user.value?.display_name || auth.user.value?.username }}</p>
+      <nav aria-label="Account Navigation" class="auth-nav">
+        <BaseButton
+          variant="secondary"
+          :disabled="busy"
+          @click="() => navigateTo({ name: 'sessions' })"
+        >
+          {{ t('auth.sessions.title') }}
+        </BaseButton>
+      </nav>
       <BaseButton :loading="busy" :loading-label="t('button.loading')" @click="submitLogout">{{ t('auth.logout.label') }}</BaseButton>
-      <SessionsView :auth="auth" :locale="locale" :t="t" />
+      <template v-if="router.currentRoute.value.name === 'sessions'">
+        <SessionsView :auth="auth" :locale="locale" :t="t" />
+      </template>
+      <template v-else>
+        <div class="app-placeholder">
+          <p>{{ t('app.notConnected') }}</p>
+        </div>
+      </template>
     </section>
   </main>
   <footer class="app-footer">{{ t('app.title') }}</footer>
@@ -112,5 +154,8 @@ onUnmounted(() => {
 .app-header h1 { margin: 0; flex-basis: 100%; }
 .app-header select { max-width: 100%; min-height: 2.75rem; font: inherit; }
 .auth-signed-in { display: grid; gap: var(--space-4); min-width: 0; }
+.auth-nav { display: flex; gap: var(--space-2); }
 .auth-retry { margin-inline-start: auto; }
+.app-placeholder { display: grid; gap: var(--space-2); padding: var(--space-4); border: 1px dashed var(--color-border, #ccc); border-radius: 4px; }
+.app-placeholder p { margin: 0; color: var(--color-text-muted, #666); }
 </style>

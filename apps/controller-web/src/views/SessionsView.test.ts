@@ -127,4 +127,22 @@ describe('SessionsView component', () => {
     await fireEvent.click(screen.getByRole('button', { name: '加载更多' }))
     expect(auth.listSessions).toHaveBeenCalledWith('next-cursor-xyz')
   })
+
+  it('renders error notice with working retry button and links busy loading state', async () => {
+    const auth = fakeAuthStore([], null, false, 'NETWORK_ERROR')
+    const i18n = createI18n()
+    render(SessionsView, {
+      props: {
+        auth,
+        locale: i18n.locale.value,
+        t: i18n.t,
+      },
+    })
+
+    expect(screen.getByText('无法完成操作，请稍后重试')).toBeTruthy()
+    const retryBtn = screen.getByRole('button', { name: '重试' })
+    expect(retryBtn).toBeTruthy()
+    await fireEvent.click(retryBtn)
+    expect(auth.listSessions).toHaveBeenCalled()
+  })
 })

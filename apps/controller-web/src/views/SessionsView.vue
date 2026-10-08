@@ -44,6 +44,16 @@ async function loadMoreSessions() {
     busy.value = false
   }
 }
+
+async function retrySessions() {
+  if (busy.value) return
+  busy.value = true
+  try {
+    await props.auth.listSessions()
+  } finally {
+    busy.value = false
+  }
+}
 </script>
 
 <template>
@@ -70,7 +80,7 @@ async function loadMoreSessions() {
           :disabled="busy"
           :loading="busy && auth.sessionsLoading.value"
           :loading-label="t('button.loading')"
-          @click="() => void auth.listSessions()"
+          @click="retrySessions"
         >
           {{ t('state.retry') }}
         </BaseButton>
