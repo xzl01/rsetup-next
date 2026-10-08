@@ -109,7 +109,7 @@ onUnmounted(() => {
     <section v-else class="auth-signed-in">
       <h2>{{ t('auth.signedIn.heading') }}</h2>
       <p role="status">{{ auth.user.value?.display_name || auth.user.value?.username }}</p>
-      <nav aria-label="Account Navigation" class="auth-nav">
+      <nav :aria-label="t('auth.sessions.title')" class="auth-nav">
         <BaseButton
           variant="secondary"
           :disabled="busy"

@@ -245,6 +245,23 @@ test('language switch translates the auth page and accessible names without re-f
   expect(fetcher).toHaveBeenCalledOnce();
 });
 
+test('signed_in language switch translates navigation accessible name according to dictionary without hardcoded English', async () => {
+  fetchForMe(jsonResponse({ data: ME_DATA, request_id: RID_ME }));
+  render(App);
+  await vi.waitFor(() => expect(screen.getByRole('status').textContent).toContain('admin'));
+
+  // In zh-CN, navigation accessible name must match localized dictionary, not hardcoded English "Account Navigation"
+  expect(screen.queryByRole('navigation', { name: 'Account Navigation' })).toBeNull();
+  const navZh = screen.getByRole('navigation', { name: '登录会话' });
+  expect(navZh).toBeTruthy();
+
+  // Switch language to en
+  await fireEvent.update(screen.getByRole('combobox', { name: '语言' }), 'en');
+  expect(screen.queryByRole('navigation', { name: 'Account Navigation' })).toBeNull();
+  const navEn = screen.getByRole('navigation', { name: 'Active sessions' });
+  expect(navEn).toBeTruthy();
+});
+
 test('skip-link keyboard activation focuses main element without clobbering existing hash route', async () => {
   window.location.hash = '#/sessions';
   fetchForMe(jsonResponse({ data: ME_DATA, request_id: RID_ME }));

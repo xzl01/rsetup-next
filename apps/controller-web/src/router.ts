@@ -145,9 +145,12 @@ export function createRouter(auth: AuthStore): AppRouter {
   function onHashChange() {
     if (typeof window === 'undefined') return
     const routeFromHash = parseHash(window.location.hash)
-    // 如果解析出的路由与 currentRoute 相同，不需要重复 navigate
+    // 如果解析出的路由与 currentRoute 相同且地址栏已是规范 Hash，不需要重复 navigate
     if (JSON.stringify(routeFromHash) === JSON.stringify(currentRoute.value)) {
-      return
+      const canonicalHash = formatRouteToHash(currentRoute.value)
+      if (window.location.hash === canonicalHash) {
+        return
+      }
     }
     navigate(routeFromHash)
   }

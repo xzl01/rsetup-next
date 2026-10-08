@@ -230,7 +230,7 @@ describe('client router hash synchronization & guards', () => {
       revision: '3',
     }
 
-    it('accepts canonical lowercase hex64 device id and rejects malformed ones by falling back to devices', () => {
+    it('accepts canonical lowercase hex64 device id and rejects malformed ones by falling back to devices and normalizing hash', () => {
       const auth = fakeAuthStore(adminUser)
       const router = createRouter(auth)
       const validHex64 = '0123456789abcdef'.repeat(4) // 64 chars
@@ -251,16 +251,18 @@ describe('client router hash synchronization & guards', () => {
       window.location.hash = `#/devices/${upperHex64}`
       window.dispatchEvent(new HashChangeEvent('hashchange'))
       expect(router.currentRoute.value).toEqual({ name: 'devices' })
+      expect(window.location.hash).toBe('#/devices')
 
       // Short or malformed id fails closed
       window.location.hash = '#/devices/dev-123'
       window.dispatchEvent(new HashChangeEvent('hashchange'))
       expect(router.currentRoute.value).toEqual({ name: 'devices' })
+      expect(window.location.hash).toBe('#/devices')
 
       router.cleanup()
     })
 
-    it('accepts canonical UUIDv4 task id and rejects malformed ones by falling back to tasks', () => {
+    it('accepts canonical UUIDv4 task id and rejects malformed ones by falling back to tasks and normalizing hash', () => {
       const auth = fakeAuthStore(adminUser)
       const router = createRouter(auth)
       const validTaskUuid = 'a1234567-e89b-42d3-a456-426614174099'
@@ -281,21 +283,34 @@ describe('client router hash synchronization & guards', () => {
       window.location.hash = `#/tasks/${nonV4Uuid}`
       window.dispatchEvent(new HashChangeEvent('hashchange'))
       expect(router.currentRoute.value).toEqual({ name: 'tasks' })
+      expect(window.location.hash).toBe('#/tasks')
 
       // Short id fails closed
       window.location.hash = '#/tasks/task-456'
       window.dispatchEvent(new HashChangeEvent('hashchange'))
       expect(router.currentRoute.value).toEqual({ name: 'tasks' })
+      expect(window.location.hash).toBe('#/tasks')
 
       router.cleanup()
     })
 
-    it('fails closed to devices when unknown path is requested for authenticated user', () => {
+    it('fails closed to devices when unknown path is requested for authenticated user and normalizes URL hash', () => {
       const auth = fakeAuthStore(adminUser)
       const router = createRouter(auth)
+      expect(router.currentRoute.value).toEqual({ name: 'devices' })
+      expect(window.location.hash).toBe('#/devices')
+
+      // Malformed or unknown hash when currentRoute is already devices
+      window.location.hash = '#/devices/INVALID'
+      window.dispatchEvent(new HashChangeEvent('hashchange'))
+      expect(router.currentRoute.value).toEqual({ name: 'devices' })
+      expect(window.location.hash).toBe('#/devices')
+
       window.location.hash = '#/unknown/something'
       window.dispatchEvent(new HashChangeEvent('hashchange'))
       expect(router.currentRoute.value).toEqual({ name: 'devices' })
+      expect(window.location.hash).toBe('#/devices')
+
       router.cleanup()
     })
   })
