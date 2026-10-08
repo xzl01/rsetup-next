@@ -27,6 +27,8 @@ const RID_LIST = '89afbcde-4f7b-49cb-8bcd-b9dd8b84b777';
 const RID_REVOKE = '9abcfdef-5a8c-4adc-9cde-c0ee9c95c888';
 const RID_ERR = '678d9abc-2d5f-47a9-99ab-97bb69629555';
 const RID_NULL = '789eabcd-3e6a-48ba-babc-a8cc7a73a666';
+const RID_DEV_DETAIL = 'abcdef01-2345-4678-9abc-def012345678';
+const RID_DEV_STATUS = '456789ab-cdef-4123-8456-789abcdef012';
 
 const ME_DATA = {
   user: CONTRACT_USER,
@@ -53,6 +55,7 @@ function fetchForMe(meResponse: Response, loginResponse?: (init?: RequestInit) =
     if (url.includes('/auth/password')) return passwordResponse ? passwordResponse(init) : jsonResponse({ data: { changed: true }, request_id: RID_PW });
     if (url.includes('/auth/logout')) return jsonResponse({ data: { logged_out: true }, request_id: RID_LOGOUT });
     if (url.includes('/auth/sessions')) return jsonResponse({ data: { items: [], next_cursor: null }, request_id: RID_LIST });
+    if (url.includes('/devices')) return jsonResponse({ data: { items: [], next_cursor: null }, request_id: RID_LIST });
     throw new TypeError(`unexpected fetch ${url}`);
   });
   vi.stubGlobal('fetch', fetcher);
@@ -70,17 +73,24 @@ afterEach(() => {
   document.documentElement.removeAttribute('lang');
 });
 
-test('checking state: mount triggers exactly one GET /auth/me and shows a safe waiting status', () => {
+test('checking state: mount triggers exactly one GET /auth/me and shows a safe waiting status without rendering protected content', () => {
+  window.location.hash = '#/tasks';
   // 永不 resolve 的 fetch：状态在断言期间确定停留在 checking，无异步竞态。
   const fetcher = vi.fn((_input: RequestInfo | URL) => new Promise<Response>(() => {}));
   vi.stubGlobal('fetch', fetcher);
   render(App);
   expect(screen.getByRole('status').textContent).toContain('正在检查登录状态');
   expect(screen.queryByRole('form')).toBeNull();
+  // 保护内容绝不被渲染
+  expect(screen.queryByRole('heading', { name: '已登录' })).toBeNull();
+  expect(screen.queryByText('尚未连接业务服务')).toBeNull();
+  expect(screen.queryByRole('heading', { name: '登录会话' })).toBeNull();
   // 密码框按可访问 label 查询：钉住的 dom-accessibility-api 0.5.x 不把 type=password 映射为 textbox 角色。
   expect(screen.queryByLabelText('密码')).toBeNull();
   expect(fetcher).toHaveBeenCalledOnce();
   expect(String(fetcher.mock.calls[0]?.[0])).toContain('/api/v1/auth/me');
+  // hash 路由未被强行修改为 login
+  expect(window.location.hash).toBe('#/tasks');
 });
 
 test('signed_in state: no forms, shows user and logout; logout returns to the login form, no device data surface', async () => {
@@ -137,6 +147,61 @@ test('login form: submit posts credentials, error uses the safe mapped message, 
   expect(screen.queryByRole('form')).toBeNull();
 });
 
+test('login in-flight checking state does NOT unmount LoginView; deferred 401 preserves username, clears password, and shows button loading without leak', async () => {
+  let deferredLoginResolve!: (r: Response) => void;
+  const deferredLoginPromise = new Promise<Response>((r) => {
+    deferredLoginResolve = r;
+  });
+
+  const fetcher = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit): Promise<Response> => {
+    const url = String(input);
+    if (url.includes('/auth/me')) {
+      return jsonResponse({ error: { code: 'AUTH_REQUIRED', message_key: 'errors.authRequired' }, request_id: RID_ERR }, 401);
+    }
+    if (url.includes('/auth/login')) {
+      return deferredLoginPromise;
+    }
+    throw new TypeError(`unexpected fetch ${url}`);
+  });
+  vi.stubGlobal('fetch', fetcher);
+
+  render(App);
+  await vi.waitFor(() => expect(screen.getByRole('form')).toBeTruthy());
+
+  await fireEvent.update(screen.getByRole('textbox', { name: '用户名' }), 'testuser');
+  await fireEvent.update(screen.getByLabelText('密码') as HTMLInputElement, 'sensitive_pass_123');
+
+  const submitButton = screen.getByRole('button', { name: '登录' });
+  await fireEvent.click(submitButton);
+
+  // RED 断言：在 login in-flight 阶段（auth.status === 'checking'），LoginView 不得被卸载成全页 AppNotice！
+  // 表单依然存在在文档中
+  expect(screen.queryByRole('form')).not.toBeNull();
+  expect(screen.getByRole('heading', { name: '登录' })).toBeTruthy();
+  // 全局 checking notice 不应该取代登录表单
+  expect(screen.queryByText('正在检查登录状态')).toBeNull();
+
+  // 按钮处于 loading 状态（aria-busy="true" 或包含处理中）
+  expect(submitButton.getAttribute('aria-busy')).toBe('true');
+
+  // 口令内容绝不泄露到 DOM 其他文本区域
+  expect(document.body.textContent).not.toContain('sensitive_pass_123');
+
+  // 现在 resolve 401 INVALID_CREDENTIALS
+  deferredLoginResolve(
+    jsonResponse({ error: { code: 'INVALID_CREDENTIALS', message_key: 'errors.invalidCredentials' }, request_id: RID_ERR }, 401)
+  );
+
+  // 等待 401 处理完成
+  await vi.waitFor(() => expect(screen.getByRole('alert').textContent).toContain('用户名或密码不正确'));
+
+  // 401 后：用户名保留、密码清空、按钮 loading 恢复
+  expect((screen.getByRole('textbox', { name: '用户名' }) as HTMLInputElement).value).toBe('testuser');
+  expect((screen.getByLabelText('密码') as HTMLInputElement).value).toBe('');
+  expect(submitButton.getAttribute('aria-busy')).toBe('false');
+  expect(document.body.textContent).not.toContain('sensitive_pass_123');
+});
+
 test('signed_in state: csrf/session stay in memory only, never in localStorage (changePassword 成功路径已由 auth.test.ts 锁定)', async () => {
   let me = 0;
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
@@ -181,6 +246,46 @@ test('language switch translates the auth page and accessible names without re-f
   expect(document.documentElement.lang).toBe('en');
   expect(localStorage.getItem('rsetup.controller.locale')).toBe('en');
   expect(fetcher).toHaveBeenCalledOnce();
+});
+
+test('signed_in language switch translates navigation accessible name according to dictionary without hardcoded English', async () => {
+  fetchForMe(jsonResponse({ data: ME_DATA, request_id: RID_ME }));
+  render(App);
+  await vi.waitFor(() => expect(screen.getByRole('status').textContent).toContain('admin'));
+
+  // In zh-CN, navigation accessible name must match localized dictionary, not hardcoded English "Account Navigation"
+  expect(screen.queryByRole('navigation', { name: 'Account Navigation' })).toBeNull();
+  const navZh = screen.getByRole('navigation', { name: '登录会话' });
+  expect(navZh).toBeTruthy();
+
+  // Switch language to en
+  await fireEvent.update(screen.getByRole('combobox', { name: '语言' }), 'en');
+  expect(screen.queryByRole('navigation', { name: 'Account Navigation' })).toBeNull();
+  const navEn = screen.getByRole('navigation', { name: 'Active sessions' });
+  expect(navEn).toBeTruthy();
+});
+
+test('skip-link keyboard activation focuses main element without clobbering existing hash route', async () => {
+  window.location.hash = '#/sessions';
+  fetchForMe(jsonResponse({ data: ME_DATA, request_id: RID_ME }));
+  render(App);
+
+  await vi.waitFor(() => expect(screen.getByRole('heading', { name: '登录会话' })).toBeTruthy());
+  expect(window.location.hash).toBe('#/sessions');
+
+  const skipLink = screen.getByRole('link', { name: '跳至主要内容' });
+  const mainElement = screen.getByRole('main');
+
+  // Trigger keyboard activation (Enter key on skip link)
+  await fireEvent.keyDown(skipLink, { key: 'Enter', code: 'Enter' });
+  await fireEvent.click(skipLink);
+
+  // Assert main element received focus
+  expect(document.activeElement).toBe(mainElement);
+
+  // Assert current route hash is NOT wiped or replaced by #main-content
+  expect(window.location.hash).toBe('#/sessions');
+  expect(screen.getByRole('heading', { name: '登录会话' })).toBeTruthy();
 });
 
 test('login submit clears the password field on both failed and successful attempts', async () => {
@@ -303,6 +408,12 @@ test('force_password: network failure on submit is an unknown outcome — error 
 });
 
 describe('signed_in session management UI (Task 5)', () => {
+  beforeEach(() => {
+    window.location.hash = '#/sessions';
+  });
+  afterEach(() => {
+    window.location.hash = '';
+  });
   const SESSIONS_MOCK = {
     items: [
       { id: '1'.repeat(64), current: true, created_time: '2026-10-05T10:00:00Z' },
@@ -528,5 +639,714 @@ describe('signed_in session management UI (Task 5)', () => {
     await vi.waitFor(() => expect(screen.getByText('无法完成操作，请稍后重试')).toBeTruthy());
     expect(screen.getByRole('status').textContent).toContain('admin');
     expect(screen.getByText('2026-10-05T11:00:00Z')).toBeTruthy();
+  });
+
+  test('signed_in devices view: integrates DevicesView and allows navigating to device-detail with canonical hex64 id', async () => {
+    const DEV_ID = 'e'.repeat(64);
+    const mockDevices = [
+      {
+        device_id: DEV_ID,
+        display_name: 'Device Echo',
+        effective_permissions: ['device.read'],
+      },
+    ];
+    const mockDetail = {
+      device_id: DEV_ID,
+      display_name: 'Device Echo',
+      effective_permissions: ['device.read'],
+      admission_state: 'APPROVED',
+      review_decision: 'approved',
+      connection_state: 'online',
+      control_health: 'healthy',
+      data_health: 'healthy',
+      capabilities: ['reboot'],
+      revision: '1',
+    };
+
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input);
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME });
+      if (url.includes('/devices/') && !url.includes('/status')) {
+        return jsonResponse({ data: mockDetail, request_id: RID_DEV_DETAIL });
+      }
+      if (url.includes('/devices')) {
+        return jsonResponse({ data: { items: mockDevices, next_cursor: null }, request_id: RID_LIST });
+      }
+      throw new TypeError(`unexpected fetch ${url}`);
+    }));
+
+    window.location.hash = '#/devices';
+    render(App);
+
+    await vi.waitFor(() => expect(screen.getByRole('status').textContent).toContain('admin'));
+    await vi.waitFor(() => expect(screen.getByText('Device Echo')).toBeTruthy());
+    expect(screen.getByText(DEV_ID)).toBeTruthy();
+
+    // 点击设备名称进入设备详情路由
+    await fireEvent.click(screen.getByText('Device Echo'));
+
+    await vi.waitFor(() => expect(window.location.hash).toBe(`#/devices/${DEV_ID}`));
+    await vi.waitFor(() => expect(screen.getByTestId('detail-profile-card')).toBeTruthy());
+    expect(screen.getByTestId('dim-admission').textContent).toContain('APPROVED');
+  });
+
+  test('Critical 1: user with READ + STATUS permissions fetches BOTH detail and status on device-detail route', async () => {
+    const DEV_ID = 'f'.repeat(64);
+    const mockDevices = [
+      {
+        device_id: DEV_ID,
+        display_name: 'Device Foxtrot',
+        effective_permissions: ['device.read', 'device.status.read'],
+      },
+    ];
+    const mockDetail = {
+      device_id: DEV_ID,
+      display_name: 'Device Foxtrot',
+      effective_permissions: ['device.read', 'device.status.read'],
+      admission_state: 'APPROVED',
+      review_decision: 'approved',
+      connection_state: 'online',
+      control_health: 'healthy',
+      data_health: 'healthy',
+      capabilities: ['reboot'],
+      revision: '1',
+    };
+    const mockStatus = {
+      snapshot: { clock_quality: 'observed' },
+      received_time: {
+        quality: 'ntp_valid',
+        system_wall_utc: '2026-10-07T00:00:00Z',
+        reference_utc: '2026-10-07T00:00:00Z',
+      },
+      freshness: 'fresh',
+      age_ms: '50',
+    };
+
+    const fetchedUrls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input);
+      fetchedUrls.push(url);
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME });
+      if (url.includes(`/devices/${DEV_ID}/status`)) {
+        return jsonResponse({ data: mockStatus, request_id: RID_DEV_STATUS });
+      }
+      if (url.includes(`/devices/${DEV_ID}`)) {
+        return jsonResponse({ data: mockDetail, request_id: RID_DEV_DETAIL });
+      }
+      if (url.includes('/devices')) {
+        return jsonResponse({ data: { items: mockDevices, next_cursor: null }, request_id: RID_LIST });
+      }
+      throw new TypeError(`unexpected fetch ${url}`);
+    }));
+
+    window.location.hash = '#/devices';
+    render(App);
+
+    await vi.waitFor(() => expect(screen.getByText('Device Foxtrot')).toBeTruthy());
+    // Click button to navigate to detail
+    await fireEvent.click(screen.getByText('Device Foxtrot'));
+
+    await vi.waitFor(() => expect(screen.getByTestId('detail-profile-card')).toBeTruthy());
+    await vi.waitFor(() => expect(screen.getByTestId('status-card')).toBeTruthy());
+    expect(fetchedUrls.some(u => u.includes(`/devices/${DEV_ID}/status`))).toBe(true);
+    expect(fetchedUrls.some(u => u.endsWith(`/devices/${DEV_ID}`))).toBe(true);
+  });
+
+  test('Critical 2: status-only user never fetches profile detail GET; reboot-only never fetches detail or status GET', async () => {
+    const DEV_STATUS_ONLY = '1'.repeat(64);
+    const DEV_REBOOT_ONLY = '2'.repeat(64);
+    const mockDevices = [
+      {
+        device_id: DEV_STATUS_ONLY,
+        display_name: 'Status Only Dev',
+        effective_permissions: ['device.status.read'],
+      },
+      {
+        device_id: DEV_REBOOT_ONLY,
+        display_name: 'Reboot Only Dev',
+        effective_permissions: ['device.reboot'],
+      },
+    ];
+    const mockStatus = {
+      snapshot: { clock_quality: 'observed' },
+      received_time: {
+        quality: 'ntp_valid',
+        system_wall_utc: '2026-10-07T00:00:00Z',
+        reference_utc: '2026-10-07T00:00:00Z',
+      },
+      freshness: 'fresh',
+      age_ms: '100',
+    };
+
+    const fetchedUrls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input);
+      fetchedUrls.push(url);
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME });
+      if (url.includes(`/devices/${DEV_STATUS_ONLY}/status`)) {
+        return jsonResponse({ data: mockStatus, request_id: RID_DEV_STATUS });
+      }
+      if (url.includes(`/devices/${DEV_STATUS_ONLY}`)) {
+        throw new Error('STATUS_ONLY MUST NEVER ISSUE DETAIL GET');
+      }
+      if (url.includes(`/devices/${DEV_REBOOT_ONLY}`)) {
+        throw new Error('REBOOT_ONLY MUST NEVER ISSUE DETAIL OR STATUS GET');
+      }
+      if (url.includes('/devices')) {
+        return jsonResponse({ data: { items: mockDevices, next_cursor: null }, request_id: RID_LIST });
+      }
+      throw new TypeError(`unexpected fetch ${url}`);
+    }));
+
+    window.location.hash = '#/devices';
+    render(App);
+
+    await vi.waitFor(() => expect(screen.getByText('Status Only Dev')).toBeTruthy());
+    await fireEvent.click(screen.getByText('Status Only Dev'));
+
+    await vi.waitFor(() => expect(screen.getByTestId('status-card')).toBeTruthy());
+    expect(screen.queryByTestId('detail-profile-card')).toBeNull();
+    expect(fetchedUrls.some(u => u.endsWith(`/devices/${DEV_STATUS_ONLY}`))).toBe(false);
+  });
+
+  test('Critical 3: deep link without known permission projection safely redirects or fails closed without speculative detail GET', async () => {
+    const DEV_DEEP = '3'.repeat(64);
+    const fetchedUrls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input);
+      fetchedUrls.push(url);
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME });
+      if (url.includes(`/devices/${DEV_DEEP}`)) {
+        throw new Error('DEEP LINK MUST NEVER ISSUE SPECULATIVE DETAIL GET');
+      }
+      if (url.includes('/devices')) {
+        return jsonResponse({ data: { items: [], next_cursor: null }, request_id: RID_LIST });
+      }
+      throw new TypeError(`unexpected fetch ${url}`);
+    }));
+
+    window.location.hash = `#/devices/${DEV_DEEP}`;
+    render(App);
+
+    await vi.waitFor(() => expect(screen.getByRole('status').textContent).toContain('admin'));
+    // Should safely fallback to devices list, not probing /devices/:id
+    await vi.waitFor(() => expect(window.location.hash).toBe('#/devices'));
+    expect(fetchedUrls.some(u => u.includes(`/devices/${DEV_DEEP}`))).toBe(false);
+  });
+
+  test('Critical 4: device list 503 error renders error notice with retry button and does not disguise as empty list', async () => {
+    let devFetchCount = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input);
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME });
+      if (url.includes('/devices')) {
+        devFetchCount++;
+        if (devFetchCount === 1) {
+          return jsonResponse({ error: { code: 'NOT_READY', message_key: 'errors.notReady' }, request_id: RID_ERR }, 503);
+        }
+        return jsonResponse({
+          data: {
+            items: [{ device_id: '4'.repeat(64), display_name: 'Device Four', effective_permissions: ['device.read'] }],
+            next_cursor: null,
+          },
+          request_id: RID_LIST,
+        });
+      }
+      throw new TypeError(`unexpected fetch ${url}`);
+    }));
+
+    window.location.hash = '#/devices';
+    render(App);
+
+    await vi.waitFor(() => expect(screen.getByRole('status').textContent).toContain('admin'));
+    // Never show empty list notice!
+    expect(screen.queryByText('暂无可见设备')).toBeNull();
+
+    // Must show error and retry button
+    await vi.waitFor(() => expect(screen.getAllByText('无法加载内容').length).toBeGreaterThan(0));
+    const retryBtn = screen.getByRole('button', { name: '重试' });
+    await fireEvent.click(retryBtn);
+
+    await vi.waitFor(() => expect(screen.getByText('Device Four')).toBeTruthy());
+    expect(screen.queryAllByText('无法加载内容').length).toBe(0);
+    expect(devFetchCount).toBe(2);
+  });
+
+  test('Critical 5: logout / relogin clears devices list and in-flight requests cannot resurface for new user', async () => {
+    let slowListResolve!: (r: Response) => void;
+    const slowListPromise = new Promise<Response>((r) => { slowListResolve = r; });
+
+    let fetchCount = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input);
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME });
+      if (url.includes('/auth/logout')) return jsonResponse({ data: { logged_out: true }, request_id: RID_LOGOUT });
+      if (url.includes('/devices')) {
+        fetchCount++;
+        if (fetchCount === 1) {
+          return slowListPromise;
+        }
+        return jsonResponse({
+          data: {
+            items: [{ device_id: '5'.repeat(64), display_name: 'User2 Device', effective_permissions: ['device.read'] }],
+            next_cursor: null,
+          },
+          request_id: RID_LIST,
+        });
+      }
+      throw new TypeError(`unexpected fetch ${url}`);
+    }));
+
+    window.location.hash = '#/devices';
+    render(App);
+
+    await vi.waitFor(() => expect(screen.getByRole('status').textContent).toContain('admin'));
+
+    // User logs out before slow list returns
+    const logoutBtn = screen.getByRole('button', { name: '退出登录' });
+    await fireEvent.click(logoutBtn);
+
+    // Old list resolves after logout
+    slowListResolve(jsonResponse({
+      data: {
+        items: [{ device_id: '6'.repeat(64), display_name: 'Stale User1 Device', effective_permissions: ['device.read'] }],
+        next_cursor: null,
+      },
+      request_id: RID_LIST,
+    }));
+
+    await vi.waitFor(() => expect(screen.getByRole('heading', { name: '登录' })).toBeTruthy());
+    // Stale device must not be rendered anywhere
+    expect(screen.queryByText('Stale User1 Device')).toBeNull();
+  });
+
+  test('Important: GET /devices returning malformed 200 (e.g. non-hex64 device_id) triggers safe error state, not crash or corrupted list', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input);
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME });
+      if (url.includes('/devices')) {
+        return jsonResponse({
+          data: {
+            items: [
+              {
+                device_id: 'not-hex64',
+                display_name: 'Corrupted Device',
+                effective_permissions: ['device.read'],
+              },
+            ],
+            next_cursor: null,
+          },
+          request_id: RID_LIST,
+        });
+      }
+      throw new TypeError(`unexpected fetch ${url}`);
+    }));
+
+    window.location.hash = '#/devices';
+    render(App);
+
+    await vi.waitFor(() => expect(screen.getByRole('status').textContent).toContain('admin'));
+    // Should show error notice, never render Corrupted Device
+    await vi.waitFor(() => expect(screen.getAllByText('无法加载内容').length).toBeGreaterThan(0));
+    expect(screen.queryByText('Corrupted Device')).toBeNull();
+  });
+
+  test('Important: GET /devices/:id returning malformed revision triggers safe error state in detail view', async () => {
+    const DEV_ID = '7'.repeat(64);
+    const mockDevices = [
+      {
+        device_id: DEV_ID,
+        display_name: 'Device Seven',
+        effective_permissions: ['device.read'],
+      },
+    ];
+    const malformedDetail = {
+      device_id: DEV_ID,
+      display_name: 'Device Seven',
+      effective_permissions: ['device.read'],
+      admission_state: 'APPROVED',
+      review_decision: 'approved',
+      connection_state: 'online',
+      control_health: 'healthy',
+      data_health: 'healthy',
+      capabilities: ['reboot'],
+      revision: 12345, // malformed: number instead of canonical decimal string
+    };
+
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input);
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME });
+      if (url.includes(`/devices/${DEV_ID}`)) {
+        return jsonResponse({ data: malformedDetail, request_id: RID_DEV_DETAIL });
+      }
+      if (url.includes('/devices')) {
+        return jsonResponse({ data: { items: mockDevices, next_cursor: null }, request_id: RID_LIST });
+      }
+      throw new TypeError(`unexpected fetch ${url}`);
+    }));
+
+    window.location.hash = '#/devices';
+    render(App);
+
+    await vi.waitFor(() => expect(screen.getByText('Device Seven')).toBeTruthy());
+    await fireEvent.click(screen.getByText('Device Seven'));
+
+    // Should show safe error in detail view, not corrupted profile card
+    await vi.waitFor(() => expect(screen.getByRole('alert')).toBeTruthy());
+    expect(screen.getByText('无法加载内容')).toBeTruthy();
+    expect(screen.queryByTestId('detail-profile-card')).toBeNull();
+  });
+
+  test('Important: GET /devices/:id/status returning numeric age_ms triggers safe error state', async () => {
+    const DEV_ID = '8'.repeat(64);
+    const mockDevices = [
+      {
+        device_id: DEV_ID,
+        display_name: 'Device Eight',
+        effective_permissions: ['device.status.read'],
+      },
+    ];
+    const malformedStatus = {
+      snapshot: { clock_quality: 'observed' },
+      received_time: {
+        quality: 'ntp_valid',
+        system_wall_utc: '2026-10-07T00:00:00Z',
+        reference_utc: '2026-10-07T00:00:00Z',
+      },
+      freshness: 'fresh',
+      age_ms: 12345, // malformed: number instead of decimal string
+    };
+
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input);
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME });
+      if (url.includes(`/devices/${DEV_ID}/status`)) {
+        return jsonResponse({ data: malformedStatus, request_id: RID_DEV_STATUS });
+      }
+      if (url.includes('/devices')) {
+        return jsonResponse({ data: { items: mockDevices, next_cursor: null }, request_id: RID_LIST });
+      }
+      throw new TypeError(`unexpected fetch ${url}`);
+    }));
+
+    window.location.hash = '#/devices';
+    render(App);
+
+    await vi.waitFor(() => expect(screen.getByText('Device Eight')).toBeTruthy());
+    await fireEvent.click(screen.getByText('Device Eight'));
+
+    // Should show safe error in detail view, not corrupted status card
+    await vi.waitFor(() => expect(screen.getByRole('alert')).toBeTruthy());
+    expect(screen.getByText('无法加载内容')).toBeTruthy();
+    expect(screen.queryByTestId('status-card')).toBeNull();
+  });
+
+  test('Defect 1: page2 device selection preserves permission projection and navigates to detail without redirecting back', async () => {
+    const DEV_PAGE1 = '1'.repeat(64);
+    const DEV_PAGE2 = '2'.repeat(64);
+
+    const page1Items = [
+      {
+        device_id: DEV_PAGE1,
+        display_name: 'Page 1 Device',
+        effective_permissions: ['device.read'],
+      },
+    ];
+    const page2Items = [
+      {
+        device_id: DEV_PAGE2,
+        display_name: 'Page 2 Device',
+        effective_permissions: ['device.read', 'device.status.read'],
+      },
+    ];
+
+    const mockDetailP2 = {
+      device_id: DEV_PAGE2,
+      display_name: 'Page 2 Device',
+      effective_permissions: ['device.read', 'device.status.read'],
+      admission_state: 'APPROVED',
+      review_decision: 'approved',
+      connection_state: 'online',
+      control_health: 'healthy',
+      data_health: 'healthy',
+      capabilities: ['reboot'],
+      revision: '1',
+    };
+    const mockStatusP2 = {
+      snapshot: { clock_quality: 'observed' },
+      received_time: {
+        quality: 'ntp_valid',
+        system_wall_utc: '2026-10-07T00:00:00Z',
+        reference_utc: '2026-10-07T00:00:00Z',
+      },
+      freshness: 'fresh',
+      age_ms: '50',
+    };
+
+    const fetchedUrls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input);
+      fetchedUrls.push(url);
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME });
+      if (url.includes(`/devices/${DEV_PAGE2}/status`)) {
+        return jsonResponse({ data: mockStatusP2, request_id: RID_DEV_STATUS });
+      }
+      if (url.includes(`/devices/${DEV_PAGE2}`)) {
+        return jsonResponse({ data: mockDetailP2, request_id: RID_DEV_DETAIL });
+      }
+      if (url.includes('/devices?cursor=') || url.includes('/devices?limit=50&cursor=') || url.includes('cursor=')) {
+        return jsonResponse({ data: { items: page2Items, next_cursor: null }, request_id: RID_LIST });
+      }
+      if (url.includes('/devices')) {
+        return jsonResponse({ data: { items: page1Items, next_cursor: 'opaque:c2' }, request_id: RID_LIST });
+      }
+      throw new TypeError(`unexpected fetch ${url}`);
+    }));
+
+    window.location.hash = '#/devices';
+    render(App);
+
+    // Initial page1 loaded
+    await vi.waitFor(() => expect(screen.getByText('Page 1 Device')).toBeTruthy());
+    expect(screen.queryByText('Page 2 Device')).toBeNull();
+
+    // Click load more to fetch page2
+    const loadMoreBtn = screen.getByTestId('load-more-btn');
+    await fireEvent.click(loadMoreBtn);
+
+    // Page 2 device appears in DOM
+    await vi.waitFor(() => expect(screen.getByText('Page 2 Device')).toBeTruthy());
+
+    // Click page 2 native button
+    await fireEvent.click(screen.getByText('Page 2 Device'));
+
+    // Should navigate to #/devices/:DEV_PAGE2 without redirecting back to #/devices
+    await vi.waitFor(() => expect(window.location.hash).toBe(`#/devices/${DEV_PAGE2}`));
+    await vi.waitFor(() => expect(screen.getByTestId('detail-profile-card')).toBeTruthy());
+    expect(screen.getByTestId('status-card')).toBeTruthy();
+
+    // Both detail and status GETs were dispatched according to page2 device row's effective_permissions
+    expect(fetchedUrls.some(u => u.endsWith(`/devices/${DEV_PAGE2}`))).toBe(true);
+    expect(fetchedUrls.some(u => u.endsWith(`/devices/${DEV_PAGE2}/status`))).toBe(true);
+  });
+
+  test('Reviewer A: late page2 loadMore after logout and login as another user never contaminates new user', async () => {
+    const USER_A_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const USER_B_ID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+
+    const USER_A = {
+      id: USER_A_ID,
+      username: 'alice',
+      active: true,
+      is_admin: false,
+      must_change_password: false,
+      revision: '1',
+    };
+    const USER_B = {
+      id: USER_B_ID,
+      username: 'bob',
+      active: true,
+      is_admin: false,
+      must_change_password: false,
+      revision: '1',
+    };
+
+    const DEV_A_PAGE1 = '1'.repeat(64);
+    const DEV_A_PAGE2 = '2'.repeat(64);
+    const DEV_B_PAGE1 = '3'.repeat(64);
+
+    let currentUser = USER_A;
+    let resolveLatePage2: ((value: Response) => void) | undefined;
+    const latePage2Promise = new Promise<Response>((resolve) => {
+      resolveLatePage2 = resolve;
+    });
+
+    const dispatchedUrls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input);
+      dispatchedUrls.push(url);
+      if (url.includes('/auth/me')) {
+        return jsonResponse({
+          data: { user: currentUser, csrf_token: 'csrf', authz_epoch: '1' },
+          request_id: RID_ME,
+        });
+      }
+      if (url.includes('/auth/logout')) {
+        return jsonResponse({ data: { logged_out: true }, request_id: RID_LOGOUT });
+      }
+      if (url.includes('/auth/login')) {
+        currentUser = USER_B;
+        return jsonResponse({ data: { user: USER_B, csrf_token: 'csrf-b' }, request_id: RID_LOGIN });
+      }
+      if (url.includes('/devices?cursor=cursor_a_2') || url.includes('cursor=cursor_a_2')) {
+        return latePage2Promise;
+      }
+      if (url.includes('/devices')) {
+        if (currentUser.id === USER_A_ID) {
+          return jsonResponse({
+            data: {
+              items: [{ device_id: DEV_A_PAGE1, display_name: 'Alice Dev 1', effective_permissions: ['device.read'] }],
+              next_cursor: 'cursor_a_2',
+            },
+            request_id: RID_LIST,
+          });
+        } else {
+          return jsonResponse({
+            data: {
+              items: [{ device_id: DEV_B_PAGE1, display_name: 'Bob Dev 1', effective_permissions: ['device.read'] }],
+              next_cursor: null,
+            },
+            request_id: RID_LIST,
+          });
+        }
+      }
+      throw new TypeError(`unexpected fetch ${url}`);
+    }));
+
+    window.location.hash = '#/devices';
+    render(App);
+
+    // Alice is signed in, Alice Dev 1 visible
+    await vi.waitFor(() => expect(screen.getByText('Alice Dev 1')).toBeTruthy());
+
+    // Alice clicks load more -> pending in latePage2Promise
+    const loadMoreBtn = screen.getByTestId('load-more-btn');
+    await fireEvent.click(loadMoreBtn);
+
+    // Alice logs out
+    const logoutBtn = screen.getByRole('button', { name: '退出登录' });
+    await fireEvent.click(logoutBtn);
+    await vi.waitFor(() => expect(screen.getByRole('form')).toBeTruthy());
+
+    // Bob logs in
+    await fireEvent.update(screen.getByRole('textbox', { name: '用户名' }), 'bob');
+    await fireEvent.update(screen.getByLabelText('密码') as HTMLInputElement, 'pass-b');
+    await fireEvent.click(screen.getByRole('button', { name: '登录' }));
+
+    // Bob is signed in and visits #/devices
+    await vi.waitFor(() => expect(screen.getByText('Bob Dev 1')).toBeTruthy());
+    expect(screen.queryByText('Alice Dev 1')).toBeNull();
+    expect(screen.queryByText('Alice Dev 2')).toBeNull();
+
+    // Now Alice's slow page2 finally resolves!
+    resolveLatePage2!(new Response(JSON.stringify({
+      data: {
+        items: [{ device_id: DEV_A_PAGE2, display_name: 'Alice Dev 2', effective_permissions: ['device.read', 'device.status.read'] }],
+        next_cursor: 'alice_cursor_leak',
+      },
+      request_id: '12345678-1234-4234-8234-123456789abc',
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+
+    // Wait a short time for any microtasks / async handlers to run
+    await new Promise((r) => setTimeout(r, 60));
+
+    // Bob must NOT see Alice's devices or Alice's cursor
+    expect(screen.queryByText('Alice Dev 2')).toBeNull();
+    expect(screen.queryByText('Alice Dev 1')).toBeNull();
+    expect(screen.getByText('Bob Dev 1')).toBeTruthy();
+    // Bob has next_cursor: null so load more button should NOT appear from Alice's cursor
+    expect(screen.queryByTestId('load-more-btn')).toBeNull();
+
+    // If Bob tries to access Alice Dev 2 deep link, Bob has no permission projection and cannot fetch detail or status
+    dispatchedUrls.length = 0;
+    window.location.hash = `#/devices/${DEV_A_PAGE2}`;
+    await new Promise((r) => setTimeout(r, 60));
+    expect(dispatchedUrls.some((u) => u.includes(DEV_A_PAGE2))).toBe(false);
+  });
+
+  test('Reviewer B: page2 duplicate device_id replaces with newer projection, immediately tightens revoked status permission', async () => {
+    const DEV_DUP = '4'.repeat(64);
+    const DEV_NEW = '5'.repeat(64);
+
+    // Page 1: DEV_DUP has READ + STATUS
+    const page1Items = [
+      {
+        device_id: DEV_DUP,
+        display_name: 'Duplicate Device',
+        effective_permissions: ['device.read', 'device.status.read'],
+      },
+    ];
+
+    // Page 2: DEV_DUP revoked STATUS (now READ only), plus brand new DEV_NEW
+    const page2Items = [
+      {
+        device_id: DEV_DUP,
+        display_name: 'Duplicate Device Renamed',
+        effective_permissions: ['device.read'], // status revoked!
+      },
+      {
+        device_id: DEV_NEW,
+        display_name: 'Brand New Device',
+        effective_permissions: ['device.read'],
+      },
+    ];
+
+    const mockDetail = {
+      device_id: DEV_DUP,
+      display_name: 'Duplicate Device Renamed',
+      effective_permissions: ['device.read'],
+      admission_state: 'APPROVED',
+      review_decision: 'approved',
+      connection_state: 'online',
+      control_health: 'healthy',
+      data_health: 'healthy',
+      capabilities: ['reboot'],
+      revision: '2',
+    };
+
+    const dispatchedUrls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input);
+      dispatchedUrls.push(url);
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME });
+      if (url.includes(`/devices/${DEV_DUP}/status`)) {
+        return jsonResponse({
+          data: {
+            snapshot: { clock_quality: 'observed' },
+            received_time: { quality: 'ntp_valid', system_wall_utc: '2026-10-07T00:00:00Z', reference_utc: '2026-10-07T00:00:00Z' },
+            freshness: 'fresh',
+            age_ms: '10',
+          },
+          request_id: RID_DEV_STATUS,
+        });
+      }
+      if (url.includes(`/devices/${DEV_DUP}`)) {
+        return jsonResponse({ data: mockDetail, request_id: RID_DEV_DETAIL });
+      }
+      if (url.includes('cursor=c2')) {
+        return jsonResponse({ data: { items: page2Items, next_cursor: null }, request_id: RID_LIST });
+      }
+      if (url.includes('/devices')) {
+        return jsonResponse({ data: { items: page1Items, next_cursor: 'c2' }, request_id: RID_LIST });
+      }
+      throw new TypeError(`unexpected fetch ${url}`);
+    }));
+
+    window.location.hash = '#/devices';
+    render(App);
+
+    await vi.waitFor(() => expect(screen.getByText('Duplicate Device')).toBeTruthy());
+
+    // Click load more
+    const loadMoreBtn = screen.getByTestId('load-more-btn');
+    await fireEvent.click(loadMoreBtn);
+
+    // After page2 loaded:
+    // 1. UI must NOT show duplicate rows for DEV_DUP
+    await vi.waitFor(() => expect(screen.getByText('Brand New Device')).toBeTruthy());
+    const allDupRows = screen.queryAllByTestId(`device-item-${DEV_DUP}`);
+    expect(allDupRows.length).toBe(1);
+    expect(screen.getByText('Duplicate Device Renamed')).toBeTruthy();
+
+    // 2. Click the updated device to navigate to detail
+    await fireEvent.click(screen.getByText('Duplicate Device Renamed'));
+
+    // 3. Detail profile card is rendered, BUT status card is NOT rendered because status permission was revoked in page2!
+    await vi.waitFor(() => expect(screen.getByTestId('detail-profile-card')).toBeTruthy());
+    expect(screen.queryByTestId('status-card')).toBeNull();
+
+    // 4. Must NOT have dispatched GET /devices/:DEV_DUP/status
+    expect(dispatchedUrls.some((u) => u.endsWith(`/devices/${DEV_DUP}/status`))).toBe(false);
+    expect(dispatchedUrls.some((u) => u.endsWith(`/devices/${DEV_DUP}`))).toBe(true);
   });
 });

@@ -1,0 +1,293 @@
+import { fireEvent, render, screen } from '@testing-library/vue'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import DevicesView from './DevicesView.vue'
+import { createI18n } from '../i18n'
+import type { DeviceItem } from '../types'
+
+describe('DevicesView pagination, projection and permissions', () => {
+  const i18n = createI18n({ initialLocale: 'zh-CN', storage: null })
+
+  beforeEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('renders minimal projection: device_id and display_name, without detail or status', () => {
+    const devices: DeviceItem[] = [
+      {
+        device_id: 'a'.repeat(64),
+        display_name: 'Device Alpha',
+        effective_permissions: ['device.read'],
+      },
+      {
+        device_id: 'b'.repeat(64),
+        display_name: 'Device Beta',
+        effective_permissions: ['device.reboot'],
+      },
+    ]
+
+    render(DevicesView, {
+      props: {
+        initialDevices: devices,
+        permissions: ['device.read', 'device.reboot'],
+      },
+      global: { provide: { i18n } },
+    })
+
+    expect(screen.getByText('Device Alpha')).toBeTruthy()
+    expect(screen.getByText('Device Beta')).toBeTruthy()
+    expect(screen.getByText('a'.repeat(64))).toBeTruthy()
+    expect(screen.getByText('b'.repeat(64))).toBeTruthy()
+    // 列表仅最小投影，严禁直接展示详情卡片/状态卡片
+    expect(screen.queryByTestId('detail-profile-card')).toBeNull()
+    expect(screen.queryByTestId('status-card')).toBeNull()
+  })
+
+  it('when user has only device.reboot: displays reboot trigger, never requests detail or status GET', async () => {
+    const fetchSpy = vi.fn()
+    vi.stubGlobal('fetch', fetchSpy)
+
+    const devices: DeviceItem[] = [
+      {
+        device_id: 'c'.repeat(64),
+        display_name: 'Reboot Only Device',
+        effective_permissions: ['device.reboot'],
+      },
+    ]
+
+    render(DevicesView, {
+      props: {
+        initialDevices: devices,
+        permissions: ['device.reboot'],
+      },
+      global: { provide: { i18n } },
+    })
+
+    // reboot-only 用户可以看到重启入口
+    const rebootBtn = screen.getByTestId(`reboot-action-${'c'.repeat(64)}`)
+    expect(rebootBtn).toBeTruthy()
+
+    // 绝不自动发起 GET /devices/{id} 或 GET /devices/{id}/status 请求
+    const calledUrls = fetchSpy.mock.calls.map(c => String(c[0]))
+    expect(calledUrls.some(u => u.includes(`/devices/${'c'.repeat(64)}/status`))).toBe(false)
+    expect(calledUrls.some(u => u.endsWith(`/devices/${'c'.repeat(64)}`))).toBe(false)
+  })
+
+  it('hides reboot trigger when device lacks device.reboot, even if user has global or props permission', () => {
+    const devices: DeviceItem[] = [
+      {
+        device_id: 'd'.repeat(64),
+        display_name: 'Read Only Device',
+        effective_permissions: ['device.read'],
+      },
+    ]
+
+    render(DevicesView, {
+      props: {
+        initialDevices: devices,
+        permissions: ['device.read', 'device.reboot'], // Even if props has reboot, this specific row does not have it!
+      },
+      global: { provide: { i18n } },
+    })
+
+    // 单行无 reboot 权限时，绝不能出现 reboot 按钮
+    expect(screen.queryByTestId(`reboot-action-${'d'.repeat(64)}`)).toBeNull()
+  })
+
+  it('renders device detail entry as real keyboard-accessible button or link, not unclickable strong', () => {
+    const devices: DeviceItem[] = [
+      {
+        device_id: 'k'.repeat(64),
+        display_name: 'Keyboard Accessible Device',
+        effective_permissions: ['device.read'],
+      },
+    ]
+
+    render(DevicesView, {
+      props: {
+        initialDevices: devices,
+      },
+      global: { provide: { i18n } },
+    })
+
+    const nameBtn = screen.getByRole('button', { name: 'Keyboard Accessible Device' })
+    expect(nameBtn).toBeTruthy()
+  })
+
+  it('handles loadMore pagination errors gracefully with safe retry feedback', async () => {
+    const page1: DeviceItem[] = [
+      { device_id: '1'.repeat(64), display_name: 'Dev 1', effective_permissions: ['device.read'] },
+    ]
+
+    let loadMoreCalls = 0
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('cursor=')) {
+        loadMoreCalls++
+        if (loadMoreCalls === 1) {
+          return new Response(JSON.stringify({
+            error: { code: 'NOT_READY', message_key: 'errors.notReady' },
+            request_id: '11111111-2222-4333-8444-555555555555',
+          }), { status: 503, headers: { 'Content-Type': 'application/json' } })
+        }
+        return new Response(JSON.stringify({
+          data: {
+            items: [{ device_id: '2'.repeat(64), display_name: 'Dev 2', effective_permissions: ['device.read'] }],
+            next_cursor: null,
+          },
+          request_id: '22222222-3333-4444-8555-666666666666',
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      throw new Error(`Unexpected url ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchSpy)
+
+    render(DevicesView, {
+      props: {
+        initialDevices: page1,
+        initialNextCursor: 'c'.repeat(132),
+      },
+      global: { provide: { i18n } },
+    })
+
+    const loadMoreBtn = screen.getByTestId('load-more-btn')
+    await fireEvent.click(loadMoreBtn)
+
+    // Should display pagination error
+    await vi.waitFor(() => expect(screen.getAllByText('无法加载内容').length).toBeGreaterThan(0))
+    expect(screen.getByText('Dev 1')).toBeTruthy()
+    // Retrying loadMore works
+    await fireEvent.click(screen.getByTestId('load-more-btn'))
+    await vi.waitFor(() => expect(screen.getByText('Dev 2')).toBeTruthy())
+  })
+
+  it('supports pagination via next_cursor and loads additional devices without losing existing list', async () => {
+    const page1: DeviceItem[] = [
+      { device_id: '1'.repeat(64), display_name: 'Dev 1', effective_permissions: ['device.read'] },
+    ]
+    const page2: DeviceItem[] = [
+      { device_id: '2'.repeat(64), display_name: 'Dev 2', effective_permissions: ['device.read'] },
+    ]
+
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/api/v1/devices') && url.includes('cursor=cursor_page_2')) {
+        return new Response(JSON.stringify({
+          data: {
+            items: page2,
+            next_cursor: null,
+          },
+          request_id: '12345678-1234-4234-8234-123456789abc',
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({
+        data: { items: page1, next_cursor: 'cursor_page_2' },
+        request_id: '23456789-2345-4345-8345-23456789abcd',
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchSpy)
+
+    const onPageLoaded = vi.fn()
+    render(DevicesView, {
+      props: {
+        initialDevices: page1,
+        initialNextCursor: 'cursor_page_2',
+        permissions: ['device.read'],
+        onPageLoaded,
+      },
+      global: { provide: { i18n } },
+    })
+
+    expect(screen.getByText('Dev 1')).toBeTruthy()
+    expect(screen.queryByText('Dev 2')).toBeNull()
+
+    const loadMoreBtn = screen.getByTestId('load-more-btn')
+    await fireEvent.click(loadMoreBtn)
+
+    await vi.waitFor(() => expect(screen.getByText('Dev 2')).toBeTruthy())
+    expect(screen.getByText('Dev 1')).toBeTruthy()
+    expect(screen.queryByTestId('load-more-btn')).toBeNull()
+    expect(onPageLoaded).toHaveBeenCalledWith({
+      items: page2,
+      next_cursor: null,
+    })
+  })
+
+  it('filters devices by search input', async () => {
+    const devices: DeviceItem[] = [
+      { device_id: 'a'.repeat(64), display_name: 'Sensor Kitchen', effective_permissions: ['device.read'] },
+      { device_id: 'b'.repeat(64), display_name: 'Actuator Garden', effective_permissions: ['device.read'] },
+    ]
+
+    render(DevicesView, {
+      props: {
+        initialDevices: devices,
+        permissions: ['device.read'],
+      },
+      global: { provide: { i18n } },
+    })
+
+    expect(screen.getByText('Sensor Kitchen')).toBeTruthy()
+    expect(screen.getByText('Actuator Garden')).toBeTruthy()
+
+    const searchInput = screen.getByRole('textbox', { name: '搜索设备' })
+    await fireEvent.update(searchInput, 'Kitchen')
+
+    expect(screen.getByText('Sensor Kitchen')).toBeTruthy()
+    expect(screen.queryByText('Actuator Garden')).toBeNull()
+  })
+
+  it('aborts in-flight loadMore request on unmount and prevents pageLoaded emit', async () => {
+    let capturedSignal: AbortSignal | undefined
+    let resolvePage2: ((value: Response) => void) | undefined
+    const page2Promise = new Promise<Response>((resolve) => {
+      resolvePage2 = resolve
+    })
+
+    const fetchSpy = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('cursor=c2')) {
+        capturedSignal = init?.signal ?? undefined
+        return page2Promise
+      }
+      throw new Error(`Unexpected url ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchSpy)
+
+    const onPageLoaded = vi.fn()
+    const { unmount } = render(DevicesView, {
+      props: {
+        initialDevices: [{ device_id: '1'.repeat(64), display_name: 'Dev 1', effective_permissions: ['device.read'] }],
+        initialNextCursor: 'c2',
+        onPageLoaded,
+      },
+      global: { provide: { i18n } },
+    })
+
+    const loadMoreBtn = screen.getByTestId('load-more-btn')
+    await fireEvent.click(loadMoreBtn)
+
+    expect(capturedSignal).toBeDefined()
+    expect(capturedSignal?.aborted).toBe(false)
+
+    // Unmount while request is still pending
+    unmount()
+
+    expect(capturedSignal?.aborted).toBe(true)
+
+    // Now resolve the late page2
+    resolvePage2!(new Response(JSON.stringify({
+      data: {
+        items: [{ device_id: '2'.repeat(64), display_name: 'Dev 2', effective_permissions: ['device.read'] }],
+        next_cursor: null,
+      },
+      request_id: '12345678-1234-4234-8234-123456789abc',
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+
+    await new Promise(r => setTimeout(r, 50))
+    expect(onPageLoaded).not.toHaveBeenCalled()
+  })
+})

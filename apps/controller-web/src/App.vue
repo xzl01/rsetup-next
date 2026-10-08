@@ -1,131 +1,173 @@
 <script setup lang="ts">
-import { onMounted, ref, watch } from 'vue';
-import AppNotice from './components/AppNotice.vue';
-import BaseButton from './components/BaseButton.vue';
-import BaseInput from './components/BaseInput.vue';
-import { createI18n, type Locale } from './i18n';
-import { authErrorKey, createAuth } from './auth';
+import { onMounted, onUnmounted, provide, ref, watch } from 'vue'
+import AppNotice from './components/AppNotice.vue'
+import BaseButton from './components/BaseButton.vue'
+import LoginView from './views/LoginView.vue'
+import PasswordView from './views/PasswordView.vue'
+import SessionsView from './views/SessionsView.vue'
+import DevicesView from './views/DevicesView.vue'
+import DeviceDetailView from './views/DeviceDetailView.vue'
+import { createI18n, type Locale } from './i18n'
+import { createAuth } from './auth'
+import { createRouter, type AppRoute } from './router'
+import { get } from './api'
+import { assertDeviceListPageShape, type DeviceItem, type DeviceListPage } from './types'
 
-const { locale, t, setLocale } = createI18n();
-const auth = createAuth();
+const i18nInstance = createI18n()
+const { locale, t, setLocale } = i18nInstance
+provide('i18n', i18nInstance)
 
-const username = ref('');
-const password = ref('');
-const currentPassword = ref('');
-const newPassword = ref('');
-const formError = ref('');
-const busy = ref(false);
-const revokingSessionId = ref<string | null>(null);
+const auth = createAuth()
+const router = createRouter(auth)
+
+const busy = ref(false)
+const sessionChecked = ref(false)
+
+const devicesList = ref<DeviceItem[]>([])
+const devicesNextCursor = ref<string | null>(null)
+const devicesLoading = ref(false)
+const devicesError = ref<string | null>(null)
+let devicesGeneration = 0
+
+async function loadDevices() {
+  if (devicesLoading.value) return
+  devicesLoading.value = true
+  devicesError.value = null
+  const currentGen = ++devicesGeneration
+  try {
+    const res = await get<DeviceListPage>('devices')
+    assertDeviceListPageShape(res.data)
+    if (currentGen !== devicesGeneration || auth.status.value !== 'signed_in') return
+    devicesList.value = res.data.items
+    devicesNextCursor.value = res.data.next_cursor
+  } catch (err: unknown) {
+    if (currentGen !== devicesGeneration || auth.status.value !== 'signed_in') return
+    devicesError.value = t('state.error')
+    devicesList.value = []
+    devicesNextCursor.value = null
+  } finally {
+    if (currentGen === devicesGeneration) {
+      devicesLoading.value = false
+    }
+  }
+}
+
+// 得到特定设备的权限投影
+function getDevicePermissions(deviceId: string): string[] | undefined {
+  const item = devicesList.value.find(d => d.device_id === deviceId)
+  return item ? item.effective_permissions : undefined
+}
+
+function handlePageLoaded(page: DeviceListPage, parentGen?: number) {
+  if (auth.status.value !== 'signed_in') return
+  if (parentGen !== undefined && parentGen !== devicesGeneration) return
+  if (!auth.user.value?.id) return
+
+  // 针对相同 device_id，以后到项的最新投影替换；若后到项可能比先到项更旧，按安全 fail-closed
+  // 选取权限交集与后到 display_name；若仅是正常后到分页，收紧已撤回权限。新项则直接追加。
+  const map = new Map<string, DeviceItem>()
+  for (const item of devicesList.value) {
+    map.set(item.device_id, item)
+  }
+  for (const incoming of page.items) {
+    const existing = map.get(incoming.device_id)
+    if (existing) {
+      // 安全 fail-closed 策略：对于重复项，权限取交集（任何一方未授权或已撤权均视为无权限，绝不盲目扩权）
+      const incomingPermsSet = new Set(incoming.effective_permissions)
+      const tightenedPerms = existing.effective_permissions.filter(p => incomingPermsSet.has(p))
+      map.set(incoming.device_id, {
+        ...incoming,
+        effective_permissions: tightenedPerms,
+      })
+    } else {
+      map.set(incoming.device_id, incoming)
+    }
+  }
+  devicesList.value = Array.from(map.values())
+  devicesNextCursor.value = page.next_cursor
+}
 
 watch(
-  () => auth.status.value,
-  (newStatus) => {
+  [() => auth.status.value, () => router.currentRoute.value.name],
+  async ([newStatus, routeName]) => {
     if (newStatus === 'signed_in') {
-      void auth.listSessions();
+      if (routeName === 'sessions') {
+        void auth.listSessions()
+      } else if (routeName === 'devices') {
+        void loadDevices()
+      } else if (routeName === 'device-detail') {
+        const targetId = (router.currentRoute.value as { params?: { id?: string } }).params?.id
+        // Deep link 进入详情路由：如果当前还没有该设备的授权缓存，且尚未加载列表，先获取受控最小列表
+        if (!getDevicePermissions(targetId || '') && !devicesLoading.value) {
+          await loadDevices()
+        }
+        // 如果确认没有该设备的授权投影，安全重定向回 /devices 列表，且在此之前不挂载 DeviceDetailView
+        if (targetId && !getDevicePermissions(targetId)) {
+          router.navigate({ name: 'devices' })
+        }
+      }
+    } else {
+      // 登出/非 signed_in 状态立即清理设备列表与失效代际
+      devicesGeneration++
+      devicesList.value = []
+      devicesNextCursor.value = null
+      devicesError.value = null
+      devicesLoading.value = false
     }
   },
   { immediate: true },
-);
+)
 
 function changeLocale(event: Event) {
-  setLocale((event.target as HTMLSelectElement).value as Locale);
+  setLocale((event.target as HTMLSelectElement).value as Locale)
 }
 
-function mappedFormError(): string {
-  // 服务端文案永不展示：auth 状态机已把错误归约为 errorCode，唯一映射 authErrorKey 给出本地安全文案。
-  return t(authErrorKey(auth.errorCode.value ?? 'OTHER'));
-}
-
-async function submitLogin(event: Event) {
-  event.preventDefault();
-  if (busy.value) return;
-  busy.value = true;
-  formError.value = '';
-  const name = username.value;
-  const secret = password.value;
-  try {
-    const ok = await auth.login(name, secret);
-    if (!ok) formError.value = mappedFormError(); // 失败时视图仍停在登录表单；成功时表单随视图消失
-  } catch {
-    formError.value = t('errors.generic');
-  } finally {
-    password.value = ''; // 每次提交都清空口令输入，失败也不在界面残留
-    busy.value = false;
+function handleSkipLink(event: Event) {
+  event.preventDefault()
+  const main = document.getElementById('main-content')
+  if (main) {
+    main.focus()
   }
 }
 
-async function submitPassword(event: Event) {
-  event.preventDefault();
-  if (busy.value) return;
-  busy.value = true;
-  formError.value = '';
-  const current = currentPassword.value;
-  const next = newPassword.value;
-  try {
-    const ok = await auth.changePassword(current, next);
-    if (!ok) formError.value = mappedFormError();
-    // 结果未知（auth.status 落为 error）时视图整体切到错误提示，绝不虚报成功。
-  } catch {
-    formError.value = t('errors.generic');
-  } finally {
-    currentPassword.value = '';
-    newPassword.value = '';
-    busy.value = false;
-  }
+function navigateTo(route: AppRoute) {
+  router.navigate(route)
 }
 
 async function submitLogout() {
-  if (busy.value) return;
-  busy.value = true;
-  formError.value = '';
+  if (busy.value) return
+  busy.value = true
   try {
-    await auth.logout(); // 网络失败时 auth.status 为 error，视图显示重试而不是 signed_out
+    await auth.logout()
   } finally {
-    username.value = '';
-    password.value = '';
-    currentPassword.value = '';
-    newPassword.value = '';
-    busy.value = false;
+    busy.value = false
   }
 }
 
-async function revokeSingle(sessionId: string) {
-  if (busy.value) return;
-  busy.value = true;
-  revokingSessionId.value = sessionId;
+async function retryRefresh() {
+  sessionChecked.value = false
   try {
-    await auth.revokeSession(sessionId);
+    await auth.refresh()
   } finally {
-    revokingSessionId.value = null;
-    busy.value = false;
+    sessionChecked.value = true
   }
 }
 
-async function revokeOthers() {
-  if (busy.value) return;
-  busy.value = true;
+onMounted(async () => {
   try {
-    await auth.revokeOtherSessions();
+    await auth.refresh()
   } finally {
-    busy.value = false;
+    sessionChecked.value = true
   }
-}
+})
 
-async function loadMoreSessions() {
-  if (busy.value || !auth.sessionsNextCursor.value) return;
-  busy.value = true;
-  try {
-    await auth.listSessions(auth.sessionsNextCursor.value);
-  } finally {
-    busy.value = false;
-  }
-}
-
-onMounted(() => { void auth.refresh(); });
+onUnmounted(() => {
+  router.cleanup()
+})
 </script>
 
 <template>
-  <a class="skip-link" href="#main-content">{{ t('nav.skip') }}</a>
+  <a class="skip-link" href="#main-content" @click.prevent="handleSkipLink" @keydown.enter.prevent="handleSkipLink">{{ t('nav.skip') }}</a>
   <header class="app-header">
     <h1>{{ t('app.title') }}</h1>
     <label for="app-language">{{ t('language.label') }}</label>
@@ -135,108 +177,75 @@ onMounted(() => { void auth.refresh(); });
     </select>
   </header>
   <main id="main-content" class="app-main" tabindex="-1">
-    <template v-if="auth.status.value === 'checking' || auth.status.value === 'error'">
+    <template v-if="!sessionChecked && auth.status.value === 'checking'">
       <AppNotice :tone-label="locale === 'en' ? 'Status' : '状态'"
-        :title="auth.status.value === 'checking' ? t('state.loading') : t('state.error')">
-        <span v-if="auth.status.value === 'checking'">{{ t('auth.checking') }}</span>
-        <span v-else>{{ t('auth.error.generic') }}</span>
-        <BaseButton v-if="auth.status.value === 'error'" class="auth-retry" :loading-label="t('button.loading')" @click="() => void auth.refresh()">
+        :title="t('state.loading')">
+        <span>{{ t('auth.checking') }}</span>
+      </AppNotice>
+    </template>
+    <template v-else-if="auth.status.value === 'error'">
+      <AppNotice :tone-label="locale === 'en' ? 'Status' : '状态'"
+        :title="t('state.error')">
+        <span>{{ t('auth.error.generic') }}</span>
+        <BaseButton class="auth-retry" :loading-label="t('button.loading')" @click="retryRefresh">
           {{ t('state.retry') }}
         </BaseButton>
       </AppNotice>
     </template>
-    <form v-else-if="auth.status.value === 'signed_out'" class="auth-form" novalidate :aria-label="t('auth.login.title')" @submit.prevent="submitLogin">
-      <h2>{{ t('auth.login.title') }}</h2>
-      <p v-if="formError" role="alert" class="auth-form__error">{{ formError }}</p>
-      <BaseInput id="auth-username" v-model="username" :label="t('auth.username.label')"
-        :hint="t('auth.username.hint')" required :disabled="busy" />
-      <BaseInput id="auth-password" v-model="password" :label="t('auth.password.label')"
-        type="password" required :error="formError || undefined" :disabled="busy" />
-      <BaseButton type="submit" :loading="busy" :loading-label="t('button.loading')">{{ t('auth.login.submit') }}</BaseButton>
-    </form>
-    <form v-else-if="auth.status.value === 'force_password'" class="auth-form" novalidate :aria-label="t('auth.passwordChange.title')" @submit.prevent="submitPassword">
-      <h2>{{ t('auth.passwordChange.title') }}</h2>
-      <p class="auth-form__forced">{{ t('auth.passwordChange.forced') }}</p>
-      <p v-if="formError" role="alert" class="auth-form__error">{{ formError }}</p>
-      <BaseInput id="auth-current-password" v-model="currentPassword" :label="t('auth.currentPassword.label')"
-        type="password" required :error="formError || undefined" :disabled="busy" />
-      <BaseInput id="auth-new-password" v-model="newPassword" :label="t('auth.newPassword.label')"
-        :hint="t('auth.newPassword.hint')" type="password" required :error="formError || undefined" :disabled="busy" />
-      <div class="auth-form__actions">
-        <BaseButton type="submit" :loading="busy" :loading-label="t('button.loading')">{{ t('auth.passwordChange.submit') }}</BaseButton>
-        <BaseButton variant="secondary" :disabled="busy" @click="submitLogout">{{ t('auth.logout.label') }}</BaseButton>
-      </div>
-    </form>
+    <template v-else-if="router.currentRoute.value.name === 'login'">
+      <LoginView :auth="auth" :t="t" />
+    </template>
+    <template v-else-if="router.currentRoute.value.name === 'password'">
+      <PasswordView :auth="auth" :t="t" />
+    </template>
     <section v-else class="auth-signed-in">
       <h2>{{ t('auth.signedIn.heading') }}</h2>
       <p role="status">{{ auth.user.value?.display_name || auth.user.value?.username }}</p>
+      <nav :aria-label="t('auth.sessions.title')" class="auth-nav">
+        <BaseButton
+          variant="secondary"
+          :disabled="busy"
+          @click="() => navigateTo({ name: 'devices' })"
+        >
+          {{ t('nav.devices') }}
+        </BaseButton>
+        <BaseButton
+          variant="secondary"
+          :disabled="busy"
+          @click="() => navigateTo({ name: 'sessions' })"
+        >
+          {{ t('auth.sessions.title') }}
+        </BaseButton>
+      </nav>
       <BaseButton :loading="busy" :loading-label="t('button.loading')" @click="submitLogout">{{ t('auth.logout.label') }}</BaseButton>
 
-      <section class="auth-sessions" :aria-label="t('auth.sessions.title')">
-        <header class="auth-sessions__header">
-          <h3>{{ t('auth.sessions.title') }}</h3>
-          <BaseButton
-            v-if="auth.sessions.value.length > 0"
-            variant="secondary"
-            :disabled="busy"
-            :loading="busy && auth.sessionsLoading.value"
-            :loading-label="t('button.loading')"
-            @click="revokeOthers"
-          >
-            {{ t('auth.sessions.revokeOthers') }}
-          </BaseButton>
-        </header>
-
-        <div v-if="auth.sessionsError.value" class="auth-sessions__error">
-          <AppNotice tone="error" :tone-label="locale === 'en' ? 'Error' : '错误'" :title="t('state.error')">
-            <span>{{ t('auth.error.generic') }}</span>
-            <BaseButton
-              class="auth-retry"
-              :disabled="busy"
-              :loading="busy && auth.sessionsLoading.value"
-              :loading-label="t('button.loading')"
-              @click="() => void auth.listSessions()"
-            >
-              {{ t('state.retry') }}
-            </BaseButton>
-          </AppNotice>
+      <template v-if="router.currentRoute.value.name === 'sessions'">
+        <SessionsView :auth="auth" :locale="locale" :t="t" />
+      </template>
+      <template v-else-if="router.currentRoute.value.name === 'devices'">
+        <DevicesView
+          :initial-devices="devicesList"
+          :initial-next-cursor="devicesNextCursor"
+          :loading="devicesLoading"
+          :error="devicesError"
+          :parent-generation="devicesGeneration"
+          @retry="loadDevices"
+          @page-loaded="handlePageLoaded"
+          @select-device="(id) => navigateTo({ name: 'device-detail', params: { id } })"
+        />
+      </template>
+      <template v-else-if="router.currentRoute.value.name === 'device-detail'">
+        <DeviceDetailView
+          v-if="getDevicePermissions(router.currentRoute.value.params.id)"
+          :device-id="router.currentRoute.value.params.id"
+          :permissions="getDevicePermissions(router.currentRoute.value.params.id)"
+        />
+      </template>
+      <template v-else>
+        <div class="app-placeholder">
+          <p>{{ t('app.notConnected') }}</p>
         </div>
-
-        <p v-else-if="auth.sessions.value.length === 0 && !auth.sessionsLoading.value" class="auth-sessions__empty">
-          {{ t('auth.sessions.empty') }}
-        </p>
-
-        <ul v-if="auth.sessions.value.length > 0" class="auth-sessions__list">
-          <li v-for="sessionItem in auth.sessions.value" :key="sessionItem.id" class="auth-sessions__item">
-            <div class="auth-sessions__info">
-              <span v-if="sessionItem.current" class="auth-sessions__badge">{{ t('auth.sessions.current') }}</span>
-              <span class="auth-sessions__label">{{ t('auth.sessions.created') }}:</span>
-              <span class="auth-sessions__time">{{ sessionItem.created_time }}</span>
-            </div>
-            <BaseButton
-              variant="secondary"
-              :disabled="busy"
-              :loading="busy && revokingSessionId === sessionItem.id"
-              :loading-label="t('button.loading')"
-              @click="() => revokeSingle(sessionItem.id)"
-            >
-              {{ t('auth.sessions.revoke') }}
-            </BaseButton>
-          </li>
-        </ul>
-
-        <div v-if="auth.sessionsNextCursor.value" class="auth-sessions__pagination">
-          <BaseButton
-            variant="secondary"
-            :disabled="busy"
-            :loading="busy && auth.sessionsLoading.value"
-            :loading-label="t('button.loading')"
-            @click="loadMoreSessions"
-          >
-            {{ t('auth.sessions.loadMore') }}
-          </BaseButton>
-        </div>
-      </section>
+      </template>
     </section>
   </main>
   <footer class="app-footer">{{ t('app.title') }}</footer>
@@ -263,20 +272,9 @@ onMounted(() => { void auth.refresh(); });
 .app-header { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-4); }
 .app-header h1 { margin: 0; flex-basis: 100%; }
 .app-header select { max-width: 100%; min-height: 2.75rem; font: inherit; }
-.auth-form { display: grid; gap: var(--space-4); min-width: 0; max-width: 34rem; }
-.auth-form__error { color: var(--color-danger, var(--color-surface)); margin: 0; }
-.auth-form__forced { margin: 0; }
-.auth-form__actions { display: flex; gap: var(--space-2); flex-wrap: wrap; }
 .auth-signed-in { display: grid; gap: var(--space-4); min-width: 0; }
+.auth-nav { display: flex; gap: var(--space-2); }
 .auth-retry { margin-inline-start: auto; }
-.auth-sessions { display: grid; gap: var(--space-3); margin-top: var(--space-4); border-top: 1px solid var(--color-border, #ccc); padding-top: var(--space-4); }
-.auth-sessions__header { display: flex; justify-content: space-between; align-items: center; gap: var(--space-2); }
-.auth-sessions__header h3 { margin: 0; }
-.auth-sessions__list { list-style: none; padding: 0; margin: 0; display: grid; gap: var(--space-2); }
-.auth-sessions__item { display: flex; justify-content: space-between; align-items: center; gap: var(--space-2); padding: var(--space-2); border: 1px solid var(--color-border, #eee); border-radius: 4px; }
-.auth-sessions__info { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
-.auth-sessions__badge { background: var(--color-primary-subtle, #e0f2fe); color: var(--color-primary, #0369a1); padding: 2px 8px; border-radius: 9999px; font-size: 0.875rem; font-weight: 500; }
-.auth-sessions__time { font-size: 0.875rem; color: var(--color-text-muted, #666); }
-.auth-sessions__empty { margin: 0; color: var(--color-text-muted, #666); font-style: italic; }
-.auth-sessions__pagination { display: flex; justify-content: center; }
+.app-placeholder { display: grid; gap: var(--space-2); padding: var(--space-4); border: 1px dashed var(--color-border, #ccc); border-radius: 4px; }
+.app-placeholder p { margin: 0; color: var(--color-text-muted, #666); }
 </style>
