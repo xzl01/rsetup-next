@@ -7,3 +7,4 @@
 pub mod ed25519;
 pub mod frame;
 pub mod sig;
+pub mod wire;
