@@ -25,7 +25,13 @@ const keys = ['app.title', 'app.foundation', 'app.notConnected', 'nav.skip', 'la
   'device.list.title', 'device.list.search', 'device.list.empty', 'device.list.reboot', 'device.list.loadMore',
   'device.dim.admission', 'device.dim.connection', 'device.dim.streamHealth',
   'device.health.control', 'device.health.data',
-  'device.dim.freshness', 'device.status.age', 'device.dim.controllerClock', 'device.dim.boardClock'];
+  'device.dim.freshness', 'device.status.age', 'device.dim.controllerClock', 'device.dim.boardClock',
+  'task.state.queued', 'task.state.held', 'task.state.dispatching', 'task.state.accepted', 'task.state.verifying',
+  'task.state.succeeded', 'task.state.failed', 'task.state.unknown', 'task.state.cancelled', 'task.state.expired',
+  'task.reason.PERMISSION_DENIED', 'task.reason.DEVICE_OFFLINE', 'task.reason.CAPABILITY_UNAVAILABLE', 'task.reason.DEVICE_BUSY',
+  'task.reason.QUEUE_EXPIRED', 'task.reason.TIME_UNCERTAIN', 'task.reason.EXECUTION_REJECTED', 'task.reason.OS_ERROR',
+  'task.reason.RESULT_TIMEOUT', 'task.reason.JOURNAL_LOST', 'task.reason.PROTOCOL_MISMATCH', 'task.reason.USER_CANCELLED',
+  'task.reason.unknown'];
 
 afterEach(() => {
   vi.restoreAllMocks();
