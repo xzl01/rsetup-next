@@ -744,7 +744,7 @@ cargo clippy --offline --locked -p rsetup-controller -- -D warnings
 - Consumes: Task 1 `TimeEvidence`, `std::time::{Duration, Instant}`.
 - Produces:
   - `pub struct PollScheduler { ... }`
-  - `impl PollScheduler { pub fn new(origin: Instant, period: Duration, devices: Vec<[u8; 32]>) -> Self; pub fn due(&mut self, now: Instant) -> Vec<[u8; 32]>; pub fn set_overloaded(&mut self, overloaded: bool); pub fn backlog(&self) -> usize; }`
+  - `impl PollScheduler { pub fn new(origin: Instant, period: Duration, tick_cadence: Duration, devices: Vec<[u8; 32]>) -> Self; pub fn due(&mut self, now: Instant) -> Vec<[u8; 32]>; pub fn set_overloaded(&mut self, overloaded: bool); pub fn backlog(&self) -> usize; }`
   - `pub struct SnapshotStore { ... }`（仅按认证连接管理器确认的当前代际推进，不按随机 UUID 大小排序）
   - `impl SnapshotStore { pub fn update(&self, device: [u8; 32], session_epoch: uuid::Uuid, stream_epoch: uuid::Uuid, boot_id: &str, agent_epoch: uuid::Uuid, sample_seq: u64, metrics: Vec<Metric>, now: Instant); pub fn read(&self, device: &[u8; 32], now: Instant) -> Option<SnapshotView>; }`
 
@@ -759,7 +759,7 @@ pub struct PollScheduler {
 }
 
 impl PollScheduler {
-    pub fn new(_origin: Instant, _period: Duration, devices: Vec<[u8; 32]>) -> Self {
+    pub fn new(_origin: Instant, _period: Duration, _tick_cadence: Duration, devices: Vec<[u8; 32]>) -> Self {
         Self { devices }
     }
     pub fn set_overloaded(&mut self, _overloaded: bool) {}
@@ -786,7 +786,7 @@ mod tests {
     fn overdue_after_pause_skips_without_backlog_and_keeps_distribution() {
         let origin = Instant::now();
         let devices = make_test_devices(1024);
-        let mut scheduler = PollScheduler::new(origin, Duration::from_secs(10), devices);
+        let mut scheduler = PollScheduler::new(origin, Duration::from_secs(10), Duration::from_millis(100), devices);
 
         let pause_now = origin.checked_add(Duration::from_secs(30)).unwrap()
             .checked_add(Duration::from_nanos(1)).unwrap();
@@ -814,7 +814,7 @@ mod tests {
     fn normal_tick_due_emits_ready_devices_without_starvation() {
         let origin = Instant::now();
         let devices = make_test_devices(1024);
-        let mut scheduler = PollScheduler::new(origin, Duration::from_secs(10), devices);
+        let mut scheduler = PollScheduler::new(origin, Duration::from_secs(10), Duration::from_millis(100), devices);
 
         // 正常到期下发测试：在首个 100ms tick，严格分配到该窗口的设备必须正常 emit，绝不能因跳轮逻辑误判而饿死
         let first_tick = origin.checked_add(Duration::from_millis(100)).unwrap();
@@ -881,9 +881,7 @@ cargo test --offline --locked -p rsetup-controller overdue_after_pause_skips_wit
 - [ ] **Step 3: 最小实现**
 
 1. 纳秒整数相位错峰：1024 台设备按 `(i as u128 * period_nanos) / 1024` 分配整数纳秒相位；
-2. 停顿与过载跳轮算法：严格区分正常到期下发与停顿/过载跳轮。若设备 `next_due <= now`：
-   - 若系统处于过载（overloaded）或停顿恢复滞后（`now - next_due >= period`）：计算 `missed_cycles = (elapsed / period) + 1`，将 `next_due` 推进至大于 `now` 的下一个同相位点，逾期轮次一律跳过，**绝不积压（backlog 恒为 0），恢复后绝无洪峰**；
-   - 若系统处于正常 tick 且未过载：将该设备加入当前 tick 的待下发批次（每 100ms tick 下发 ≤11 台），并将其 `next_due` 正常推进一个 `period`。**绝不能把所有 `next_due <= now` 的设备无差别全部跳过而导致设备轮询饿死**。
+2. 停顿与过载跳轮算法：调用方显式传入 `tick_cadence` 并与真实驱动步长保持一致，调度器记录上一轮 `due` 时间（初始 `origin`）。若调用间隔 `now - last_tick > tick_cadence` 或系统已标记 `overloaded`，本次零下发、将已到期设备的 `next_due` 按整数个 `period` 推进至严格大于 `now` 的下一个同相位点，**绝不积压（内部 backlog 恒为 0），恢复后绝无洪峰**；仅当间隔 `<= tick_cadence`、无过载且设备 `next_due <= now` 时发出该设备并推进一轮，已逾期整个 `period` 的旧轮次仍跳过。原 `now - next_due >= period` 不能识别亚周期停顿（例如 5s/10s 造成单 tick 数百台突发），不得再单独作为停顿判据。完整裁决及 RED 用例见[错峰 tick-cadence 修订设计](../specs/2026-10-07-controller-poll-cadence-correction-design.md)。
 3. 内存最新快照：仅驻留内存，按单调接收年龄计算 30s 新鲜度（05 RUN-01 状态过期阈值）；更新时严格比对 session/stream/boot/agent 代际与严格递增的 sample_seq，旧代际或旧序号丢弃；发生错误保留最后好样本与 `last_error`，未知指标绝不回填 0。
 
 - [ ] **Step 4: 运行并确认 GREEN**
