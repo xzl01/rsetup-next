@@ -13,7 +13,9 @@ pub const MAX_GLOBAL_IDENTITIES: usize = 8192; // 05 §6 拟议上限；待 G0 �
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServerHandshakePhase {
     Initial,
+    AwaitingChallengeSend,
     AwaitingAuthRequest,
+    EvaluatingAuth,
     InPending,
     Completed,
     Terminated,
@@ -90,19 +92,19 @@ pub enum AdmissionDecision {
 }
 
 /// 准入与连接限额分类纯模型：
-/// 无论是否已有 snapshot（即使为已批准设备 APPROVED），连接握手前必须检查未认证/活动连接限额，绝不因存在快照而绕过连接预算。
+/// 1. UnauthLimitReached 属于所有连接的前置检查（preflight check）：
+///    无论是否已有快照（即使快照为 Approved 或 Revoked），均返回 RetryableServerError，
+///    绝不在此阶段读取具体身份，未具完整认证上下文不可错误泄露永久状态，且连接配额绝不能绕过。
+/// 2. PendingPoolExhausted 与 IdentityStorageFull 仅限制新身份或待决（Pending）身份：
+///    若快照已处于 Approved 或已明确决议（Denied / Revoked），不占用新待决槽位或新身份配额，不应被此类资源池阻断。
+/// 3. 资源耗尽分类始终为 RetryableServerError，绝不产生持久化的 ApprovalDenied 或 Revoked。
 pub fn classify_admission(
     slot: IdentitySlot,
     snapshot: Option<&AdmissionSnapshot>,
 ) -> AdmissionDecision {
-    // 资源配额检查优先：若连接层资源已耗尽，均拒绝并返回 RetryableServerError，绝不产生 ApprovalDenied 或 Revoked。
-    match slot {
-        IdentitySlot::UnauthLimitReached
-        | IdentitySlot::PendingPoolExhausted
-        | IdentitySlot::IdentityStorageFull => {
-            return AdmissionDecision::RetryableServerError;
-        }
-        IdentitySlot::Available => {}
+    // 1. 未认证连接配额超限是所有握手的硬性 preflight，无论身份快照为何，均返回 RetryableServerError
+    if slot == IdentitySlot::UnauthLimitReached {
+        return AdmissionDecision::RetryableServerError;
     }
 
     if let Some(snap) = snapshot {
@@ -113,11 +115,28 @@ pub fn classify_admission(
             (AdmissionState::Pending, ReviewDecision::Denied) => {
                 AdmissionDecision::Reject(ReasonCode::ApprovalDenied)
             }
-            (AdmissionState::Approved, ReviewDecision::Approved) => AdmissionDecision::Approved,
-            (AdmissionState::Pending, ReviewDecision::None) => AdmissionDecision::Pending,
+            (AdmissionState::Approved, ReviewDecision::Approved) => {
+                // 已批准设备无需占用 PendingPool 或新 IdentityStorage，直接 Approved
+                AdmissionDecision::Approved
+            }
+            (AdmissionState::Pending, ReviewDecision::None) => {
+                // 处于待决状态，受 PendingPoolExhausted 和 IdentityStorageFull 限制
+                if slot == IdentitySlot::PendingPoolExhausted
+                    || slot == IdentitySlot::IdentityStorageFull
+                {
+                    AdmissionDecision::RetryableServerError
+                } else {
+                    AdmissionDecision::Pending
+                }
+            }
             _ => AdmissionDecision::Reject(ReasonCode::Unspecified),
         }
     } else {
-        AdmissionDecision::Pending
+        // 新身份（无快照），若挂起池耗尽或身份存储满，返回 RetryableServerError；否则进入 Pending
+        if slot == IdentitySlot::PendingPoolExhausted || slot == IdentitySlot::IdentityStorageFull {
+            AdmissionDecision::RetryableServerError
+        } else {
+            AdmissionDecision::Pending
+        }
     }
 }

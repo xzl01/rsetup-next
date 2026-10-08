@@ -31,6 +31,19 @@ pub enum HandshakeError {
     AlreadyFinished(ServerHandshakePhase),
     #[error("payload level verification not implemented in frame-only API")]
     PayloadVerificationUnimplemented,
+    #[error("in-flight probe must be settled before final approval")]
+    ProbeInFlightBeforeFinalApproval,
+    #[error("pong verification failed: status_nonce mismatch")]
+    PongNonceMismatch,
+    #[error("pong verification failed: pending_token mismatch")]
+    PongTokenMismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedPendingContext {
+    pub status_nonce: [u8; 16],
+    pub pending_token: [u8; 16],
+    pub probe_seq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +58,7 @@ pub struct ServerHandshakeSM {
     phase: ServerHandshakePhase,
     probe_in_flight: bool,
     next_probe_seq: u64,
+    pending_ctx: Option<TypedPendingContext>,
 }
 
 impl Default for ServerHandshakeSM {
@@ -59,6 +73,7 @@ impl ServerHandshakeSM {
             phase: ServerHandshakePhase::Initial,
             probe_in_flight: false,
             next_probe_seq: 1,
+            pending_ctx: None,
         }
     }
 
@@ -74,37 +89,29 @@ impl ServerHandshakeSM {
         self.next_probe_seq
     }
 
-    /// 服务端出站发送 ServerChallenge（仅在收到 ClientHello 之后由 Initial 迁移至 AwaitingAuthRequest）。
-    /// 如果在非预期阶段调用，进入 Terminated 并报错。
-    pub fn on_send_server_challenge(&mut self) -> Result<(), HandshakeError> {
-        match self.phase {
-            ServerHandshakePhase::Initial => {
-                // 不能在未收到 ClientHello 时由服务端盲发 Challenge
-                self.phase = ServerHandshakePhase::Terminated;
-                Err(HandshakeError::UnexpectedFrame(FrameType::ServerChallenge))
-            }
-            ServerHandshakePhase::AwaitingAuthRequest => Ok(()),
-            ServerHandshakePhase::Completed | ServerHandshakePhase::Terminated => {
-                let err = HandshakeError::AlreadyFinished(self.phase);
-                self.phase = ServerHandshakePhase::Terminated;
-                Err(err)
-            }
-            _ => {
-                self.phase = ServerHandshakePhase::Terminated;
-                Err(HandshakeError::UnexpectedFrame(FrameType::ServerChallenge))
-            }
-        }
+    pub fn current_pending_context(&self) -> Option<&TypedPendingContext> {
+        self.pending_ctx.as_ref()
     }
 
     /// 标记进入 PENDING 阶段。
-    /// 前序约束：只有在已经收到 ClientAuthRequest 之后（处于 AwaitingAuthRequest 阶段完成初始检查）才允许进入 InPending。
+    /// 前序约束：只有在已经收到 ClientAuthRequest 之后（处于 EvaluatingAuth 阶段完成初始检查）才允许进入 InPending。
     /// 首个 ServerPending 即为第一轮 probe（probe_seq = 1），标记 probe_in_flight = true。
-    pub fn enter_pending(&mut self) -> Result<(), HandshakeError> {
+    /// 必须提供初始 typed pending 上下文（status_nonce 与 pending_token）。
+    pub fn enter_pending(
+        &mut self,
+        status_nonce: [u8; 16],
+        pending_token: [u8; 16],
+    ) -> Result<(), HandshakeError> {
         match self.phase {
-            ServerHandshakePhase::AwaitingAuthRequest => {
+            ServerHandshakePhase::EvaluatingAuth => {
                 self.phase = ServerHandshakePhase::InPending;
                 self.probe_in_flight = true;
                 self.next_probe_seq = 1;
+                self.pending_ctx = Some(TypedPendingContext {
+                    status_nonce,
+                    pending_token,
+                    probe_seq: 1,
+                });
                 Ok(())
             }
             ServerHandshakePhase::Completed | ServerHandshakePhase::Terminated => {
@@ -123,8 +130,14 @@ impl ServerHandshakeSM {
     /// 约束：
     /// - 必须处于 InPending
     /// - 单连接仅允许一个在途 probe（上一轮未结清不得发送新 probe）
-    /// - probe_seq 从 1 开始单调递增，不得回绕（u64 溢出直接拒绝）
-    pub fn on_send_server_pending_probe(&mut self, probe_seq: u64) -> Result<(), HandshakeError> {
+    /// - probe_seq 从 1 开始单调递增，且必须等于 expected next_probe_seq，不得跳号或回绕
+    /// - probe_seq == u64::MAX 溢出直接拒绝
+    /// - 必须原子更新内部 pending_token 为新 probe token，同时保持 status_nonce 严格不变
+    pub fn on_send_server_pending_probe(
+        &mut self,
+        probe_seq: u64,
+        next_pending_token: [u8; 16],
+    ) -> Result<(), HandshakeError> {
         if self.phase == ServerHandshakePhase::Completed
             || self.phase == ServerHandshakePhase::Terminated
         {
@@ -140,35 +153,137 @@ impl ServerHandshakeSM {
             self.phase = ServerHandshakePhase::Terminated;
             return Err(HandshakeError::ProbeAlreadyInFlight);
         }
-        if probe_seq < self.next_probe_seq {
+        if probe_seq == u64::MAX {
+            self.phase = ServerHandshakePhase::Terminated;
+            return Err(HandshakeError::ProbeSeqWrapAround(probe_seq));
+        }
+        if probe_seq != self.next_probe_seq {
             self.phase = ServerHandshakePhase::Terminated;
             return Err(HandshakeError::ProbeSeqOutOfOrder {
                 expected: self.next_probe_seq,
                 actual: probe_seq,
             });
         }
-        if probe_seq == u64::MAX {
+
+        let ctx = self.pending_ctx.as_mut().ok_or_else(|| {
             self.phase = ServerHandshakePhase::Terminated;
-            return Err(HandshakeError::ProbeSeqWrapAround(probe_seq));
-        }
+            HandshakeError::NoProbeInFlight
+        })?;
+        ctx.pending_token = next_pending_token;
+        ctx.probe_seq = probe_seq;
 
         self.probe_in_flight = true;
-        self.next_probe_seq = probe_seq;
         Ok(())
     }
 
-    /// 服务端发送 ServerAuthResponse 结束握手
-    pub fn on_send_auth_response(&mut self) -> Result<(), HandshakeError> {
+    /// 收到并核验客户端回显的 typed PendingPong。
+    /// 原子比较三字段：status_nonce 逐字相等、pending_token 逐字相等、probe_seq == expected。
+    /// 匹配才结清 probe_in_flight 并将 next_probe_seq 严格 + 1。
+    /// 失配则 fail-closed，进入 Terminated 并返回具体错误。
+    pub fn on_pong(&mut self, actual: &TypedPongPayloadContext) -> Result<(), HandshakeError> {
+        if self.phase == ServerHandshakePhase::Completed
+            || self.phase == ServerHandshakePhase::Terminated
+        {
+            let err = HandshakeError::AlreadyFinished(self.phase);
+            self.phase = ServerHandshakePhase::Terminated;
+            return Err(err);
+        }
+        if self.phase != ServerHandshakePhase::InPending {
+            self.phase = ServerHandshakePhase::Terminated;
+            return Err(HandshakeError::UnexpectedFrame(FrameType::PendingPong));
+        }
+        if !self.probe_in_flight {
+            self.phase = ServerHandshakePhase::Terminated;
+            return Err(HandshakeError::NoProbeInFlight);
+        }
+
+        let ctx = match self.pending_ctx.as_ref() {
+            Some(c) => c,
+            None => {
+                self.phase = ServerHandshakePhase::Terminated;
+                return Err(HandshakeError::NoProbeInFlight);
+            }
+        };
+
+        if actual.status_nonce != ctx.status_nonce {
+            self.phase = ServerHandshakePhase::Terminated;
+            return Err(HandshakeError::PongNonceMismatch);
+        }
+        if actual.pending_token != ctx.pending_token {
+            self.phase = ServerHandshakePhase::Terminated;
+            return Err(HandshakeError::PongTokenMismatch);
+        }
+        if actual.probe_seq != ctx.probe_seq {
+            self.phase = ServerHandshakePhase::Terminated;
+            return Err(HandshakeError::ProbeSeqOutOfOrder {
+                expected: ctx.probe_seq,
+                actual: actual.probe_seq,
+            });
+        }
+
+        // 校验通过：结清在途 probe，准备下一轮
+        self.probe_in_flight = false;
+        if let Some(next) = self.next_probe_seq.checked_add(1) {
+            self.next_probe_seq = next;
+            Ok(())
+        } else {
+            self.phase = ServerHandshakePhase::Terminated;
+            Err(HandshakeError::ProbeSeqWrapAround(self.next_probe_seq))
+        }
+    }
+
+    /// 服务端出站发送 ServerChallenge（仅在 Initial 阶段收到 ClientHello 之后由 AwaitingChallengeSend 迁移至 AwaitingAuthRequest）。
+    /// 如果在非预期阶段调用，进入 Terminated 并报错。
+    pub fn on_send_server_challenge(&mut self) -> Result<(), HandshakeError> {
         match self.phase {
-            ServerHandshakePhase::AwaitingAuthRequest | ServerHandshakePhase::InPending => {
-                self.phase = ServerHandshakePhase::Completed;
-                self.probe_in_flight = false;
+            ServerHandshakePhase::AwaitingChallengeSend => {
+                self.phase = ServerHandshakePhase::AwaitingAuthRequest;
                 Ok(())
             }
             ServerHandshakePhase::Completed | ServerHandshakePhase::Terminated => {
                 let err = HandshakeError::AlreadyFinished(self.phase);
                 self.phase = ServerHandshakePhase::Terminated;
                 Err(err)
+            }
+            _ => {
+                self.phase = ServerHandshakePhase::Terminated;
+                Err(HandshakeError::UnexpectedFrame(FrameType::ServerChallenge))
+            }
+        }
+    }
+
+    /// 服务端做最终决策发送 ServerAuthResponse：
+    /// - approved 为 true 时：必须在已经收到 ClientAuthRequest 后（EvaluatingAuth 或 InPending 且无在途 probe），迁移至 Completed。
+    ///   若在 InPending 期间仍有在途 probe，禁止 final approved，必须 fail-closed 报错并转移至 Terminated。
+    /// - approved 为 false 时（REJECTED 分支）：根据 protocol_spec §4.1 / §4.5，拒绝为终结状态，进入 Terminated。
+    pub fn on_send_auth_response(&mut self, approved: bool) -> Result<(), HandshakeError> {
+        if self.phase == ServerHandshakePhase::Completed
+            || self.phase == ServerHandshakePhase::Terminated
+        {
+            let err = HandshakeError::AlreadyFinished(self.phase);
+            self.phase = ServerHandshakePhase::Terminated;
+            return Err(err);
+        }
+
+        match (self.phase, approved) {
+            (ServerHandshakePhase::EvaluatingAuth, true) => {
+                self.phase = ServerHandshakePhase::Completed;
+                self.probe_in_flight = false;
+                Ok(())
+            }
+            (ServerHandshakePhase::InPending, true) => {
+                if self.probe_in_flight {
+                    self.phase = ServerHandshakePhase::Terminated;
+                    return Err(HandshakeError::ProbeInFlightBeforeFinalApproval);
+                }
+                self.phase = ServerHandshakePhase::Completed;
+                Ok(())
+            }
+            (ServerHandshakePhase::EvaluatingAuth, false)
+            | (ServerHandshakePhase::InPending, false) => {
+                self.phase = ServerHandshakePhase::Terminated;
+                self.probe_in_flight = false;
+                Ok(())
             }
             _ => {
                 self.phase = ServerHandshakePhase::Terminated;
@@ -180,12 +295,12 @@ impl ServerHandshakeSM {
     }
 
     /// 处理客户端入站帧：
-    /// 1. 服务端出站帧（ServerChallenge / ServerAuthResponse）绝不得作为客户端入站帧接收。
+    /// 1. 服务端出站帧（ServerChallenge / ServerAuthResponse / ServerPending）绝不得作为客户端入站帧接收。
     /// 2. 终止态 / 完成态不可接任何后续握手帧。
-    /// 3. Initial 阶段只接受 ClientHello。
-    /// 4. AwaitingAuthRequest 阶段只接受 ClientAuthRequest。
-    /// 5. InPending 阶段只接受 PendingPong。注意：frame-only API 无法验证 Protobuf payload 中携带的 pong token/status_nonce/probe_seq，
-    ///    因此仅在此更新帧序列状态（结清 probe_in_flight，并使 next_probe_seq 单调步进）。
+    /// 3. Initial 阶段只接受 ClientHello，迁移至 AwaitingChallengeSend。
+    /// 4. AwaitingAuthRequest 阶段只接受 ClientAuthRequest，迁移至 EvaluatingAuth。
+    /// 5. InPending 阶段收到 frame-only PendingPong 必须 fail-closed（返回 PayloadVerificationUnimplemented 并转移到 Terminated），
+    ///    绝不能未验证 token/nonce/seq 即提前结清在途 probe。必须通过 `on_pong(&TypedPongPayloadContext)` 进行原子核验。
     pub fn on_frame(&mut self, frame_type: FrameType) -> Result<(), HandshakeError> {
         // 完成/终止态不可接后续握手帧
         if self.phase == ServerHandshakePhase::Completed
@@ -207,27 +322,17 @@ impl ServerHandshakeSM {
 
         match (self.phase, frame_type) {
             (ServerHandshakePhase::Initial, FrameType::ClientHello) => {
-                self.phase = ServerHandshakePhase::AwaitingAuthRequest;
+                self.phase = ServerHandshakePhase::AwaitingChallengeSend;
                 Ok(())
             }
             (ServerHandshakePhase::AwaitingAuthRequest, FrameType::ClientAuthRequest) => {
-                // 收到认证请求，保持在 AwaitingAuthRequest 等待后续签名验证/准入决策（可转 InPending 或 Completed）
+                self.phase = ServerHandshakePhase::EvaluatingAuth;
                 Ok(())
             }
             (ServerHandshakePhase::InPending, FrameType::PendingPong) => {
-                if !self.probe_in_flight {
-                    self.phase = ServerHandshakePhase::Terminated;
-                    return Err(HandshakeError::NoProbeInFlight);
-                }
-                // 收到 pong，结清在途 probe，准备下一轮
-                self.probe_in_flight = false;
-                if let Some(next) = self.next_probe_seq.checked_add(1) {
-                    self.next_probe_seq = next;
-                } else {
-                    self.phase = ServerHandshakePhase::Terminated;
-                    return Err(HandshakeError::ProbeSeqWrapAround(self.next_probe_seq));
-                }
-                Ok(())
+                // frame-only Pong 必须 fail-closed 不能更新状态
+                self.phase = ServerHandshakePhase::Terminated;
+                Err(HandshakeError::PayloadVerificationUnimplemented)
             }
             _ => {
                 self.phase = ServerHandshakePhase::Terminated;
@@ -236,17 +341,18 @@ impl ServerHandshakeSM {
         }
     }
 
-    /// 当使用带 typed payload context 的验证时，对 PendingPong 载荷进行严格核验。
-    /// 注意：由于目前是在协议纯序列切片，若没有 typed payload context 则应通过此显式方法表明区别。
+    /// 当使用外部 typed payload context 比较两组数据时，核验 PendingPong 载荷。
+    /// 注意：若与状态机内部绑定的 context 校验，请直接使用原子方法 `sm.on_pong(actual)`。
     pub fn verify_pong_payload(
         &self,
         expected: &TypedPongPayloadContext,
         actual: &TypedPongPayloadContext,
     ) -> Result<(), HandshakeError> {
-        if expected.status_nonce != actual.status_nonce
-            || expected.pending_token != actual.pending_token
-        {
-            return Err(HandshakeError::UnexpectedFrame(FrameType::PendingPong));
+        if expected.status_nonce != actual.status_nonce {
+            return Err(HandshakeError::PongNonceMismatch);
+        }
+        if expected.pending_token != actual.pending_token {
+            return Err(HandshakeError::PongTokenMismatch);
         }
         if actual.probe_seq != expected.probe_seq {
             return Err(HandshakeError::ProbeSeqOutOfOrder {
