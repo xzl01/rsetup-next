@@ -12,7 +12,9 @@
 
 ## Global Constraints
 
-- 构造器 `new(origin: Instant, period: Duration, tick_cadence: Duration, devices: Vec<[u8; 32]>) -> Self`；不保留隐式猜测 tick 的三参数生产入口。周期、cadence、设备数由调用方决定；1024/10s/100ms/11 只在测试中作为建议基准。`due`, `set_overloaded`, `backlog` 保持原名称。
+- 构造器 `new(origin: Instant, period: Duration, tick_cadence: Duration, devices: Vec<[u8; 32]>) -> Self`；不保留隐式猜测 tick 的三参数生产入口。周期、cadence、设备数均由调用方显式决定，无默认硬编码；1024/10s/100ms/11 只在测试中作为建议基准。`due`, `set_overloaded`, `backlog` 保持原名称。
+- 配置前提：`tick_cadence` 严格定义为正常调用的**最长可接受间隔**（包含定时器抖动与容限裕量），而非标称 timer 周期。调度器不引入隐式倍数或第五参数。
+- 首周期窗口定义为半开区间 `(origin, origin + period]`：非零 `period` 下相位 0 设备的初始 `next_due` 设为 `origin.checked_add(period)`，杜绝冷启动首个 tick 与周期边界的双发；零周期在 `origin` 处保持一次性发放。
 - 一次停顿 `now - last_tick > tick_cadence` 或明确过载时零下发、无队列、保持原相位；正常 tick 不饿死。`backlog()==0` 不等于系统完成整体背压。
 - RED 在旧三参数实现上编写可运行的行为断言；先证实输出数百台导致断言失败，再修改接口。编译错误、缺依赖和零用例均非有效 RED。
 - 离线锁定 Cargo；无 DB/NTP/硬件/外网/root 锁，不能声称 Task5 整体完成或容量实测。
@@ -57,7 +59,7 @@ self.last_tick = now;
 
 之后遍历所有 `next_due <= now` 的设备；`period == Duration::ZERO` 保留旧的一次性分支并在除法前完成。对普通周期，若 `self.overloaded || paused || now.duration_since(next_due) >= self.period`，以原有 `mul_duration_u128` 和 `checked_add` 按 `(elapsed/period)+1` 个整数周期前推该设备的 `next_due` 至 `> now`，不把它加入 `ready`；否则将设备 ID 加入 `ready` 且 `next_due.checked_add(self.period)`。整轮 `paused` 的调用必须返回空，而不能对某些刚到期设备放行。`backlog()` 恒零仅代表内部不排队。
 
-- [ ] **Step 3 扩展测试：** 5s/10s/30s+1ns 首次停顿应零发放，然后 100 次 100ms tick 每次 `<=11` 且收齐 1024 个唯一设备；首个正常 `origin+100ms` 下发非空；过载解除不回放；相同 `now` 无双发；60s 周期+1s cadence 的正常驱动不饿死；零 cadence、零周期、空设备和倒退 now 不 panic、不发旧轮次。参考测试（保留计划原 30s、normal tick 及已有 overload 测试，将其构造器改成显式 cadence）：
+- [ ] **Step 3 扩展测试：** 5s/10s/30s+1ns 首次停顿应零发放，然后 100 次 100ms tick 每次 `<=11` 且收齐 1024 个唯一设备；首个正常 `origin+100ms` 下发非空；过载解除不回放；相同 `now` 无双发；首周期窗口定义为半开区间 `(origin, origin + period]`，冷启动 100 个连续 100ms 正常 tick（`tick in 1..=100`）收齐 1024 个唯一设备且设备 0 在首个周期末尾发放无双发；60s 周期+1s cadence（`tick in 1..=60`）正常驱动不饿死；带抖动标称 100ms 在显式 125ms cadence 裕量下不饿死；零 cadence、零周期、空设备和倒退 now 不 panic、不发旧轮次。参考测试（保留计划原 30s、normal tick 及已有 overload 测试，将其构造器改成显式 cadence）：
 
 ```rust
 #[test]
@@ -81,7 +83,7 @@ fn one_second_cadence_with_sixty_second_period_is_not_starved() {
     let origin = Instant::now();
     let mut s = PollScheduler::new(origin, Duration::from_secs(60), Duration::from_secs(1), make_test_devices(60));
     let mut seen = std::collections::HashSet::new();
-    for tick in 0..60 {
+    for tick in 1..=60 {
         let at = origin.checked_add(Duration::from_secs(tick)).unwrap();
         for id in s.due(at) { assert!(seen.insert(id)); }
     }

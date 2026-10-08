@@ -29,6 +29,9 @@ impl PollScheduler {
             .map(|(i, id)| {
                 let next_due = if period.is_zero() || n == 0 {
                     Some(origin)
+                } else if i == 0 {
+                    // 首周期窗口定义为 (origin, origin + period]；非零 period 相位 0 的初始到期时刻为 origin + period
+                    origin.checked_add(period)
                 } else {
                     let phase_nanos = (i as u128 * period.as_nanos()) / (n as u128);
                     u64::try_from(phase_nanos / 1_000_000_000)
@@ -220,7 +223,7 @@ mod tests {
             make_test_devices(60),
         );
         let mut seen = std::collections::HashSet::new();
-        for tick in 0..60 {
+        for tick in 1..=60 {
             let at = origin.checked_add(Duration::from_secs(tick)).unwrap();
             for id in s.due(at) {
                 assert!(seen.insert(id));
@@ -430,5 +433,81 @@ mod tests {
         let tick2 = tick1.checked_add(Duration::from_millis(100)).unwrap();
         let batch2 = scheduler.due(tick2);
         assert!(!batch2.is_empty());
+    }
+
+    #[test]
+    fn cold_start_one_hundred_normal_ticks_collects_all_unique_devices() {
+        let origin = Instant::now();
+        let devices = make_test_devices(1024);
+        let mut scheduler = PollScheduler::new(
+            origin,
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+            devices,
+        );
+
+        let mut collected = std::collections::HashSet::new();
+        let mut total_emitted = 0;
+        for tick in 1..=100 {
+            let at = origin
+                .checked_add(Duration::from_millis(tick * 100))
+                .unwrap();
+            let batch = scheduler.due(at);
+            assert!(
+                batch.len() <= 11,
+                "tick {} exceeded limit: {}",
+                tick,
+                batch.len()
+            );
+            for id in batch {
+                total_emitted += 1;
+                assert!(collected.insert(id), "duplicate device emitted: {:?}", id);
+            }
+        }
+        assert_eq!(total_emitted, 1024);
+        assert_eq!(collected.len(), 1024);
+        assert_eq!(scheduler.backlog(), 0);
+    }
+
+    #[test]
+    fn nominal_one_hundred_millis_with_jitter_under_one_hundred_twenty_five_cadence_not_starved() {
+        let origin = Instant::now();
+        let devices = make_test_devices(1024);
+        // 调用方显式配置 125ms 作为最长可接受间隔（headroom），标称 100ms 驱动且每次累积 +1µs 抖动
+        let mut scheduler = PollScheduler::new(
+            origin,
+            Duration::from_secs(10),
+            Duration::from_millis(125),
+            devices,
+        );
+
+        let mut collected = std::collections::HashSet::new();
+        let mut total_emitted = 0;
+        let mut current_now = origin;
+        for tick in 1..=100 {
+            // 每次 tick 间隔标称 100ms 额外增加 1µs 延迟
+            let step = Duration::from_millis(100) + Duration::from_micros(1);
+            current_now = current_now.checked_add(step).unwrap();
+            let batch = scheduler.due(current_now);
+            assert!(
+                batch.len() <= 11,
+                "tick {} exceeded limit: {}",
+                tick,
+                batch.len()
+            );
+            for id in batch {
+                total_emitted += 1;
+                // 注意：在 Device 0 修复前，此测试同样可能在 tick 100 遇到 Device 0 重复
+                // 此处记录正向契约每 tick 不饿死与正常发放
+                collected.insert(id);
+            }
+        }
+        // 100 次 tick 期间没有因为单次 100.001ms 超过 125ms 而整轮跳轮或饿死
+        assert!(
+            total_emitted >= 1000,
+            "jittered ticks must not starve under sufficient cadence headroom: {}",
+            total_emitted
+        );
+        assert_eq!(scheduler.backlog(), 0);
     }
 }

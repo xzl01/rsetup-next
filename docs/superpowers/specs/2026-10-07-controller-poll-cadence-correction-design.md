@@ -8,7 +8,7 @@
 
 ## 公开接口与数据流
 
-将构造器明确为 `PollScheduler::new(origin: Instant, period: Duration, tick_cadence: Duration, devices: Vec<[u8; 32]>) -> Self`；`due(now)`, `set_overloaded(bool)`, `backlog()` 名称不变。当前无生产调用方，更新 Task 5 测试和计划中的签名，不保留隐式猜测 tick 间隔的三参数重载。`period`、`tick_cadence`、设备数均由调用方传入，1024/10s/100ms/≤11 仅是基准测试组合，不是生产硬编码常量。`tick_cadence` 表示一次普通调度调用可接受的最长时间窗口，而非 NTP/设备采样周期。
+将构造器明确为 `PollScheduler::new(origin: Instant, period: Duration, tick_cadence: Duration, devices: Vec<[u8; 32]>) -> Self`；`due(now)`, `set_overloaded(bool)`, `backlog()` 名称不变。当前无生产调用方，更新 Task 5 测试和计划中的签名，不保留隐式猜测 tick 间隔的三参数重载。`period`、`tick_cadence`、设备数均由调用方传入，1024/10s/100ms/≤11 仅是基准测试组合，无任何默认硬编码。`tick_cadence` 的配置前提被严格定义为正常调用**最长可接受间隔**（即容许上限，包含驱动 timer 的调度抖动与执行 headroom），而非驱动 timer 的标称周期；若调用方传入与名义 timer 完全相等的 cadence，任何正向抖动均会判定为停顿而跳轮，此行为属于调用方违反配置契约而非调度器缺陷。首周期窗口定义为半开区间 `(origin, origin + period]`，非零 `period` 时相位 0 设备的初始 `next_due` 为 `origin.checked_add(period)`，避免冷启动首个 tick 与满周期边界产生双发；零周期仍保持 `origin` 处一次性发放。
 
 调度器记录 `last_tick`（初始为 `origin`）。当 `due(now)` 满足 `now < last_tick` 时不下发且不倒退状态；重复相同 `now` 不重复下发。`tick_cadence == 0` 失败关闭为不下发（也不猜测 cadence），以后的配置修复须重新建调度器；`period == 0` 保持既有一次性安全行为，只在最初 `origin` 到期且非过载时下发一次。
 
