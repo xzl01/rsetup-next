@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, inject, ref, watch } from 'vue'
+import { computed, inject, onUnmounted, ref, watch } from 'vue'
 import { assertDeviceListPageShape, canReboot, type DeviceItem, type DeviceListPage } from '../types'
 import { get } from '../api'
 import type { createI18n } from '../i18n'
@@ -13,13 +13,14 @@ const props = defineProps<{
   permissions?: string[]
   loading?: boolean
   error?: string | null
+  parentGeneration?: number
 }>()
 
 const emit = defineEmits<{
   selectDevice: [deviceId: string]
   rebootDevice: [deviceId: string]
   retry: []
-  pageLoaded: [page: DeviceListPage]
+  pageLoaded: [page: DeviceListPage, parentGen?: number]
 }>()
 
 const i18n = inject<ReturnType<typeof createI18n>>('i18n')!
@@ -29,10 +30,21 @@ const searchQuery = ref('')
 const loadingMore = ref(false)
 const paginationError = ref<string | null>(null)
 let paginationGeneration = 0
+let abortController: AbortController | null = null
+let isMounted = true
+
+function abortPendingLoadMore() {
+  paginationGeneration++
+  if (abortController) {
+    abortController.abort()
+    abortController = null
+  }
+}
 
 watch(
   () => props.initialDevices,
   (newDevs) => {
+    abortPendingLoadMore()
     if (newDevs) {
       devices.value = newDevs
     }
@@ -46,6 +58,13 @@ watch(
   },
 )
 
+watch(
+  () => props.parentGeneration,
+  () => {
+    abortPendingLoadMore()
+  },
+)
+
 const filteredDevices = computed(() => {
   const query = searchQuery.value.trim().toLowerCase()
   if (!query) return devices.value
@@ -54,22 +73,58 @@ const filteredDevices = computed(() => {
   )
 })
 
+function mergeDevicesReplacingDuplicates(existing: DeviceItem[], incoming: DeviceItem[]): DeviceItem[] {
+  const map = new Map<string, DeviceItem>()
+  for (const item of existing) {
+    map.set(item.device_id, item)
+  }
+  for (const inc of incoming) {
+    const prev = map.get(inc.device_id)
+    if (prev) {
+      // 安全 fail-closed 权限交集收紧
+      const incPerms = new Set(inc.effective_permissions)
+      map.set(inc.device_id, {
+        ...inc,
+        effective_permissions: prev.effective_permissions.filter(p => incPerms.has(p)),
+      })
+    } else {
+      map.set(inc.device_id, inc)
+    }
+  }
+  return Array.from(map.values())
+}
+
 async function loadMore() {
-  if (loadingMore.value || !nextCursor.value) return
+  if (loadingMore.value || !nextCursor.value || !isMounted) return
   loadingMore.value = true
   paginationError.value = null
   const currentGen = ++paginationGeneration
+  if (abortController) {
+    abortController.abort()
+  }
+  abortController = new AbortController()
+  const signal = abortController.signal
+  const boundParentGen = props.parentGeneration
+
   try {
     const res = await get<DeviceListPage>(
-      `devices?cursor=${encodeURIComponent(nextCursor.value)}`
+      `devices?cursor=${encodeURIComponent(nextCursor.value)}`,
+      { signal }
     )
     assertDeviceListPageShape(res.data)
-    if (currentGen !== paginationGeneration) return
-    devices.value = [...devices.value, ...res.data.items]
+    if (!isMounted || currentGen !== paginationGeneration) return
+    if (props.parentGeneration !== undefined && props.parentGeneration !== boundParentGen) return
+
+    devices.value = mergeDevicesReplacingDuplicates(devices.value, res.data.items)
     nextCursor.value = res.data.next_cursor
-    emit('pageLoaded', res.data)
+    if (boundParentGen !== undefined) {
+      emit('pageLoaded', res.data, boundParentGen)
+    } else {
+      emit('pageLoaded', res.data)
+    }
   } catch (err: unknown) {
-    if (currentGen !== paginationGeneration) return
+    if (!isMounted || currentGen !== paginationGeneration) return
+    if (err && typeof err === 'object' && 'name' in err && err.name === 'AbortError') return
     paginationError.value = i18n.t('state.error')
   } finally {
     if (currentGen === paginationGeneration) {
@@ -77,6 +132,11 @@ async function loadMore() {
     }
   }
 }
+
+onUnmounted(() => {
+  isMounted = false
+  abortPendingLoadMore()
+})
 
 function handleReboot(deviceId: string) {
   emit('rebootDevice', deviceId)

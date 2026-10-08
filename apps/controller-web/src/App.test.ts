@@ -1129,4 +1129,224 @@ describe('signed_in session management UI (Task 5)', () => {
     expect(fetchedUrls.some(u => u.endsWith(`/devices/${DEV_PAGE2}`))).toBe(true);
     expect(fetchedUrls.some(u => u.endsWith(`/devices/${DEV_PAGE2}/status`))).toBe(true);
   });
+
+  test('Reviewer A: late page2 loadMore after logout and login as another user never contaminates new user', async () => {
+    const USER_A_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const USER_B_ID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+
+    const USER_A = {
+      id: USER_A_ID,
+      username: 'alice',
+      active: true,
+      is_admin: false,
+      must_change_password: false,
+      revision: '1',
+    };
+    const USER_B = {
+      id: USER_B_ID,
+      username: 'bob',
+      active: true,
+      is_admin: false,
+      must_change_password: false,
+      revision: '1',
+    };
+
+    const DEV_A_PAGE1 = '1'.repeat(64);
+    const DEV_A_PAGE2 = '2'.repeat(64);
+    const DEV_B_PAGE1 = '3'.repeat(64);
+
+    let currentUser = USER_A;
+    let resolveLatePage2: ((value: Response) => void) | undefined;
+    const latePage2Promise = new Promise<Response>((resolve) => {
+      resolveLatePage2 = resolve;
+    });
+
+    const dispatchedUrls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input);
+      dispatchedUrls.push(url);
+      if (url.includes('/auth/me')) {
+        return jsonResponse({
+          data: { user: currentUser, csrf_token: 'csrf', authz_epoch: '1' },
+          request_id: RID_ME,
+        });
+      }
+      if (url.includes('/auth/logout')) {
+        return jsonResponse({ data: { logged_out: true }, request_id: RID_LOGOUT });
+      }
+      if (url.includes('/auth/login')) {
+        currentUser = USER_B;
+        return jsonResponse({ data: { user: USER_B, csrf_token: 'csrf-b' }, request_id: RID_LOGIN });
+      }
+      if (url.includes('/devices?cursor=cursor_a_2') || url.includes('cursor=cursor_a_2')) {
+        return latePage2Promise;
+      }
+      if (url.includes('/devices')) {
+        if (currentUser.id === USER_A_ID) {
+          return jsonResponse({
+            data: {
+              items: [{ device_id: DEV_A_PAGE1, display_name: 'Alice Dev 1', effective_permissions: ['device.read'] }],
+              next_cursor: 'cursor_a_2',
+            },
+            request_id: RID_LIST,
+          });
+        } else {
+          return jsonResponse({
+            data: {
+              items: [{ device_id: DEV_B_PAGE1, display_name: 'Bob Dev 1', effective_permissions: ['device.read'] }],
+              next_cursor: null,
+            },
+            request_id: RID_LIST,
+          });
+        }
+      }
+      throw new TypeError(`unexpected fetch ${url}`);
+    }));
+
+    window.location.hash = '#/devices';
+    render(App);
+
+    // Alice is signed in, Alice Dev 1 visible
+    await vi.waitFor(() => expect(screen.getByText('Alice Dev 1')).toBeTruthy());
+
+    // Alice clicks load more -> pending in latePage2Promise
+    const loadMoreBtn = screen.getByTestId('load-more-btn');
+    await fireEvent.click(loadMoreBtn);
+
+    // Alice logs out
+    const logoutBtn = screen.getByRole('button', { name: '退出登录' });
+    await fireEvent.click(logoutBtn);
+    await vi.waitFor(() => expect(screen.getByRole('form')).toBeTruthy());
+
+    // Bob logs in
+    await fireEvent.update(screen.getByRole('textbox', { name: '用户名' }), 'bob');
+    await fireEvent.update(screen.getByLabelText('密码') as HTMLInputElement, 'pass-b');
+    await fireEvent.click(screen.getByRole('button', { name: '登录' }));
+
+    // Bob is signed in and visits #/devices
+    await vi.waitFor(() => expect(screen.getByText('Bob Dev 1')).toBeTruthy());
+    expect(screen.queryByText('Alice Dev 1')).toBeNull();
+    expect(screen.queryByText('Alice Dev 2')).toBeNull();
+
+    // Now Alice's slow page2 finally resolves!
+    resolveLatePage2!(new Response(JSON.stringify({
+      data: {
+        items: [{ device_id: DEV_A_PAGE2, display_name: 'Alice Dev 2', effective_permissions: ['device.read', 'device.status.read'] }],
+        next_cursor: 'alice_cursor_leak',
+      },
+      request_id: '12345678-1234-4234-8234-123456789abc',
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+
+    // Wait a short time for any microtasks / async handlers to run
+    await new Promise((r) => setTimeout(r, 60));
+
+    // Bob must NOT see Alice's devices or Alice's cursor
+    expect(screen.queryByText('Alice Dev 2')).toBeNull();
+    expect(screen.queryByText('Alice Dev 1')).toBeNull();
+    expect(screen.getByText('Bob Dev 1')).toBeTruthy();
+    // Bob has next_cursor: null so load more button should NOT appear from Alice's cursor
+    expect(screen.queryByTestId('load-more-btn')).toBeNull();
+
+    // If Bob tries to access Alice Dev 2 deep link, Bob has no permission projection and cannot fetch detail or status
+    dispatchedUrls.length = 0;
+    window.location.hash = `#/devices/${DEV_A_PAGE2}`;
+    await new Promise((r) => setTimeout(r, 60));
+    expect(dispatchedUrls.some((u) => u.includes(DEV_A_PAGE2))).toBe(false);
+  });
+
+  test('Reviewer B: page2 duplicate device_id replaces with newer projection, immediately tightens revoked status permission', async () => {
+    const DEV_DUP = '4'.repeat(64);
+    const DEV_NEW = '5'.repeat(64);
+
+    // Page 1: DEV_DUP has READ + STATUS
+    const page1Items = [
+      {
+        device_id: DEV_DUP,
+        display_name: 'Duplicate Device',
+        effective_permissions: ['device.read', 'device.status.read'],
+      },
+    ];
+
+    // Page 2: DEV_DUP revoked STATUS (now READ only), plus brand new DEV_NEW
+    const page2Items = [
+      {
+        device_id: DEV_DUP,
+        display_name: 'Duplicate Device Renamed',
+        effective_permissions: ['device.read'], // status revoked!
+      },
+      {
+        device_id: DEV_NEW,
+        display_name: 'Brand New Device',
+        effective_permissions: ['device.read'],
+      },
+    ];
+
+    const mockDetail = {
+      device_id: DEV_DUP,
+      display_name: 'Duplicate Device Renamed',
+      effective_permissions: ['device.read'],
+      admission_state: 'APPROVED',
+      review_decision: 'approved',
+      connection_state: 'online',
+      control_health: 'healthy',
+      data_health: 'healthy',
+      capabilities: ['reboot'],
+      revision: '2',
+    };
+
+    const dispatchedUrls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input);
+      dispatchedUrls.push(url);
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME });
+      if (url.includes(`/devices/${DEV_DUP}/status`)) {
+        return jsonResponse({
+          data: {
+            snapshot: { clock_quality: 'observed' },
+            received_time: { quality: 'ntp_valid', system_wall_utc: '2026-10-07T00:00:00Z', reference_utc: '2026-10-07T00:00:00Z' },
+            freshness: 'fresh',
+            age_ms: '10',
+          },
+          request_id: RID_DEV_STATUS,
+        });
+      }
+      if (url.includes(`/devices/${DEV_DUP}`)) {
+        return jsonResponse({ data: mockDetail, request_id: RID_DEV_DETAIL });
+      }
+      if (url.includes('cursor=c2')) {
+        return jsonResponse({ data: { items: page2Items, next_cursor: null }, request_id: RID_LIST });
+      }
+      if (url.includes('/devices')) {
+        return jsonResponse({ data: { items: page1Items, next_cursor: 'c2' }, request_id: RID_LIST });
+      }
+      throw new TypeError(`unexpected fetch ${url}`);
+    }));
+
+    window.location.hash = '#/devices';
+    render(App);
+
+    await vi.waitFor(() => expect(screen.getByText('Duplicate Device')).toBeTruthy());
+
+    // Click load more
+    const loadMoreBtn = screen.getByTestId('load-more-btn');
+    await fireEvent.click(loadMoreBtn);
+
+    // After page2 loaded:
+    // 1. UI must NOT show duplicate rows for DEV_DUP
+    await vi.waitFor(() => expect(screen.getByText('Brand New Device')).toBeTruthy());
+    const allDupRows = screen.queryAllByTestId(`device-item-${DEV_DUP}`);
+    expect(allDupRows.length).toBe(1);
+    expect(screen.getByText('Duplicate Device Renamed')).toBeTruthy();
+
+    // 2. Click the updated device to navigate to detail
+    await fireEvent.click(screen.getByText('Duplicate Device Renamed'));
+
+    // 3. Detail profile card is rendered, BUT status card is NOT rendered because status permission was revoked in page2!
+    await vi.waitFor(() => expect(screen.getByTestId('detail-profile-card')).toBeTruthy());
+    expect(screen.queryByTestId('status-card')).toBeNull();
+
+    // 4. Must NOT have dispatched GET /devices/:DEV_DUP/status
+    expect(dispatchedUrls.some((u) => u.endsWith(`/devices/${DEV_DUP}/status`))).toBe(false);
+    expect(dispatchedUrls.some((u) => u.endsWith(`/devices/${DEV_DUP}`))).toBe(true);
+  });
 });

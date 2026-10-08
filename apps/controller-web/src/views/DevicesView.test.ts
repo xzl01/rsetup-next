@@ -239,4 +239,55 @@ describe('DevicesView pagination, projection and permissions', () => {
     expect(screen.getByText('Sensor Kitchen')).toBeTruthy()
     expect(screen.queryByText('Actuator Garden')).toBeNull()
   })
+
+  it('aborts in-flight loadMore request on unmount and prevents pageLoaded emit', async () => {
+    let capturedSignal: AbortSignal | undefined
+    let resolvePage2: ((value: Response) => void) | undefined
+    const page2Promise = new Promise<Response>((resolve) => {
+      resolvePage2 = resolve
+    })
+
+    const fetchSpy = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('cursor=c2')) {
+        capturedSignal = init?.signal ?? undefined
+        return page2Promise
+      }
+      throw new Error(`Unexpected url ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchSpy)
+
+    const onPageLoaded = vi.fn()
+    const { unmount } = render(DevicesView, {
+      props: {
+        initialDevices: [{ device_id: '1'.repeat(64), display_name: 'Dev 1', effective_permissions: ['device.read'] }],
+        initialNextCursor: 'c2',
+        onPageLoaded,
+      },
+      global: { provide: { i18n } },
+    })
+
+    const loadMoreBtn = screen.getByTestId('load-more-btn')
+    await fireEvent.click(loadMoreBtn)
+
+    expect(capturedSignal).toBeDefined()
+    expect(capturedSignal?.aborted).toBe(false)
+
+    // Unmount while request is still pending
+    unmount()
+
+    expect(capturedSignal?.aborted).toBe(true)
+
+    // Now resolve the late page2
+    resolvePage2!(new Response(JSON.stringify({
+      data: {
+        items: [{ device_id: '2'.repeat(64), display_name: 'Dev 2', effective_permissions: ['device.read'] }],
+        next_cursor: null,
+      },
+      request_id: '12345678-1234-4234-8234-123456789abc',
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+
+    await new Promise(r => setTimeout(r, 50))
+    expect(onPageLoaded).not.toHaveBeenCalled()
+  })
 })

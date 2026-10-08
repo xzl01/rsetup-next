@@ -58,11 +58,32 @@ function getDevicePermissions(deviceId: string): string[] | undefined {
   return item ? item.effective_permissions : undefined
 }
 
-function handlePageLoaded(page: DeviceListPage) {
+function handlePageLoaded(page: DeviceListPage, parentGen?: number) {
   if (auth.status.value !== 'signed_in') return
-  const existingIds = new Set(devicesList.value.map(d => d.device_id))
-  const newItems = page.items.filter(d => !existingIds.has(d.device_id))
-  devicesList.value = [...devicesList.value, ...newItems]
+  if (parentGen !== undefined && parentGen !== devicesGeneration) return
+  if (!auth.user.value?.id) return
+
+  // 针对相同 device_id，以后到项的最新投影替换；若后到项可能比先到项更旧，按安全 fail-closed
+  // 选取权限交集与后到 display_name；若仅是正常后到分页，收紧已撤回权限。新项则直接追加。
+  const map = new Map<string, DeviceItem>()
+  for (const item of devicesList.value) {
+    map.set(item.device_id, item)
+  }
+  for (const incoming of page.items) {
+    const existing = map.get(incoming.device_id)
+    if (existing) {
+      // 安全 fail-closed 策略：对于重复项，权限取交集（任何一方未授权或已撤权均视为无权限，绝不盲目扩权）
+      const incomingPermsSet = new Set(incoming.effective_permissions)
+      const tightenedPerms = existing.effective_permissions.filter(p => incomingPermsSet.has(p))
+      map.set(incoming.device_id, {
+        ...incoming,
+        effective_permissions: tightenedPerms,
+      })
+    } else {
+      map.set(incoming.device_id, incoming)
+    }
+  }
+  devicesList.value = Array.from(map.values())
   devicesNextCursor.value = page.next_cursor
 }
 
@@ -207,6 +228,7 @@ onUnmounted(() => {
           :initial-next-cursor="devicesNextCursor"
           :loading="devicesLoading"
           :error="devicesError"
+          :parent-generation="devicesGeneration"
           @retry="loadDevices"
           @page-loaded="handlePageLoaded"
           @select-device="(id) => navigateTo({ name: 'device-detail', params: { id } })"
