@@ -28,6 +28,7 @@ const RID_REVOKE = '9abcfdef-5a8c-4adc-9cde-c0ee9c95c888';
 const RID_ERR = '678d9abc-2d5f-47a9-99ab-97bb69629555';
 const RID_NULL = '789eabcd-3e6a-48ba-babc-a8cc7a73a666';
 const RID_DEV_DETAIL = 'abcdef01-2345-4678-9abc-def012345678';
+const RID_DEV_STATUS = '456789ab-cdef-4123-8456-789abcdef012';
 
 const ME_DATA = {
   user: CONTRACT_USER,
@@ -687,6 +688,357 @@ describe('signed_in session management UI (Task 5)', () => {
     await vi.waitFor(() => expect(window.location.hash).toBe(`#/devices/${DEV_ID}`));
     await vi.waitFor(() => expect(screen.getByTestId('detail-profile-card')).toBeTruthy());
     expect(screen.getByTestId('dim-admission').textContent).toContain('APPROVED');
+  });
+
+  test('Critical 1: user with READ + STATUS permissions fetches BOTH detail and status on device-detail route', async () => {
+    const DEV_ID = 'f'.repeat(64);
+    const mockDevices = [
+      {
+        device_id: DEV_ID,
+        display_name: 'Device Foxtrot',
+        effective_permissions: ['device.read', 'device.status.read'],
+      },
+    ];
+    const mockDetail = {
+      device_id: DEV_ID,
+      display_name: 'Device Foxtrot',
+      effective_permissions: ['device.read', 'device.status.read'],
+      admission_state: 'APPROVED',
+      review_decision: 'approved',
+      connection_state: 'online',
+      control_health: 'healthy',
+      data_health: 'healthy',
+      capabilities: ['reboot'],
+      revision: '1',
+    };
+    const mockStatus = {
+      snapshot: { clock_quality: 'observed' },
+      received_time: {
+        quality: 'ntp_valid',
+        system_wall_utc: '2026-10-07T00:00:00Z',
+        reference_utc: '2026-10-07T00:00:00Z',
+      },
+      freshness: 'fresh',
+      age_ms: '50',
+    };
+
+    const fetchedUrls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input);
+      fetchedUrls.push(url);
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME });
+      if (url.includes(`/devices/${DEV_ID}/status`)) {
+        return jsonResponse({ data: mockStatus, request_id: RID_DEV_STATUS });
+      }
+      if (url.includes(`/devices/${DEV_ID}`)) {
+        return jsonResponse({ data: mockDetail, request_id: RID_DEV_DETAIL });
+      }
+      if (url.includes('/devices')) {
+        return jsonResponse({ data: { items: mockDevices, next_cursor: null }, request_id: RID_LIST });
+      }
+      throw new TypeError(`unexpected fetch ${url}`);
+    }));
+
+    window.location.hash = '#/devices';
+    render(App);
+
+    await vi.waitFor(() => expect(screen.getByText('Device Foxtrot')).toBeTruthy());
+    // Click button to navigate to detail
+    await fireEvent.click(screen.getByText('Device Foxtrot'));
+
+    await vi.waitFor(() => expect(screen.getByTestId('detail-profile-card')).toBeTruthy());
+    await vi.waitFor(() => expect(screen.getByTestId('status-card')).toBeTruthy());
+    expect(fetchedUrls.some(u => u.includes(`/devices/${DEV_ID}/status`))).toBe(true);
+    expect(fetchedUrls.some(u => u.endsWith(`/devices/${DEV_ID}`))).toBe(true);
+  });
+
+  test('Critical 2: status-only user never fetches profile detail GET; reboot-only never fetches detail or status GET', async () => {
+    const DEV_STATUS_ONLY = '1'.repeat(64);
+    const DEV_REBOOT_ONLY = '2'.repeat(64);
+    const mockDevices = [
+      {
+        device_id: DEV_STATUS_ONLY,
+        display_name: 'Status Only Dev',
+        effective_permissions: ['device.status.read'],
+      },
+      {
+        device_id: DEV_REBOOT_ONLY,
+        display_name: 'Reboot Only Dev',
+        effective_permissions: ['device.reboot'],
+      },
+    ];
+    const mockStatus = {
+      snapshot: { clock_quality: 'observed' },
+      received_time: {
+        quality: 'ntp_valid',
+        system_wall_utc: '2026-10-07T00:00:00Z',
+        reference_utc: '2026-10-07T00:00:00Z',
+      },
+      freshness: 'fresh',
+      age_ms: '100',
+    };
+
+    const fetchedUrls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input);
+      fetchedUrls.push(url);
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME });
+      if (url.includes(`/devices/${DEV_STATUS_ONLY}/status`)) {
+        return jsonResponse({ data: mockStatus, request_id: RID_DEV_STATUS });
+      }
+      if (url.includes(`/devices/${DEV_STATUS_ONLY}`)) {
+        throw new Error('STATUS_ONLY MUST NEVER ISSUE DETAIL GET');
+      }
+      if (url.includes(`/devices/${DEV_REBOOT_ONLY}`)) {
+        throw new Error('REBOOT_ONLY MUST NEVER ISSUE DETAIL OR STATUS GET');
+      }
+      if (url.includes('/devices')) {
+        return jsonResponse({ data: { items: mockDevices, next_cursor: null }, request_id: RID_LIST });
+      }
+      throw new TypeError(`unexpected fetch ${url}`);
+    }));
+
+    window.location.hash = '#/devices';
+    render(App);
+
+    await vi.waitFor(() => expect(screen.getByText('Status Only Dev')).toBeTruthy());
+    await fireEvent.click(screen.getByText('Status Only Dev'));
+
+    await vi.waitFor(() => expect(screen.getByTestId('status-card')).toBeTruthy());
+    expect(screen.queryByTestId('detail-profile-card')).toBeNull();
+    expect(fetchedUrls.some(u => u.endsWith(`/devices/${DEV_STATUS_ONLY}`))).toBe(false);
+  });
+
+  test('Critical 3: deep link without known permission projection safely redirects or fails closed without speculative detail GET', async () => {
+    const DEV_DEEP = '3'.repeat(64);
+    const fetchedUrls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input);
+      fetchedUrls.push(url);
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME });
+      if (url.includes(`/devices/${DEV_DEEP}`)) {
+        throw new Error('DEEP LINK MUST NEVER ISSUE SPECULATIVE DETAIL GET');
+      }
+      if (url.includes('/devices')) {
+        return jsonResponse({ data: { items: [], next_cursor: null }, request_id: RID_LIST });
+      }
+      throw new TypeError(`unexpected fetch ${url}`);
+    }));
+
+    window.location.hash = `#/devices/${DEV_DEEP}`;
+    render(App);
+
+    await vi.waitFor(() => expect(screen.getByRole('status').textContent).toContain('admin'));
+    // Should safely fallback to devices list, not probing /devices/:id
+    await vi.waitFor(() => expect(window.location.hash).toBe('#/devices'));
+    expect(fetchedUrls.some(u => u.includes(`/devices/${DEV_DEEP}`))).toBe(false);
+  });
+
+  test('Critical 4: device list 503 error renders error notice with retry button and does not disguise as empty list', async () => {
+    let devFetchCount = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input);
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME });
+      if (url.includes('/devices')) {
+        devFetchCount++;
+        if (devFetchCount === 1) {
+          return jsonResponse({ error: { code: 'NOT_READY', message_key: 'errors.notReady' }, request_id: RID_ERR }, 503);
+        }
+        return jsonResponse({
+          data: {
+            items: [{ device_id: '4'.repeat(64), display_name: 'Device Four', effective_permissions: ['device.read'] }],
+            next_cursor: null,
+          },
+          request_id: RID_LIST,
+        });
+      }
+      throw new TypeError(`unexpected fetch ${url}`);
+    }));
+
+    window.location.hash = '#/devices';
+    render(App);
+
+    await vi.waitFor(() => expect(screen.getByRole('status').textContent).toContain('admin'));
+    // Never show empty list notice!
+    expect(screen.queryByText('暂无可见设备')).toBeNull();
+
+    // Must show error and retry button
+    await vi.waitFor(() => expect(screen.getAllByText('无法加载内容').length).toBeGreaterThan(0));
+    const retryBtn = screen.getByRole('button', { name: '重试' });
+    await fireEvent.click(retryBtn);
+
+    await vi.waitFor(() => expect(screen.getByText('Device Four')).toBeTruthy());
+    expect(screen.queryAllByText('无法加载内容').length).toBe(0);
+    expect(devFetchCount).toBe(2);
+  });
+
+  test('Critical 5: logout / relogin clears devices list and in-flight requests cannot resurface for new user', async () => {
+    let slowListResolve!: (r: Response) => void;
+    const slowListPromise = new Promise<Response>((r) => { slowListResolve = r; });
+
+    let fetchCount = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input);
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME });
+      if (url.includes('/auth/logout')) return jsonResponse({ data: { logged_out: true }, request_id: RID_LOGOUT });
+      if (url.includes('/devices')) {
+        fetchCount++;
+        if (fetchCount === 1) {
+          return slowListPromise;
+        }
+        return jsonResponse({
+          data: {
+            items: [{ device_id: '5'.repeat(64), display_name: 'User2 Device', effective_permissions: ['device.read'] }],
+            next_cursor: null,
+          },
+          request_id: RID_LIST,
+        });
+      }
+      throw new TypeError(`unexpected fetch ${url}`);
+    }));
+
+    window.location.hash = '#/devices';
+    render(App);
+
+    await vi.waitFor(() => expect(screen.getByRole('status').textContent).toContain('admin'));
+
+    // User logs out before slow list returns
+    const logoutBtn = screen.getByRole('button', { name: '退出登录' });
+    await fireEvent.click(logoutBtn);
+
+    // Old list resolves after logout
+    slowListResolve(jsonResponse({
+      data: {
+        items: [{ device_id: '6'.repeat(64), display_name: 'Stale User1 Device', effective_permissions: ['device.read'] }],
+        next_cursor: null,
+      },
+      request_id: RID_LIST,
+    }));
+
+    await vi.waitFor(() => expect(screen.getByRole('heading', { name: '登录' })).toBeTruthy());
+    // Stale device must not be rendered anywhere
+    expect(screen.queryByText('Stale User1 Device')).toBeNull();
+  });
+
+  test('Important: GET /devices returning malformed 200 (e.g. non-hex64 device_id) triggers safe error state, not crash or corrupted list', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input);
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME });
+      if (url.includes('/devices')) {
+        return jsonResponse({
+          data: {
+            items: [
+              {
+                device_id: 'not-hex64',
+                display_name: 'Corrupted Device',
+                effective_permissions: ['device.read'],
+              },
+            ],
+            next_cursor: null,
+          },
+          request_id: RID_LIST,
+        });
+      }
+      throw new TypeError(`unexpected fetch ${url}`);
+    }));
+
+    window.location.hash = '#/devices';
+    render(App);
+
+    await vi.waitFor(() => expect(screen.getByRole('status').textContent).toContain('admin'));
+    // Should show error notice, never render Corrupted Device
+    await vi.waitFor(() => expect(screen.getAllByText('无法加载内容').length).toBeGreaterThan(0));
+    expect(screen.queryByText('Corrupted Device')).toBeNull();
+  });
+
+  test('Important: GET /devices/:id returning malformed revision triggers safe error state in detail view', async () => {
+    const DEV_ID = '7'.repeat(64);
+    const mockDevices = [
+      {
+        device_id: DEV_ID,
+        display_name: 'Device Seven',
+        effective_permissions: ['device.read'],
+      },
+    ];
+    const malformedDetail = {
+      device_id: DEV_ID,
+      display_name: 'Device Seven',
+      effective_permissions: ['device.read'],
+      admission_state: 'APPROVED',
+      review_decision: 'approved',
+      connection_state: 'online',
+      control_health: 'healthy',
+      data_health: 'healthy',
+      capabilities: ['reboot'],
+      revision: 12345, // malformed: number instead of canonical decimal string
+    };
+
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input);
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME });
+      if (url.includes(`/devices/${DEV_ID}`)) {
+        return jsonResponse({ data: malformedDetail, request_id: RID_DEV_DETAIL });
+      }
+      if (url.includes('/devices')) {
+        return jsonResponse({ data: { items: mockDevices, next_cursor: null }, request_id: RID_LIST });
+      }
+      throw new TypeError(`unexpected fetch ${url}`);
+    }));
+
+    window.location.hash = '#/devices';
+    render(App);
+
+    await vi.waitFor(() => expect(screen.getByText('Device Seven')).toBeTruthy());
+    await fireEvent.click(screen.getByText('Device Seven'));
+
+    // Should show safe error in detail view, not corrupted profile card
+    await vi.waitFor(() => expect(screen.getByRole('alert')).toBeTruthy());
+    expect(screen.getByText('无法加载内容')).toBeTruthy();
+    expect(screen.queryByTestId('detail-profile-card')).toBeNull();
+  });
+
+  test('Important: GET /devices/:id/status returning numeric age_ms triggers safe error state', async () => {
+    const DEV_ID = '8'.repeat(64);
+    const mockDevices = [
+      {
+        device_id: DEV_ID,
+        display_name: 'Device Eight',
+        effective_permissions: ['device.status.read'],
+      },
+    ];
+    const malformedStatus = {
+      snapshot: { clock_quality: 'observed' },
+      received_time: {
+        quality: 'ntp_valid',
+        system_wall_utc: '2026-10-07T00:00:00Z',
+        reference_utc: '2026-10-07T00:00:00Z',
+      },
+      freshness: 'fresh',
+      age_ms: 12345, // malformed: number instead of decimal string
+    };
+
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input);
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME });
+      if (url.includes(`/devices/${DEV_ID}/status`)) {
+        return jsonResponse({ data: malformedStatus, request_id: RID_DEV_STATUS });
+      }
+      if (url.includes('/devices')) {
+        return jsonResponse({ data: { items: mockDevices, next_cursor: null }, request_id: RID_LIST });
+      }
+      throw new TypeError(`unexpected fetch ${url}`);
+    }));
+
+    window.location.hash = '#/devices';
+    render(App);
+
+    await vi.waitFor(() => expect(screen.getByText('Device Eight')).toBeTruthy());
+    await fireEvent.click(screen.getByText('Device Eight'));
+
+    // Should show safe error in detail view, not corrupted status card
+    await vi.waitFor(() => expect(screen.getByRole('alert')).toBeTruthy());
+    expect(screen.getByText('无法加载内容')).toBeTruthy();
+    expect(screen.queryByTestId('status-card')).toBeNull();
   });
 });
 

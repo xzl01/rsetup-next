@@ -11,7 +11,7 @@ import { createI18n, type Locale } from './i18n'
 import { createAuth } from './auth'
 import { createRouter, type AppRoute } from './router'
 import { get } from './api'
-import type { DeviceItem } from './types'
+import { assertDeviceListPageShape, type DeviceItem, type DeviceListPage } from './types'
 
 const i18nInstance = createI18n()
 const { locale, t, setLocale } = i18nInstance
@@ -27,31 +27,63 @@ const devicesList = ref<DeviceItem[]>([])
 const devicesNextCursor = ref<string | null>(null)
 const devicesLoading = ref(false)
 const devicesError = ref<string | null>(null)
+let devicesGeneration = 0
 
 async function loadDevices() {
   if (devicesLoading.value) return
   devicesLoading.value = true
   devicesError.value = null
+  const currentGen = ++devicesGeneration
   try {
-    const res = await get<{ items: DeviceItem[]; next_cursor: string | null }>('devices')
+    const res = await get<DeviceListPage>('devices')
+    assertDeviceListPageShape(res.data)
+    if (currentGen !== devicesGeneration || auth.status.value !== 'signed_in') return
     devicesList.value = res.data.items
     devicesNextCursor.value = res.data.next_cursor
   } catch (err: unknown) {
+    if (currentGen !== devicesGeneration || auth.status.value !== 'signed_in') return
     devicesError.value = t('state.error')
+    devicesList.value = []
+    devicesNextCursor.value = null
   } finally {
-    devicesLoading.value = false
+    if (currentGen === devicesGeneration) {
+      devicesLoading.value = false
+    }
   }
+}
+
+// 得到特定设备的权限投影
+function getDevicePermissions(deviceId: string): string[] | undefined {
+  const item = devicesList.value.find(d => d.device_id === deviceId)
+  return item ? item.effective_permissions : undefined
 }
 
 watch(
   [() => auth.status.value, () => router.currentRoute.value.name],
-  ([newStatus, routeName]) => {
+  async ([newStatus, routeName]) => {
     if (newStatus === 'signed_in') {
       if (routeName === 'sessions') {
         void auth.listSessions()
       } else if (routeName === 'devices') {
         void loadDevices()
+      } else if (routeName === 'device-detail') {
+        const targetId = (router.currentRoute.value as { params?: { id?: string } }).params?.id
+        // Deep link 进入详情路由：如果当前还没有该设备的授权缓存，且尚未加载列表，先获取受控最小列表
+        if (!getDevicePermissions(targetId || '') && !devicesLoading.value) {
+          await loadDevices()
+        }
+        // 如果确认没有该设备的授权投影，安全重定向回 /devices 列表，且在此之前不挂载 DeviceDetailView
+        if (targetId && !getDevicePermissions(targetId)) {
+          router.navigate({ name: 'devices' })
+        }
       }
+    } else {
+      // 登出/非 signed_in 状态立即清理设备列表与失效代际
+      devicesGeneration++
+      devicesList.value = []
+      devicesNextCursor.value = null
+      devicesError.value = null
+      devicesLoading.value = false
     }
   },
   { immediate: true },
@@ -165,12 +197,17 @@ onUnmounted(() => {
         <DevicesView
           :initial-devices="devicesList"
           :initial-next-cursor="devicesNextCursor"
+          :loading="devicesLoading"
+          :error="devicesError"
+          @retry="loadDevices"
           @select-device="(id) => navigateTo({ name: 'device-detail', params: { id } })"
         />
       </template>
       <template v-else-if="router.currentRoute.value.name === 'device-detail'">
         <DeviceDetailView
+          v-if="getDevicePermissions(router.currentRoute.value.params.id)"
           :device-id="router.currentRoute.value.params.id"
+          :permissions="getDevicePermissions(router.currentRoute.value.params.id)"
         />
       </template>
       <template v-else>

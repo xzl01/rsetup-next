@@ -1,6 +1,13 @@
 <script setup lang="ts">
-import { computed, inject, onMounted, ref, watch } from 'vue'
-import { canReadDevice, canReadStatus, type DeviceDetail, type DeviceStatusReport } from '../types'
+import { computed, inject, onMounted, onUnmounted, ref, watch } from 'vue'
+import {
+  assertDeviceDetailShape,
+  assertDeviceStatusReportShape,
+  canReadDevice,
+  canReadStatus,
+  type DeviceDetail,
+  type DeviceStatusReport,
+} from '../types'
 import { get } from '../api'
 import type { createI18n } from '../i18n'
 import BaseButton from '../components/BaseButton.vue'
@@ -79,15 +86,22 @@ async function loadData() {
     }
 
     if (detailRes && typeof detailRes === 'object' && 'data' in detailRes) {
-      detailData.value = (detailRes as { data: DeviceDetail }).data
+      const d = (detailRes as { data: unknown }).data
+      assertDeviceDetailShape(d)
+      detailData.value = d
     }
     if (statusRes && typeof statusRes === 'object' && 'data' in statusRes) {
-      statusData.value = (statusRes as { data: DeviceStatusReport }).data
+      const s = (statusRes as { data: unknown }).data
+      assertDeviceStatusReportShape(s)
+      statusData.value = s
     }
   } catch (err: unknown) {
     if (currentGen !== fetchGeneration) return
     if (err && typeof err === 'object' && 'name' in err && err.name === 'AbortError') return
     error.value = i18n.t('state.error')
+    // 校验失败或请求失败时清空损坏投影
+    detailData.value = null
+    statusData.value = null
   } finally {
     if (currentGen === fetchGeneration) {
       loading.value = false
@@ -98,15 +112,29 @@ async function loadData() {
 watch(
   [() => props.deviceId, () => props.permissions],
   () => {
+    // 换设备或撤权时废弃正在进行的请求
+    if (abortController) {
+      abortController.abort()
+      abortController = null
+    }
     // 换设备时必须立即清空旧数据，防止陈旧投影残留
     detailData.value = props.initialDetail ?? null
     statusData.value = props.initialStatus ?? null
+    error.value = null
     void loadData()
   },
 )
 
 onMounted(() => {
   void loadData()
+})
+
+onUnmounted(() => {
+  fetchGeneration += 1
+  if (abortController) {
+    abortController.abort()
+    abortController = null
+  }
 })
 </script>
 

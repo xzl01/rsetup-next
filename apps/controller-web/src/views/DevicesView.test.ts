@@ -76,7 +76,7 @@ describe('DevicesView pagination, projection and permissions', () => {
     expect(calledUrls.some(u => u.endsWith(`/devices/${'c'.repeat(64)}`))).toBe(false)
   })
 
-  it('hides reboot trigger when user lacks device.reboot', () => {
+  it('hides reboot trigger when device lacks device.reboot, even if user has global or props permission', () => {
     const devices: DeviceItem[] = [
       {
         device_id: 'd'.repeat(64),
@@ -88,12 +88,80 @@ describe('DevicesView pagination, projection and permissions', () => {
     render(DevicesView, {
       props: {
         initialDevices: devices,
-        permissions: ['device.read'],
+        permissions: ['device.read', 'device.reboot'], // Even if props has reboot, this specific row does not have it!
       },
       global: { provide: { i18n } },
     })
 
+    // 单行无 reboot 权限时，绝不能出现 reboot 按钮
     expect(screen.queryByTestId(`reboot-action-${'d'.repeat(64)}`)).toBeNull()
+  })
+
+  it('renders device detail entry as real keyboard-accessible button or link, not unclickable strong', () => {
+    const devices: DeviceItem[] = [
+      {
+        device_id: 'k'.repeat(64),
+        display_name: 'Keyboard Accessible Device',
+        effective_permissions: ['device.read'],
+      },
+    ]
+
+    render(DevicesView, {
+      props: {
+        initialDevices: devices,
+      },
+      global: { provide: { i18n } },
+    })
+
+    const nameBtn = screen.getByRole('button', { name: 'Keyboard Accessible Device' })
+    expect(nameBtn).toBeTruthy()
+  })
+
+  it('handles loadMore pagination errors gracefully with safe retry feedback', async () => {
+    const page1: DeviceItem[] = [
+      { device_id: '1'.repeat(64), display_name: 'Dev 1', effective_permissions: ['device.read'] },
+    ]
+
+    let loadMoreCalls = 0
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('cursor=')) {
+        loadMoreCalls++
+        if (loadMoreCalls === 1) {
+          return new Response(JSON.stringify({
+            error: { code: 'NOT_READY', message_key: 'errors.notReady' },
+            request_id: '11111111-2222-4333-8444-555555555555',
+          }), { status: 503, headers: { 'Content-Type': 'application/json' } })
+        }
+        return new Response(JSON.stringify({
+          data: {
+            items: [{ device_id: '2'.repeat(64), display_name: 'Dev 2', effective_permissions: ['device.read'] }],
+            next_cursor: null,
+          },
+          request_id: '22222222-3333-4444-8555-666666666666',
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      throw new Error(`Unexpected url ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchSpy)
+
+    render(DevicesView, {
+      props: {
+        initialDevices: page1,
+        initialNextCursor: 'c'.repeat(132),
+      },
+      global: { provide: { i18n } },
+    })
+
+    const loadMoreBtn = screen.getByTestId('load-more-btn')
+    await fireEvent.click(loadMoreBtn)
+
+    // Should display pagination error
+    await vi.waitFor(() => expect(screen.getAllByText('无法加载内容').length).toBeGreaterThan(0))
+    expect(screen.getByText('Dev 1')).toBeTruthy()
+    // Retrying loadMore works
+    await fireEvent.click(screen.getByTestId('load-more-btn'))
+    await vi.waitFor(() => expect(screen.getByText('Dev 2')).toBeTruthy())
   })
 
   it('supports pagination via next_cursor and loads additional devices without losing existing list', async () => {

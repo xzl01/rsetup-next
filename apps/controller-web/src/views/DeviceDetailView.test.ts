@@ -225,5 +225,29 @@ describe('DeviceDetailView U-01 five-dimensional health', () => {
     expect(screen.queryByTestId('detail-profile-card')).toBeNull()
     expect(screen.queryByText('Device Fast')).toBeNull()
   })
+
+  it('aborts in-flight requests and cleans up on unmount', () => {
+    let capturedSignal: AbortSignal | undefined
+    const fetchSpy = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      capturedSignal = init?.signal as AbortSignal
+      return new Promise(() => {}) // never resolves
+    })
+    vi.stubGlobal('fetch', fetchSpy)
+
+    const { unmount } = render(DeviceDetailView, {
+      props: {
+        deviceId: '9'.repeat(64),
+        permissions: ['device.read'],
+      },
+      global: { provide: { i18n } },
+    })
+
+    expect(fetchSpy).toHaveBeenCalled()
+    expect(capturedSignal?.aborted).toBe(false)
+
+    unmount()
+
+    expect(capturedSignal?.aborted).toBe(true)
+  })
 })
 
