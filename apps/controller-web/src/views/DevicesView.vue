@@ -19,6 +19,7 @@ const emit = defineEmits<{
   selectDevice: [deviceId: string]
   rebootDevice: [deviceId: string]
   retry: []
+  pageLoaded: [page: DeviceListPage]
 }>()
 
 const i18n = inject<ReturnType<typeof createI18n>>('i18n')!
@@ -66,6 +67,7 @@ async function loadMore() {
     if (currentGen !== paginationGeneration) return
     devices.value = [...devices.value, ...res.data.items]
     nextCursor.value = res.data.next_cursor
+    emit('pageLoaded', res.data)
   } catch (err: unknown) {
     if (currentGen !== paginationGeneration) return
     paginationError.value = i18n.t('state.error')

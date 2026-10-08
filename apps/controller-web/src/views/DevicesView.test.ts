@@ -190,11 +190,13 @@ describe('DevicesView pagination, projection and permissions', () => {
     })
     vi.stubGlobal('fetch', fetchSpy)
 
+    const onPageLoaded = vi.fn()
     render(DevicesView, {
       props: {
         initialDevices: page1,
         initialNextCursor: 'cursor_page_2',
         permissions: ['device.read'],
+        onPageLoaded,
       },
       global: { provide: { i18n } },
     })
@@ -208,6 +210,10 @@ describe('DevicesView pagination, projection and permissions', () => {
     await vi.waitFor(() => expect(screen.getByText('Dev 2')).toBeTruthy())
     expect(screen.getByText('Dev 1')).toBeTruthy()
     expect(screen.queryByTestId('load-more-btn')).toBeNull()
+    expect(onPageLoaded).toHaveBeenCalledWith({
+      items: page2,
+      next_cursor: null,
+    })
   })
 
   it('filters devices by search input', async () => {

@@ -58,6 +58,14 @@ function getDevicePermissions(deviceId: string): string[] | undefined {
   return item ? item.effective_permissions : undefined
 }
 
+function handlePageLoaded(page: DeviceListPage) {
+  if (auth.status.value !== 'signed_in') return
+  const existingIds = new Set(devicesList.value.map(d => d.device_id))
+  const newItems = page.items.filter(d => !existingIds.has(d.device_id))
+  devicesList.value = [...devicesList.value, ...newItems]
+  devicesNextCursor.value = page.next_cursor
+}
+
 watch(
   [() => auth.status.value, () => router.currentRoute.value.name],
   async ([newStatus, routeName]) => {
@@ -200,6 +208,7 @@ onUnmounted(() => {
           :loading="devicesLoading"
           :error="devicesError"
           @retry="loadDevices"
+          @page-loaded="handlePageLoaded"
           @select-device="(id) => navigateTo({ name: 'device-detail', params: { id } })"
         />
       </template>

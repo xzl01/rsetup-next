@@ -250,4 +250,3 @@ describe('DeviceDetailView U-01 five-dimensional health', () => {
     expect(capturedSignal?.aborted).toBe(true)
   })
 })
-

@@ -53,9 +53,16 @@ export interface DeviceListPage {
 }
 
 const DEVICE_ID_HEX64_REGEX = /^[0-9a-f]{64}(?![\s\S])/
-const CURSOR_HEX132_REGEX = /^[0-9a-f]{132}(?![\s\S])/
 const DECIMAL_STRING_REGEX = /^(0|[1-9][0-9]*)(?![\s\S])/
 const U64_MAX_DEC = '18446744073709551615'
+
+export function isSafeOpaqueCursor(value: unknown): value is string {
+  if (typeof value !== 'string') return false
+  if (value.length === 0 || value.length > 1024) return false
+  // Reject control characters (0x00-0x1f and 0x7f-0x9f)
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(value)) return false
+  return true
+}
 
 export function isU64DecimalString(value: unknown): value is string {
   if (typeof value !== 'string') return false
@@ -85,7 +92,7 @@ export function assertDeviceListPageShape(data: unknown): asserts data is Device
   if (!isPlainObject(data) || !Array.isArray(data.items)) {
     throw new Error('INVALID_DEVICE_LIST_PAGE')
   }
-  if (data.next_cursor !== null && (typeof data.next_cursor !== 'string' || !CURSOR_HEX132_REGEX.test(data.next_cursor))) {
+  if (data.next_cursor !== null && !isSafeOpaqueCursor(data.next_cursor)) {
     throw new Error('INVALID_NEXT_CURSOR')
   }
   for (const item of data.items) {
@@ -160,4 +167,3 @@ export function canReadStatus(permissions: string[]): boolean {
 export function canReboot(permissions: string[]): boolean {
   return permissions.includes('device.reboot')
 }
-

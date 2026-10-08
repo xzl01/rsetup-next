@@ -1040,5 +1040,93 @@ describe('signed_in session management UI (Task 5)', () => {
     expect(screen.getByText('无法加载内容')).toBeTruthy();
     expect(screen.queryByTestId('status-card')).toBeNull();
   });
-});
 
+  test('Defect 1: page2 device selection preserves permission projection and navigates to detail without redirecting back', async () => {
+    const DEV_PAGE1 = '1'.repeat(64);
+    const DEV_PAGE2 = '2'.repeat(64);
+
+    const page1Items = [
+      {
+        device_id: DEV_PAGE1,
+        display_name: 'Page 1 Device',
+        effective_permissions: ['device.read'],
+      },
+    ];
+    const page2Items = [
+      {
+        device_id: DEV_PAGE2,
+        display_name: 'Page 2 Device',
+        effective_permissions: ['device.read', 'device.status.read'],
+      },
+    ];
+
+    const mockDetailP2 = {
+      device_id: DEV_PAGE2,
+      display_name: 'Page 2 Device',
+      effective_permissions: ['device.read', 'device.status.read'],
+      admission_state: 'APPROVED',
+      review_decision: 'approved',
+      connection_state: 'online',
+      control_health: 'healthy',
+      data_health: 'healthy',
+      capabilities: ['reboot'],
+      revision: '1',
+    };
+    const mockStatusP2 = {
+      snapshot: { clock_quality: 'observed' },
+      received_time: {
+        quality: 'ntp_valid',
+        system_wall_utc: '2026-10-07T00:00:00Z',
+        reference_utc: '2026-10-07T00:00:00Z',
+      },
+      freshness: 'fresh',
+      age_ms: '50',
+    };
+
+    const fetchedUrls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input);
+      fetchedUrls.push(url);
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME });
+      if (url.includes(`/devices/${DEV_PAGE2}/status`)) {
+        return jsonResponse({ data: mockStatusP2, request_id: RID_DEV_STATUS });
+      }
+      if (url.includes(`/devices/${DEV_PAGE2}`)) {
+        return jsonResponse({ data: mockDetailP2, request_id: RID_DEV_DETAIL });
+      }
+      if (url.includes('/devices?cursor=') || url.includes('/devices?limit=50&cursor=') || url.includes('cursor=')) {
+        return jsonResponse({ data: { items: page2Items, next_cursor: null }, request_id: RID_LIST });
+      }
+      if (url.includes('/devices')) {
+        return jsonResponse({ data: { items: page1Items, next_cursor: 'opaque:c2' }, request_id: RID_LIST });
+      }
+      throw new TypeError(`unexpected fetch ${url}`);
+    }));
+
+    window.location.hash = '#/devices';
+    render(App);
+
+    // Initial page1 loaded
+    await vi.waitFor(() => expect(screen.getByText('Page 1 Device')).toBeTruthy());
+    expect(screen.queryByText('Page 2 Device')).toBeNull();
+
+    // Click load more to fetch page2
+    const loadMoreBtn = screen.getByTestId('load-more-btn');
+    await fireEvent.click(loadMoreBtn);
+
+    // Page 2 device appears in DOM
+    await vi.waitFor(() => expect(screen.getByText('Page 2 Device')).toBeTruthy());
+
+    // Click page 2 native button
+    await fireEvent.click(screen.getByText('Page 2 Device'));
+
+    // Should navigate to #/devices/:DEV_PAGE2 without redirecting back to #/devices
+    await vi.waitFor(() => expect(window.location.hash).toBe(`#/devices/${DEV_PAGE2}`));
+    await vi.waitFor(() => expect(screen.getByTestId('detail-profile-card')).toBeTruthy());
+    expect(screen.getByTestId('status-card')).toBeTruthy();
+
+    // Both detail and status GETs were dispatched according to page2 device row's effective_permissions
+    expect(fetchedUrls.some(u => u.endsWith(`/devices/${DEV_PAGE2}`))).toBe(true);
+    expect(fetchedUrls.some(u => u.endsWith(`/devices/${DEV_PAGE2}/status`))).toBe(true);
+  });
+});
