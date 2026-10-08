@@ -19,7 +19,13 @@ const keys = ['app.title', 'app.foundation', 'app.notConnected', 'nav.skip', 'la
   'auth.passwordChange.submit', 'auth.signedIn.heading',
   'auth.sessions.title', 'auth.sessions.current', 'auth.sessions.created',
   'auth.sessions.revoke', 'auth.sessions.revokeOthers', 'auth.sessions.loadMore',
-  'auth.sessions.empty'];
+  'auth.sessions.empty',
+  'common.unknown', 'common.error',
+  'nav.devices',
+  'device.list.title', 'device.list.search', 'device.list.empty', 'device.list.reboot', 'device.list.loadMore',
+  'device.dim.admission', 'device.dim.connection', 'device.dim.streamHealth',
+  'device.health.control', 'device.health.data',
+  'device.dim.freshness', 'device.status.age', 'device.dim.controllerClock', 'device.dim.boardClock'];
 
 afterEach(() => {
   vi.restoreAllMocks();

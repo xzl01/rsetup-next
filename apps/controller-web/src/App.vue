@@ -1,26 +1,57 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { onMounted, onUnmounted, provide, ref, watch } from 'vue'
 import AppNotice from './components/AppNotice.vue'
 import BaseButton from './components/BaseButton.vue'
 import LoginView from './views/LoginView.vue'
 import PasswordView from './views/PasswordView.vue'
 import SessionsView from './views/SessionsView.vue'
+import DevicesView from './views/DevicesView.vue'
+import DeviceDetailView from './views/DeviceDetailView.vue'
 import { createI18n, type Locale } from './i18n'
 import { createAuth } from './auth'
 import { createRouter, type AppRoute } from './router'
+import { get } from './api'
+import type { DeviceItem } from './types'
 
-const { locale, t, setLocale } = createI18n()
+const i18nInstance = createI18n()
+const { locale, t, setLocale } = i18nInstance
+provide('i18n', i18nInstance)
+
 const auth = createAuth()
 const router = createRouter(auth)
 
 const busy = ref(false)
 const sessionChecked = ref(false)
 
+const devicesList = ref<DeviceItem[]>([])
+const devicesNextCursor = ref<string | null>(null)
+const devicesLoading = ref(false)
+const devicesError = ref<string | null>(null)
+
+async function loadDevices() {
+  if (devicesLoading.value) return
+  devicesLoading.value = true
+  devicesError.value = null
+  try {
+    const res = await get<{ items: DeviceItem[]; next_cursor: string | null }>('devices')
+    devicesList.value = res.data.items
+    devicesNextCursor.value = res.data.next_cursor
+  } catch (err: unknown) {
+    devicesError.value = t('state.error')
+  } finally {
+    devicesLoading.value = false
+  }
+}
+
 watch(
-  () => [auth.status.value, router.currentRoute.value.name] as const,
+  [() => auth.status.value, () => router.currentRoute.value.name],
   ([newStatus, routeName]) => {
-    if (newStatus === 'signed_in' && routeName === 'sessions') {
-      void auth.listSessions()
+    if (newStatus === 'signed_in') {
+      if (routeName === 'sessions') {
+        void auth.listSessions()
+      } else if (routeName === 'devices') {
+        void loadDevices()
+      }
     }
   },
   { immediate: true },
@@ -113,14 +144,34 @@ onUnmounted(() => {
         <BaseButton
           variant="secondary"
           :disabled="busy"
+          @click="() => navigateTo({ name: 'devices' })"
+        >
+          {{ t('nav.devices') }}
+        </BaseButton>
+        <BaseButton
+          variant="secondary"
+          :disabled="busy"
           @click="() => navigateTo({ name: 'sessions' })"
         >
           {{ t('auth.sessions.title') }}
         </BaseButton>
       </nav>
       <BaseButton :loading="busy" :loading-label="t('button.loading')" @click="submitLogout">{{ t('auth.logout.label') }}</BaseButton>
+
       <template v-if="router.currentRoute.value.name === 'sessions'">
         <SessionsView :auth="auth" :locale="locale" :t="t" />
+      </template>
+      <template v-else-if="router.currentRoute.value.name === 'devices'">
+        <DevicesView
+          :initial-devices="devicesList"
+          :initial-next-cursor="devicesNextCursor"
+          @select-device="(id) => navigateTo({ name: 'device-detail', params: { id } })"
+        />
+      </template>
+      <template v-else-if="router.currentRoute.value.name === 'device-detail'">
+        <DeviceDetailView
+          :device-id="router.currentRoute.value.params.id"
+        />
       </template>
       <template v-else>
         <div class="app-placeholder">

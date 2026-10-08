@@ -27,6 +27,7 @@ const RID_LIST = '89afbcde-4f7b-49cb-8bcd-b9dd8b84b777';
 const RID_REVOKE = '9abcfdef-5a8c-4adc-9cde-c0ee9c95c888';
 const RID_ERR = '678d9abc-2d5f-47a9-99ab-97bb69629555';
 const RID_NULL = '789eabcd-3e6a-48ba-babc-a8cc7a73a666';
+const RID_DEV_DETAIL = 'abcdef01-2345-4678-9abc-def012345678';
 
 const ME_DATA = {
   user: CONTRACT_USER,
@@ -53,6 +54,7 @@ function fetchForMe(meResponse: Response, loginResponse?: (init?: RequestInit) =
     if (url.includes('/auth/password')) return passwordResponse ? passwordResponse(init) : jsonResponse({ data: { changed: true }, request_id: RID_PW });
     if (url.includes('/auth/logout')) return jsonResponse({ data: { logged_out: true }, request_id: RID_LOGOUT });
     if (url.includes('/auth/sessions')) return jsonResponse({ data: { items: [], next_cursor: null }, request_id: RID_LIST });
+    if (url.includes('/devices')) return jsonResponse({ data: { items: [], next_cursor: null }, request_id: RID_LIST });
     throw new TypeError(`unexpected fetch ${url}`);
   });
   vi.stubGlobal('fetch', fetcher);
@@ -637,4 +639,54 @@ describe('signed_in session management UI (Task 5)', () => {
     expect(screen.getByRole('status').textContent).toContain('admin');
     expect(screen.getByText('2026-10-05T11:00:00Z')).toBeTruthy();
   });
+
+  test('signed_in devices view: integrates DevicesView and allows navigating to device-detail with canonical hex64 id', async () => {
+    const DEV_ID = 'e'.repeat(64);
+    const mockDevices = [
+      {
+        device_id: DEV_ID,
+        display_name: 'Device Echo',
+        effective_permissions: ['device.read'],
+      },
+    ];
+    const mockDetail = {
+      device_id: DEV_ID,
+      display_name: 'Device Echo',
+      effective_permissions: ['device.read'],
+      admission_state: 'APPROVED',
+      review_decision: 'approved',
+      connection_state: 'online',
+      control_health: 'healthy',
+      data_health: 'healthy',
+      capabilities: ['reboot'],
+      revision: '1',
+    };
+
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input);
+      if (url.includes('/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME });
+      if (url.includes('/devices/') && !url.includes('/status')) {
+        return jsonResponse({ data: mockDetail, request_id: RID_DEV_DETAIL });
+      }
+      if (url.includes('/devices')) {
+        return jsonResponse({ data: { items: mockDevices, next_cursor: null }, request_id: RID_LIST });
+      }
+      throw new TypeError(`unexpected fetch ${url}`);
+    }));
+
+    window.location.hash = '#/devices';
+    render(App);
+
+    await vi.waitFor(() => expect(screen.getByRole('status').textContent).toContain('admin'));
+    await vi.waitFor(() => expect(screen.getByText('Device Echo')).toBeTruthy());
+    expect(screen.getByText(DEV_ID)).toBeTruthy();
+
+    // 点击设备名称进入设备详情路由
+    await fireEvent.click(screen.getByText('Device Echo'));
+
+    await vi.waitFor(() => expect(window.location.hash).toBe(`#/devices/${DEV_ID}`));
+    await vi.waitFor(() => expect(screen.getByTestId('detail-profile-card')).toBeTruthy());
+    expect(screen.getByTestId('dim-admission').textContent).toContain('APPROVED');
+  });
 });
+
