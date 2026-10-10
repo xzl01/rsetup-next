@@ -932,6 +932,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(target_os = "linux")]
     async fn storage_route_same_router_injected_storage_freshness() {
         use axum::body::Body;
         use rsetup_core::{

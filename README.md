@@ -27,6 +27,15 @@ recovery, root-filesystem expansion, reversible sleep policy, and reboot.
 Operations that do not apply to the current system remain visible with a reason
 instead of failing only after execution starts.
 
+Local system, SoC, firmware, thermal and block-device inspection uses the GPL-3.0-or-later
+[`deviceinfo` library](https://github.com/shallow-out/devicesinfo/tree/0d6c947f555344b072000694c431e1593a47a72c),
+pinned to that commit as the `externals/devicesinfo` Git submodule and linked
+through a Cargo path dependency. No `deviceinfo` executable or new
+runtime package is needed. CPU utilization is a guarded difference between
+system samples, not load average; the initial sample is unknown. Missing metrics
+remain `null` in JSON and unavailable in CLI/TUI/Web. Mutations, Polkit and the
+existing NVMe/MMC health readers remain owned by Next.
+
 APT source management is implemented as a guided workflow across the CLI, TUI,
 Web, and Tauri surfaces. It detects both traditional `.list` files and Deb822
 `.sources` files, limits replacements to known Debian, Ubuntu, and Radxa
@@ -133,6 +142,18 @@ version prevents an older in-flight GPIO response from replacing the newer
 device selection.
 
 ## Build and run
+
+Clone with submodules included:
+
+```bash
+git clone --recurse-submodules https://github.com/xzl01/rsetup-next.git
+cd rsetup-next
+```
+
+For an existing checkout, run `git submodule update --init --recursive` before
+building. GitHub's automatic source ZIP/tarballs omit submodule contents; use a
+recursive clone for source builds. The submodule revision belongs to the parent
+repository, so updating Next also requires updating its submodules.
 
 ```bash
 cargo build --workspace
@@ -279,6 +300,7 @@ crates/rsetup-core/       typed telemetry, capability, action and audit models
 crates/rsetup-app/        clap CLI, ratatui TUI, axum API and embedded Web assets
 ui/                       browser/Tauri control center and presentation locale catalog
 apps/desktop/src-tauri/   optional desktop shell
+externals/devicesinfo/    pinned upstream Git submodule (read-only probe library)
 data/pinouts.json         normalized 20-profile SBC pinout catalog
 data/pinouts/dragon-q8b.json  official Q8B profile (maintained separately)
 scripts/import-pinouts.mjs reproducible importer for the local pin-out checkout
@@ -303,7 +325,8 @@ make deb-prepare
 make deb
 ```
 
-`deb-prepare` downloads locked Rust dependencies into an ignored, package-local
+Initialize the Git submodules before preparing the package. `deb-prepare`
+downloads locked Rust dependencies into an ignored, package-local
 Cargo cache. The following `dpkg-buildpackage` step runs Cargo in offline mode.
 The generated packages are maintained and distributed only through this
 repository; they are not intended for submission to the Debian archive.

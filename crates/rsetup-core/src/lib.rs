@@ -1,4 +1,5 @@
 mod actions;
+mod deviceinfo_probe;
 mod efi_overlay;
 mod fan_curve;
 mod hardware;
@@ -30,8 +31,8 @@ pub use mmc::{MmcError, MmcManager};
 pub use model::{
     ActionRun, ActionSpec, ActionStatus, ActivityEvent, Alert, AlertLevel, Capability,
     DeviceIdentity, DeviceSnapshot, HealthState, MetricSet, MmcDevice, MmcHealth, MmcStatus,
-    NetworkInterface, NvmeDevice, NvmeSmartLog, NvmeStatus, ProbeMode, RiskLevel, ServiceState,
-    ServiceSummary, StorageMetric, StorageStatus, TelemetryError, TelemetryErrorKind,
+    NetworkInterface, NvmeDevice, NvmeSmartLog, NvmeStatus, ProbeMetadata, ProbeMode, RiskLevel,
+    ServiceState, ServiceSummary, StorageMetric, StorageStatus, TelemetryError, TelemetryErrorKind,
     TelemetryReadState, TelemetryStatus,
 };
 pub use nvme::{NvmeError, NvmeManager};

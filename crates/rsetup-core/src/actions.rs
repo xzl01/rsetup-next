@@ -2,7 +2,7 @@ use crate::{
     ActionRun, ActionSpec, ActionStatus, ActivityEvent, HealthState, MmcDevice, MmcHealth,
     MmcStatus, NvmeDevice, NvmeSmartLog, NvmeStatus, ProbeMode, RiskLevel, SourceApplyResult,
     SourceError, SourcePlan, SourceStatus, StorageStatus, TelemetryReadState, TelemetryStatus,
-    collect_snapshot,
+    deviceinfo_probe::LocalProbe,
     fan_curve::{
         FanCurveApplyResult, FanCurveManager, FanCurvePlan, FanCurveRequest, FanCurveStatus,
         FanCurveTick,
@@ -11,6 +11,7 @@ use crate::{
         GpioStatus, HardwareError, HardwareManager, LedStatus, OverlayApplyResult, OverlayPlan,
         OverlayStatus, RgbLedConfig, ThermalStatus, VideoFrame, VideoStatus,
     },
+    probe::collect_with_probe,
     sources::{SourceManager, source_run},
     spi_flash::{
         SpiFlashApplyResult, SpiFlashManager, SpiFlashPlan, SpiFlashRequest, SpiFlashStatus,
@@ -22,7 +23,7 @@ use std::{
     env, fs,
     path::Path,
     process::Command,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -80,6 +81,7 @@ pub struct Controller {
     fan_curve: Arc<FanCurveManager>,
     storage_reader: Arc<dyn crate::storage::StorageReader>,
     overlay_cache: Arc<RwLock<Option<OverlayStatus>>>,
+    probe: Arc<Mutex<LocalProbe>>,
 }
 
 impl Controller {
@@ -128,6 +130,7 @@ impl Controller {
             fan_curve: Arc::new(FanCurveManager::new(synthetic)),
             storage_reader: reader,
             overlay_cache: Arc::new(RwLock::new(None)),
+            probe: Arc::new(Mutex::new(LocalProbe::default())),
         }
     }
 
@@ -141,7 +144,13 @@ impl Controller {
     }
 
     pub fn snapshot(&self) -> anyhow::Result<crate::DeviceSnapshot> {
-        let mut snapshot = collect_snapshot(self.mode)?;
+        let mut snapshot = collect_with_probe(
+            self.mode,
+            &mut *self
+                .probe
+                .lock()
+                .map_err(|_| anyhow::anyhow!("probe lock poisoned"))?,
+        )?;
         // Polling remains unprivileged. Do not label the GPIO tool as unread
         // after an explicit read; make the cached provenance visible instead.
         if !snapshot.synthetic
@@ -2173,9 +2182,11 @@ mod tests {
         assert!(actions.iter().all(|action| action.available));
     }
 
+    #[cfg(target_os = "linux")]
     #[derive(Clone)]
     struct FakeStorage(Arc<std::sync::Mutex<StorageStatus>>);
 
+    #[cfg(target_os = "linux")]
     impl crate::storage::StorageReader for FakeStorage {
         fn nvme_status(&self) -> Result<NvmeStatus, HardwareError> {
             Ok(self.0.lock().unwrap().nvme.clone())
@@ -2196,6 +2207,17 @@ mod tests {
     }
 
     #[test]
+    fn controller_clones_share_probe_but_independent_controllers_do_not() {
+        let first = Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun);
+        let cloned = first.clone();
+        let other = Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun);
+        assert!(Arc::ptr_eq(&first.probe, &cloned.probe));
+        assert!(!Arc::ptr_eq(&first.probe, &other.probe));
+        assert!(first.snapshot().unwrap().probe.is_none());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn controller_same_instance_injected_storage_freshness() {
         let demo_storage = StorageStatus {
             nvme: demo_nvme_status(),

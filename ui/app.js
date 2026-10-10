@@ -412,6 +412,20 @@ function formatPercent(value) {
   return `${formatNumber(value, 1)}%`;
 }
 
+function renderCpuMetric(value) {
+  const known = typeof value === "number" && Number.isFinite(value);
+  const percent = known ? Math.max(0, Math.min(100, value)) : 0;
+  setText("[data-cpu]", known ? formatPercent(percent) : "—");
+  $("[data-cpu-meter]").style.transform = `scaleX(${percent / 100})`;
+}
+
+function memoryUsagePercent(metrics) {
+  const used = metrics.memoryUsedBytes;
+  const total = metrics.memoryTotalBytes;
+  return Number.isFinite(used) && Number.isFinite(total) && total > 0 && used >= 0 && used <= total
+    ? used / total * 100 : null;
+}
+
 function byteUnit(value) {
   const bytes = Number(value || 0);
   if (bytes < 1024) return `${bytes} B`;
@@ -929,7 +943,7 @@ function renderSnapshot() {
   const snapshot = state.snapshot;
   if (!snapshot) return;
   const { identity, metrics, storage, interfaces, services, capabilities } = snapshot;
-  const memoryPercent = metrics.memoryTotalBytes ? metrics.memoryUsedBytes / metrics.memoryTotalBytes * 100 : 0;
+  const memoryPercent = memoryUsagePercent(metrics);
   const root = storage.find((item) => item.mountPoint === "/") || storage[0];
   const rootPercent = root?.totalBytes ? root.usedBytes / root.totalBytes * 100 : 0;
   const vendor = socVendor(identity);
@@ -944,17 +958,16 @@ function renderSnapshot() {
   setText("[data-soc-vendor]", vendor.name);
   setText("[data-core-state]", snapshot.synthetic ? t("core.demo") : t("core.online"));
   setText("[data-core-detail]", `${socName} · ${identity.architecture}`);
-  setText("[data-cpu]", formatPercent(metrics.cpuPercent));
-  setText("[data-memory]", formatPercent(memoryPercent));
+  renderCpuMetric(metrics.cpuPercent);
+  setText("[data-memory]", memoryPercent == null ? "—" : formatPercent(memoryPercent));
   setText("[data-temperature]", metrics.temperatureC == null ? "N/A" : `${formatNumber(metrics.temperatureC, 1)} °C`);
   setText("[data-thermal-detail]", metrics.temperatureC == null ? t("temperature.none") : metrics.temperatureC < 70 ? t("temperature.normal") : t("temperature.hot"));
   setText("[data-storage]", root ? formatPercent(rootPercent) : "N/A");
   setText("[data-storage-detail]", root ? `${byteUnit(root.usedBytes)} / ${byteUnit(root.totalBytes)}` : t("storage.unavailable"));
-  setText("[data-uptime]", duration(metrics.uptimeSeconds));
+  setText("[data-uptime]", metrics.uptimeSeconds == null ? "—" : duration(metrics.uptimeSeconds));
   setText("[data-kernel]", identity.kernel);
   setText("[data-arch]", identity.architecture);
   setText("[data-collected]", t("updated", { time: relativeTime(snapshot.collectedAt) }));
-  $("[data-cpu-meter]").style.transform = `scaleX(${Math.min(100, metrics.cpuPercent) / 100})`;
   $("[data-memory-meter]").style.transform = `scaleX(${Math.min(100, memoryPercent) / 100})`;
 
   const stamp = $("[data-mode-stamp]");

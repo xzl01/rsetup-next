@@ -1,21 +1,27 @@
 use crate::{
     Alert, AlertLevel, Capability, DeviceIdentity, DeviceSnapshot, MetricSet, NetworkInterface,
-    ProbeMode, ServiceState, ServiceSummary, StorageMetric, hardware::HardwareManager,
+    ProbeMode, ServiceState, ServiceSummary, StorageMetric, deviceinfo_probe::LocalProbe,
+    hardware::HardwareManager,
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
-use std::{
-    collections::{BTreeSet, HashMap},
-    env, fs,
-    path::Path,
-    process::Command,
-};
+use std::{env, fs, path::Path, process::Command};
 
 pub fn collect_snapshot(requested_mode: ProbeMode) -> Result<DeviceSnapshot> {
+    collect_with_probe(requested_mode, &mut LocalProbe::default())
+}
+
+pub(crate) fn collect_with_probe(
+    requested_mode: ProbeMode,
+    probe: &mut LocalProbe,
+) -> Result<DeviceSnapshot> {
     let mode = resolve_mode(requested_mode);
     match mode {
-        ProbeMode::Demo => Ok(demo_snapshot()),
-        ProbeMode::Live | ProbeMode::Auto => live_snapshot(),
+        ProbeMode::Demo => {
+            probe.invalidate_identity();
+            Ok(demo_snapshot())
+        }
+        ProbeMode::Live | ProbeMode::Auto => live_snapshot(probe),
     }
 }
 
@@ -29,41 +35,10 @@ fn resolve_mode(requested: ProbeMode) -> ProbeMode {
     }
 }
 
-fn live_snapshot() -> Result<DeviceSnapshot> {
-    let hostname = read_trimmed("/etc/hostname").unwrap_or_else(|| "localhost".into());
-    let product = read_trimmed("/proc/device-tree/model")
-        .or_else(|| read_trimmed("/sys/devices/virtual/dmi/id/product_name"))
-        .unwrap_or_else(|| "Linux SBC".into());
-    let compatibles = read_nul_lines("/proc/device-tree/compatible");
-    let soc = detect_soc(&compatibles).unwrap_or_else(|| "unknown-soc".into());
-    let soc_vendor = detect_soc_vendor(&compatibles, &soc).map(str::to_owned);
-    let os_release = parse_key_values("/etc/os-release");
-    let operating_system = os_release
-        .get("PRETTY_NAME")
-        .cloned()
-        .unwrap_or_else(|| "Linux".into());
-    let kernel = command_text("uname", &["-r"]).unwrap_or_else(|| "unknown".into());
-    let architecture = command_text("uname", &["-m"]).unwrap_or_else(|| env::consts::ARCH.into());
-    let meminfo = parse_meminfo();
-    let memory_total_bytes = meminfo.get("MemTotal").copied().unwrap_or(0) * 1024;
-    let memory_available = meminfo.get("MemAvailable").copied().unwrap_or(0) * 1024;
-    let memory_used_bytes = memory_total_bytes.saturating_sub(memory_available);
-    let load_average = parse_load_average();
-    let cpu_count = read_trimmed("/proc/cpuinfo")
-        .map(|value| {
-            value
-                .lines()
-                .filter(|line| line.starts_with("processor"))
-                .count()
-        })
-        .unwrap_or(1)
-        .max(1) as f32;
-    let cpu_percent = ((load_average[0] / cpu_count) * 100.0).clamp(0.0, 100.0);
-    let uptime_seconds = read_trimmed("/proc/uptime")
-        .and_then(|value| value.split_whitespace().next()?.parse::<f64>().ok())
-        .unwrap_or(0.0) as u64;
-    let temperature_c = read_temperature();
-    let storage = probe_storage();
+fn live_snapshot(probe: &mut LocalProbe) -> Result<DeviceSnapshot> {
+    let observation = probe.collect();
+    let temperature_c = observation.metrics.temperature_c;
+    let storage = observation.storage;
     let interfaces = probe_interfaces();
     let services = vec![
         probe_service("ssh.service", "Remote shell"),
@@ -127,12 +102,11 @@ fn live_snapshot() -> Result<DeviceSnapshot> {
             spi_nor_detected(),
             "SPI NOR MTD device",
         ),
-        {
-            let nvme_devices = crate::NvmeManager::probe_sysfs(Path::new("/"));
-            let mmc_names = crate::MmcManager::probe_sysfs(Path::new("/"));
-            let (emmc_count, sd_count) = mmc_type_counts(&mmc_names);
-            storage_capability(nvme_devices.len() as u32, emmc_count, sd_count)
-        },
+        storage_capability(
+            observation.storage_counts.0,
+            observation.storage_counts.1,
+            observation.storage_counts.2,
+        ),
     ];
     let mut alerts = Vec::new();
     if temperature_c.is_some_and(|value| value >= 80.0) {
@@ -143,10 +117,10 @@ fn live_snapshot() -> Result<DeviceSnapshot> {
             detail: "Sustained operation above 80°C may throttle the board.".into(),
         });
     }
-    if storage
-        .iter()
-        .any(|disk| disk.total_bytes > 0 && disk.used_bytes * 100 / disk.total_bytes >= 90)
-    {
+    if storage.iter().any(|disk| {
+        disk.total_bytes > 0
+            && u128::from(disk.used_bytes) * 100 / u128::from(disk.total_bytes) >= 90
+    }) {
         alerts.push(Alert {
             id: "storage-high".into(),
             level: AlertLevel::Warning,
@@ -158,25 +132,9 @@ fn live_snapshot() -> Result<DeviceSnapshot> {
     Ok(DeviceSnapshot {
         collected_at: Utc::now(),
         synthetic: false,
-        identity: DeviceIdentity {
-            id: stable_device_id(&hostname, &product),
-            hostname,
-            product,
-            soc,
-            soc_vendor,
-            operating_system,
-            kernel,
-            architecture,
-            mode: ProbeMode::Live,
-        },
-        metrics: MetricSet {
-            cpu_percent,
-            load_average,
-            memory_used_bytes,
-            memory_total_bytes,
-            temperature_c,
-            uptime_seconds,
-        },
+        identity: observation.identity,
+        metrics: observation.metrics,
+        probe: Some(observation.metadata),
         storage,
         interfaces,
         services,
@@ -204,6 +162,7 @@ fn demo_snapshot() -> DeviceSnapshot {
     DeviceSnapshot {
         collected_at: Utc::now(),
         synthetic: true,
+        probe: None,
         identity: DeviceIdentity {
             id: "demo-rock-5b-01".into(),
             hostname: "lab-rock-5b".into(),
@@ -216,12 +175,12 @@ fn demo_snapshot() -> DeviceSnapshot {
             mode: ProbeMode::Demo,
         },
         metrics: MetricSet {
-            cpu_percent: 31.4,
-            load_average: [2.51, 1.94, 1.37],
-            memory_used_bytes: 5_421_883_392,
-            memory_total_bytes: 17_179_869_184,
+            cpu_percent: Some(31.4),
+            load_average: Some([2.51, 1.94, 1.37]),
+            memory_used_bytes: Some(5_421_883_392),
+            memory_total_bytes: Some(17_179_869_184),
             temperature_c: Some(54.8),
-            uptime_seconds: 352_842,
+            uptime_seconds: Some(352_842),
         },
         storage: vec![
             StorageMetric { name: "nvme0n1p2".into(), mount_point: "/".into(), used_bytes: 76_826_968_064, total_bytes: 256_060_514_304, removable: false },
@@ -297,21 +256,6 @@ pub(crate) fn storage_detail(nvme_count: u32, emmc_count: u32, sd_count: u32) ->
     }
 }
 
-/// Split probed MMC bus device names into eMMC and SD card counts.
-///
-/// `MmcManager::probe_sysfs` already drops every card whose `type` is neither
-/// `MMC` nor `SD`, so the two counts add up to the number of probed devices.
-fn mmc_type_counts(mmc_names: &[String]) -> (u32, u32) {
-    mmc_names.iter().fold((0u32, 0u32), |(emmc, sd), name| {
-        let type_path = Path::new("/sys/bus/mmc/devices").join(name).join("type");
-        match crate::mmc::sys::read_trimmed_attr(&type_path).as_deref() {
-            Some("MMC") => (emmc + 1, sd),
-            Some("SD") => (emmc, sd + 1),
-            _ => (emmc, sd),
-        }
-    })
-}
-
 /// Unified `storage` capability for the hardware matrix.
 ///
 /// Available as soon as one of the three counts is non-zero, so an MMC-only
@@ -340,58 +284,6 @@ fn probe_service(id: &str, label: &str) -> ServiceSummary {
         state: parsed,
         detail: state.unwrap_or_else(|| "systemd state unavailable".into()),
     }
-}
-
-fn probe_storage() -> Vec<StorageMetric> {
-    let Some(output) = command_text("df", &["-Pk", "/", "/boot"]) else {
-        return Vec::new();
-    };
-    parse_storage(&output, Path::new("/"))
-}
-
-fn parse_storage(output: &str, root: &Path) -> Vec<StorageMetric> {
-    let mut seen = BTreeSet::new();
-    output
-        .lines()
-        .skip(1)
-        .filter_map(|line| {
-            let fields: Vec<_> = line.split_whitespace().collect();
-            if fields.len() < 6 {
-                return None;
-            }
-            let metric = StorageMetric {
-                name: fields[0].trim_start_matches("/dev/").into(),
-                mount_point: fields[5].into(),
-                used_bytes: fields[2].parse::<u64>().ok()?.saturating_mul(1024),
-                total_bytes: fields[1].parse::<u64>().ok()?.saturating_mul(1024),
-                removable: block_removable(root, fields[0]),
-            };
-            seen.insert((fields[0], fields[5])).then_some(metric)
-        })
-        .collect()
-}
-
-fn block_removable(root: &Path, device: &str) -> bool {
-    let Some(name) = device.strip_prefix("/dev/") else {
-        return false;
-    };
-    // Resolve aliases such as /dev/root and /dev/mapper/* when available.
-    let resolved = fs::canonicalize(root.join("dev").join(name)).ok();
-    let name = resolved
-        .as_ref()
-        .and_then(|path| path.file_name())
-        .or_else(|| Path::new(name).file_name());
-    let Some(name) = name else {
-        return false;
-    };
-    let Ok(mut sysfs) = fs::canonicalize(root.join("sys/class/block").join(name)) else {
-        return false;
-    };
-    // A partition has no removable attribute of its own; query its parent disk.
-    if sysfs.join("partition").is_file() {
-        sysfs.pop();
-    }
-    read_trimmed(sysfs.join("removable")).as_deref() == Some("1")
 }
 
 fn inspected_capability(
@@ -453,183 +345,6 @@ fn probe_interfaces() -> Vec<NetworkInterface> {
         .collect()
 }
 
-fn read_temperature() -> Option<f32> {
-    let entries = fs::read_dir("/sys/class/thermal").ok()?;
-    entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| read_trimmed(entry.path().join("temp")))
-        .filter_map(|value| value.parse::<f32>().ok())
-        .map(|value| {
-            if value > 1000.0 {
-                value / 1000.0
-            } else {
-                value
-            }
-        })
-        .max_by(f32::total_cmp)
-}
-
-fn parse_meminfo() -> HashMap<String, u64> {
-    read_trimmed("/proc/meminfo")
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| {
-            let (key, value) = line.split_once(':')?;
-            let number = value.split_whitespace().next()?.parse().ok()?;
-            Some((key.into(), number))
-        })
-        .collect()
-}
-
-fn parse_load_average() -> [f32; 3] {
-    let values: Vec<f32> = read_trimmed("/proc/loadavg")
-        .unwrap_or_default()
-        .split_whitespace()
-        .take(3)
-        .filter_map(|value| value.parse().ok())
-        .collect();
-    [
-        *values.first().unwrap_or(&0.0),
-        *values.get(1).unwrap_or(&0.0),
-        *values.get(2).unwrap_or(&0.0),
-    ]
-}
-
-fn parse_key_values(path: impl AsRef<Path>) -> HashMap<String, String> {
-    read_trimmed(path)
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| {
-            let (key, value) = line.split_once('=')?;
-            Some((key.into(), value.trim_matches('"').into()))
-        })
-        .collect()
-}
-
-fn stable_device_id(hostname: &str, product: &str) -> String {
-    let machine_id = read_trimmed("/etc/machine-id").unwrap_or_default();
-    let seed = if machine_id.is_empty() {
-        format!("{hostname}-{product}")
-    } else {
-        machine_id
-    };
-    seed.chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .take(16)
-        .collect()
-}
-
-fn detect_soc_vendor<'a>(compatibles: &'a [String], soc: &'a str) -> Option<&'static str> {
-    compatibles
-        .iter()
-        .map(String::as_str)
-        .chain(std::iter::once(soc))
-        .find_map(|value| {
-            let value = value.to_ascii_lowercase();
-            if value.starts_with("rockchip,")
-                || value.starts_with("rockchip ")
-                || value.starts_with("rk35")
-            {
-                Some("Rockchip")
-            } else if value.starts_with("allwinner,")
-                || value.starts_with("allwinner ")
-                || value.starts_with("sunxi")
-                || value.starts_with("sun50")
-            {
-                Some("Allwinner")
-            } else if value.starts_with("cix,") || value.starts_with("cix ") {
-                Some("CIX")
-            } else if value.starts_with("qcom,")
-                || value.starts_with("qualcomm")
-                || value.starts_with("snapdragon")
-                || value.starts_with("qcs")
-            {
-                Some("Qualcomm")
-            } else if value.starts_with("amlogic,") || value.starts_with("amlogic ") {
-                Some("Amlogic")
-            } else if value.starts_with("brcm,")
-                || value.starts_with("broadcom")
-                || value.starts_with("bcm")
-            {
-                Some("Broadcom")
-            } else if value.starts_with("mediatek,")
-                || value.starts_with("mediatek ")
-                || value.starts_with("mtk")
-            {
-                Some("MediaTek")
-            } else if value.starts_with("nvidia,")
-                || value.starts_with("nvidia ")
-                || value.starts_with("tegra")
-            {
-                Some("NVIDIA")
-            } else if value.starts_with("nxp,")
-                || value.starts_with("nxp ")
-                || value.starts_with("fsl,")
-                || value.starts_with("imx")
-            {
-                Some("NXP")
-            } else if value.starts_with("starfive,")
-                || value.starts_with("starfive ")
-                || value.starts_with("jh71")
-            {
-                Some("StarFive")
-            } else if value.starts_with("sophgo,")
-                || value.starts_with("sophgo ")
-                || value.starts_with("cv18")
-            {
-                Some("Sophgo")
-            } else {
-                None
-            }
-        })
-}
-
-fn detect_soc(compatibles: &[String]) -> Option<String> {
-    // DT compatibles run from specific (SBC) to general (SoC). Do not use an
-    // arbitrary board-vendor suffix as the SoC, and prefer the general SoC entry.
-    compatibles.iter().rev().find_map(|value| {
-        let (vendor, id) = value.split_once(',')?;
-        let family_prefixes: &[&str] = match vendor.to_ascii_lowercase().as_str() {
-            "qcom" => &["sc", "sm", "qcs", "qcm", "sdm", "msm", "apq", "ipq", "sa"],
-            "rockchip" => &["rk", "rv", "px"],
-            "allwinner" => &["sun"],
-            "cix" => &["sky", "p"],
-            "amlogic" => &["meson", "a", "s", "t"],
-            "brcm" => &["bcm"],
-            "mediatek" => &["mt"],
-            "nvidia" => &["tegra"],
-            "fsl" | "nxp" => &["imx", "ls", "lx"],
-            "starfive" => &["jh"],
-            "sophgo" => &["cv", "sg", "bm"],
-            "spacemit" => &["k"],
-            _ => return None,
-        };
-        let id = id.to_ascii_lowercase();
-        family_prefixes
-            .iter()
-            .any(|prefix| {
-                id.strip_prefix(prefix).is_some_and(|suffix| {
-                    suffix.starts_with(|ch: char| ch.is_ascii_digit())
-                        || (*prefix == "meson" && suffix.starts_with('-'))
-                })
-            })
-            .then(|| id.to_ascii_uppercase())
-    })
-}
-
-fn read_nul_lines(path: impl AsRef<Path>) -> Vec<String> {
-    fs::read(path)
-        .ok()
-        .map(|bytes| {
-            bytes
-                .split(|byte| *byte == 0)
-                .filter(|value| !value.is_empty())
-                .map(|value| String::from_utf8_lossy(value).into_owned())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
     let mut value = fs::read_to_string(path).ok()?;
     while value.ends_with(['\0', '\n', '\r', ' ']) {
@@ -644,73 +359,9 @@ fn command_text(program: &str, args: &[&str]) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-#[allow(dead_code)]
-fn require_file(path: &str) -> Result<String> {
-    fs::read_to_string(path).with_context(|| format!("unable to read {path}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn soc_identity_uses_soc_compatible_instead_of_the_sbc_name() {
-        for (values, expected) in [
-            (vec!["radxa,dragon-q8b", "qcom,sc8280xp"], "SC8280XP"),
-            (vec!["qcom,sc8280xp-crd", "qcom,sc8280xp"], "SC8280XP"),
-            (vec!["radxa,rock-5b", "rockchip,rk3588"], "RK3588"),
-            (vec!["radxa,orion-o6", "cix,sky1"], "SKY1"),
-            (
-                vec!["radxa,zero", "amlogic,g12a", "amlogic,meson-g12a"],
-                "MESON-G12A",
-            ),
-            (
-                vec!["radxa,cubie-a5e", "allwinner,sun55i-a527"],
-                "SUN55I-A527",
-            ),
-        ] {
-            let values = values.into_iter().map(str::to_owned).collect::<Vec<_>>();
-            assert_eq!(detect_soc(&values).as_deref(), Some(expected));
-        }
-        assert_eq!(detect_soc(&["radxa,dragon-q8b".into()]), None);
-        assert_eq!(detect_soc(&["qcom,unknown-board".into()]), None);
-        assert_eq!(detect_soc(&[]), None);
-    }
-
-    #[test]
-    fn storage_deduplicates_mounts_and_reads_parent_disk_removable_attribute() {
-        use std::os::unix::fs::symlink;
-        let root = std::env::temp_dir().join(format!("rsetup-storage-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(root.join("sys/class/block")).unwrap();
-        for (disk, partition, removable) in [
-            ("sda", "sda3", "0"),
-            ("sdb", "sdb1", "1"),
-            ("mmcblk0", "mmcblk0p1", "0"),
-        ] {
-            let disk_dir = root.join("sys/devices/block").join(disk);
-            fs::create_dir_all(disk_dir.join(partition)).unwrap();
-            fs::write(disk_dir.join("removable"), removable).unwrap();
-            fs::write(disk_dir.join(partition).join("partition"), "1").unwrap();
-            symlink(&disk_dir, root.join("sys/class/block").join(disk)).unwrap();
-            symlink(
-                disk_dir.join(partition),
-                root.join("sys/class/block").join(partition),
-            )
-            .unwrap();
-        }
-        let output = "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda3 100 25 75 25% /\n/dev/sda3 100 25 75 25% /\n/dev/sdb1 200 50 150 25% /boot\n/dev/mmcblk0p1 40 10 30 25% /config\nmalformed\n";
-        let storage = parse_storage(output, &root);
-        assert_eq!(storage.len(), 3);
-        assert_eq!(storage[0].mount_point, "/");
-        assert_eq!(storage[0].used_bytes, 25 * 1024);
-        assert!(!storage[0].removable);
-        assert!(storage[1].removable);
-        assert!(!storage[2].removable);
-        assert!(block_removable(&root, "/dev/sdb"));
-        assert!(!block_removable(&root, "tmpfs"));
-        assert!(!block_removable(&root, "/dev/unknown"));
-        fs::remove_dir_all(root).unwrap();
-    }
 
     #[test]
     fn unavailable_capability_preserves_a_known_backend_reason() {
@@ -738,6 +389,15 @@ mod tests {
     #[test]
     fn demo_snapshot_exposes_storage_capability() {
         let snapshot = demo_snapshot();
+        assert!(snapshot.probe.is_none());
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert!(json.get("probe").is_none());
+        assert_eq!(json["metrics"]["cpuPercent"], serde_json::json!(31.4_f32));
+        let restored: DeviceSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            restored.metrics.memory_used_bytes,
+            snapshot.metrics.memory_used_bytes
+        );
         let storage = snapshot
             .capabilities
             .iter()
@@ -791,20 +451,10 @@ mod tests {
 
     #[test]
     fn live_storage_capability_mirrors_probe_results() {
-        // The probe machine decides the hardware, so this test covers the
-        // wiring: both sysfs probes must feed the single `storage` capability
-        // and the legacy `nvme` capability must be gone. The MMC-only and
-        // empty-host cases are asserted deterministically by the two tests
-        // above, which do not depend on what this host happens to have.
-        let snapshot = live_snapshot().expect("live snapshot on a Linux host");
-        let nvme_devices = crate::NvmeManager::probe_sysfs(Path::new("/"));
-        let mmc_devices = crate::MmcManager::probe_sysfs(Path::new("/"));
-        let (emmc, sd) = mmc_type_counts(&mmc_devices);
-        assert_eq!(
-            mmc_devices.len() as u32,
-            emmc + sd,
-            "probe_sysfs only reports MMC and SD cards, so the type counts must add up"
-        );
+        let snapshot = live_snapshot(&mut LocalProbe::default()).expect("live snapshot");
+        let counts = crate::deviceinfo_probe::LocalProbe::default()
+            .collect()
+            .storage_counts;
         let storage = snapshot
             .capabilities
             .iter()
@@ -816,7 +466,7 @@ mod tests {
                 .iter()
                 .any(|capability| capability.id == "nvme")
         );
-        let expected = storage_capability(nvme_devices.len() as u32, emmc, sd);
+        let expected = storage_capability(counts.0, counts.1, counts.2);
         assert_eq!(storage.id, expected.id);
         assert_eq!(storage.label, expected.label);
         assert_eq!(
@@ -827,17 +477,5 @@ mod tests {
             storage.detail, expected.detail,
             "storage detail must reflect live probe counts"
         );
-    }
-
-    #[test]
-    fn detects_vendor_after_board_compatible() {
-        let compatibles = vec!["radxa,rock-5b".into(), "rockchip,rk3588".into()];
-        assert_eq!(detect_soc_vendor(&compatibles, "rock-5b"), Some("Rockchip"));
-    }
-
-    #[test]
-    fn detects_common_vendor_from_soc_fallback() {
-        assert_eq!(detect_soc_vendor(&[], "sun50i-h616"), Some("Allwinner"));
-        assert_eq!(detect_soc_vendor(&[], "qcs8550"), Some("Qualcomm"));
     }
 }

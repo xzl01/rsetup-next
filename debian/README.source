@@ -7,11 +7,18 @@ the runtime compatibility baseline.
 
 The package build itself is network-isolated. For local and CI builds, run:
 
+    git submodule update --init --recursive
     make deb-prepare
     dpkg-buildpackage --build=binary --no-sign
 
-The first command resolves Cargo.lock and fills debian/cargo-home. That ignored
-cache is intentionally not part of the source package.
+The first command checks out the pinned devicesinfo source in
+externals/devicesinfo. Next links its crates/deviceinfo library as a Cargo path
+dependency; it does not install or execute the upstream CLI. Automatic GitHub
+source ZIP/tarballs omit submodule contents, so use a recursive Git clone.
+
+The second command resolves Cargo.lock and fills debian/cargo-home. That ignored
+cache is intentionally not part of the source package. Both preparation steps
+must finish before the offline dpkg-buildpackage step.
 
 The generated Debian packages are maintained and distributed only from the
 rsetup-next repository. They are not intended for submission to the Debian

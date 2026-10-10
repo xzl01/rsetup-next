@@ -6,6 +6,18 @@ Files: *
 Copyright: 2025-2026 Radxa Computer Co., Ltd
            2026 xzl
 License: GPL-3+
+Comment: The binaries also statically include deviceinfo v0.2.0, maintained by
+ the devicesinfo contributors at https://github.com/shallow-out/devicesinfo.
+ That Rust library declares GPL-3.0-or-later and its Git submodule is pinned to commit
+ 0d6c947f555344b072000694c431e1593a47a72c. Its ownership is not transferred to
+ rsetup-next; the same GPL-3+ redistribution terms apply to the combined binary.
+
+Files: externals/devicesinfo/*
+Copyright: devicesinfo contributors
+License: GPL-3+
+Comment: Upstream source is retained in a Git submodule from
+ https://github.com/shallow-out/devicesinfo. Its Cargo workspace declares
+ GPL-3.0-or-later; this attribution does not transfer upstream ownership.
 
 Files: ui/fonts/BarlowCondensed-*.ttf
 Copyright: 2017 The Barlow Project Authors

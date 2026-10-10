@@ -473,11 +473,13 @@ fn render_mission(frame: &mut Frame, app: &App, area: Rect) {
             Constraint::Min(4),
         ])
         .split(area);
-    let cpu = app.snapshot.metrics.cpu_percent.clamp(0.0, 100.0) as u16;
-    let memory = percent(
-        app.snapshot.metrics.memory_used_bytes,
-        app.snapshot.metrics.memory_total_bytes,
-    ) as u16;
+    let cpu = app
+        .snapshot
+        .metrics
+        .cpu_percent
+        .map(|v| v.clamp(0.0, 100.0) as u16)
+        .unwrap_or(0);
+    let memory = app.snapshot.metrics.memory_percent();
     let gauges = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -487,7 +489,13 @@ fn render_mission(frame: &mut Frame, app: &App, area: Rect) {
             .block(instrument(app.locale.text("cpu_load")))
             .gauge_style(Style::default().fg(SIGNAL).bg(Color::Rgb(42, 46, 38)))
             .percent(cpu)
-            .label(format!("{:.1}%", app.snapshot.metrics.cpu_percent)),
+            .label(
+                app.snapshot
+                    .metrics
+                    .cpu_percent
+                    .map(|v| format!("{v:.1}%"))
+                    .unwrap_or_else(|| app.locale.text("not_available").into()),
+            ),
         gauges[0],
     );
     frame.render_widget(
@@ -498,8 +506,12 @@ fn render_mission(frame: &mut Frame, app: &App, area: Rect) {
                     .fg(Color::Rgb(103, 214, 255))
                     .bg(Color::Rgb(42, 46, 38)),
             )
-            .percent(memory)
-            .label(format!("{memory}%")),
+            .percent(memory.map(|v| v.clamp(0.0, 100.0) as u16).unwrap_or(0))
+            .label(
+                memory
+                    .map(|v| format!("{v:.1}%"))
+                    .unwrap_or_else(|| app.locale.text("not_available").into()),
+            ),
         gauges[1],
     );
 
@@ -509,17 +521,27 @@ fn render_mission(frame: &mut Frame, app: &App, area: Rect) {
         .temperature_c
         .map(|v| format!("{v:.1} °C"))
         .unwrap_or_else(|| app.locale.text("no_sensor").into());
+    let load = app
+        .snapshot
+        .metrics
+        .load_average
+        .map(|v| format!("{:.2} {:.2} {:.2}", v[0], v[1], v[2]))
+        .unwrap_or_else(|| app.locale.text("not_available").into());
+    let uptime = app
+        .snapshot
+        .metrics
+        .uptime_seconds
+        .map(|v| duration(v, app.locale))
+        .unwrap_or_else(|| app.locale.text("not_available").into());
     let identity = format!(
-        "{}\n{} / {}\n{} {}  ·  {} {:.2} {:.2} {:.2}  ·  {} {}",
+        "{}\n{} / {}\n{} {}  ·  {} {}  ·  {} {}",
         app.snapshot.identity.product,
         app.snapshot.identity.soc,
         app.snapshot.identity.architecture,
         app.locale.text("uptime"),
-        duration(app.snapshot.metrics.uptime_seconds, app.locale),
+        uptime,
         app.locale.text("load_average"),
-        app.snapshot.metrics.load_average[0],
-        app.snapshot.metrics.load_average[1],
-        app.snapshot.metrics.load_average[2],
+        load,
         app.locale.text("thermal"),
         temp
     );
@@ -1239,14 +1261,6 @@ fn instrument(title: &str) -> Block<'_> {
         .border_style(Style::default().fg(Color::Rgb(76, 82, 68)))
 }
 
-fn percent(value: u64, total: u64) -> f32 {
-    if total == 0 {
-        0.0
-    } else {
-        value as f32 / total as f32 * 100.0
-    }
-}
-
 fn duration(seconds: u64, locale: Locale) -> String {
     let days = seconds / 86_400;
     let hours = (seconds % 86_400) / 3_600;
@@ -1262,6 +1276,43 @@ mod tests {
     use super::*;
     use ratatui::Terminal;
     use rsetup_core::{ExecutionPolicy, ProbeMode};
+
+    #[test]
+    fn mission_gauges_distinguish_unknown_from_zero_in_both_locales() {
+        for locale in [Locale::En, Locale::ZhCn] {
+            let controller = Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun);
+            let mut app = App::new(controller, locale).unwrap();
+            let backend = ratatui::backend::TestBackend::new(120, 40);
+            let mut terminal = Terminal::new(backend).unwrap();
+            app.snapshot.metrics.cpu_percent = None;
+            app.snapshot.metrics.memory_used_bytes = None;
+            app.snapshot.metrics.memory_total_bytes = None;
+            app.snapshot.metrics.load_average = None;
+            app.snapshot.metrics.uptime_seconds = None;
+            terminal
+                .draw(|frame| render_mission(frame, &app, frame.area()))
+                .unwrap();
+            let gauge_text = terminal.backend().buffer().content()[..120 * 6]
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            // Buffer cells reserve an extra column for wide CJK characters.
+            let gauge_text = gauge_text.split_whitespace().collect::<Vec<_>>().join("");
+            assert!(gauge_text.matches(locale.text("not_available")).count() >= 2);
+            assert!(!gauge_text.contains("0.0%"));
+            app.snapshot.metrics.cpu_percent = Some(0.0);
+            app.snapshot.metrics.memory_used_bytes = Some(0);
+            app.snapshot.metrics.memory_total_bytes = Some(100);
+            terminal
+                .draw(|frame| render_mission(frame, &app, frame.area()))
+                .unwrap();
+            let gauge_text = terminal.backend().buffer().content()[..120 * 6]
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert_eq!(gauge_text.matches("0.0%").count(), 2);
+        }
+    }
 
     #[test]
     fn test_tui_app_loads_and_refreshes_nvme_status() {
@@ -1758,6 +1809,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_tui_app_same_instance_injected_storage_freshness() {
         use rsetup_core::{
             ExecutionPolicy, HardwareError, HealthState, MmcDevice, MmcHealth, MmcStatus,
@@ -1980,11 +2032,13 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[derive(Clone)]
     struct EnumerationFixture(
         std::sync::Arc<std::sync::Mutex<(rsetup_core::StorageStatus, bool, bool)>>,
     );
 
+    #[cfg(target_os = "linux")]
     impl rsetup_core::StorageReader for EnumerationFixture {
         fn nvme_status(&self) -> Result<rsetup_core::NvmeStatus, rsetup_core::HardwareError> {
             let state = self.0.lock().unwrap();
@@ -2006,6 +2060,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn storage_card_text(app: &App) -> String {
         let backend = ratatui::backend::TestBackend::new(120, 40);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -2024,6 +2079,7 @@ mod tests {
         raw.split_whitespace().collect::<Vec<_>>().join("")
     }
 
+    #[cfg(target_os = "linux")]
     fn norm(s: &str) -> String {
         s.split_whitespace().collect::<Vec<_>>().join("")
     }

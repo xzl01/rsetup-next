@@ -172,7 +172,9 @@ impl SafeFd {
     fn open_read_only(path: &std::ffi::CStr) -> Result<Self, i32> {
         let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         if fd < 0 {
-            let errno = unsafe { *libc::__errno_location() };
+            let errno = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
             Err(errno)
         } else {
             Ok(Self(fd))
@@ -229,7 +231,9 @@ pub fn read_smart_log_raw(dev_path: &str) -> Result<[u8; 512], NvmeError> {
 
     let ret = unsafe { libc::ioctl(fd.as_raw_fd(), NVME_IOCTL_ADMIN_CMD, &mut cmd) };
     let captured_errno = if ret < 0 {
-        unsafe { *libc::__errno_location() }
+        std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO)
     } else {
         0
     };

@@ -1329,36 +1329,40 @@ impl HardwareManager {
             return Ok(demo_thermal_status());
         }
         let thermal_root = self.root.join("sys/class/thermal");
-        let mut zones = Vec::new();
-        let mut cooling_devices = Vec::new();
-        if let Ok(entries) = fs::read_dir(&thermal_root) {
-            for entry in entries.flatten() {
-                let id = entry.file_name().to_string_lossy().into_owned();
-                if id.starts_with("thermal_zone") {
-                    let available_policies = read_trimmed(entry.path().join("available_policies"))
+        let observed =
+            deviceinfo::observe_thermal(&self.root, &deviceinfo::ThermalOptions::default());
+        let mut zones: Vec<_> = observed
+            .data
+            .temperatures
+            .iter()
+            .filter(|sensor| sensor.origin == deviceinfo::TemperatureOrigin::ThermalZone)
+            .map(|sensor| {
+                let base = thermal_root.join(&sensor.device);
+                ThermalZone {
+                    id: sensor.device.clone(),
+                    kind: sensor
+                        .label
+                        .clone()
+                        .unwrap_or_else(|| sensor.device.clone()),
+                    temperature_c: sensor.temperature_millicelsius.map(|v| v as f32 / 1000.0),
+                    policy: read_trimmed(base.join("policy")),
+                    available_policies: read_trimmed(base.join("available_policies"))
                         .map(|value| value.split_whitespace().map(str::to_owned).collect())
-                        .unwrap_or_default();
-                    zones.push(ThermalZone {
-                        id: id.clone(),
-                        kind: read_trimmed(entry.path().join("type")).unwrap_or(id),
-                        temperature_c: read_trimmed(entry.path().join("temp"))
-                            .and_then(|value| value.parse::<f32>().ok())
-                            .map(|value| value / 1000.0),
-                        policy: read_trimmed(entry.path().join("policy")),
-                        available_policies,
-                    });
-                } else if id.starts_with("cooling_device") {
-                    cooling_devices.push(CoolingDevice {
-                        id: id.clone(),
-                        kind: read_trimmed(entry.path().join("type")).unwrap_or(id),
-                        current_state: read_trimmed(entry.path().join("cur_state"))
-                            .and_then(|value| value.parse().ok()),
-                        max_state: read_trimmed(entry.path().join("max_state"))
-                            .and_then(|value| value.parse().ok()),
-                    });
+                        .unwrap_or_default(),
                 }
-            }
-        }
+            })
+            .collect();
+        let mut cooling_devices: Vec<_> = observed
+            .data
+            .cooling_devices
+            .iter()
+            .map(|device| CoolingDevice {
+                id: device.device.clone(),
+                kind: device.kind.clone().unwrap_or_else(|| device.device.clone()),
+                current_state: device.current_state.and_then(|v| u32::try_from(v).ok()),
+                max_state: device.maximum_state.and_then(|v| u32::try_from(v).ok()),
+            })
+            .collect();
         zones.sort_by(|left, right| left.id.cmp(&right.id));
         cooling_devices.sort_by(|left, right| left.id.cmp(&right.id));
         let pwm_fan_detected = cooling_devices.iter().any(|device| {

@@ -898,10 +898,11 @@ fn print_status(controller: &Controller, locale: Locale, json: bool) -> Result<(
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
         return Ok(());
     }
-    let memory = percent(
-        snapshot.metrics.memory_used_bytes,
-        snapshot.metrics.memory_total_bytes,
-    );
+    let memory = snapshot
+        .metrics
+        .memory_percent()
+        .map(|value| format!("{value:.1}%"))
+        .unwrap_or_else(|| locale.text("not_available").into());
     println!(
         "{} · {}",
         snapshot.identity.product, snapshot.identity.hostname
@@ -917,16 +918,15 @@ fn print_status(controller: &Controller, locale: Locale, json: bool) -> Result<(
         .temperature_c
         .map(|value| format!("{value:.1}°C"))
         .unwrap_or_else(|| locale.text("not_available").into());
+    let cpu = snapshot
+        .metrics
+        .cpu_percent
+        .map(|value| format!("{value:.1}%"))
+        .unwrap_or_else(|| locale.text("not_available").into());
     if locale.is_zh() {
-        println!(
-            "处理器 {:>5.1}%   内存 {:>5.1}%   温度 {temperature}",
-            snapshot.metrics.cpu_percent, memory
-        );
+        println!("处理器 {cpu:>6}   内存 {memory:>6}   温度 {temperature}");
     } else {
-        println!(
-            "CPU {:>5.1}%   MEM {:>5.1}%   TEMP {temperature}",
-            snapshot.metrics.cpu_percent, memory
-        );
+        println!("CPU {cpu:>6}   MEM {memory:>6}   TEMP {temperature}");
     }
     println!(
         "{} {} · {} {} · {} {}{}",
@@ -1380,14 +1380,6 @@ fn format_storage_status(status: &rsetup_core::StorageStatus, locale: Locale) ->
     let nvme = format_nvme_status(&status.nvme, locale);
     let mmc = format_mmc_status(&status.mmc, locale);
     format!("{nvme}\n\n{mmc}")
-}
-
-fn percent(value: u64, total: u64) -> f32 {
-    if total == 0 {
-        0.0
-    } else {
-        value as f32 / total as f32 * 100.0
-    }
 }
 
 fn print_json_or_debug<T>(value: &T, json: bool) -> Result<()>

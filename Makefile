@@ -13,7 +13,7 @@ test:
 	node --test ui/*.test.mjs
 
 lint:
-	cargo fmt --all -- --check
+	cargo fmt --package rsetup-core --package rsetup-next -- --check
 	cargo clippy --workspace --all-targets -- -D warnings
 
 run:

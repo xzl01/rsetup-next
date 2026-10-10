@@ -34,12 +34,54 @@ and HTTP payloads remain locale-neutral.
 elsewhere. `RSETUP_MODE=demo` and `--demo` force the synthetic provider;
 `RSETUP_MODE=live` forces the Linux provider.
 
-The Linux provider currently reads only conventional local interfaces:
+The Linux provider uses the GPL-3.0-or-later `deviceinfo` v0.2.0 library,
+pinned to `0d6c947f555344b072000694c431e1593a47a72c` by the
+`externals/devicesinfo` Git submodule. Both the root workspace and desktop build
+use its `crates/deviceinfo` Cargo path dependency. The upstream workspace is
+excluded from Next's workspace: its CLI is neither built nor installed as part
+of Next. CI checks out submodules recursively; offline Debian builds require
+the initialized source checkout plus the prepared registry cache.
+Next's formatting checks explicitly select its two workspace packages because
+`cargo fmt --all` also follows local path dependencies into upstream sources.
+`deviceinfo_probe` is the adapter, not an external executable:
 
-- `/proc/device-tree`, DMI, `/etc/os-release`, `uname`
-- `/proc/meminfo`, `/proc/loadavg`, `/proc/uptime`
-- `/sys/class/thermal` and `/sys/class/net`
-- `df`, `ip`, and selected `systemctl is-active` probes
+- `inspect_system` and `inspect_platform` provide CPU architecture, SBC/SoC,
+  OS and firmware identity. UEFI, DT and ACPI are independent observations;
+  UEFI + DT does not disable Next's EFI Overlay backend.
+- Identity is cached for 30 seconds. Boot ID, namespace, hostname or kernel
+  changes invalidate it immediately. Each `Controller` owns its cache;
+  controller clones share it, independent controllers do not.
+- `observe_system` and `observe_thermal` supply changing memory, load, uptime,
+  trusted temperatures and filesystem usage. `inspect_storage` refreshes block
+  inventory on every snapshot so hotplug remains visible. Mounts associate by
+  major:minor; `/boot` on the root filesystem is not counted twice.
+- CPU utilization uses `Snapshot::cpu_usage_since` with the complete previous
+  envelope. First samples, resets, reboot, namespace changes, missing counters
+  and overlapping/frozen sampling windows are unknown, never fabricated zeroes.
+  Collection is serialized per controller and does not sleep. The exported
+  one-shot `collect_snapshot` has no previous sample; use `Controller` for
+  repeated observations.
+- Network and service observation still uses Next's `/sys/class/net`, `ip`
+  and selected `systemctl is-active` readers. Thermal policies and every write
+  remain in Next. The thermal drawer uses deviceinfo temperatures/cooling-state
+  validation while policy discovery, write validation and persistence stay local.
+
+The existing JSON field names are preserved, but missing metrics (including
+`cpuPercent`, `loadAverage`, memory byte counts and `uptimeSeconds`) are nullable.
+Live snapshots add `probe`: provider/schema, separate dynamic and cached source
+contexts, independent firmware observations, diagnostics and warnings. Upstream
+context/diagnostic/platform objects preserve deviceinfo's snake_case schema;
+nanosecond timestamps remain decimal strings to avoid JavaScript precision loss.
+Demo snapshots omit this evidence and never call deviceinfo. Free-text warnings
+are informational, not inputs to control decisions.
+
+This integration calls only local read-only inspection/observation APIs. It does
+not use `check_environment`, SSH capture, runtime scanning or storage-health
+ioctls. Captured test roots never inherit the collector's clocks/filesystem
+usage. NVMe/MMC health ioctl readers, authorization and their error mapping
+remain unchanged. Normal polling cannot start a command through deviceinfo,
+drive GPIO or trigger firmware/health operations. Debian packages compile the
+library into the binary; they have no deviceinfo runtime dependency.
 
 A failed optional probe produces an unavailable or unknown signal instead of
 turning the entire device snapshot into a failure.

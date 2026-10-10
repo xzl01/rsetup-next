@@ -36,17 +36,45 @@ pub struct DeviceSnapshot {
     pub services: Vec<ServiceSummary>,
     pub capabilities: Vec<Capability>,
     pub alerts: Vec<Alert>,
+    /// Read-only source evidence. Absent for synthetic/older snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<ProbeMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeMetadata {
+    pub provider: String,
+    pub schema_version: u32,
+    /// This window describes the dynamic system sample, not the cached identity.
+    pub context: deviceinfo::SampleContext,
+    pub identity_context: deviceinfo::SampleContext,
+    pub platform_context: deviceinfo::SampleContext,
+    pub storage_context: deviceinfo::SampleContext,
+    pub thermal_context: deviceinfo::SampleContext,
+    pub platform: deviceinfo::PlatformReport,
+    pub diagnostics: Vec<deviceinfo::Diagnostic>,
+    pub warnings: Vec<String>,
+    pub cpu_unavailable_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MetricSet {
-    pub cpu_percent: f32,
-    pub load_average: [f32; 3],
-    pub memory_used_bytes: u64,
-    pub memory_total_bytes: u64,
+    /// First sample, counter resets and invalid source contexts are unknown.
+    pub cpu_percent: Option<f32>,
+    pub load_average: Option<[f32; 3]>,
+    pub memory_used_bytes: Option<u64>,
+    pub memory_total_bytes: Option<u64>,
     pub temperature_c: Option<f32>,
-    pub uptime_seconds: u64,
+    pub uptime_seconds: Option<u64>,
+}
+
+impl MetricSet {
+    pub fn memory_percent(&self) -> Option<f32> {
+        let (used, total) = self.memory_used_bytes.zip(self.memory_total_bytes)?;
+        (total > 0 && used <= total).then(|| used as f32 / total as f32 * 100.0)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
