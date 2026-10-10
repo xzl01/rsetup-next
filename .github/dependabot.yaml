@@ -8,10 +8,18 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # The rust-msrv job pins this action to the workspace rust-version.
+      # Bumping it would silently stop testing the declared minimum.
+      - dependency-name: dtolnay/rust-toolchain
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # crossterm must stay on the version ratatui 0.29 is built against;
+      # bumping it alone compiles two crossterm versions.
+      - dependency-name: crossterm
   - package-ecosystem: cargo
     directory: /apps/desktop/src-tauri
     schedule:
