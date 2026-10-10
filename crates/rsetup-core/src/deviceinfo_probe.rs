@@ -13,6 +13,12 @@ use std::{
 
 const IDENTITY_TTL: Duration = Duration::from_secs(30);
 
+/// Window used to establish the CPU baseline of a fresh probe. Utilization is a
+/// difference between two samples and deviceinfo never delays implicitly, so a
+/// one-shot consumer (CLI `status`, TUI startup, the first HTTP poll) would
+/// otherwise report CPU as unknown until its second observation.
+const FIRST_SAMPLE_WINDOW: Duration = Duration::from_millis(200);
+
 struct IdentityCache {
     at: Instant,
     fingerprint: [Option<String>; 5],
@@ -25,6 +31,7 @@ pub(crate) struct LocalProbe {
     architecture: String,
     identity: Option<IdentityCache>,
     previous: Option<Snapshot<SystemState>>,
+    baseline_window: Option<Duration>,
 }
 
 pub(crate) struct LocalObservation {
@@ -48,6 +55,7 @@ impl LocalProbe {
             architecture,
             identity: None,
             previous: None,
+            baseline_window: Some(FIRST_SAMPLE_WINDOW),
         }
     }
 
@@ -57,12 +65,19 @@ impl LocalProbe {
     }
 
     pub(crate) fn collect(&mut self) -> LocalObservation {
-        let state = deviceinfo::observe_system(
-            &self.root,
-            &SystemSampleOptions {
-                watch: vec!["/".into(), "/boot".into()],
-            },
-        );
+        let options = SystemSampleOptions {
+            watch: vec!["/".into(), "/boot".into()],
+        };
+        let mut state = deviceinfo::observe_system(&self.root, &options);
+        if self.previous.is_none() {
+            if let Some(window) = self.baseline_window {
+                // A difference-based CPU sample needs a baseline: keep the first
+                // sample as `previous`, wait, then observe again.
+                self.previous = Some(state);
+                std::thread::sleep(window);
+                state = deviceinfo::observe_system(&self.root, &options);
+            }
+        }
         // Kernel/hostname changes invalidate immediately, even inside the TTL.
         let fingerprint = [
             state.context.finished.boot_id.clone(),
@@ -304,7 +319,39 @@ mod tests {
     const BOOT: &str = "11111111-1111-4111-8111-111111111111";
     const NEXT_BOOT: &str = "22222222-2222-4222-8222-222222222222";
 
+    fn write_at(root: &Path, relative: &str, text: &str) {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+
+    fn context_at(root: &Path, boot: &str, time: u64, namespace: &str, preserved: bool) {
+        write_at(root, deviceinfo::BOOT_ID_INPUT, boot);
+        let start = SampleStamp {
+            unix_time_ns: Some(1_000_000_000_000 + time),
+            boot_time_ns: Some(time),
+            boot_id: Some(boot.into()),
+            time_namespace: Some(namespace.into()),
+            mount_namespace: Some("mnt:[8]".into()),
+            boot_clock_resolution_ns: Some(1),
+        };
+        let mut end = start.clone();
+        end.boot_time_ns = Some(time + 1000);
+        let metadata = CaptureMetadata {
+            schema_version: deviceinfo::SCHEMA_VERSION,
+            context: SampleContext::from_bounds(ObservationOrigin::Captured, start, end),
+            devices: vec![],
+            counters_preserved: preserved,
+        };
+        write_at(
+            root,
+            deviceinfo::CONTEXT_FILE,
+            &serde_json::to_string(&metadata).unwrap(),
+        );
+    }
+
     struct Fixture(PathBuf);
+
     impl Fixture {
         fn new() -> Self {
             let fixture = Self(
@@ -339,35 +386,17 @@ mod tests {
             fixture
         }
         fn write(&self, relative: &str, text: &str) {
-            let path = self.0.join(relative);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, text).unwrap();
+            write_at(&self.0, relative, text);
         }
         fn context(&self, boot: &str, time: u64, namespace: &str, preserved: bool) {
-            self.write(deviceinfo::BOOT_ID_INPUT, boot);
-            let start = SampleStamp {
-                unix_time_ns: Some(1_000_000_000_000 + time),
-                boot_time_ns: Some(time),
-                boot_id: Some(boot.into()),
-                time_namespace: Some(namespace.into()),
-                mount_namespace: Some("mnt:[8]".into()),
-                boot_clock_resolution_ns: Some(1),
-            };
-            let mut end = start.clone();
-            end.boot_time_ns = Some(time + 1000);
-            let metadata = CaptureMetadata {
-                schema_version: deviceinfo::SCHEMA_VERSION,
-                context: SampleContext::from_bounds(ObservationOrigin::Captured, start, end),
-                devices: vec![],
-                counters_preserved: preserved,
-            };
-            self.write(
-                deviceinfo::CONTEXT_FILE,
-                &serde_json::to_string(&metadata).unwrap(),
-            );
+            context_at(&self.0, boot, time, namespace, preserved);
         }
         fn probe(&self) -> LocalProbe {
-            LocalProbe::new(self.0.clone(), "aarch64".into())
+            let mut probe = LocalProbe::new(self.0.clone(), "aarch64".into());
+            // Fixtures have no advancing /proc/stat, so the baseline window adds
+            // latency without changing any assertion. Tests that exercise it opt in.
+            probe.baseline_window = None;
+            probe
         }
     }
     impl Drop for Fixture {
@@ -453,6 +482,31 @@ mod tests {
             unchanged.metadata.cpu_unavailable_reason.as_deref(),
             Some("NoCounterProgress")
         );
+    }
+
+    #[test]
+    fn one_shot_collect_establishes_a_cpu_baseline_inside_the_window() {
+        let fixture = Fixture::new();
+        let mut probe = fixture.probe();
+        // Production behaviour: a fresh probe must not need a second call.
+        // Generous margins keep the two samples on either side of the change.
+        probe.baseline_window = Some(Duration::from_millis(1000));
+        let root = fixture.0.clone();
+        let advancing = std::thread::spawn(move || {
+            // Land the counter change inside the adapter's sampling window.
+            std::thread::sleep(Duration::from_millis(200));
+            write_at(&root, "proc/stat", "cpu 60 0 0 140 0 0 0 0\n");
+            context_at(&root, BOOT, 2_000_000_000, "time:[7]", true);
+        });
+        let observed = probe.collect();
+        advancing.join().unwrap();
+        assert_eq!(
+            observed.metrics.cpu_percent,
+            Some(50.0),
+            "reason: {:?}",
+            observed.metadata.cpu_unavailable_reason
+        );
+        assert_eq!(observed.metadata.cpu_unavailable_reason, None);
     }
 
     #[test]

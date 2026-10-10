@@ -56,11 +56,14 @@ Next's formatting checks explicitly select its two workspace packages because
   inventory on every snapshot so hotplug remains visible. Mounts associate by
   major:minor; `/boot` on the root filesystem is not counted twice.
 - CPU utilization uses `Snapshot::cpu_usage_since` with the complete previous
-  envelope. First samples, resets, reboot, namespace changes, missing counters
-  and overlapping/frozen sampling windows are unknown, never fabricated zeroes.
-  Collection is serialized per controller and does not sleep. The exported
-  one-shot `collect_snapshot` has no previous sample; use `Controller` for
-  repeated observations.
+  envelope. Resets, reboot, namespace changes, missing counters and
+  overlapping/frozen sampling windows are unknown, never fabricated zeroes.
+  Collection is serialized per controller. A fresh probe has no previous
+  envelope, so its first observation takes one bounded in-process baseline
+  window (200 ms) and keeps the earlier sample as `previous`; that is what lets
+  a one-shot consumer (`status`, TUI startup, the first HTTP poll) report a real
+  utilization instead of waiting for its next observation. Later observations
+  compare against the previous envelope and never sleep.
 - Network and service observation still uses Next's `/sys/class/net`, `ip`
   and selected `systemctl is-active` readers. Thermal policies and every write
   remain in Next. The thermal drawer uses deviceinfo temperatures/cooling-state

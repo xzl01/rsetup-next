@@ -32,9 +32,10 @@ Local system, SoC, firmware, thermal and block-device inspection uses the GPL-3.
 pinned to that commit as the `externals/devicesinfo` Git submodule and linked
 through a Cargo path dependency. No `deviceinfo` executable or new
 runtime package is needed. CPU utilization is a guarded difference between
-system samples, not load average; the initial sample is unknown. Missing metrics
-remain `null` in JSON and unavailable in CLI/TUI/Web. Mutations, Polkit and the
-existing NVMe/MMC health readers remain owned by Next.
+system samples, not load average; a fresh probe takes one bounded 200 ms
+baseline window so `status`, TUI startup and the first Web poll report a real
+value. Missing metrics remain `null` in JSON and unavailable in CLI/TUI/Web.
+Mutations, Polkit and the existing NVMe/MMC health readers remain owned by Next.
 
 APT source management is implemented as a guided workflow across the CLI, TUI,
 Web, and Tauri surfaces. It detects both traditional `.list` files and Deb822
