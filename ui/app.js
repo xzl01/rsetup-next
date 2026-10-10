@@ -959,6 +959,7 @@ function renderSnapshot() {
   setText("[data-core-state]", snapshot.synthetic ? t("core.demo") : t("core.online"));
   setText("[data-core-detail]", `${socName} · ${identity.architecture}`);
   renderCpuMetric(metrics.cpuPercent);
+  const memoryScale = memoryPercent == null ? 0 : Math.max(0, Math.min(100, memoryPercent));
   setText("[data-memory]", memoryPercent == null ? "—" : formatPercent(memoryPercent));
   setText("[data-temperature]", metrics.temperatureC == null ? "N/A" : `${formatNumber(metrics.temperatureC, 1)} °C`);
   setText("[data-thermal-detail]", metrics.temperatureC == null ? t("temperature.none") : metrics.temperatureC < 70 ? t("temperature.normal") : t("temperature.hot"));
@@ -968,7 +969,7 @@ function renderSnapshot() {
   setText("[data-kernel]", identity.kernel);
   setText("[data-arch]", identity.architecture);
   setText("[data-collected]", t("updated", { time: relativeTime(snapshot.collectedAt) }));
-  $("[data-memory-meter]").style.transform = `scaleX(${Math.min(100, memoryPercent) / 100})`;
+  $("[data-memory-meter]").style.transform = `scaleX(${memoryScale / 100})`;
 
   const stamp = $("[data-mode-stamp]");
   $("strong", stamp).textContent = snapshot.synthetic ? t("status.demoOnline") : t("local.device");
