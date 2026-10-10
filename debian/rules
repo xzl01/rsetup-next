@@ -9,7 +9,17 @@ export CARGO_PROFILE_RELEASE_DEBUG := 1
 %:
 	dh $@ --buildsystem=none
 
-override_dh_auto_build:
+# deviceinfo is a Git submodule linked as a Cargo path dependency. A Debian
+# build must start from a recursive clone; GitHub source archives omit it.
+.PHONY: check-submodule
+check-submodule:
+	@test -f externals/devicesinfo/crates/deviceinfo/Cargo.toml || { \
+	  echo "externals/devicesinfo is not initialized." >&2; \
+	  echo "Run: git submodule update --init --recursive" >&2; \
+	  exit 1; \
+	}
+
+override_dh_auto_build: check-submodule
 	cargo rustc -p rsetup-next --release --bin rsetup-next --locked --offline -- -C target-feature=+crt-static
 	cargo rustc -p rsetup-next --release --bin rsetup-next-helper --locked --offline -- -C target-feature=+crt-static
 
