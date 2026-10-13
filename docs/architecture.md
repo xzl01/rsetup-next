@@ -35,7 +35,7 @@ elsewhere. `RSETUP_MODE=demo` and `--demo` force the synthetic provider;
 `RSETUP_MODE=live` forces the Linux provider.
 
 The Linux provider uses the GPL-3.0-or-later `deviceinfo` v0.2.0 library,
-pinned to `0d6c947f555344b072000694c431e1593a47a72c` by the
+pinned to `716ad13ca316e0d6c0b36b87df6a3107ace31c45` by the
 `externals/devicesinfo` Git submodule. Both the root workspace and desktop build
 use its `crates/deviceinfo` Cargo path dependency. The upstream workspace is
 excluded from Next's workspace: its CLI is neither built nor installed as part

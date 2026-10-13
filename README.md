@@ -28,7 +28,7 @@ Operations that do not apply to the current system remain visible with a reason
 instead of failing only after execution starts.
 
 Local system, SoC, firmware, thermal and block-device inspection uses the GPL-3.0-or-later
-[`deviceinfo` library](https://github.com/shallow-out/devicesinfo/tree/0d6c947f555344b072000694c431e1593a47a72c),
+[`deviceinfo` library](https://github.com/shallow-out/devicesinfo/tree/716ad13ca316e0d6c0b36b87df6a3107ace31c45),
 pinned to that commit as the `externals/devicesinfo` Git submodule and linked
 through a Cargo path dependency. No `deviceinfo` executable or new
 runtime package is needed. CPU utilization is a guarded difference between

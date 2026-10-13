@@ -8,9 +8,10 @@ Copyright: 2025-2026 Radxa Computer Co., Ltd
 License: GPL-3+
 Comment: The binaries also statically include deviceinfo v0.2.0, maintained by
  the devicesinfo contributors at https://github.com/shallow-out/devicesinfo.
- That Rust library declares GPL-3.0-or-later and its Git submodule is pinned to commit
- 0d6c947f555344b072000694c431e1593a47a72c. Its ownership is not transferred to
- rsetup-next; the same GPL-3+ redistribution terms apply to the combined binary.
+ That Rust library declares GPL-3.0-or-later and its Git submodule is pinned to
+ commit 716ad13ca316e0d6c0b36b87df6a3107ace31c45. Its ownership is not
+ transferred to rsetup-next; the same GPL-3+ redistribution terms apply to the
+ combined binary.
 
 Files: externals/devicesinfo/*
 Copyright: devicesinfo contributors
