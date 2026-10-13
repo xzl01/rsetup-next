@@ -30,6 +30,13 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test Rust workspace
         run: cargo test --workspace
+      # The pinned deviceinfo crate is excluded from our workspace, so the
+      # workspace commands above never compile or test it, even though it owns
+      # the system/thermal/storage sampling and the difference logic.
+      - name: Test pinned deviceinfo
+        run: cargo test --manifest-path externals/devicesinfo/Cargo.toml -p deviceinfo --locked
+        env:
+          CARGO_TARGET_DIR: target/deviceinfo-check
       - name: Test native EFI Overlay validation
         run: |
           sudo apt-get update
