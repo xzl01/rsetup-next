@@ -11,3 +11,9 @@ tauri-build = { version = "2", features = [] }
 rsetup-core = { path = "../../../crates/rsetup-core" }
 serde = { version = "1", features = ["derive"] }
 tauri = { version = "2", features = [] }
+
+# The Tauri test runtime is only needed to exercise the production command
+# registry through real IPC dispatch, so it stays out of shipped builds.
+[dev-dependencies]
+serde_json = "1"
+tauri = { version = "2", features = ["test"] }

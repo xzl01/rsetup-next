@@ -2520,6 +2520,7 @@ version = "0.5.0"
 dependencies = [
  "rsetup-core",
  "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
 ]
