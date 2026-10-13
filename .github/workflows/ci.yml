@@ -76,6 +76,43 @@ jobs:
       - name: Test minimum supported Rust version
         run: cargo test --workspace --locked
 
+  # apps/desktop/src-tauri is listed in Cargo.toml's `workspace.exclude`, so no
+  # other job here ever compiles it: the workspace commands skip it and the
+  # Debian job never installs WebKitGTK. Build and test it explicitly with the
+  # Linux Tauri stack, so the Tauri IPC regression tests run in CI instead of
+  # only on a developer machine.
+  desktop-tauri-ipc:
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_TARGET_DIR: target/desktop-ci
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Install Tauri Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config \
+            libgtk-3-dev libglib2.0-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev patchelf \
+            libxdo-dev libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      # `make desktop-test` runs this same command locally.
+      - name: Test Tauri IPC commands
+        run: cargo test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml
+      - name: Check rsetup-desktop formatting
+        run: cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check
+      # `make desktop-check` runs the formatting and lint commands locally.
+      - name: Lint rsetup-desktop
+        run: cargo clippy --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
+
   debian-package:
     strategy:
       matrix:
