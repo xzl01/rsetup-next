@@ -14,7 +14,7 @@ require the legacy `rsetup` command at runtime.
 
 | Surface | Entry | Purpose |
 | --- | --- | --- |
-| CLI | `rsetup-next status`, `actions`, `run`, `sources`, `hardware`, `doctor` | automation and recovery-friendly output, including JSON |
+| CLI | `rsetup-next status`, `actions`, `run`, `sources`, `hardware`, `system`, `doctor` | automation and recovery-friendly output, including JSON |
 | TUI | `rsetup-next tui` | keyboard-operated local mission control |
 | Web GUI | `rsetup-next serve` | responsive browser control center and JSON API |
 | Desktop GUI | `apps/desktop` | Tauri shell using the same static UI and `rsetup-core` |
@@ -57,6 +57,26 @@ Only catalog HTTPS endpoints are used, TLS is verified, redirects are not
 followed, and curl configuration files are ignored. No APT refresh, file write,
 or automatic mirror selection occurs. Demo mode uses labeled synthetic results.
 Selecting a tested mirror still requires preview and confirmation before apply.
+
+Writing a system image to a board's UFS, eMMC, SD card, or NVMe is available as
+`rsetup-next system targets|plan|install`. `targets` and `plan` are read-only:
+they list the candidate devices and every partition a write would destroy, the
+image format, the uncompressed write size, and the SHA-256 binding of the first
+1 MiB. `install` stays a preview unless `--live-execution` is given on Linux, and
+it applies only after the exact target device name is typed; the device that
+carries the running root or boot filesystem is refused permanently, and a
+mounted target is refused with its mount points. A write cannot be rolled back,
+and a failing write reports how many bytes are already on the device.
+`.img.xz` images are previewed by a Rust parser and decompressed through
+`xz -dc` (the `xz-utils` dependency) only while they are written. The same
+procedure is available from the CLI, the TUI panel (press `i`), the loopback
+HTTP API (`GET/POST /api/v1/storage/install/…`, where an image is an id from a
+fixed server-side catalogue and mutating calls carry `x-rsetup-request: 1`), the
+Tauri desktop shell, and the browser's **Install** page. Each surface refuses the
+write unless live execution is enabled, so a demo or preview session cannot
+write. The full procedure, the stable failure codes, and the on-board
+verification checklist for the Radxa Cubie A7Z are in
+[docs/system-install.md](docs/system-install.md).
 
 The native hardware manager now covers seven migrated workflows:
 
@@ -124,6 +144,10 @@ rsetup separates observation from mutation:
 - Live execution requires Linux, root where declared, and an explicit
   `RSETUP_EXECUTION=live` or `--live-execution` opt-in.
 - Guarded, high-risk, and critical actions require confirmation.
+- Writing a system image is destructive and irreversible: it needs
+  `--live-execution` on Linux, an exact typed device name, and it never selects
+  the device that carries the running root or boot filesystem. A failed write
+  reports the bytes already on the device; there is no rollback.
 - The HTTP API accepts action identifiers from a fixed catalog; it does not
   expose arbitrary shell execution.
 - The Web server binds to `127.0.0.1:8788` by default.
@@ -321,6 +345,12 @@ the removed Bash implementation or run the browser process as root. Optional
 `device-tree-compiler`, `gpiod`, `v4l-utils`, and `ffmpeg` packages enrich the
 corresponding hardware tools.
 
+The package depends on `xz-utils` because writing a compressed `.img.xz` system
+image decompresses it with `xz -dc`. The choice of a hard dependency over
+`Recommends`, and the fallback when the tool is absent, are recorded in
+[`debian/README.source`](debian/README.source). The system-image guide ships as
+`/usr/share/doc/rsetup-next/system-install.md`.
+
 ```bash
 make deb-prepare
 make deb
@@ -355,6 +385,13 @@ The Rust workspace, demo provider, CLI, HTTP API, and browser GUI can be tested
 on the development host. Q8B live read-only probing has been checked on Ubuntu
 26.04.1 with UEFI + DT; see the [test report](docs/testing/q8b-2026-09-07/report.md)
 for results and limitations. Other supported SBCs still need live validation.
+Writing a system image to real UFS/eMMC/SD/NVMe storage is implemented and
+covered by injected-fixture and dry-run tests, but no write has been executed on
+a physical board yet. The command sequence, expected output, failure criteria,
+and the split between what is verified locally and what is still pending are in
+[docs/system-install.md](docs/system-install.md); host-side evidence is in the
+[local validation report](docs/testing/system-install-2026-10-13/report.md).
+Device-level checks cannot run in CI and are not CI gates.
 The overlay transaction, Overlay-to-Pinout mapping, real camera capture,
 sysfs thermal/LED writes, boot-time restore, and backed-up SPI NOR operations
 are implemented but have not yet been exercised on physical hardware. In

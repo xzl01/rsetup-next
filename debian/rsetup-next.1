@@ -1,4 +1,4 @@
-.TH RSETUP-NEXT 1 "2026-09-07" "rsetup-next 0.5.0" "User Commands"
+.TH RSETUP-NEXT 1 "2026-10-13" "rsetup-next 0.5.0" "User Commands"
 .SH NAME
 rsetup-next \- local control center for Linux single-board computers
 .SH SYNOPSIS
@@ -9,7 +9,8 @@ rsetup-next \- local control center for Linux single-board computers
 .SH DESCRIPTION
 .B rsetup-next
 provides device inspection, guided system operations, APT source management,
-an interactive terminal interface, and a loopback Web control center.
+system-image installation, an interactive terminal interface, and a loopback
+Web control center.
 Mutating operations are dry-run by default.
 Root-required live operations from an unprivileged interface use a fixed-action
 Polkit helper; the application itself remains unprivileged.
@@ -43,6 +44,44 @@ Saved configuration describes the next matching boot, not a claim of the
 currently active electrical function. Status inspection does not invoke
 .BR gpioget (1)
 or request a GPIO line.
+.TP
+.B system COMMAND
+Inspect the block devices an image can be written to, preview the damage, and
+write a system image.
+.B system targets
+lists the candidate devices with their kind, capacity, mount points and the
+partitions a write would destroy.
+.B system plan --target ID --image FILE
+previews the target identity, every destroyed partition, the image format, the
+uncompressed write size, the SHA-256 binding of the first 1 MiB and the image
+partition table.
+.B system install
+writes only after the exact target device name has been typed, and only with
+.B --live-execution
+on Linux; without that switch it stays a dry run.
+The device that carries the running root or boot filesystem is refused
+permanently, a mounted target is refused with its mount points, and the typed
+name must match exactly.
+The write replaces every partition on the target and cannot be rolled back.
+A compressed
+.I .img.xz
+image is decompressed through
+.BR xz (1)
+while it is written, so xz-utils is a hard dependency; the preview still works
+without it and warns that the write needs it.
+The same procedure is available from the TUI panel (press
+.BR i ),
+the loopback Web console's Install page, and the desktop shell; every surface
+refuses the write unless live execution is enabled.
+The plan token is a handle, not a credential: it is single use and expires
+600 seconds after it was issued, and both are decided by the process that issued
+it. A preview produced in another process is checked for state drift and age
+only, which is advisory and not an adversarial guarantee; what protects the
+device is the rebuilt plan, the gates above, the typed device name and the
+administrator authorization.
+See
+.I /usr/share/doc/rsetup-next/system-install.md
+for the full procedure and the on-board verification checklist.
 .TP
 .B doctor
 Check the current runtime and execution policy.
@@ -85,6 +124,10 @@ sudo rsetup-next --live-execution hardware thermal fan-curve apply \
   --plan-token TOKEN --confirm
 sudo rsetup-next --live-execution sources apply cqu \
   --plan-token TOKEN --confirm
+rsetup-next system targets
+rsetup-next system plan --target sda --image /root/radxa-cubie-a7z.img.xz
+sudo rsetup-next --live-execution system install --target sda \
+  --image /root/radxa-cubie-a7z.img.xz --acknowledge sda
 .fi
 .SH FILES
 .TP
@@ -134,6 +177,14 @@ Runtime pinmux evidence used when debugfs is available and readable.
 .I /usr/share/doc/rsetup-next/PINOUT_PROVENANCE.md
 Source commit, license, and regeneration instructions for the normalized
 21-profile pinout catalog (20 imported profiles and an official Q8B profile).
+.TP
+.I /usr/share/doc/rsetup-next/system-install.md
+System-image installation procedure, failure codes and the on-board
+verification checklist.
+.TP
+.I /var/lib/rsetup-next/images
+Operator-provided catalogue of system images the HTTP and desktop surfaces may
+write. Only the file name is accepted from a client.
 .SH NOTES
 The pinout snapshot is derived from
 .I xzl01/pin-out
@@ -154,6 +205,19 @@ Root-only backups are saved under
 Saved configuration is not proof of the currently running pinmux state.
 Runtime pinctrl and read-only GPIO metadata still require validation across
 real SBCs; absent evidence is intentionally left unconfirmed.
+
+Writing a system image is destructive and irreversible. If a write fails, the
+target keeps the bytes already written, the error reports how many, and no
+rollback exists; plan the recovery path (maskrom or a second boot medium)
+before starting. The running system's device can never be selected. For a
+compressed image the layout is never read before writing, so the re-read
+partition table is not compared with the image: the run reports its verification
+state as unsupported and names that reason, separately from a host that cannot
+re-read partition tables at all; the JSON output carries the same reason in the
+verification detail. Confirm the result by booting the target or inspecting it
+with
+.BR lsblk (8)
+instead. Real-device writes are validated on hardware, not in CI.
 .SH ENVIRONMENT
 .TP
 .B RSETUP_EXECUTION
@@ -166,7 +230,13 @@ Select the presentation language.
 .TP
 .B RSETUP_MODE
 Select automatic, live, or demo probing.
+.TP
+.B RSETUP_IMAGE_DIR
+Directory the HTTP and desktop surfaces read install images from, default
+.IR /var/lib/rsetup-next/images .
+Clients submit an identifier from that directory, never a path.
 .SH SEE ALSO
 .BR apt-get (8),
 .BR gpioinfo (1),
-.BR systemctl (1)
+.BR systemctl (1),
+.BR xz (1)

@@ -18,3 +18,18 @@ rsetup-next --demo hardware video status --json | grep -q '"captureAvailable"'
 rsetup-next --demo hardware thermal status --json | grep -q '"availablePolicies"'
 rsetup-next --demo hardware thermal fan-curve status --json | grep -q '"points"'
 rsetup-next --demo hardware thermal fan-curve plan --zone thermal_zone0 --device cooling_device0 --point 40:20 --point 55:45 --point 70:75 --point 82:100 --json | grep -q '"planToken"'
+rsetup-next --demo system targets --json | grep -q '"holdsRunningSystem"'
+# A rejected preview must still report its stable error code. This request fails
+# while validating the path, before any device or image file is opened.
+rsetup-next --demo system plan --target sda --image /nonexistent.img --json | grep -q 'invalid_install_request'
+
+# /run/rsetup-next holds private work trees (the SPI flash manager stages there),
+# so the package ships a root-only tmpfiles.d rule and postinst also creates it.
+# Assert the rule and, where the tooling is available, the directory it produces.
+test -f /usr/lib/tmpfiles.d/rsetup-next.conf
+grep -q '^d /run/rsetup-next 0700 root root - -$' /usr/lib/tmpfiles.d/rsetup-next.conf
+if [ "$(id -u)" = 0 ] && command -v systemd-tmpfiles >/dev/null 2>&1; then
+    systemd-tmpfiles --create /usr/lib/tmpfiles.d/rsetup-next.conf
+    test -d /run/rsetup-next
+    test "$(stat -c '%a %U' /run/rsetup-next)" = "700 root"
+fi

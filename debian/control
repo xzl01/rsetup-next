@@ -25,6 +25,7 @@ Depends:
  mtd-utils,
  pkexec,
  systemd,
+ xz-utils,
  ${misc:Depends},
  ${shlibs:Depends},
 Suggests:

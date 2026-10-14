@@ -9,6 +9,16 @@ case "$1" in
         if [ -f "$config" ] && [ ! -L "$config" ] && [ "$(stat -c %u "$config")" = 0 ]; then
             chmod 0644 "$config"
         fi
+
+        # /run is a tmpfs: create the root-only /run/rsetup-next now, so tools
+        # that stage private work there (the SPI flash manager) find it before
+        # the first reboot. systemd-tmpfiles does the same on every boot and the
+        # installable activates it too; running it twice is harmless. A failure
+        # here must not fail the installation, because the managers create their
+        # own subdirectories on demand as root.
+        if command -v systemd-tmpfiles >/dev/null 2>&1; then
+            systemd-tmpfiles --create /usr/lib/tmpfiles.d/rsetup-next.conf || true
+        fi
         ;;
 esac
 

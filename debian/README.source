@@ -36,3 +36,120 @@ The Web interface embeds SoC vendor marks supplied from the Vamrs partner page
 and a CIX reference image. Each mark remains the property of its respective
 owner and is used only to identify the detected SoC vendor. The rsetup-next
 project does not claim ownership of or relicense these marks.
+
+Runtime dependency: xz-utils
+============================
+
+`rsetup-next system install` writes compressed `.img.xz` images by running
+
+    xz -dc IMAGE
+
+and streaming the decompressed bytes to the target block device. xz-utils is
+declared in Depends, not Recommends, and the trade-off was decided explicitly:
+
+- A compressed image is the format Radxa publishes, so this is the primary path
+  of the system-install workflow rather than an optional extra.
+- Recommends is skipped by `apt install --no-install-recommends`, by container
+  and Dockerfile installs, and by minimal images. That would silently turn the
+  main installation workflow into a runtime failure on exactly the headless
+  systems this feature targets.
+- The hard dependency is cheap: xz-utils is `Priority: standard` in Debian, is
+  not a service, and is already present on an ordinary installation.
+
+Absence is still handled without a crash and without a silent short write. The
+preview path (`system plan`) parses the `.xz` stream header, index and footer in
+Rust, so the consequence list, the uncompressed write size and the SHA-256
+binding all work without xz-utils; only the write itself needs the tool, and the
+preview already warns that it does. If `xz` is missing when the write starts,
+the CLI prints the stable code `install_unsupported` with an actionable reason
+instead of failing obscurely:
+
+    env PATH=/usr/bin:/bin rsetup-next --demo system install \
+      --target sda --image image.img.xz --acknowledge sda --json
+    # {"error":{"code":"install_unsupported","message":"system image
+    #  installation is unavailable: install xz-utils to write a compressed
+    #  image"}}
+
+That is the same explainable-reason style the action catalog uses for missing
+commands (`Missing required command(s): ...`), expressed as a
+`SystemInstallError::Unsupported` reason on the install path. The behavior is
+covered by `debian/tests/smoke` and by the system-install checklist in
+`docs/system-install.md`.
+
+Unreleased changes and the changelog
+====================================
+
+The working tree carries the system-image installation feature set: core gates
+and image validation, the CLI, the TUI panel, the HTTP routes, the Tauri
+commands, the browser page, the new `xz-utils` dependency, and the install
+guide. `debian/changelog` currently ends at the released `0.5.0-1` entry, and the
+repository keeps no "unreleased" placeholder entry: every entry was written when
+the maintainer chose the version (the `0.5.0-1` entry arrived in the same commit
+whose subject names that version).
+
+Choosing the next version number and its release date is a maintainer decision,
+so no entry was invented here. Candidates to pick from:
+
+- `0.5.1-1` - patch release: the same surfaces with a new runtime dependency and
+  the packaged install guide.
+- `0.6.0-1` - minor release: a large new user-visible capability (guided,
+  irreversible system-image installation on four surfaces) plus that dependency.
+
+The distribution (`bookworm`), urgency (`medium`), bullet style and trailer
+format follow the existing entries. The trailer date must be the actual release
+date, not the date this note was written.
+
+Run-time directories under /run
+===============================
+
+`/run/rsetup-next` is a root-only parent for runtime work trees. The SPI boot
+flash manager stages its private tree in `/run/rsetup-next/spi`
+(`WORK_DIRECTORY` in `crates/rsetup-core/src/spi_flash.rs`) and creates that
+directory on demand as root (`secure_directory` calls `create_dir_all` and then
+sets mode 0700), so the tmpfiles.d rule is hardening rather than a hard
+prerequisite: it keeps the mode at the declared 0700 instead of whatever the
+caller's umask produces, and makes the tree exist before the first use instead
+of appearing as a side effect. The rule and the postinst activation stay for
+that reason.
+
+Removed: the system-image install-token ledger
+----------------------------------------------
+
+An earlier revision of the system-image work claimed plan tokens in a ledger
+directory (default `/run/rsetup-next/install-tokens`, overridable with
+`RSETUP_INSTALL_TOKEN_DIR`) to make a token single use across processes. That
+mechanism is gone: the package no longer ships a tmpfiles.d rule, an environment
+variable, a postinst step or a smoke assertion for it. It was removed because the
+two problems it had could not be fixed from inside it:
+
+- the claim could not be authenticated. The ledger was shared state whose content
+  any process able to write that directory could influence, and the token itself
+  carried no integrity protection, so a rewritten nonce or issuance time could
+  make a consumed token look new.
+- it could not certify the property it existed for. "Single use across
+  processes" is not provable from a directory whose writers are not
+  authenticated, so the guarantee was weaker than the documentation claimed.
+
+What the implementation does instead (`crates/rsetup-core/src/system_install.rs`):
+
+- a token is signed with an HMAC-SHA256 key generated per process, so only the
+  process that issued it can verify it, and editing any field fails;
+- single use and the 600 second window are decided by the issuing process's own
+  record of what it handed out, and consumption removes that entry in one step;
+- a token is a **handle, not a credential**: the cross-process preview check
+  (`verify_preview_token`) only notices state drift and age, and is explicitly
+  advisory rather than an adversarial boundary;
+- what protects the device is the rebuilt plan and its binding check, the hard
+  gates, the typed device name, and the administrator authorization a real write
+  requires.
+
+A consequence for packaging: this feature needs no run-time directory, no extra
+dependency and no tmpfiles.d rule, which is why this section replaces the earlier
+"install-token ledger" one.
+
+Not changed here
+----------------
+
+`/var/lib/rsetup-next/images` is the persistent, operator-populated image
+catalogue the HTTP and desktop surfaces read. It is not ephemeral `/run` state,
+so the package does not create or manage it.
