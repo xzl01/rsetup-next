@@ -489,7 +489,8 @@ const PICK_HANDLE_RANDOM_BYTES: usize = 16;
 
 /// Opens the platform's native file chooser. It is a trait so registration and
 /// validation can be tested without a dialog, and it is only ever called from
-/// Rust: the WebView gets no dialog permission and never learns a path.
+/// Rust: the WebView gets no dialog permission, and the file is chosen by the user
+/// in this process rather than named by the page.
 trait ImagePicker: Send + Sync + 'static {
     /// `Ok(None)` means the user cancelled, which is not an error. `Err` carries
     /// a readable reason, e.g. that no dialog helper is installed.
@@ -636,15 +637,17 @@ fn hex_of(bytes: &[u8]) -> String {
     text
 }
 
-/// A picked image, and the only name the WebView ever sees for it.
+/// A picked image, plus the handle that is the only name a request may use for it.
 struct PickedImage {
     path: PathBuf,
     picked_at: SystemTime,
 }
 
-/// Images the user chose through the Rust-side dialog. The paths live here and
-/// nowhere else; the WebView holds handles, and a handle is accepted only if this
-/// process issued it and it has not expired.
+/// Images the user chose through the Rust-side dialog. Their paths are held here,
+/// not in anything the WebView sends; the WebView holds handles, and a handle is
+/// accepted only if this process issued it and it has not expired. What is kept
+/// from the page is the ability to *name* a path, not the ability to read one: the
+/// plan echoes the resolved `image.path` like every other surface.
 struct PickedImages {
     entries: Mutex<HashMap<String, PickedImage>>,
     now: Box<dyn Fn() -> SystemTime + Send + Sync>,
@@ -779,8 +782,10 @@ struct InstallSurface {
     image_directory: PathBuf,
     mode: OnceLock<InstallMode>,
     manager: OnceLock<SystemInstallManager>,
-    /// Images the user picked through the Rust-side dialog. Only this process
-    /// knows their paths.
+    /// Images the user picked through the Rust-side dialog. Their paths are held
+    /// here rather than in anything the WebView sends: a page can only point the
+    /// core at a picked file through a handle. (The plan response still echoes the
+    /// resolved `image.path`, as it does on every surface.)
     picks: PickedImages,
     /// Injectable so the registration and validation logic is testable without a
     /// real dialog.
@@ -875,7 +880,9 @@ impl InstallSurface {
     }
 
     /// Opens the native file chooser from Rust and keeps the resulting path here.
-    /// The WebView receives an opaque handle plus display metadata, never a path.
+    /// The pick answer carries an opaque handle plus display metadata and no path;
+    /// the plan response will echo the resolved `image.path`, as it does for a
+    /// catalogue id.
     fn pick_image(&self) -> Result<PickedImageResponse, CommandError> {
         let picked = self.picker.pick().map_err(|detail| CommandError {
             code: "install_unsupported",
@@ -933,9 +940,14 @@ impl InstallSurface {
     }
 }
 
-/// What the WebView gets for a pick. Exactly one of the two shapes is filled in:
-/// a cancelled dialog carries no handle at all, and a successful pick carries no
-/// path — the path never leaves this process.
+/// What the WebView gets for a pick. Exactly one of the two shapes is filled in: a
+/// cancelled dialog carries no handle at all, and a successful pick carries a
+/// handle and display metadata but no path.
+///
+/// That guarantee is scoped to this answer: the *pick response* never carries a
+/// path. The plan response does echo the resolved `image.path`, exactly as the
+/// catalogue, CLI, TUI and HTTP surfaces do — a page can read a path, it just
+/// cannot name one.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PickedImageResponse {
@@ -1861,10 +1873,11 @@ mod tests {
         })
     }
 
-    /// The picker runs in Rust and the WebView only ever sees a handle: the path
-    /// must not appear anywhere in the answer, and the handle must not look like a
-    /// path. The handle then plans and applies through the same code path as a
-    /// catalogue id.
+    /// The picker runs in Rust and the pick answer carries only a handle: the path
+    /// must not appear anywhere in that answer, and the handle must not look like a
+    /// path. The scope is this answer — the plan response does echo the resolved
+    /// `image.path`, which this test does not assert. The handle then plans and
+    /// applies through the same code path as a catalogue id.
     #[test]
     fn desktop_pick_image_answers_with_an_opaque_handle_not_a_path() {
         let image = pick_fixture("downloaded.img");
@@ -1893,11 +1906,13 @@ mod tests {
             valid_pick_handle(&handle),
             "the handle has the documented shape: {handle}"
         );
-        // The whole point: no path reaches the WebView.
+        // The scope of this assertion: the pick answer carries no path. The plan
+        // response echoes the resolved path; that is a different answer, asserted
+        // where the plan is.
         let serialized = picked.to_string();
         assert!(
             !serialized.contains(&image.display().to_string()),
-            "the picked path must not reach the WebView: {serialized}"
+            "the pick answer must not carry the picked path: {serialized}"
         );
         assert!(
             !serialized.contains("desktop-pick-tests"),
