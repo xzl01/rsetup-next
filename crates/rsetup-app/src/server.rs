@@ -1441,6 +1441,14 @@ mod tests {
             "demo.img/..",
             "notes.txt",
             "/etc/passwd",
+            // The desktop shell issues opaque handles for images the user chose in
+            // its own native dialog. The browser surface has no notion of them: a
+            // handle is just another name that is not a file in the fixed
+            // catalogue, so it is rejected here exactly like a path. The two
+            // surfaces stay independent — nothing about the desktop picker widens
+            // what a browser may ask for.
+            "pick-000102030405060708090a0b0c0d0e0f-demo.img",
+            "pick-00000000000000000000000000000000",
         ] {
             let response = app
                 .clone()

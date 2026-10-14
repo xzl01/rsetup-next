@@ -10,8 +10,14 @@ use rsetup_core::{
 };
 use serde::Serialize;
 use std::{
+    collections::HashMap,
+    fs::File,
+    hash::{BuildHasher, Hash, Hasher},
+    io::Read,
     path::{Path as FsPath, PathBuf},
-    sync::{Arc, OnceLock},
+    process::Command,
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, SystemTime},
 };
 
 #[derive(Debug, Serialize)]
@@ -469,6 +475,288 @@ struct InstallMode {
     live: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Desktop image picking: the Rust side owns the path
+// ---------------------------------------------------------------------------
+
+/// Prefix of every handle this process issues for a picked image.
+const PICK_HANDLE_PREFIX: &str = "pick-";
+/// How long a picked image stays usable: long enough for a preview, a typed
+/// confirmation and a write, short enough that a stale handle stops working.
+const PICK_HANDLE_TTL: Duration = Duration::from_secs(600);
+/// Random bytes behind a handle (16 bytes render as 32 hex characters).
+const PICK_HANDLE_RANDOM_BYTES: usize = 16;
+
+/// Opens the platform's native file chooser. It is a trait so registration and
+/// validation can be tested without a dialog, and it is only ever called from
+/// Rust: the WebView gets no dialog permission and never learns a path.
+trait ImagePicker: Send + Sync + 'static {
+    /// `Ok(None)` means the user cancelled, which is not an error. `Err` carries
+    /// a readable reason, e.g. that no dialog helper is installed.
+    fn pick(&self) -> Result<Option<PathBuf>, String>;
+}
+
+/// The real picker: hands the request to the platform's own dialog helper, so no
+/// dialog dependency (and no dialog permission for the WebView) is introduced.
+///
+/// The helper's filter is a convenience only — the rules that decide what may be
+/// written are enforced in Rust afterwards, so a helper that ignores its filter
+/// cannot widen anything.
+struct SystemImagePicker;
+
+impl ImagePicker for SystemImagePicker {
+    fn pick(&self) -> Result<Option<PathBuf>, String> {
+        platform_pick_image()
+    }
+}
+
+/// Runs a dialog helper and reads one path from its standard output.
+///
+/// A cancelled dialog is a helper that exits non-zero with nothing to say, or one
+/// that succeeds with empty output: both are reported as "cancelled". Anything a
+/// helper explains on stderr is a real failure, so a missing or broken helper is
+/// never silently reported as a cancelled selection.
+fn run_dialog_helper(program: &str, args: &[&str]) -> Result<Option<PathBuf>, String> {
+    let output = match Command::new(program).args(args).output() {
+        Ok(output) => output,
+        Err(error) => return Err(format!("{program} is not available: {error}")),
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if !output.status.success() && !(stdout.is_empty() && stderr.is_empty()) {
+        return Err(format!("{program} failed: {stderr}"));
+    }
+    if stdout.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(PathBuf::from(stdout)))
+}
+
+#[cfg(target_os = "macos")]
+fn platform_pick_image() -> Result<Option<PathBuf>, String> {
+    // `choose file` raises -128 when the user cancels; that is turned into empty
+    // output so it is reported as a cancelled selection.
+    const SCRIPT: &str = "try\nset chosen to choose file with prompt \"Choose a system image (.img or .img.xz)\" of type {\"img\", \"xz\"}\nreturn POSIX path of chosen\non error number -128\nreturn \"\"\nend try";
+    run_dialog_helper("osascript", &["-e", SCRIPT])
+}
+
+#[cfg(target_os = "linux")]
+fn platform_pick_image() -> Result<Option<PathBuf>, String> {
+    // The two common dialog helpers, tried in turn; the last explanation is
+    // reported if neither is available.
+    let candidates: [(&str, &[&str]); 2] = [
+        (
+            "zenity",
+            &[
+                "--file-selection",
+                "--title=Choose a system image",
+                "--file-filter=Images | *.img *.img.xz",
+                "--file-filter=All files | *",
+            ],
+        ),
+        (
+            "kdialog",
+            &["--getopenfilename", ".", "Images (*.img *.img.xz)"],
+        ),
+    ];
+    let mut last = None;
+    for (program, args) in candidates {
+        match run_dialog_helper(program, args) {
+            Ok(result) => return Ok(result),
+            Err(reason) => last = Some(reason),
+        }
+    }
+    Err(last.unwrap_or_else(|| "no file chooser is available".to_owned()))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn platform_pick_image() -> Result<Option<PathBuf>, String> {
+    // Honest refusal instead of an untested dialog implementation: this host has
+    // no picker, so the user still has the catalogue route.
+    Err(
+        "choosing an image file is implemented on Linux (zenity or kdialog) and macOS only; copy the image into the image directory and pick it from the list instead"
+            .to_owned(),
+    )
+}
+
+/// True for exactly the shape this process issues: `pick-`, 32 lowercase hex
+/// characters, a dash, and a display slug. A path-shaped string can never match,
+/// and a hand-written handle still has to exist in the registry below.
+fn valid_pick_handle(handle: &str) -> bool {
+    let Some(rest) = handle.strip_prefix(PICK_HANDLE_PREFIX) else {
+        return false;
+    };
+    let Some((random, slug)) = rest.split_once('-') else {
+        return false;
+    };
+    random.len() == PICK_HANDLE_RANDOM_BYTES * 2
+        && random
+            .chars()
+            .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+        && !slug.is_empty()
+        && slug.len() <= 64
+        && slug.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+        })
+}
+
+/// Random bytes for a handle. Without `/dev/urandom` this falls back to the
+/// hasher seed, which the standard library itself seeds from the OS: the random
+/// part only has to be unguessable, because acceptance is decided by the registry
+/// lookup, never by the handle alone.
+fn pick_handle_random() -> [u8; PICK_HANDLE_RANDOM_BYTES] {
+    let mut bytes = [0u8; PICK_HANDLE_RANDOM_BYTES];
+    if let Ok(mut urandom) = File::open("/dev/urandom") {
+        if urandom.read_exact(&mut bytes).is_ok() {
+            return bytes;
+        }
+    }
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    std::process::id().hash(&mut hasher);
+    (
+        std::time::SystemTime::now(),
+        &bytes as *const [u8; PICK_HANDLE_RANDOM_BYTES],
+    )
+        .hash(&mut hasher);
+    hasher.finish().hash(&mut hasher);
+    let first = hasher.finish();
+    hasher.finish().hash(&mut hasher);
+    let second = hasher.finish();
+    bytes[..8].copy_from_slice(&first.to_le_bytes());
+    bytes[8..].copy_from_slice(&second.to_le_bytes());
+    bytes
+}
+
+fn hex_of(bytes: &[u8]) -> String {
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
+}
+
+/// A picked image, and the only name the WebView ever sees for it.
+struct PickedImage {
+    path: PathBuf,
+    picked_at: SystemTime,
+}
+
+/// Images the user chose through the Rust-side dialog. The paths live here and
+/// nowhere else; the WebView holds handles, and a handle is accepted only if this
+/// process issued it and it has not expired.
+struct PickedImages {
+    entries: Mutex<HashMap<String, PickedImage>>,
+    now: Box<dyn Fn() -> SystemTime + Send + Sync>,
+}
+
+impl PickedImages {
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            now: Box::new(SystemTime::now),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_clock(now: impl Fn() -> SystemTime + Send + Sync + 'static) -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            now: Box::new(now),
+        }
+    }
+
+    /// Registers a path that already passed the image rules, and returns the
+    /// handle plus the display metadata the WebView may show.
+    fn insert(&self, path: PathBuf, name: &str) -> String {
+        let slug: String = name
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .take(48)
+            .collect();
+        let handle = format!(
+            "{PICK_HANDLE_PREFIX}{}-{}",
+            hex_of(&pick_handle_random()),
+            slug
+        );
+        let mut entries = self.entries.lock().expect("picked image lock");
+        entries.insert(
+            handle.clone(),
+            PickedImage {
+                path,
+                picked_at: (self.now)(),
+            },
+        );
+        handle
+    }
+
+    /// Resolves a handle to the path this process picked. A handle this process
+    /// did not issue, one whose shape is wrong, and one that expired are all
+    /// refused — and refused *here*, never by being treated as a file name or a
+    /// path inside the catalogue directory.
+    fn resolve(&self, handle: &str) -> Result<PathBuf, SystemInstallError> {
+        let invalid = |detail: &str| SystemInstallError::InvalidInput(detail.to_owned());
+        if !valid_pick_handle(handle) {
+            return Err(invalid(
+                "the image handle is not one this process issued; choose the image through the desktop shell",
+            ));
+        }
+        let entries = self.entries.lock().expect("picked image lock");
+        let Some(entry) = entries.get(handle) else {
+            return Err(invalid(
+                "the image handle is not one this process issued; choose the image through the desktop shell",
+            ));
+        };
+        let age = (self.now)()
+            .duration_since(entry.picked_at)
+            .unwrap_or_default();
+        if age > PICK_HANDLE_TTL {
+            return Err(invalid(
+                "the image selection has expired; choose the image again",
+            ));
+        }
+        Ok(entry.path.clone())
+    }
+}
+
+/// The image rules the CLI applies before it will plan: absolute, a regular file,
+/// not a symlink, not empty, and named like an image. Whether the image sits on
+/// the target device is left to the core, which knows the mounts and the running
+/// system.
+fn validate_picked_image(path: &FsPath) -> Result<(PathBuf, String, u64), SystemInstallError> {
+    let invalid = |detail: &str| SystemInstallError::InvalidInput(detail.to_owned());
+    if !path.is_absolute() {
+        return Err(invalid("the chosen image must be an absolute path"));
+    }
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| invalid(&format!("the chosen image cannot be read: {error}")))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(invalid(
+            "the chosen image must be a regular file, not a symlink or a directory",
+        ));
+    }
+    if metadata.len() == 0 {
+        return Err(invalid("the chosen image is empty"));
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| invalid("the chosen image name cannot be read"))?
+        .to_owned();
+    if !(name.ends_with(".img") || name.ends_with(".img.xz")) {
+        return Err(invalid("the chosen image must end with .img or .img.xz"));
+    }
+    let resolved = std::fs::canonicalize(path)
+        .map_err(|error| invalid(&format!("the chosen image cannot be resolved: {error}")))?;
+    Ok((resolved, name, metadata.len()))
+}
+
 fn install_manager(mode: InstallMode) -> SystemInstallManager {
     let backend: Arc<dyn BlockDeviceBackend> = if mode.synthetic {
         Arc::new(SyntheticBackend::default())
@@ -491,15 +779,38 @@ struct InstallSurface {
     image_directory: PathBuf,
     mode: OnceLock<InstallMode>,
     manager: OnceLock<SystemInstallManager>,
+    /// Images the user picked through the Rust-side dialog. Only this process
+    /// knows their paths.
+    picks: PickedImages,
+    /// Injectable so the registration and validation logic is testable without a
+    /// real dialog.
+    picker: Arc<dyn ImagePicker>,
 }
 
 impl InstallSurface {
     fn new(controller: Controller) -> Self {
+        Self::with_picker(controller, Arc::new(SystemImagePicker))
+    }
+
+    #[cfg(test)]
+    fn new_for_tests(
+        controller: Controller,
+        picker: Arc<dyn ImagePicker>,
+        now: impl Fn() -> SystemTime + Send + Sync + 'static,
+    ) -> Self {
+        let mut surface = Self::with_picker(controller, picker);
+        surface.picks = PickedImages::with_clock(now);
+        surface
+    }
+
+    fn with_picker(controller: Controller, picker: Arc<dyn ImagePicker>) -> Self {
         Self {
             controller,
             image_directory: image_directory(),
             mode: OnceLock::new(),
             manager: OnceLock::new(),
+            picks: PickedImages::new(),
+            picker,
         }
     }
 
@@ -541,7 +852,16 @@ impl InstallSurface {
         target_id: &str,
         image_id: &str,
     ) -> Result<SystemInstallRequest, SystemInstallError> {
-        let image_path = catalog_image_path(&self.image_directory, image_id)?;
+        // Two, and only two, ways a path can be named: a handle this process
+        // issued for a file the user chose in the native dialog, or a plain file
+        // name inside the fixed catalogue directory. A handle-shaped string is
+        // never treated as a file name, and a path-shaped string is never treated
+        // as a handle — neither falls back to the other.
+        let image_path = if image_id.starts_with(PICK_HANDLE_PREFIX) {
+            self.picks.resolve(image_id)?
+        } else {
+            catalog_image_path(&self.image_directory, image_id)?
+        };
         Ok(SystemInstallRequest {
             target_id: target_id.to_owned(),
             image_path: Some(image_path.display().to_string()),
@@ -551,6 +871,28 @@ impl InstallSurface {
             // uses the resolved path, size and hash — not this label — so the
             // echoed id can never widen what may be written.
             image_id: Some(image_id.to_owned()),
+        })
+    }
+
+    /// Opens the native file chooser from Rust and keeps the resulting path here.
+    /// The WebView receives an opaque handle plus display metadata, never a path.
+    fn pick_image(&self) -> Result<PickedImageResponse, CommandError> {
+        let picked = self.picker.pick().map_err(|detail| CommandError {
+            code: "install_unsupported",
+            message: detail,
+        })?;
+        // A cancelled dialog is an answer, not a failure: nothing was chosen and
+        // nothing will be written.
+        let Some(path) = picked else {
+            return Ok(PickedImageResponse::cancelled());
+        };
+        let (path, name, size_bytes) = validate_picked_image(&path).map_err(CommandError::from)?;
+        let handle = self.picks.insert(path, &name);
+        Ok(PickedImageResponse {
+            cancelled: false,
+            handle: Some(handle),
+            name: Some(name),
+            size_bytes: Some(size_bytes),
         })
     }
 
@@ -591,6 +933,29 @@ impl InstallSurface {
     }
 }
 
+/// What the WebView gets for a pick. Exactly one of the two shapes is filled in:
+/// a cancelled dialog carries no handle at all, and a successful pick carries no
+/// path — the path never leaves this process.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PickedImageResponse {
+    cancelled: bool,
+    handle: Option<String>,
+    name: Option<String>,
+    size_bytes: Option<u64>,
+}
+
+impl PickedImageResponse {
+    fn cancelled() -> Self {
+        Self {
+            cancelled: true,
+            handle: None,
+            name: None,
+            size_bytes: None,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CatalogImage {
@@ -626,6 +991,18 @@ async fn system_install_targets(
     })
     .await
     .map_err(CommandError::internal)?
+}
+
+/// Opens the native image picker in Rust. The WebView cannot name a path: it asks
+/// this process to ask the user, and receives an opaque handle back.
+#[tauri::command]
+async fn system_install_pick_image(
+    surface: tauri::State<'_, Arc<InstallSurface>>,
+) -> Result<PickedImageResponse, CommandError> {
+    let surface = surface.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || surface.pick_image())
+        .await
+        .map_err(CommandError::internal)?
 }
 
 #[tauri::command]
@@ -704,6 +1081,7 @@ pub fn command_handler<R: tauri::Runtime>()
         apply_thermal_policy,
         storage_status,
         system_install_targets,
+        system_install_pick_image,
         system_install_plan,
         system_install_apply
     ]
@@ -788,6 +1166,7 @@ mod tests {
         "apply_thermal_policy",
         "storage_status",
         "system_install_targets",
+        "system_install_pick_image",
         "system_install_plan",
         "system_install_apply",
     ];
@@ -1390,5 +1769,361 @@ mod tests {
             CommandError::from(SourceError::UnknownProvider("unknown".into())).code,
             "unknown_mirror"
         );
+    }
+
+    /// A picker that answers with a scripted result, so registration and
+    /// validation are exercised without a real dialog (and CI never blocks on
+    /// one).
+    struct ScriptedPicker {
+        answer: Mutex<Result<Option<PathBuf>, String>>,
+    }
+
+    impl ScriptedPicker {
+        fn new(answer: Result<Option<PathBuf>, String>) -> Arc<Self> {
+            Arc::new(Self {
+                answer: Mutex::new(answer),
+            })
+        }
+
+        fn cancelling() -> Arc<Self> {
+            Self::new(Ok(None))
+        }
+
+        fn choosing(path: &FsPath) -> Arc<Self> {
+            Self::new(Ok(Some(path.to_path_buf())))
+        }
+
+        fn failing(reason: &str) -> Arc<Self> {
+            Self::new(Err(reason.to_owned()))
+        }
+    }
+
+    impl ImagePicker for ScriptedPicker {
+        fn pick(&self) -> Result<Option<PathBuf>, String> {
+            self.answer.lock().expect("script lock").clone()
+        }
+    }
+
+    /// A valid image *outside* the catalogue directory, so a picked file is never
+    /// confused with a catalogue id. The bytes are the catalogue fixture's own.
+    fn pick_fixture(name: &str) -> PathBuf {
+        let directory =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../target/desktop-pick-tests");
+        std::fs::create_dir_all(&directory).expect("create the pick fixture directory");
+        let path = directory.join(name);
+        // Replace whatever a previous run left behind, including a symlink a
+        // failed run may have created at this path.
+        let _ = std::fs::remove_file(&path);
+        let source = std::fs::read(install_fixture_directory().join("demo.img"))
+            .expect("read the catalogue fixture");
+        std::fs::write(&path, source).expect("write the pick fixture");
+        path
+    }
+
+    fn pick_webview(
+        controller: Controller,
+        picker: Arc<dyn ImagePicker>,
+        now: impl Fn() -> SystemTime + Send + Sync + 'static,
+    ) -> (tauri::App<tauri::test::MockRuntime>, MockWebview) {
+        // The catalogue is a process-wide override that is set once, so point it
+        // at the fixture directory before any surface reads it.
+        set_image_directory(install_fixture_directory());
+        let mut context = tauri::test::mock_context(tauri::test::noop_assets());
+        for command in IPC_COMMANDS {
+            context.runtime_authority_mut().__allow_command(
+                (*command).to_string(),
+                tauri::utils::acl::ExecutionContext::Local,
+            );
+        }
+        let surface = Arc::new(InstallSurface::new_for_tests(
+            controller.clone(),
+            picker,
+            now,
+        ));
+        let app = tauri::test::mock_builder()
+            .manage(controller)
+            .manage(surface)
+            .invoke_handler(command_handler())
+            .build(context)
+            .expect("mock desktop app builds");
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", tauri::WebviewUrl::default())
+            .build()
+            .expect("mock desktop webview builds");
+        (app, webview)
+    }
+
+    fn apply_body(handle: &str, token: &str) -> serde_json::Value {
+        serde_json::json!({
+            "targetId": "sda",
+            "imageId": handle,
+            "planToken": token,
+            "acknowledgement": "sda",
+        })
+    }
+
+    /// The picker runs in Rust and the WebView only ever sees a handle: the path
+    /// must not appear anywhere in the answer, and the handle must not look like a
+    /// path. The handle then plans and applies through the same code path as a
+    /// catalogue id.
+    #[test]
+    fn desktop_pick_image_answers_with_an_opaque_handle_not_a_path() {
+        let image = pick_fixture("downloaded.img");
+        // Live policy on the demo provider: the production write path runs against
+        // the synthetic backend, so a handle is applied end to end without a device.
+        let (app, webview) = pick_webview(
+            Controller::new(ProbeMode::Demo, ExecutionPolicy::Live),
+            ScriptedPicker::choosing(&image),
+            SystemTime::now,
+        );
+        let picked = invoke(&webview, "system_install_pick_image", serde_json::json!({}))
+            .expect("picking answers");
+
+        assert_eq!(picked["cancelled"], serde_json::json!(false));
+        let handle = picked["handle"].as_str().expect("a handle").to_owned();
+        assert!(handle.starts_with("pick-"), "{handle}");
+        assert!(!handle.contains('/'), "a handle is not a path: {handle}");
+        assert_eq!(
+            picked["name"].as_str(),
+            Some("downloaded.img"),
+            "the display name is the file name"
+        );
+        let size = std::fs::metadata(&image).expect("fixture metadata").len();
+        assert_eq!(picked["sizeBytes"].as_u64(), Some(size));
+        assert!(
+            valid_pick_handle(&handle),
+            "the handle has the documented shape: {handle}"
+        );
+        // The whole point: no path reaches the WebView.
+        let serialized = picked.to_string();
+        assert!(
+            !serialized.contains(&image.display().to_string()),
+            "the picked path must not reach the WebView: {serialized}"
+        );
+        assert!(
+            !serialized.contains("desktop-pick-tests"),
+            "not even part of the path: {serialized}"
+        );
+
+        // The handle is usable exactly like a catalogue id, and the plan echoes the
+        // identity apply needs (t22/t25: one source, no UI memory).
+        let plan = invoke(
+            &webview,
+            "system_install_plan",
+            serde_json::json!({"targetId": "sda", "imageId": handle}),
+        )
+        .expect("the handle plans");
+        assert_eq!(plan["image"]["id"].as_str(), Some(handle.as_str()));
+        assert_eq!(plan["image"]["sizeBytes"].as_u64(), Some(size));
+
+        let token = plan["planToken"].as_str().expect("a plan token").to_owned();
+        let result = invoke(
+            &webview,
+            "system_install_apply",
+            apply_body(&handle, &token),
+        )
+        .expect("the handle applies");
+        assert_eq!(result["bytesWritten"].as_u64(), Some(size));
+        assert_eq!(result["run"]["status"].as_str(), Some("succeeded"));
+        let _ = app;
+    }
+
+    /// Cancelling is an answer, not a failure, and produces no handle at all.
+    #[test]
+    fn desktop_pick_image_reports_a_cancelled_dialog_as_an_answer() {
+        let (app, webview) = pick_webview(
+            Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun),
+            ScriptedPicker::cancelling(),
+            SystemTime::now,
+        );
+        let picked = invoke(&webview, "system_install_pick_image", serde_json::json!({}))
+            .expect("cancelling is not an error");
+        assert_eq!(picked["cancelled"], serde_json::json!(true));
+        assert_eq!(picked["handle"], serde_json::json!(null));
+        assert_eq!(picked["name"], serde_json::json!(null));
+        let _ = app;
+
+        // A picker that cannot run explains itself instead of pretending the user
+        // cancelled.
+        let (app, webview) = pick_webview(
+            Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun),
+            ScriptedPicker::failing("no file chooser is available"),
+            SystemTime::now,
+        );
+        let error = invoke(&webview, "system_install_pick_image", serde_json::json!({}))
+            .expect_err("a broken picker is reported");
+        assert_eq!(error_code(&error), "install_unsupported");
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no file chooser"),
+            "{error}"
+        );
+        let _ = app;
+    }
+
+    /// The boundary invariant: nothing but a handle this process issued may reach
+    /// the core. Path-shaped input is refused where it arrives, and it is never
+    /// retried as a file name or a relative path.
+    #[test]
+    fn desktop_plan_refuses_everything_but_an_issued_handle() {
+        let (app, webview) = pick_webview(
+            Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun),
+            ScriptedPicker::cancelling(),
+            SystemTime::now,
+        );
+        let unsigned = "pick-000102030405060708090a0b0c0d0e0f-demo.img";
+        let refusals = [
+            // Path shapes: neither the catalogue nor a handle may see these.
+            "/etc/passwd",
+            "/tmp/passwd.img",
+            "../demo.img",
+            "../../etc/passwd",
+            "./demo.img",
+            "~/demo.img",
+            "~",
+            "..",
+            "desktop-pick-tests/demo.img",
+            // Handle shapes this process never issued.
+            unsigned,
+            "pick-00000000000000000000000000000000",
+            "pick-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-demo.img",
+            "pick-000102030405060708090a0b0c0d0e0f-../../etc/passwd",
+            "pick-000102030405060708090A0B0C0D0E0F-demo.img",
+            "pick-000102030405060708090a0b0c0d0e0f",
+            "pick--demo.img",
+            "pick-000102030405060708090a0b0c0d0e0f-",
+        ];
+        for image_id in refusals {
+            match invoke(
+                &webview,
+                "system_install_plan",
+                serde_json::json!({"targetId": "sda", "imageId": image_id}),
+            ) {
+                Ok(value) => panic!("{image_id} was accepted and planned: {value}"),
+                Err(error) => {
+                    assert_eq!(
+                        error_code(&error),
+                        "invalid_install_request",
+                        "{image_id} must be refused with a stable code: {error}"
+                    );
+                    println!("REFUSED[{image_id}]: {error}");
+                }
+            }
+        }
+        // Control: the catalogue route still works, so the refusals above are
+        // targeted rather than a blanket failure.
+        let plan = invoke(
+            &webview,
+            "system_install_plan",
+            serde_json::json!({"targetId": "sda", "imageId": "demo.img"}),
+        )
+        .expect("a catalogue id still plans");
+        assert_eq!(plan["image"]["id"].as_str(), Some("demo.img"));
+        let _ = app;
+    }
+
+    /// A handle stops working when it expires, and it is refused in the same place
+    /// as an unknown one.
+    #[test]
+    fn desktop_pick_image_handles_expire() {
+        let image = pick_fixture("expiring.img");
+        let clock = Arc::new(Mutex::new(SystemTime::now()));
+        let clock_for_surface = clock.clone();
+        let (app, webview) = pick_webview(
+            Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun),
+            ScriptedPicker::choosing(&image),
+            move || *clock_for_surface.lock().expect("clock lock"),
+        );
+        let picked = invoke(&webview, "system_install_pick_image", serde_json::json!({}))
+            .expect("picking answers");
+        let handle = picked["handle"].as_str().expect("a handle").to_owned();
+        invoke(
+            &webview,
+            "system_install_plan",
+            serde_json::json!({"targetId": "sda", "imageId": handle}),
+        )
+        .expect("a fresh handle plans");
+
+        // A fixed step, not "the constant plus one": otherwise a mutated lifetime
+        // would move the test with it and the check would be vacuous.
+        assert_eq!(
+            PICK_HANDLE_TTL,
+            Duration::from_secs(600),
+            "the handle lifetime is part of the contract"
+        );
+        *clock.lock().expect("clock lock") += Duration::from_secs(601);
+        let error = invoke(
+            &webview,
+            "system_install_plan",
+            serde_json::json!({"targetId": "sda", "imageId": handle}),
+        )
+        .expect_err("an expired handle is refused");
+        assert_eq!(error_code(&error), "invalid_install_request");
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("expired"),
+            "{error}"
+        );
+        let _ = app;
+    }
+
+    /// Replacing the picked file behind the same handle must not silently write
+    /// something else: the core re-checks the path and refuses a symlink.
+    #[test]
+    fn desktop_handle_cannot_be_repointed_at_another_file() {
+        let image = pick_fixture("repointed.img");
+        let other = pick_fixture("repointed-other.img");
+        let (app, webview) = pick_webview(
+            Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun),
+            ScriptedPicker::choosing(&image),
+            SystemTime::now,
+        );
+        let picked = invoke(&webview, "system_install_pick_image", serde_json::json!({}))
+            .expect("picking answers");
+        let handle = picked["handle"].as_str().expect("a handle").to_owned();
+        invoke(
+            &webview,
+            "system_install_plan",
+            serde_json::json!({"targetId": "sda", "imageId": handle}),
+        )
+        .expect("the picked file plans");
+
+        // The same path now names a different file through a symlink.
+        std::fs::rename(&image, image.with_extension("moved")).expect("move the picked file");
+        std::os::unix::fs::symlink(&other, &image).expect("repoint the path at another file");
+
+        match invoke(
+            &webview,
+            "system_install_plan",
+            serde_json::json!({"targetId": "sda", "imageId": handle}),
+        ) {
+            Ok(value) => panic!("a symlinked path must not plan: {value}"),
+            Err(error) => {
+                assert_eq!(error_code(&error), "invalid_install_request");
+                let message = error["message"].as_str().unwrap_or_default();
+                assert!(
+                    message.contains("not a regular file"),
+                    "the reason names what the path became: {error}"
+                );
+                assert!(
+                    message.contains("repointed.img"),
+                    "and the path it refused: {error}"
+                );
+                println!("REPOINTED: {error}");
+            }
+        }
+        let _ = app;
+    }
+
+    /// The pick command opens a dialog, so it must not be driven by the
+    /// read-only JSON guard (which would block CI on a real dialog); it is the
+    /// registry guard that covers it.
+    #[test]
+    fn desktop_pick_image_is_registered_but_not_read_only() {
+        assert!(IPC_COMMANDS.contains(&"system_install_pick_image"));
+        assert!(!READ_ONLY_COMMANDS.contains(&"system_install_pick_image"));
     }
 }
