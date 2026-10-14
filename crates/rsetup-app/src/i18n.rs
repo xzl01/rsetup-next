@@ -781,6 +781,12 @@ impl Locale {
             (_, "the_target_is_removable_media") => {
                 "The target is removable media; confirm it is the device to overwrite.".into()
             }
+            (Self::ZhCn, "the_backup_gpt_table_stays_at_the_end_of_the_image") => {
+                "镜像小于设备：主 GPT 有效、分区可正常访问，但备份 GPT 仍位于镜像末尾而不是设备末尾。如需修正，稍后可在设备上运行 `sgdisk -e <设备名>`——本工具不会自动修改分区表。".into()
+            }
+            (_, "the_backup_gpt_table_stays_at_the_end_of_the_image") => {
+                "The image is smaller than the device: the primary GPT is valid and the partitions are usable, but the backup GPT is still at the end of the image rather than the end of the device. To correct that later, run `sgdisk -e <device>` — this tool does not modify the partition table by itself.".into()
+            }
             (_, "the_image_is_compressed_and_is_decompressed_while_writing") => {
                 "The image is compressed and is decompressed while writing (requires xz).".into()
             }
@@ -1065,6 +1071,7 @@ mod tests {
             "the_write_cannot_be_rolled_back",
             "the_target_is_removable_media",
             "the_image_is_compressed_and_is_decompressed_while_writing",
+            "the_backup_gpt_table_stays_at_the_end_of_the_image",
         ] {
             let zh = Locale::ZhCn.install_warning(warning);
             let en = Locale::En.install_warning(warning);
