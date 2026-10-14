@@ -4,6 +4,7 @@ const { t } = i18n;
 const routes = [
   { id: "overview", icon: "overview" },
   { id: "system", icon: "system" },
+  { id: "install", icon: "install" },
   { id: "network", icon: "network" },
   { id: "hardware", icon: "chip" },
   { id: "workflows", icon: "run" },
@@ -163,6 +164,25 @@ const state = {
   storageRefreshError: null,
   storageStale: false,
   storageRefreshedAt: null,
+  // System image install page. `installOptions` mirrors the server payload
+  // `{ liveAllowed, targets, images }`; the acknowledgement is always the raw
+  // string a user typed and is never collapsed into a boolean.
+  // `installTargetId`/`installImageId` are the *plan* selection only: the id an
+  // apply submits always comes back from the plan response (`plan.image.id`), so
+  // there is exactly one source of the applied image identity.
+  installOptions: null,
+  installLiveAllowed: false,
+  installLoading: false,
+  installLoadingPromise: null,
+  installLoadError: null,
+  installTargetId: "",
+  installImageId: "",
+  installPlan: null,
+  installPlanning: false,
+  installAcknowledgement: "",
+  installRunning: false,
+  installError: null,
+  installResult: null,
   lastInvoker: null,
   contactInvoker: null,
   route: "overview",
@@ -341,6 +361,28 @@ const transport = {
   async storageStatus() {
     if (tauriInvoke) return tauriInvoke("storage_status");
     return request("/api/v1/hardware/storage");
+  },
+  // System image install. The image is always an identifier from the fixed
+  // server-side catalogue: the client never submits a path, and the
+  // acknowledgement is always the typed device name, never a boolean.
+  async installTargets() {
+    if (tauriInvoke) return tauriInvoke("system_install_targets");
+    return request("/api/v1/storage/install/targets");
+  },
+  async installPlan(targetId, imageId) {
+    const payload = installPlanRequest(targetId, imageId);
+    if (tauriInvoke) return tauriInvoke("system_install_plan", payload);
+    return request("/api/v1/storage/install/plan", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  },
+  async installApply(payload) {
+    if (tauriInvoke) return tauriInvoke("system_install_apply", payload);
+    return request("/api/v1/storage/install/apply", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
   },
 };
 
@@ -2798,6 +2840,540 @@ function renderNvmeDeviceCard(device) {
   `;
 }
 
+// ---------------------------------------------------------------------------
+// System image install page
+//
+// The page mirrors the HTTP/Tauri install surface that t16 wired up:
+// `GET /api/v1/storage/install/targets` -> `{ liveAllowed, targets, images }`,
+// `POST .../plan` and `POST .../apply` with `planToken` + `acknowledgement`.
+// Three rules are deliberately not implemented here:
+//   1. The client never submits an image path, only a catalogue `imageId`.
+//   2. The acknowledgement is always the string the user typed. A boolean
+//      (`confirm = true`) can never satisfy the core, which compares the typed
+//      device name against the observed target identity.
+//   3. The disabled state below is a *display* predicate. The core re-judges the
+//      acknowledgement and the plan token on every apply, so a forged state
+//      cannot write anything.
+// ---------------------------------------------------------------------------
+
+function installTargetSelectable(target) {
+  return Boolean(target) && !target.holdsRunningSystem && !target.mounted;
+}
+
+function installSelectedTarget() {
+  const targets = state.installOptions?.targets || [];
+  return targets.find((target) => target.id === state.installTargetId)
+    || targets.find(installTargetSelectable)
+    || null;
+}
+
+function installKindLabel(kind) {
+  const keys = {
+    ufs: "install.kind.ufs", emmc: "install.kind.emmc", sd: "install.kind.sd",
+    nvme: "install.kind.nvme", other: "install.kind.other",
+  };
+  const key = keys[String(kind || "").toLowerCase()] || "install.kind.other";
+  return t(key);
+}
+
+function installFormatLabel(format) {
+  return t(String(format || "").toLowerCase() === "xz" ? "install.format.xz" : "install.format.raw");
+}
+
+function installWarningCopy(warning) {
+  const keys = {
+    writing_an_image_replaces_every_partition_on_the_target: "install.warning.replaceAll",
+    the_write_cannot_be_rolled_back: "install.warning.irreversible",
+    the_target_is_removable_media: "install.warning.removable",
+    the_image_is_compressed_and_is_decompressed_while_writing: "install.warning.compressed",
+  };
+  return t(keys[warning] || "install.warning.unknown", { warning: String(warning ?? "") });
+}
+
+function installErrorCodeList() {
+  return [
+    "confirmation_required", "acknowledgement_mismatch", "plan_required", "stale_plan",
+    "root_required", "install_conflict", "writes_running_system", "install_unsupported",
+    "invalid_install_request", "internal_error",
+  ];
+}
+
+// Every failure is rendered from its stable code, so a surface failure never
+// collapses into one generic sentence. `expected`/`provided` come from the plan
+// and from what the user typed, exactly like the core reports them.
+function installErrorCopy(failure) {
+  const codes = installErrorCodeList();
+  const detailCodes = ["confirmation_required", "acknowledgement_mismatch", "stale_plan", "install_unsupported"];
+  const served = typeof failure?.code === "string" ? failure.code : "";
+  const key = codes.includes(served) ? served : "generic";
+  const expected = state.installPlan?.target?.id || "";
+  const target = state.installPlan?.target?.path || "";
+  const provided = String(state.installAcknowledgement ?? "").trim();
+  return {
+    code: key === "generic" ? "internal_error" : key,
+    key,
+    title: t(`install.error.${key}`),
+    detail: detailCodes.includes(key)
+      ? t(`install.error.${key}.detail`, { expected, provided, target })
+      : String(failure?.message || ""),
+    hint: t(`install.error.${key}.hint`),
+    replan: key === "stale_plan" || key === "plan_required",
+    liveDisabled: key === "install_unsupported",
+  };
+}
+
+function installErrorFrom(error) {
+  if (!error) return null;
+  const code = typeof error.code === "string" ? error.code : "";
+  const message = error.providerMessage || error.message || "";
+  return { code, message: String(message ?? "") };
+}
+
+// The plan request carries an identifier from the fixed server-side catalogue.
+// There is deliberately no `imagePath` field: the client cannot name a file.
+function installPlanRequest(targetId, imageId) {
+  return { targetId: String(targetId ?? ""), imageId: String(imageId ?? "") };
+}
+
+// The apply request carries the typed device name as a string. It never carries
+// a boolean confirmation, and the token is opaque to this layer.
+//
+// The image id comes from exactly one place: the `image.id` echoed by the plan
+// response. Both surfaces (`InstallSurface::request` in the HTTP server and in
+// the Tauri shell) resolve the submitted catalogue id themselves and put it
+// back into the plan, so the plan response is the merged source of truth. The
+// page deliberately keeps no fallback to its own remembered selection: an id
+// read from two places could disagree with the plan and turn a valid plan into
+// a safe-but-confusing refusal. A plan without an echoed id yields an empty
+// value, which the surface rejects as `invalid_install_request`.
+function installApplyRequest(plan, acknowledgement) {
+  return {
+    targetId: String(plan?.target?.id ?? ""),
+    imageId: installPlanImageId(plan),
+    planToken: String(plan?.planToken ?? ""),
+    acknowledgement: String(acknowledgement ?? ""),
+  };
+}
+
+// The single source of the image identity: the id the plan response echoes.
+// No fallback to the client's own selection, so the id shown and the id
+// submitted cannot drift apart.
+function installPlanImageId(plan) {
+  return String(plan?.image?.id ?? "");
+}
+
+// Display-side predicate only. The core trims the typed value and compares it
+// with the observed target id; this mirrors that comparison for rendering.
+function installAcknowledgementReady(plan, typed) {
+  const expected = plan?.target?.id ?? "";
+  return expected.length > 0 && String(typed ?? "").trim() === expected;
+}
+
+function installApplyDisabled(plan = state.installPlan, typed = state.installAcknowledgement, running = state.installRunning) {
+  if (!plan || running) return true;
+  return !installAcknowledgementReady(plan, typed);
+}
+
+function installConfirmStateCopy(plan, typed) {
+  const expected = plan?.target?.id ?? "";
+  const provided = String(typed ?? "").trim();
+  if (installAcknowledgementReady(plan, typed)) return t("install.confirmReady", { expected });
+  if (!provided) return t("install.confirmRequired", { expected });
+  return t("install.confirmMismatch", { expected, provided });
+}
+
+function installFact(labelKey, value, attribute) {
+  return `<div class="install-fact"${attribute ? ` ${attribute}` : ""}><i>${escapeHtml(t(labelKey))}</i><b>${escapeHtml(value)}</b></div>`;
+}
+
+function installTargetOptionLabel(target) {
+  const flags = [];
+  if (target.removable) flags.push(t("install.removableYes"));
+  if (target.holdsRunningSystem) flags.push(t("install.reason.runningSystem"));
+  if (target.mounted) flags.push(t("install.reason.mounted", { mounts: (target.mountPoints || []).join(", ") }));
+  const label = `${target.path} · ${target.model} · ${byteUnit(target.sizeBytes)} · ${installKindLabel(target.kind)}`;
+  return flags.length ? `${label} · ${flags.join(" · ")}` : label;
+}
+
+function installTargetOptions(targets, selected) {
+  if (!targets.length) return "";
+  return targets.map((target) => {
+    const selectable = installTargetSelectable(target);
+    const isSelected = Boolean(selected) && target.id === selected.id;
+    const label = `${installTargetOptionLabel(target)}${selectable ? "" : ` — ${t("install.notSelectable")}`}`;
+    return `<option value="${escapeHtml(target.id)}"${isSelected ? " selected" : ""}${selectable ? "" : " disabled"}>${escapeHtml(label)}</option>`;
+  }).join("");
+}
+
+function installImageOptions(images) {
+  if (!images.length) return "";
+  return images.map((image) => `<option value="${escapeHtml(image.id)}"${image.id === state.installImageId ? " selected" : ""}>${escapeHtml(`${image.id} · ${byteUnit(image.sizeBytes)}`)}</option>`).join("");
+}
+
+function renderInstallTargetCard(target) {
+  const mounts = (target.mountPoints || []).join(", ");
+  return `
+    <section class="install-card" data-install-target-card data-install-target-id="${escapeHtml(target.id)}">
+      <header>
+        <strong>${escapeHtml(t("install.targetIdentity"))}</strong>
+        <span>${escapeHtml(target.id)}</span>
+      </header>
+      <div class="install-facts">
+        ${installFact("install.path", target.path)}
+        ${installFact("install.model", target.model)}
+        ${installFact("install.capacity", byteUnit(target.sizeBytes))}
+        ${installFact("install.kind", installKindLabel(target.kind))}
+        ${installFact("install.removable", target.removable ? t("install.removableYes") : t("install.removableNo"))}
+        ${installFact("install.mountState", target.mounted && mounts ? t("install.mountedAt", { mounts }) : t("install.notMounted"))}
+        ${installFact("install.runningSystem", target.holdsRunningSystem ? t("install.yes") : t("install.no"))}
+      </div>
+    </section>
+  `;
+}
+
+function renderInstallConsequences(plan) {
+  const target = plan?.target || {};
+  const image = plan?.image || {};
+  const destroys = plan?.destroys || [];
+  const mounts = (target.mountPoints || []).join(", ");
+  const warnings = Array.isArray(plan?.warnings) ? plan.warnings.map(installWarningCopy) : [];
+  const partitions = destroys.length
+    ? `<ul class="install-partition-list" data-install-destroys>${destroys.map((partition) => `
+        <li data-install-destroy="${escapeHtml(partition.name)}">
+          <b>${escapeHtml(partition.name)}</b>
+          <span>${escapeHtml(t("install.partitionNumber", { number: partition.number }))}</span>
+          <span>${escapeHtml(byteUnit(partition.sizeBytes))}</span>
+          <span>${escapeHtml(partition.mountPoint || t("install.notMounted"))}</span>
+        </li>`).join("")}</ul>`
+    : `<p class="install-hint" data-install-destroys-empty>${escapeHtml(t("install.destroysNone"))}</p>`;
+  const sha256 = `${image.sha256Prefix || ""}${image.prefixBytes ? ` · ${t("install.sha256Scope", { size: byteUnit(image.prefixBytes) })}` : ""}`;
+  return `
+    <section class="install-card" data-install-consequences>
+      <header>
+        <strong>${escapeHtml(t("install.consequencesTitle"))}</strong>
+        <span>${escapeHtml(plan?.synthetic ? t("install.syntheticPlan") : t("install.realPlan"))}</span>
+      </header>
+      <div class="install-facts" data-install-plan-target>
+        ${installFact("install.path", target.path)}
+        ${installFact("install.model", target.model)}
+        ${installFact("install.capacity", byteUnit(target.sizeBytes))}
+        ${installFact("install.kind", installKindLabel(target.kind))}
+        ${installFact("install.removable", target.removable ? t("install.removableYes") : t("install.removableNo"))}
+        ${installFact("install.mountState", target.mounted && mounts ? t("install.mountedAt", { mounts }) : t("install.notMounted"))}
+        ${installFact("install.runningSystem", target.holdsRunningSystem ? t("install.yes") : t("install.no"))}
+      </div>
+      <h3>${escapeHtml(t("install.destroys"))}</h3>
+      ${partitions}
+      <div class="install-facts" data-install-plan-image>
+        ${installFact("install.imageId", installPlanImageId(plan) || "—")}
+        ${installFact("install.imagePath", image.path || "")}
+        ${installFact("install.format", installFormatLabel(image.format))}
+        ${installFact("install.fileSize", byteUnit(image.sizeBytes))}
+        ${installFact("install.writeSize", byteUnit(image.uncompressedBytes))}
+        ${installFact("install.partitionTable", image.partitionTable || t("install.unknownTable"))}
+        ${installFact("install.sha256", sha256)}
+      </div>
+      <h3>${escapeHtml(t("install.warnings"))}</h3>
+      <div class="install-warnings" data-install-warnings>
+        <p class="install-warning is-format" data-install-format-warning>${escapeHtml(t("install.formatNotice"))}</p>
+        <p class="install-warning is-irreversible" data-install-irreversible-warning>${escapeHtml(t("install.irreversibleNotice"))}</p>
+        ${warnings.map((warning) => `<p class="install-warning">${escapeHtml(warning)}</p>`).join("")}
+        ${plan?.requiresRoot ? `<p class="install-warning is-admin" data-install-admin-warning>${escapeHtml(t("install.requiresRootNotice"))}</p>` : ""}
+      </div>
+    </section>
+  `;
+}
+
+function renderInstallConfirmation(plan) {
+  const expected = plan?.target?.id || "";
+  const typed = state.installAcknowledgement || "";
+  const ready = installAcknowledgementReady(plan, typed);
+  const disabled = installApplyDisabled(plan, typed, state.installRunning);
+  return `
+    <section class="install-card install-confirm" data-install-confirm data-install-expected="${escapeHtml(expected)}">
+      <header><strong>${escapeHtml(t("install.confirmTitle"))}</strong></header>
+      <p class="install-hint">${escapeHtml(t("install.confirmHint", { expected }))}</p>
+      <input class="install-ack-input" type="text" autocomplete="off" spellcheck="false" data-install-acknowledge
+        aria-label="${escapeHtml(t("install.confirmTitle"))}"
+        value="${escapeHtml(typed)}" placeholder="${escapeHtml(t("install.confirmPlaceholder", { expected }))}" />
+      <p class="install-confirm-state ${ready ? "is-ready" : "is-disabled"}" data-install-confirm-state>${escapeHtml(installConfirmStateCopy(plan, typed))}</p>
+      <button class="primary-button install-apply-button" type="button" data-install-apply${disabled ? " disabled" : ""}>${escapeHtml(state.installRunning ? t("install.applying") : t("install.apply"))}</button>
+      <p class="install-hint" data-install-apply-hint>${escapeHtml(ready ? t("install.applyReadyHint") : t("install.applyDisabledHint"))}</p>
+    </section>
+  `;
+}
+
+function renderInstallLiveBanner(options) {
+  const live = Boolean(options?.liveAllowed);
+  return `
+    <div class="install-live-banner ${live ? "is-live" : "is-preview"}" data-install-live-banner data-live-allowed="${live ? "true" : "false"}">
+      ${icon("pulse")}
+      <div>
+        <strong>${escapeHtml(live ? t("install.liveAllowed") : t("install.liveDisabled"))}</strong>
+        <span>${escapeHtml(live ? t("install.liveAllowedNotice") : t("install.liveDisabledNotice"))}</span>
+      </div>
+    </div>
+  `;
+}
+
+function renderInstallErrorBox() {
+  const failure = state.installError;
+  if (!failure) return "";
+  const copy = installErrorCopy(failure);
+  return `
+    <section class="install-error" role="alert" data-install-error data-install-error-code="${escapeHtml(copy.code)}">
+      ${icon("pulse")}
+      <div>
+        <strong data-install-error-title>${escapeHtml(copy.title)}</strong>
+        ${copy.detail ? `<span data-install-error-detail>${escapeHtml(copy.detail)}</span>` : ""}
+        ${copy.hint ? `<span data-install-error-hint>${escapeHtml(copy.hint)}</span>` : ""}
+        ${copy.replan ? `<button class="secondary-button" type="button" data-install-replan>${escapeHtml(t("install.replan"))}</button>` : ""}
+      </div>
+    </section>
+  `;
+}
+
+function renderInstallResult(result) {
+  const verification = result?.verification || {};
+  const verificationState = String(verification.state || "unsupported").toLowerCase();
+  const stateKey = ["matched", "mismatched", "unsupported"].includes(verificationState) ? verificationState : "unsupported";
+  const observed = Array.isArray(verification.observed) ? verification.observed.length : null;
+  const expected = Array.isArray(verification.expected) ? verification.expected.length : null;
+  return `
+    <div class="install-facts" data-install-result-facts>
+      ${installFact("install.result.bytes", byteUnit(result?.bytesWritten))}
+      ${installFact("install.result.verification", t(`install.result.verification.${stateKey}`))}
+      ${observed !== null && expected !== null ? installFact("install.result.partitions", t("install.result.partitionCount", { expected, observed })) : ""}
+    </div>
+    ${result?.plan?.synthetic ? `<p class="install-hint" data-install-result-synthetic>${escapeHtml(t("install.result.synthetic"))}</p>` : ""}
+    ${verification.detail ? `<p class="install-hint" data-install-result-detail>${escapeHtml(verification.detail)}</p>` : ""}
+  `;
+}
+
+function renderSystemInstallBody() {
+  const options = state.installOptions;
+  if (!options) {
+    if (state.installLoadError) {
+      const message = typeof displayError === "function" ? displayError(state.installLoadError) : String(state.installLoadError?.message || state.installLoadError);
+      return `
+        <div class="install-retry" data-install-load-error>
+          ${icon("pulse")}
+          <strong>${escapeHtml(t("install.loadFailed"))}</strong>
+          <span>${escapeHtml(message)}</span>
+          <button class="secondary-button" type="button" data-install-retry>${escapeHtml(t("install.retry"))}</button>
+        </div>
+      `;
+    }
+    return `<div class="hardware-tool-loading"><span></span><span>${escapeHtml(t("install.loading"))}</span></div>`;
+  }
+
+  const targets = options.targets || [];
+  const images = options.images || [];
+  const selectable = targets.filter(installTargetSelectable);
+  const chosen = installSelectedTarget();
+  const target = installTargetSelectable(chosen) ? chosen : (selectable[0] || null);
+  const plan = state.installPlan;
+
+  return `
+    ${renderInstallLiveBanner(options)}
+    <section class="install-picker">
+      <div class="install-field">
+        <label for="install-target-select">${escapeHtml(t("install.target"))}</label>
+        <select id="install-target-select" data-install-targets${targets.length ? "" : " disabled"}>${installTargetOptions(targets, target)}</select>
+        <p>${escapeHtml(t("install.targetHint"))}</p>
+      </div>
+      <div class="install-field">
+        <label for="install-image-select">${escapeHtml(t("install.image"))}</label>
+        <select id="install-image-select" data-install-images${images.length ? "" : " disabled"}>${installImageOptions(images)}</select>
+        <p>${escapeHtml(t("install.imageHint"))}</p>
+      </div>
+      <button class="primary-button" type="button" data-install-plan-button${target && images.length ? "" : " disabled"}>
+        ${escapeHtml(state.installPlanning ? t("install.previewing") : (plan ? t("install.replan") : t("install.preview")))}
+      </button>
+    </section>
+    ${target
+      ? renderInstallTargetCard(target)
+      : `<div class="hardware-tool-empty" data-install-no-target>${escapeHtml(targets.length ? t("install.noSelectableTargets") : t("install.noTargets"))}</div>`}
+    ${plan ? renderInstallConsequences(plan) : `<p class="install-hint" data-install-no-plan>${escapeHtml(t("install.noPlan"))}</p>`}
+    ${plan ? renderInstallConfirmation(plan) : ""}
+    ${renderInstallErrorBox()}
+    ${state.installResult ? `<section class="install-card install-result" data-install-result><header><strong>${escapeHtml(t("install.result.title"))}</strong></header>${renderInstallResult(state.installResult)}</section>` : ""}
+  `;
+}
+
+function renderSystemInstallPage() {
+  const host = $("[data-install-body]");
+  if (!host) return;
+  if (typeof preserveToolFocus === "function") preserveToolFocus(host);
+  host.innerHTML = renderSystemInstallBody();
+  wireInstallEvents(host);
+}
+
+function wireInstallEvents(host) {
+  const targetSelect = $("[data-install-targets]", host);
+  if (targetSelect) {
+    targetSelect.onchange = () => {
+      state.installTargetId = targetSelect.value;
+      state.installPlan = null;
+      state.installAcknowledgement = "";
+      state.installError = null;
+      renderSystemInstallPage();
+    };
+  }
+  const imageSelect = $("[data-install-images]", host);
+  if (imageSelect) {
+    imageSelect.onchange = () => {
+      state.installImageId = imageSelect.value;
+      state.installPlan = null;
+      state.installAcknowledgement = "";
+      state.installError = null;
+      renderSystemInstallPage();
+    };
+  }
+  const planButton = $("[data-install-plan-button]", host);
+  if (planButton) planButton.onclick = () => void planSystemInstall();
+  const acknowledge = $("[data-install-acknowledge]", host);
+  if (acknowledge) acknowledge.oninput = () => onInstallAcknowledgementInput(acknowledge.value, host);
+  const applyButton = $("[data-install-apply]", host);
+  if (applyButton) {
+    applyButton.disabled = installApplyDisabled();
+    applyButton.onclick = () => void applySystemInstall();
+  }
+  const replan = $("[data-install-replan]", host);
+  if (replan) replan.onclick = () => void planSystemInstall();
+  const retry = $("[data-install-retry]", host);
+  if (retry) retry.onclick = () => void loadInstallOptions();
+}
+
+// Typing updates the disabled state in place instead of re-rendering, so the
+// caret stays where the user left it. The predicate is the same one the render
+// path uses, and the core still judges the value on apply.
+function onInstallAcknowledgementInput(value, host) {
+  state.installAcknowledgement = String(value ?? "");
+  const button = host ? $("[data-install-apply]", host) : $("[data-install-apply]");
+  if (button) button.disabled = installApplyDisabled();
+  const confirmState = host ? $("[data-install-confirm-state]", host) : $("[data-install-confirm-state]");
+  if (confirmState) {
+    confirmState.textContent = installConfirmStateCopy(state.installPlan, state.installAcknowledgement);
+    confirmState.classList.toggle("is-ready", installAcknowledgementReady(state.installPlan, state.installAcknowledgement));
+    confirmState.classList.toggle("is-disabled", !installAcknowledgementReady(state.installPlan, state.installAcknowledgement));
+  }
+  return state.installAcknowledgement;
+}
+
+function openSystemInstallPage() {
+  if (!state.installOptions && !state.installLoadingPromise) void loadInstallOptions();
+  renderSystemInstallPage();
+}
+
+async function loadInstallOptions() {
+  if (state.installLoadingPromise) return state.installLoadingPromise;
+  state.installLoading = true;
+  state.installLoadError = null;
+  let task;
+  const current = () => state.installLoadingPromise === task;
+  task = Promise.resolve().then(() => transport.installTargets()).then((options) => {
+    if (!current()) return;
+    state.installOptions = options;
+    state.installLiveAllowed = Boolean(options?.liveAllowed);
+    const targets = options?.targets || [];
+    const images = options?.images || [];
+    if (!targets.some((target) => target.id === state.installTargetId)) {
+      state.installTargetId = (targets.find(installTargetSelectable) || targets[0])?.id || "";
+    }
+    if (!images.some((image) => image.id === state.installImageId)) {
+      state.installImageId = images[0]?.id || "";
+    }
+    // A fresh catalogue read invalidates any plan built from the previous one.
+    state.installPlan = null;
+    state.installAcknowledgement = "";
+    state.installResult = null;
+    state.installError = null;
+  }).catch((error) => {
+    if (!current()) return;
+    state.installLoadError = error;
+  }).finally(() => {
+    if (!current()) return;
+    state.installLoading = false;
+    state.installLoadingPromise = null;
+    renderSystemInstallPage();
+  });
+  state.installLoadingPromise = task;
+  renderSystemInstallPage();
+  return task;
+}
+
+async function planSystemInstall() {
+  const options = state.installOptions;
+  if (!options || state.installPlanning) return null;
+  const target = installSelectedTarget();
+  const targetId = target?.id || state.installTargetId;
+  const imageId = state.installImageId || (options.images || [])[0]?.id || "";
+  if (!targetId || !imageId) {
+    state.installError = { code: "invalid_install_request", message: t("install.noSelection") };
+    renderSystemInstallPage();
+    return null;
+  }
+  state.installPlanning = true;
+  state.installError = null;
+  state.installResult = null;
+  renderSystemInstallPage();
+  let plan = null;
+  try {
+    plan = await transport.installPlan(targetId, imageId);
+    state.installPlan = plan;
+    // A new plan invalidates any acknowledgement typed for the previous one.
+    state.installAcknowledgement = "";
+  } catch (error) {
+    state.installPlan = null;
+    state.installError = installErrorFrom(error);
+  } finally {
+    state.installPlanning = false;
+    renderSystemInstallPage();
+  }
+  return plan;
+}
+
+async function applySystemInstall() {
+  const plan = state.installPlan;
+  if (!plan || state.installRunning) return null;
+  const typed = String(state.installAcknowledgement ?? "").trim();
+  if (!installAcknowledgementReady(plan, state.installAcknowledgement)) {
+    // Nothing is submitted while the typed name does not match: the button is
+    // already disabled, and this guard keeps the invariant if it is bypassed.
+    state.installError = { code: typed ? "acknowledgement_mismatch" : "confirmation_required", message: "" };
+    renderSystemInstallPage();
+    return null;
+  }
+  const payload = installApplyRequest(plan, state.installAcknowledgement);
+  state.installRunning = true;
+  state.installError = null;
+  state.installResult = null;
+  renderSystemInstallPage();
+  let result = null;
+  try {
+    result = await transport.installApply(payload);
+    state.installResult = result;
+  } catch (error) {
+    const failure = installErrorFrom(error);
+    state.installError = failure;
+    // A stale or missing plan must never be replayed: drop it and ask for a
+    // fresh preview instead of retrying the old token.
+    if (failure?.code === "stale_plan" || failure?.code === "plan_required") {
+      state.installPlan = null;
+      state.installAcknowledgement = "";
+    }
+  } finally {
+    state.installRunning = false;
+    renderSystemInstallPage();
+  }
+  if (state.installError && typeof toast === "function") {
+    const copy = installErrorCopy(state.installError);
+    toast(t("install.error.title"), copy.detail || copy.title, true);
+  }
+  return result;
+}
+
 function renderActions() {
   const actions = state.actions;
   const quick = quickActionIds
@@ -2931,6 +3507,7 @@ function navigate(route) {
   $$('[data-view]').forEach((view) => view.classList.toggle("is-active", view.dataset.view === route));
   $(".workspace").scrollTo({ top: 0, behavior: "instant" });
   history.replaceState(null, "", `#${route}`);
+  if (route === "install") openSystemInstallPage();
   const dialog = $("[data-command-dialog]");
   if (dialog.open) dismissDialog(dialog);
 }
@@ -3086,6 +3663,7 @@ function bindEvents() {
   });
   $("[data-task-execute]").addEventListener("click", executeSelectedAction);
   $("[data-hardware-close]").addEventListener("click", closeHardwareTool);
+  $("[data-install-refresh]")?.addEventListener("click", () => void loadInstallOptions());
   $("[data-hardware-drawer]").addEventListener("cancel", (event) => { event.preventDefault(); closeHardwareTool(); });
   $("[data-source-provider]").addEventListener("change", () => { clearSourcePlan(); renderProviderDetail(); });
   $("[data-source-preview]").addEventListener("click", previewSources);
@@ -3110,7 +3688,7 @@ function bindEvents() {
     const menu = $("[data-debug-menu]");
     if (menu.open && !menu.contains(event.target)) menu.open = false;
   });
-  window.addEventListener("rsetup:locale", () => { applyStaticTranslations(); renderAll(); renderActionDetails(); renderHardwareTool(); });
+  window.addEventListener("rsetup:locale", () => { applyStaticTranslations(); renderAll(); renderActionDetails(); renderHardwareTool(); renderSystemInstallPage(); });
   window.addEventListener("keydown", (event) => {
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); openCommands(); }
     if (event.key === "Escape" && $("[data-command-dialog]").open) {
