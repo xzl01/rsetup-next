@@ -17,6 +17,7 @@ repeated here.
 | --- | --- |
 | **Verified locally** | Reproduced on the development host with the shipped binary: a CLI dry run, a real request against the demo HTTP server, or the automated suite. It is *not* evidence about a physical board. |
 | **Covered by tests** | Exercised by the automated suite through fixtures, an injected backend, or a mock runtime — not driven by hand on this host. |
+| **Verified on-board** | Executed on a real Cubie A7Z; the run is cited where the claim is made. |
 | **Pending on-board** | Must be executed on a real Cubie A7Z with a real image. No result exists yet; never report it as passing. |
 
 A synthetic, dry-run, or fixture result never counts as hardware evidence, and a
@@ -487,6 +488,11 @@ Expected: the partition table the image declares, with the same sizes as the
 preview's destroyed partitions (now replaced), and — for a raw image — `cmp`
 reporting no difference for the compared prefix.
 
+If the image is smaller than the medium, `sfdisk` may also print the protective-MBR
+and backup-GPT notices described under "First boot grows the root partition and
+repairs the backup GPT" below. They are not a failure: the primary GPT is valid
+and the first boot resolves them.
+
 **Failure criteria:** no partition table, partition sizes that disagree with the
 image, or a filesystem that cannot be read. Do not reboot into it; re-flash.
 
@@ -501,6 +507,38 @@ image, or a filesystem that cannot be read. Do not reboot into it; re-flash.
 
 **Failure criteria:** no boot, an unexpected OS, or a root filesystem that does
 not match the image. Recover with the documented flashing mode.
+
+### First boot grows the root partition and repairs the backup GPT (background, no action required)
+
+Distribution images are built for the smallest member of a family (the verified
+run wrote a 10 GiB image), so they are usually smaller than the medium they land
+on. The image's own first boot therefore grows the root partition to fill the
+device — the `growpart` step belongs to the image, not to this tool — and, as part
+of the same step, moves the backup GPT and rewrites the protective MBR to the end
+of the device.
+
+That is why a smaller GPT image written to a larger device makes `sfdisk` print
+notices such as
+
+```text
+GPT PMBR size mismatch (2621439 != 31221759)
+The backup GPT table is not on the end of the device.
+```
+
+They report where the *backup* table sits, not a damaged primary table: the
+primary GPT is valid and every partition is usable throughout. The first boot
+resolves both, so they need no action — do not run `sgdisk -e` or any other repair
+tool, and do not treat them as a failure in step 4.
+
+**Verified on-board** (Radxa Cubie A7Z, 2026-10-14): a 10 GiB image written to a
+119.1 GiB UFS with 4096-byte sectors booted the board from that UFS, `sda3` grew
+from 9.5G to 118.6G automatically, and the partitions stayed usable throughout.
+
+**Design consequence:** this tool therefore **does not modify the partition table
+at all**. It writes the image bytes and asks the kernel to re-read the table for
+the comparison in step 3; it never calls `sgdisk` or `parted`, never relocates the
+backup GPT, and never rewrites the protective MBR. No write-time prompt is needed
+for the condition above either: it resolves itself on first boot.
 
 ### Step 6 — negative checks (run these before the destructive write)
 
@@ -561,7 +599,7 @@ exact commands, the observed output of every step, the gates exercised, the
 failures, and an explicit list of what was **not** covered. A checklist step
 without output is not evidence.
 
-## What is verified locally today
+## What is verified today
 
 | Area | Status | Evidence |
 | --- | --- | --- |
@@ -578,7 +616,7 @@ without output is not evidence.
 | TUI panel (entry, focus routing, consequence render, core-decided confirmation) | **Covered by tests** | `cargo test --workspace --locked` (app suite), including render and key-routing cases with a `TestBackend`. Not hand-driven here. |
 | Tauri commands (`system_install_targets/plan/apply`) | **Covered by tests** | Desktop crate tests: dispatch through the mock runtime, acknowledgement required, registry guard intact. The GUI was not launched here. |
 | Browser page (consequence list, typed-name gating, payload shape, per-code copy) | **Covered by tests** | `node --test ui/*.test.mjs` → 88 passed, 0 failed (twelve cases in `ui/system-install.test.mjs`). The page was not clicked through here. |
-| Real write to UFS/eMMC on a Cubie A7Z | **Pending on-board** | No hardware run exists. |
+| Real write to UFS/eMMC on a Cubie A7Z | **Verified on-board** (2026-10-14) | A 10 GiB image written to a 119.1 GiB UFS (4096-byte sectors) booted the board from that UFS and grew `sda3` from 9.5G to 118.6G — see the background note after step 5. The rows below still have no hardware run. |
 | Live write through the TUI, HTTP, Tauri, or Web surfaces on a board | **Pending on-board** | All four need live execution enabled on the host; never exercised on hardware. |
 | `BLKRRPART` re-read of a real device, and the post-write verification line | **Pending on-board** | Not executable on the development host. |
 | Removable-media warning, mount conflict against real `/proc/mounts` | **Pending on-board** | Detected by injected fixtures only. |
