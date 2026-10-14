@@ -550,13 +550,15 @@ impl SystemInstallManager {
                 "the image {path} is empty"
             )));
         }
-        if let Some(mount) = longest_mount_prefix(mounts, Path::new(path))
-            && resolves_to_target(&mount.device, target)
-        {
-            return Err(SystemInstallError::Conflict(format!(
-                "the image {path} is stored on {} which is being overwritten",
-                mount.mount_point
-            )));
+        // Nested rather than a `let` chain: chains need Rust 1.88 and this crate
+        // declares 1.85 as its minimum.
+        if let Some(mount) = longest_mount_prefix(mounts, Path::new(path)) {
+            if resolves_to_target(&mount.device, target) {
+                return Err(SystemInstallError::Conflict(format!(
+                    "the image {path} is stored on {} which is being overwritten",
+                    mount.mount_point
+                )));
+            }
         }
         let mut file = File::open(path).map_err(|error| {
             SystemInstallError::InvalidInput(format!("the image {path} is unreadable: {error}"))
@@ -917,10 +919,12 @@ fn mint_nonce() -> u64 {
 /// is only useful to the process that issued it.
 fn mint_token_key() -> [u8; 32] {
     let mut key = [0u8; 32];
-    if let Ok(mut urandom) = File::open("/dev/urandom")
-        && urandom.read_exact(&mut key).is_ok()
-    {
-        return key;
+    // Nested rather than a `let` chain: chains need Rust 1.88 and this crate
+    // declares 1.85 as its minimum.
+    if let Ok(mut urandom) = File::open("/dev/urandom") {
+        if urandom.read_exact(&mut key).is_ok() {
+            return key;
+        }
     }
     let mut seed = Vec::new();
     let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
@@ -2131,10 +2135,13 @@ mod tests {
             let mut written = self.chunks.lock().expect("chunk lock");
             let total: u64 =
                 written.iter().map(|size| *size as u64).sum::<u64>() + chunk.len() as u64;
-            if let Some(fail_after) = *self.fail_after.lock().expect("fail lock")
-                && total > fail_after
-            {
-                return Err(SystemInstallError::Io("simulated device failure".into()));
+            // Nested rather than a `let` chain: chains need Rust 1.88 and this
+            // crate declares 1.85 as its minimum. The guard is still held for the
+            // whole statement, exactly as it was with the chain.
+            if let Some(fail_after) = *self.fail_after.lock().expect("fail lock") {
+                if total > fail_after {
+                    return Err(SystemInstallError::Io("simulated device failure".into()));
+                }
             }
             written.push(chunk.len());
             let mut file = OpenOptions::new()
