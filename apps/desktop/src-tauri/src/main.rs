@@ -1,11 +1,18 @@
 use rsetup_core::{
-    ActionError, ActionRun, ActionSpec, ActivityEvent, Controller, DeviceSnapshot, ExecutionPolicy,
-    FanCurveApplyResult, FanCurvePlan, FanCurveRequest, FanCurveStatus, GpioStatus, HardwareError,
-    LedStatus, OverlayApplyResult, OverlayPlan, OverlayStatus, ProbeMode, RgbLedConfig,
-    SourceApplyResult, SourceError, SourcePlan, SourceStatus, SpiFlashApplyResult, SpiFlashPlan,
-    SpiFlashRequest, SpiFlashStatus, ThermalStatus, VideoFrame, VideoStatus,
+    ActionError, ActionRun, ActionSpec, ActivityEvent, BlockDeviceBackend, Controller,
+    DeviceSnapshot, ExecutionPolicy, FanCurveApplyResult, FanCurvePlan, FanCurveRequest,
+    FanCurveStatus, GpioStatus, HardwareError, LedStatus, OverlayApplyResult, OverlayPlan,
+    OverlayStatus, ProbeMode, RgbLedConfig, SourceApplyResult, SourceError, SourcePlan,
+    SourceStatus, SpiFlashApplyResult, SpiFlashPlan, SpiFlashRequest, SpiFlashStatus,
+    SyntheticBackend, SystemBlockBackend, SystemImageOpener, SystemInstallApplyResult,
+    SystemInstallError, SystemInstallManager, SystemInstallPartition, SystemInstallPlan,
+    SystemInstallRequest, SystemInstallTarget, SystemMount, ThermalStatus, VideoFrame, VideoStatus,
 };
 use serde::Serialize;
+use std::{
+    path::{Path as FsPath, PathBuf},
+    sync::{Arc, OnceLock},
+};
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -54,6 +61,29 @@ impl From<SourceError> for CommandError {
             SourceError::AuthorizationCanceled => "authorization_canceled",
             SourceError::Authorization(_) => "authorization_failed",
             SourceError::Io(_) => "internal_error",
+        };
+        Self {
+            code,
+            message: error.to_string(),
+        }
+    }
+}
+
+/// Mirrors `crates/rsetup-app/src/main.rs::system_install_error_code`: the CLI,
+/// the HTTP surface, the TUI and this crate report one vocabulary.
+impl From<SystemInstallError> for CommandError {
+    fn from(error: SystemInstallError) -> Self {
+        let code = match &error {
+            SystemInstallError::Unsupported(_) => "install_unsupported",
+            SystemInstallError::InvalidInput(_) => "invalid_install_request",
+            SystemInstallError::ConfirmationRequired => "confirmation_required",
+            SystemInstallError::AcknowledgementMismatch { .. } => "acknowledgement_mismatch",
+            SystemInstallError::PlanRequired => "plan_required",
+            SystemInstallError::StalePlan => "stale_plan",
+            SystemInstallError::RootRequired => "root_required",
+            SystemInstallError::Conflict(_) => "install_conflict",
+            SystemInstallError::RunningSystem(_) => "writes_running_system",
+            SystemInstallError::Io(_) => "internal_error",
         };
         Self {
             code,
@@ -326,6 +356,323 @@ async fn storage_status(
         .map_err(CommandError::from)
 }
 
+// ---------------------------------------------------------------------------
+// System image install: a fixed image catalogue and an explicit live selection
+// ---------------------------------------------------------------------------
+
+/// Directory the desktop shell may read install images from. The UI never submits
+/// a filesystem path: it submits an id, and only a plain file name inside this
+/// directory is accepted. Mirrors the HTTP surface in `crates/rsetup-app`.
+const DEFAULT_IMAGE_DIRECTORY: &str = "/var/lib/rsetup-next/images";
+const IMAGE_DIRECTORY_ENV: &str = "RSETUP_IMAGE_DIR";
+
+/// Test-only override for the catalogue directory. `set_var` is process-wide and
+/// racy; this is set once, before the first app is built.
+static IMAGE_DIRECTORY_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+#[cfg(test)]
+fn set_image_directory(directory: PathBuf) {
+    let _ = IMAGE_DIRECTORY_OVERRIDE.set(directory);
+}
+
+fn image_directory() -> PathBuf {
+    if let Some(directory) = IMAGE_DIRECTORY_OVERRIDE.get() {
+        return directory.clone();
+    }
+    std::env::var_os(IMAGE_DIRECTORY_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_IMAGE_DIRECTORY))
+}
+
+/// Resolves an image id to a file inside the catalogue directory. Every way the
+/// UI could escape the directory is rejected, and the name has to look like an
+/// image before the core ever sees it.
+fn catalog_image_path(directory: &FsPath, image_id: &str) -> Result<PathBuf, SystemInstallError> {
+    let invalid = |detail: &str| SystemInstallError::InvalidInput(detail.to_owned());
+    if image_id.is_empty() {
+        return Err(invalid("an image id is required"));
+    }
+    if image_id.len() > 255 {
+        return Err(invalid("the image id is too long"));
+    }
+    if image_id.contains('/') || image_id.contains('\\') || image_id.chars().any(char::is_control) {
+        return Err(invalid(
+            "the image id must be a plain file name, not a path",
+        ));
+    }
+    if image_id == "." || image_id == ".." {
+        return Err(invalid(
+            "the image id must be a plain file name, not a path",
+        ));
+    }
+    if !(image_id.ends_with(".img") || image_id.ends_with(".img.xz")) {
+        return Err(invalid("the image id must end with .img or .img.xz"));
+    }
+    let path = directory.join(image_id);
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|error| invalid(&format!("no such image in the image directory: {error}")))?;
+    if !metadata.file_type().is_file() {
+        return Err(invalid(
+            "the image must be a regular file, not a symlink or a directory",
+        ));
+    }
+    std::fs::canonicalize(&path)
+        .map_err(|error| invalid(&format!("the image path cannot be resolved: {error}")))
+}
+
+/// Marker the refusing writer leaves behind: the core wraps a failed write into
+/// `Io(...)`, so the surface recognises its own refusal and reports the policy.
+const LIVE_REQUIRED_MARKER: &str = "live execution is not enabled on this surface";
+
+/// Refuses every write. The desktop shell never simulates a write, so the UI
+/// cannot mistake a simulated image write for a real one; reads still come from
+/// the real (or demo) provider, so the consequences it shows are real.
+struct RefusingWriter {
+    inner: Arc<dyn BlockDeviceBackend>,
+}
+
+impl BlockDeviceBackend for RefusingWriter {
+    fn targets(&self) -> Result<Vec<SystemInstallTarget>, SystemInstallError> {
+        self.inner.targets()
+    }
+
+    fn mounts(&self) -> Result<Vec<SystemMount>, SystemInstallError> {
+        self.inner.mounts()
+    }
+
+    fn write_chunk(
+        &self,
+        _target: &SystemInstallTarget,
+        _offset: u64,
+        _chunk: &[u8],
+    ) -> Result<(), SystemInstallError> {
+        Err(SystemInstallError::Unsupported(LIVE_REQUIRED_MARKER.into()))
+    }
+
+    fn reread_partitions(
+        &self,
+        _target: &SystemInstallTarget,
+    ) -> Result<Vec<SystemInstallPartition>, SystemInstallError> {
+        Err(SystemInstallError::Unsupported(
+            "live execution is not enabled on this surface; the partition table was not re-read"
+                .into(),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InstallMode {
+    /// Demo contract instead of the real devices.
+    synthetic: bool,
+    /// The controller's execution policy: the same value the CLI derives from
+    /// `--live-execution`. This crate never keeps a policy of its own.
+    live: bool,
+}
+
+fn install_manager(mode: InstallMode) -> SystemInstallManager {
+    let backend: Arc<dyn BlockDeviceBackend> = if mode.synthetic {
+        Arc::new(SyntheticBackend::default())
+    } else {
+        Arc::new(SystemBlockBackend::new(None))
+    };
+    let backend: Arc<dyn BlockDeviceBackend> = if mode.live {
+        backend
+    } else {
+        Arc::new(RefusingWriter { inner: backend })
+    };
+    SystemInstallManager::with_backend(backend, Arc::new(SystemImageOpener), mode.synthetic)
+}
+
+/// One core manager per app instance: an image token issued by `plan` is consumed
+/// by the same manager in `apply`, exactly as the CLI and the TUI do it in one
+/// session. Tokens stay opaque here — the core issues and checks them.
+struct InstallSurface {
+    controller: Controller,
+    image_directory: PathBuf,
+    mode: OnceLock<InstallMode>,
+    manager: OnceLock<SystemInstallManager>,
+}
+
+impl InstallSurface {
+    fn new(controller: Controller) -> Self {
+        Self {
+            controller,
+            image_directory: image_directory(),
+            mode: OnceLock::new(),
+            manager: OnceLock::new(),
+        }
+    }
+
+    /// The provider (demo or real) comes from the controller's own snapshot and
+    /// the write policy from its execution policy, so all four surfaces decide
+    /// this once, in the same place.
+    fn mode(&self) -> Result<InstallMode, CommandError> {
+        if let Some(mode) = self.mode.get() {
+            return Ok(*mode);
+        }
+        let synthetic = self
+            .controller
+            .snapshot()
+            .map_err(CommandError::internal)?
+            .synthetic;
+        let mode = InstallMode {
+            synthetic,
+            live: self.controller.policy() == ExecutionPolicy::Live,
+        };
+        let _ = self.mode.set(mode);
+        Ok(mode)
+    }
+
+    fn live_allowed(&self) -> Result<bool, CommandError> {
+        Ok(self.mode()?.live)
+    }
+
+    fn manager(&self) -> Result<&SystemInstallManager, CommandError> {
+        let mode = self.mode()?;
+        Ok(self.manager.get_or_init(|| install_manager(mode)))
+    }
+
+    /// Turns a UI supplied image id into the absolute catalogue path the core
+    /// validates. The core resolves ids only when a catalogue is configured, so
+    /// the surface resolves the id here and hands the core a path inside its own
+    /// fixed directory.
+    fn request(
+        &self,
+        target_id: &str,
+        image_id: &str,
+    ) -> Result<SystemInstallRequest, SystemInstallError> {
+        let image_path = catalog_image_path(&self.image_directory, image_id)?;
+        Ok(SystemInstallRequest {
+            target_id: target_id.to_owned(),
+            image_path: Some(image_path.display().to_string()),
+            // The id travels with the request so the plan can echo it back and a
+            // client can build its apply payload from the plan response alone.
+            // The core ignores it whenever a path is given, and the token binding
+            // uses the resolved path, size and hash — not this label — so the
+            // echoed id can never widen what may be written.
+            image_id: Some(image_id.to_owned()),
+        })
+    }
+
+    /// Maps a core error, recognising this surface's own write refusal so a dry
+    /// run reports the policy instead of "a partial image was written".
+    fn install_error(&self, error: SystemInstallError) -> CommandError {
+        if !self.live_allowed().unwrap_or(true) && error.to_string().contains(LIVE_REQUIRED_MARKER)
+        {
+            return CommandError {
+                code: "install_unsupported",
+                message: "Live execution is not enabled: restart the desktop shell with --live-execution to write an image. Nothing was written.".into(),
+            };
+        }
+        CommandError::from(error)
+    }
+
+    /// Only ids `apply` would accept are listed, so the UI cannot be handed an id
+    /// that would be rejected later.
+    fn catalog(&self) -> Vec<CatalogImage> {
+        let Ok(entries) = std::fs::read_dir(&self.image_directory) else {
+            return Vec::new();
+        };
+        let mut images = entries
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let id = entry.file_name().to_str()?.to_owned();
+                if catalog_image_path(&self.image_directory, &id).is_err() {
+                    return None;
+                }
+                Some(CatalogImage {
+                    id,
+                    size_bytes: entry.metadata().ok()?.len(),
+                })
+            })
+            .collect::<Vec<_>>();
+        images.sort_by(|left, right| left.id.cmp(&right.id));
+        images
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogImage {
+    id: String,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InstallOptions {
+    /// Whether a write is permitted at all. When false the shell refuses the
+    /// write instead of simulating one.
+    live_allowed: bool,
+    targets: Vec<SystemInstallTarget>,
+    images: Vec<CatalogImage>,
+}
+
+#[tauri::command]
+async fn system_install_targets(
+    surface: tauri::State<'_, Arc<InstallSurface>>,
+) -> Result<InstallOptions, CommandError> {
+    let surface = surface.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let targets = surface
+            .manager()?
+            .targets()
+            .map_err(|error| surface.install_error(error))?;
+        Ok(InstallOptions {
+            live_allowed: surface.live_allowed()?,
+            targets,
+            images: surface.catalog(),
+        })
+    })
+    .await
+    .map_err(CommandError::internal)?
+}
+
+#[tauri::command]
+async fn system_install_plan(
+    surface: tauri::State<'_, Arc<InstallSurface>>,
+    target_id: String,
+    image_id: String,
+) -> Result<SystemInstallPlan, CommandError> {
+    let surface = surface.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let request = surface
+            .request(&target_id, &image_id)
+            .map_err(|error| surface.install_error(error))?;
+        surface
+            .manager()?
+            .plan(&request)
+            .map_err(|error| surface.install_error(error))
+    })
+    .await
+    .map_err(CommandError::internal)?
+}
+
+#[tauri::command]
+async fn system_install_apply(
+    surface: tauri::State<'_, Arc<InstallSurface>>,
+    target_id: String,
+    image_id: String,
+    plan_token: String,
+    acknowledgement: String,
+) -> Result<SystemInstallApplyResult, CommandError> {
+    let surface = surface.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let request = surface
+            .request(&target_id, &image_id)
+            .map_err(|error| surface.install_error(error))?;
+        // The token is opaque: it is the core's to issue and to check. The
+        // acknowledgement is judged inside the core, so the shell cannot drift
+        // from the CLI, the TUI or the HTTP surface.
+        surface
+            .manager()?
+            .apply_live(&request, &plan_token, &acknowledgement)
+            .map_err(|error| surface.install_error(error))
+    })
+    .await
+    .map_err(CommandError::internal)?
+}
+
 pub fn command_handler<R: tauri::Runtime>()
 -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
@@ -355,7 +702,10 @@ pub fn command_handler<R: tauri::Runtime>()
         capture_video_frame,
         thermal_status,
         apply_thermal_policy,
-        storage_status
+        storage_status,
+        system_install_targets,
+        system_install_plan,
+        system_install_apply
     ]
 }
 
@@ -390,8 +740,10 @@ fn main() {
     } else {
         from_env
     };
+    let install_surface = Arc::new(InstallSurface::new(controller.clone()));
     tauri::Builder::default()
         .manage(controller)
+        .manage(install_surface)
         .invoke_handler(command_handler())
         .run(tauri::generate_context!())
         .expect("failed to run rsetup desktop");
@@ -435,6 +787,9 @@ mod tests {
         "thermal_status",
         "apply_thermal_policy",
         "storage_status",
+        "system_install_targets",
+        "system_install_plan",
+        "system_install_apply",
     ];
 
     /// Commands that answer without arguments; they must return JSON directly.
@@ -451,6 +806,7 @@ mod tests {
         "video_status",
         "thermal_status",
         "storage_status",
+        "system_install_targets",
     ];
 
     fn mock_webview(controller: Controller) -> (tauri::App<tauri::test::MockRuntime>, MockWebview) {
@@ -464,8 +820,10 @@ mod tests {
                 tauri::utils::acl::ExecutionContext::Local,
             );
         }
+        let surface = Arc::new(InstallSurface::new(controller.clone()));
         let app = tauri::test::mock_builder()
             .manage(controller)
+            .manage(surface)
             .invoke_handler(command_handler())
             .build(context)
             .expect("mock desktop app builds");
@@ -671,6 +1029,223 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{command} is not dispatched: {error}"));
             assert!(!value.is_null(), "{command} answered with null");
         }
+    }
+
+    /// Fixture catalogue directory under `target/`, shared by every install test
+    /// in this process. Only plain files with an image name are listed, and the
+    /// core never sees a UI supplied path.
+    fn install_fixture_directory() -> PathBuf {
+        static DIRECTORY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        DIRECTORY
+            .get_or_init(|| {
+                let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../../target/desktop-install-tests");
+                std::fs::create_dir_all(&directory).expect("create the fixture directory");
+                let mut image = vec![0u8; 2 * 1024 * 1024];
+                image[510] = 0x55;
+                image[511] = 0xAA;
+                image[446 + 4] = 0x83;
+                image[446 + 8..446 + 12].copy_from_slice(&2048u32.to_le_bytes());
+                image[446 + 12..446 + 16].copy_from_slice(&1024u32.to_le_bytes());
+                std::fs::write(directory.join("demo.img"), &image)
+                    .expect("write the fixture image");
+                std::fs::write(directory.join("notes.txt"), b"not an image")
+                    .expect("write the non-image fixture");
+                // A second image, so "preview one, apply for another" is a real
+                // image change without mutating a fixture another test reads.
+                let mut other = vec![0u8; 4 * 1024 * 1024];
+                other[510] = 0x55;
+                other[511] = 0xAA;
+                other[446 + 4] = 0x83;
+                other[446 + 8..446 + 12].copy_from_slice(&2048u32.to_le_bytes());
+                other[446 + 12..446 + 16].copy_from_slice(&4096u32.to_le_bytes());
+                std::fs::write(directory.join("other.img"), &other)
+                    .expect("write the second fixture image");
+                set_image_directory(directory.clone());
+                directory
+            })
+            .clone()
+    }
+
+    #[test]
+    fn desktop_system_install_requires_an_acknowledgement() {
+        let directory = install_fixture_directory();
+        let (_app, webview) = demo_webview();
+
+        // The app never hides its policy: a dry-run shell says so up front.
+        let options = invoke(&webview, "system_install_targets", serde_json::json!({}))
+            .expect("system_install_targets dispatches");
+        assert_eq!(
+            options["liveAllowed"],
+            serde_json::json!(false),
+            "{options}"
+        );
+        let ids = options["images"]
+            .as_array()
+            .expect("images array")
+            .iter()
+            .map(|image| image["id"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec!["demo.img".to_string(), "other.img".to_string()],
+            "the catalogue listing is exactly what apply accepts: {options}"
+        );
+
+        // Only catalogue ids are accepted; a path or a traversal id is rejected by
+        // this crate, before the core is reached.
+        for image_id in [
+            "../demo.img",
+            "sub/demo.img",
+            "notes.txt",
+            "",
+            "/etc/passwd",
+        ] {
+            let error = invoke(
+                &webview,
+                "system_install_plan",
+                serde_json::json!({"targetId": "sda", "imageId": image_id}),
+            )
+            .expect_err(&format!("{image_id:?} must be rejected"));
+            assert_eq!(
+                error_code(&error),
+                "invalid_install_request",
+                "{image_id:?}: {error}"
+            );
+        }
+
+        let plan = invoke(
+            &webview,
+            "system_install_plan",
+            serde_json::json!({"targetId": "sda", "imageId": "demo.img"}),
+        )
+        .expect("system_install_plan dispatches");
+        let expected = std::fs::canonicalize(directory.join("demo.img")).unwrap();
+        assert_eq!(
+            plan["image"]["path"].as_str(),
+            Some(expected.display().to_string().as_str()),
+            "{plan}"
+        );
+        assert_eq!(plan["destroys"].as_array().unwrap().len(), 3, "{plan}");
+        let token = plan["planToken"].as_str().expect("plan token").to_string();
+
+        // A missing acknowledgement and a wrong one are the core's own verdicts.
+        for (acknowledgement, expected_code) in [
+            ("", "confirmation_required"),
+            ("true", "acknowledgement_mismatch"),
+            ("mmcblk0", "acknowledgement_mismatch"),
+        ] {
+            let error = invoke(
+                &webview,
+                "system_install_apply",
+                serde_json::json!({
+                    "targetId": "sda",
+                    "imageId": "demo.img",
+                    "planToken": token,
+                    "acknowledgement": acknowledgement
+                }),
+            )
+            .expect_err(&format!("{acknowledgement:?} must not confirm"));
+            assert_eq!(
+                error_code(&error),
+                expected_code,
+                "{acknowledgement:?}: {error}"
+            );
+        }
+
+        // Even the exact device name cannot write here: the shell refuses instead
+        // of simulating a write, so the UI cannot believe it installed a system.
+        let error = invoke(
+            &webview,
+            "system_install_apply",
+            serde_json::json!({
+                "targetId": "sda",
+                "imageId": "demo.img",
+                "planToken": token,
+                "acknowledgement": "sda"
+            }),
+        )
+        .expect_err("a dry-run shell refuses the write");
+        assert_eq!(error_code(&error), "install_unsupported", "{error}");
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|message| message.to_lowercase().contains("live execution")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn desktop_system_install_applies_with_the_live_policy() {
+        let _directory = install_fixture_directory();
+        // Demo provider plus the live policy: the write is real code but lands in
+        // the demo provider, never on a device.
+        let (_app, webview) = mock_webview(Controller::new(ProbeMode::Demo, ExecutionPolicy::Live));
+
+        let options = invoke(&webview, "system_install_targets", serde_json::json!({}))
+            .expect("system_install_targets dispatches");
+        assert_eq!(options["liveAllowed"], serde_json::json!(true), "{options}");
+
+        let plan = invoke(
+            &webview,
+            "system_install_plan",
+            serde_json::json!({"targetId": "sda", "imageId": "demo.img"}),
+        )
+        .expect("system_install_plan dispatches");
+        // The plan echoes the identity apply accepts, so the payload below is
+        // built from the response alone.
+        assert_eq!(plan["image"]["id"], serde_json::json!("demo.img"), "{plan}");
+        assert_eq!(plan["target"]["id"], serde_json::json!("sda"), "{plan}");
+        let token = plan["planToken"].as_str().expect("plan token").to_string();
+
+        let result = invoke(
+            &webview,
+            "system_install_apply",
+            serde_json::json!({
+                "targetId": plan["target"]["id"].clone(),
+                "imageId": plan["image"]["id"].clone(),
+                "planToken": token,
+                "acknowledgement": plan["target"]["id"].clone()
+            }),
+        )
+        .expect("the live policy writes into the demo provider");
+        assert_eq!(
+            result["bytesWritten"],
+            serde_json::json!(2 * 1024 * 1024),
+            "{result}"
+        );
+        assert_eq!(result["plan"]["image"]["id"], serde_json::json!("demo.img"));
+        assert_eq!(result["run"]["synthetic"], serde_json::json!(true));
+
+        // Preview one image, then apply for another: the token binds the image
+        // identity, so the write is refused instead of landing the wrong image.
+        let mismatch_plan = invoke(
+            &webview,
+            "system_install_plan",
+            serde_json::json!({"targetId": "sda", "imageId": "demo.img"}),
+        )
+        .expect("system_install_plan dispatches");
+        let error = invoke(
+            &webview,
+            "system_install_apply",
+            serde_json::json!({
+                "targetId": mismatch_plan["target"]["id"].clone(),
+                "imageId": "other.img",
+                "planToken": mismatch_plan["planToken"].clone(),
+                "acknowledgement": mismatch_plan["target"]["id"].clone()
+            }),
+        )
+        .expect_err("an image change invalidates the plan");
+        assert_eq!(error_code(&error), "stale_plan", "{error}");
+
+        // The core's running-system gate holds over IPC too.
+        let error = invoke(
+            &webview,
+            "system_install_plan",
+            serde_json::json!({"targetId": "mmcblk1", "imageId": "demo.img"}),
+        )
+        .expect_err("the boot device is refused");
+        assert_eq!(error_code(&error), "writes_running_system", "{error}");
     }
 
     #[test]

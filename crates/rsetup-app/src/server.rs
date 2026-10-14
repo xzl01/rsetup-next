@@ -1,6 +1,6 @@
 use anyhow::Result;
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, Query, Request, State},
     http::{StatusCode, header},
     middleware::{self, Next},
@@ -8,14 +8,21 @@ use axum::{
     routing::{get, post},
 };
 use rsetup_core::{
-    ActionRun, ActionSpec, ActivityEvent, Controller, DeviceSnapshot, FanCurveApplyResult,
-    FanCurvePlan, FanCurveRequest, FanCurveStatus, GpioStatus, LedStatus, OverlayApplyResult,
-    OverlayPlan, OverlayStatus, RgbLedConfig, SourceApplyResult, SourcePlan, SourceStatus,
-    SpiFlashApplyResult, SpiFlashPlan, SpiFlashRequest, SpiFlashStatus, StorageStatus,
-    ThermalStatus, VideoFrame, VideoStatus,
+    ActionRun, ActionSpec, ActivityEvent, BlockDeviceBackend, Controller, DeviceSnapshot,
+    ExecutionPolicy, FanCurveApplyResult, FanCurvePlan, FanCurveRequest, FanCurveStatus,
+    GpioStatus, LedStatus, OverlayApplyResult, OverlayPlan, OverlayStatus, RgbLedConfig,
+    SourceApplyResult, SourcePlan, SourceStatus, SpiFlashApplyResult, SpiFlashPlan,
+    SpiFlashRequest, SpiFlashStatus, StorageStatus, SyntheticBackend, SystemBlockBackend,
+    SystemImageOpener, SystemInstallApplyResult, SystemInstallError, SystemInstallManager,
+    SystemInstallPartition, SystemInstallPlan, SystemInstallRequest, SystemInstallTarget,
+    SystemMount, ThermalStatus, VideoFrame, VideoStatus,
 };
-use serde::Deserialize;
-use std::{net::SocketAddr, sync::Arc};
+use serde::{Deserialize, Serialize};
+use std::{
+    net::SocketAddr,
+    path::{Path as FsPath, PathBuf},
+    sync::{Arc, OnceLock},
+};
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 
@@ -192,7 +199,11 @@ pub fn router(controller: Controller) -> Router {
             post(apply_fan_curve),
         )
         .route("/api/v1/hardware/storage", get(storage_status))
+        .route("/api/v1/storage/install/targets", get(install_targets))
+        .route("/api/v1/storage/install/plan", post(plan_system_install))
+        .route("/api/v1/storage/install/apply", post(apply_system_install))
         .route("/api/v1/activity", get(activity))
+        .layer(Extension(Arc::new(InstallSurface::new(controller.clone()))))
         .layer(middleware::from_fn(local_boundary))
         .layer(TraceLayer::new_for_http())
         .with_state(Arc::new(controller))
@@ -723,6 +734,334 @@ async fn storage_status(
     .await
 }
 
+// ---------------------------------------------------------------------------
+// System image install: a fixed image catalogue and an explicit live selection
+// ---------------------------------------------------------------------------
+
+/// Directory the surfaces may read install images from. A client never submits a
+/// filesystem path; it submits an id, and only a plain file name inside this
+/// directory is accepted.
+const DEFAULT_IMAGE_DIRECTORY: &str = "/var/lib/rsetup-next/images";
+const IMAGE_DIRECTORY_ENV: &str = "RSETUP_IMAGE_DIR";
+
+/// Test-only override for the catalogue directory. `set_var` is process-wide and
+/// racy; this is set once, before the first router is built.
+static IMAGE_DIRECTORY_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Test-only: point the catalogue at a fixture directory. The first call wins.
+#[cfg(test)]
+fn set_image_directory(directory: PathBuf) {
+    let _ = IMAGE_DIRECTORY_OVERRIDE.set(directory);
+}
+
+fn image_directory() -> PathBuf {
+    if let Some(directory) = IMAGE_DIRECTORY_OVERRIDE.get() {
+        return directory.clone();
+    }
+    std::env::var_os(IMAGE_DIRECTORY_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_IMAGE_DIRECTORY))
+}
+
+/// Resolves an image id to a file inside the catalogue directory. Every way a
+/// browser could escape the directory is rejected, and the name has to look like
+/// an image before the core ever sees it.
+fn catalog_image_path(directory: &FsPath, image_id: &str) -> Result<PathBuf, SystemInstallError> {
+    let invalid = |detail: &str| SystemInstallError::InvalidInput(detail.to_owned());
+    if image_id.is_empty() {
+        return Err(invalid("an image id is required"));
+    }
+    if image_id.len() > 255 {
+        return Err(invalid("the image id is too long"));
+    }
+    if image_id.contains('/') || image_id.contains('\\') || image_id.chars().any(char::is_control) {
+        return Err(invalid(
+            "the image id must be a plain file name, not a path",
+        ));
+    }
+    if image_id == "." || image_id == ".." {
+        return Err(invalid(
+            "the image id must be a plain file name, not a path",
+        ));
+    }
+    if !(image_id.ends_with(".img") || image_id.ends_with(".img.xz")) {
+        return Err(invalid("the image id must end with .img or .img.xz"));
+    }
+    let path = directory.join(image_id);
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|error| invalid(&format!("no such image in the image directory: {error}")))?;
+    if !metadata.file_type().is_file() {
+        return Err(invalid(
+            "the image must be a regular file, not a symlink or a directory",
+        ));
+    }
+    std::fs::canonicalize(&path)
+        .map_err(|error| invalid(&format!("the image path cannot be resolved: {error}")))
+}
+
+/// Marker the refusing writer leaves behind. The core wraps a failed write into
+/// `Io(...)` because it cannot know the writer refused on purpose, so the surface
+/// recognises its own refusal and reports the policy instead of a partial write.
+const LIVE_REQUIRED_MARKER: &str = "live execution is not enabled on this surface";
+
+/// Refuses every write. The HTTP and desktop surfaces never simulate a write, so
+/// a client cannot mistake a simulated image write for a real one; reads still
+/// come from the real (or demo) provider, so the consequences it shows are real.
+struct RefusingWriter {
+    inner: Arc<dyn BlockDeviceBackend>,
+}
+
+impl BlockDeviceBackend for RefusingWriter {
+    fn targets(&self) -> Result<Vec<SystemInstallTarget>, SystemInstallError> {
+        self.inner.targets()
+    }
+
+    fn mounts(&self) -> Result<Vec<SystemMount>, SystemInstallError> {
+        self.inner.mounts()
+    }
+
+    fn write_chunk(
+        &self,
+        _target: &SystemInstallTarget,
+        _offset: u64,
+        _chunk: &[u8],
+    ) -> Result<(), SystemInstallError> {
+        Err(SystemInstallError::Unsupported(LIVE_REQUIRED_MARKER.into()))
+    }
+
+    fn reread_partitions(
+        &self,
+        _target: &SystemInstallTarget,
+    ) -> Result<Vec<SystemInstallPartition>, SystemInstallError> {
+        Err(SystemInstallError::Unsupported(
+            "live execution is not enabled on this surface; the partition table was not re-read"
+                .into(),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InstallMode {
+    /// Demo contract instead of the real devices.
+    synthetic: bool,
+    /// The controller's execution policy: the same value the CLI derives from
+    /// `--live-execution`. The surfaces never keep a policy of their own.
+    live: bool,
+}
+
+fn install_manager(mode: InstallMode) -> SystemInstallManager {
+    let backend: Arc<dyn BlockDeviceBackend> = if mode.synthetic {
+        Arc::new(SyntheticBackend::default())
+    } else {
+        Arc::new(SystemBlockBackend::new(None))
+    };
+    let backend: Arc<dyn BlockDeviceBackend> = if mode.live {
+        backend
+    } else {
+        Arc::new(RefusingWriter { inner: backend })
+    };
+    SystemInstallManager::with_backend(backend, Arc::new(SystemImageOpener), mode.synthetic)
+}
+
+/// One core manager per router: an image token issued by `plan` is consumed by
+/// the same manager in `apply`, exactly as the CLI and the TUI do it in one
+/// session. Tokens stay opaque here — the core issues and checks them.
+struct InstallSurface {
+    controller: Controller,
+    image_directory: PathBuf,
+    mode: OnceLock<InstallMode>,
+    manager: OnceLock<SystemInstallManager>,
+}
+
+impl InstallSurface {
+    fn new(controller: Controller) -> Self {
+        Self {
+            controller,
+            image_directory: image_directory(),
+            mode: OnceLock::new(),
+            manager: OnceLock::new(),
+        }
+    }
+
+    /// The provider (demo or real) comes from the controller's own snapshot and
+    /// the write policy from its execution policy, so all four surfaces decide
+    /// this once, in the same place.
+    fn mode(&self) -> Result<InstallMode, ApiError> {
+        if let Some(mode) = self.mode.get() {
+            return Ok(*mode);
+        }
+        let synthetic = self
+            .controller
+            .snapshot()
+            .map_err(ApiError::internal)?
+            .synthetic;
+        let mode = InstallMode {
+            synthetic,
+            live: self.controller.policy() == ExecutionPolicy::Live,
+        };
+        let _ = self.mode.set(mode);
+        Ok(mode)
+    }
+
+    fn live_allowed(&self) -> Result<bool, ApiError> {
+        Ok(self.mode()?.live)
+    }
+
+    fn manager(&self) -> Result<&SystemInstallManager, ApiError> {
+        let mode = self.mode()?;
+        Ok(self.manager.get_or_init(|| install_manager(mode)))
+    }
+
+    /// Turns a client supplied image id into the absolute catalog path the core
+    /// validates. The core resolves ids only when a catalogue is configured, so
+    /// the surface resolves the id here and hands the core a path inside its own
+    /// fixed directory.
+    fn request(
+        &self,
+        target_id: &str,
+        image_id: &str,
+    ) -> Result<SystemInstallRequest, SystemInstallError> {
+        let image_path = catalog_image_path(&self.image_directory, image_id)?;
+        Ok(SystemInstallRequest {
+            target_id: target_id.to_owned(),
+            image_path: Some(image_path.display().to_string()),
+            // The id travels with the request so the plan can echo it back and a
+            // client can build its apply payload from the plan response alone.
+            // The core ignores it whenever a path is given, and the token binding
+            // uses the resolved path, size and hash — not this label — so the
+            // echoed id can never widen what may be written.
+            image_id: Some(image_id.to_owned()),
+        })
+    }
+
+    /// Maps a core error, recognising this surface's own write refusal so a dry
+    /// run reports the policy instead of "a partial image was written".
+    fn install_error(&self, error: SystemInstallError) -> ApiError {
+        if !self.live_allowed().unwrap_or(true) && error.to_string().contains(LIVE_REQUIRED_MARKER)
+        {
+            return ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "install_unsupported",
+                "Live execution is not enabled on this surface; restart with --live-execution to write an image. Nothing was written.".into(),
+            );
+        }
+        ApiError::from_install(error)
+    }
+
+    /// Only ids `apply` would accept are listed, so the UI cannot be handed an id
+    /// that would be rejected later.
+    fn catalog(&self) -> Vec<CatalogImage> {
+        let Ok(entries) = std::fs::read_dir(&self.image_directory) else {
+            return Vec::new();
+        };
+        let mut images = entries
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let id = entry.file_name().to_str()?.to_owned();
+                if catalog_image_path(&self.image_directory, &id).is_err() {
+                    return None;
+                }
+                Some(CatalogImage {
+                    id,
+                    size_bytes: entry.metadata().ok()?.len(),
+                })
+            })
+            .collect::<Vec<_>>();
+        images.sort_by(|left, right| left.id.cmp(&right.id));
+        images
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogImage {
+    id: String,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InstallOptions {
+    /// Whether a write is permitted at all. When false the surfaces refuse the
+    /// write instead of simulating one.
+    live_allowed: bool,
+    targets: Vec<SystemInstallTarget>,
+    images: Vec<CatalogImage>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InstallPlanRequest {
+    target_id: String,
+    image_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InstallApplyRequest {
+    target_id: String,
+    image_id: String,
+    plan_token: String,
+    /// The device name the user typed. It is passed to the core untouched: empty
+    /// is `confirmation_required`, a wrong name is `acknowledgement_mismatch`,
+    /// and only the exact target name reaches the writer.
+    acknowledgement: String,
+}
+
+async fn install_targets(
+    Extension(surface): Extension<Arc<InstallSurface>>,
+) -> Result<Json<InstallOptions>, ApiError> {
+    blocking(move || {
+        let targets = surface
+            .manager()?
+            .targets()
+            .map_err(ApiError::from_install)?;
+        Ok(Json(InstallOptions {
+            live_allowed: surface.live_allowed()?,
+            targets,
+            images: surface.catalog(),
+        }))
+    })
+    .await
+}
+
+async fn plan_system_install(
+    Extension(surface): Extension<Arc<InstallSurface>>,
+    Json(request): Json<InstallPlanRequest>,
+) -> Result<Json<SystemInstallPlan>, ApiError> {
+    blocking(move || {
+        let install = surface
+            .request(&request.target_id, &request.image_id)
+            .map_err(ApiError::from_install)?;
+        surface
+            .manager()?
+            .plan(&install)
+            .map(Json)
+            .map_err(ApiError::from_install)
+    })
+    .await
+}
+
+async fn apply_system_install(
+    Extension(surface): Extension<Arc<InstallSurface>>,
+    Json(request): Json<InstallApplyRequest>,
+) -> Result<Json<SystemInstallApplyResult>, ApiError> {
+    blocking(move || {
+        let install = surface
+            .request(&request.target_id, &request.image_id)
+            .map_err(ApiError::from_install)?;
+        // The token is opaque: it is the core's to issue and to check. The
+        // acknowledgement is judged inside the core, so this surface cannot drift
+        // from the CLI or the TUI.
+        surface
+            .manager()?
+            .apply_live(&install, &request.plan_token, &request.acknowledgement)
+            .map(Json)
+            .map_err(|error| surface.install_error(error))
+    })
+    .await
+}
+
 struct ApiError {
     status: StatusCode,
     code: &'static str,
@@ -783,6 +1122,29 @@ impl ApiError {
             ),
             SourceError::Io(_) => Self::internal(error),
         }
+    }
+
+    /// The install codes come from `crate::system_install_error_code`, the same
+    /// table the CLI prints and the TUI shows, so a client reads one vocabulary
+    /// whichever door it came through.
+    fn from_install(error: SystemInstallError) -> Self {
+        let status = match &error {
+            SystemInstallError::Unsupported(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            SystemInstallError::InvalidInput(_) => StatusCode::BAD_REQUEST,
+            SystemInstallError::RootRequired => StatusCode::FORBIDDEN,
+            SystemInstallError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            SystemInstallError::ConfirmationRequired
+            | SystemInstallError::AcknowledgementMismatch { .. }
+            | SystemInstallError::PlanRequired
+            | SystemInstallError::StalePlan
+            | SystemInstallError::Conflict(_)
+            | SystemInstallError::RunningSystem(_) => StatusCode::CONFLICT,
+        };
+        Self::new(
+            status,
+            crate::system_install_error_code(&error),
+            error.to_string(),
+        )
     }
 
     fn from_hardware(error: rsetup_core::HardwareError) -> Self {
@@ -868,6 +1230,711 @@ mod tests {
     fn community_qr_assets_are_embedded() {
         assert!(COMMUNITY_QQ.starts_with(b"RIFF"));
         assert!(COMMUNITY_WECHAT.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    /// The install routes share one process-wide back-pressure limiter (8
+    /// concurrent operations) and one fixture directory, so the install tests take
+    /// turns instead of racing each other for both. An async mutex because the
+    /// tests hold it across awaits.
+    static INSTALL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Fixture catalogue directory under `target/`, shared by every install test
+    /// in this process. Only plain files with an image name are listed, and the
+    /// core never sees a client supplied path.
+    fn install_fixture_directory() -> PathBuf {
+        static DIRECTORY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        DIRECTORY
+            .get_or_init(|| {
+                let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../target/http-install-tests");
+                std::fs::create_dir_all(&directory).expect("create the fixture directory");
+                let mut image = vec![0u8; 2 * 1024 * 1024];
+                image[510] = 0x55;
+                image[511] = 0xAA;
+                image[446 + 4] = 0x83;
+                image[446 + 8..446 + 12].copy_from_slice(&2048u32.to_le_bytes());
+                image[446 + 12..446 + 16].copy_from_slice(&1024u32.to_le_bytes());
+                std::fs::write(directory.join("demo.img"), &image)
+                    .expect("write the fixture image");
+                std::fs::write(directory.join("notes.txt"), b"not an image")
+                    .expect("write the non-image fixture");
+                // A second image, identical in shape but different in content, so a
+                // plan for one and an apply for the other is a real image change
+                // without mutating a fixture another test may be reading.
+                let mut other = vec![0u8; 4 * 1024 * 1024];
+                other[510] = 0x55;
+                other[511] = 0xAA;
+                other[446 + 4] = 0x83;
+                other[446 + 8..446 + 12].copy_from_slice(&2048u32.to_le_bytes());
+                other[446 + 12..446 + 16].copy_from_slice(&4096u32.to_le_bytes());
+                std::fs::write(directory.join("other.img"), &other)
+                    .expect("write the second fixture image");
+                set_image_directory(directory.clone());
+                directory
+            })
+            .clone()
+    }
+
+    fn install_call(
+        method: &str,
+        uri: &str,
+        body: serde_json::Value,
+        request_header: bool,
+    ) -> Request<axum::body::Body> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", "127.0.0.1:8788")
+            .header("content-type", "application/json");
+        if request_header {
+            builder = builder.header("x-rsetup-request", "1");
+        }
+        builder
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    async fn install_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn install_plan_token(
+        app: &Router,
+        target_id: &str,
+        image_id: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        use tower::ServiceExt;
+        let response = app
+            .clone()
+            .oneshot(install_call(
+                "POST",
+                "/api/v1/storage/install/plan",
+                serde_json::json!({"targetId": target_id, "imageId": image_id}),
+                true,
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        (status, install_json(response).await)
+    }
+
+    #[tokio::test]
+    async fn install_targets_reports_the_policy_and_the_fixed_catalogue() {
+        let _guard = INSTALL_TEST_LOCK.lock().await;
+        use tower::ServiceExt;
+
+        let directory = install_fixture_directory();
+        let app = router(Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun));
+        let response = app
+            .oneshot(install_call(
+                "GET",
+                "/api/v1/storage/install/targets",
+                serde_json::json!({}),
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = install_json(response).await;
+
+        // DryRun is the default: the surface says so before a client can try to
+        // write, so there is no silently live path.
+        assert_eq!(body["liveAllowed"], serde_json::json!(false));
+        let targets = body["targets"].as_array().expect("targets array");
+        assert!(targets.iter().any(|target| target["id"] == "sda"), "{body}");
+        assert!(
+            targets.iter().any(|target| target["id"] == "mmcblk1"
+                && target["holdsRunningSystem"] == serde_json::json!(true)),
+            "{body}"
+        );
+        // Only catalogue images are offered: the non-image file is not listed.
+        let ids = body["images"]
+            .as_array()
+            .expect("images array")
+            .iter()
+            .map(|image| image["id"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec!["demo.img".to_string(), "other.img".to_string()],
+            "the catalogue listing is exactly what apply accepts: {body}"
+        );
+        assert!(directory.join("demo.img").is_file());
+    }
+
+    #[tokio::test]
+    async fn install_plan_uses_only_the_fixed_catalogue() {
+        let _guard = INSTALL_TEST_LOCK.lock().await;
+        let directory = install_fixture_directory();
+        let app = router(Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun));
+
+        let (status, plan) = install_plan_token(&app, "sda", "demo.img").await;
+        assert_eq!(status, StatusCode::OK, "{plan}");
+        let expected = std::fs::canonicalize(directory.join("demo.img")).unwrap();
+        assert_eq!(
+            plan["image"]["path"].as_str(),
+            Some(expected.display().to_string().as_str()),
+            "the plan points at the catalogue file, {plan}"
+        );
+        assert_eq!(plan["target"]["path"], serde_json::json!("/dev/sda"));
+        assert_eq!(plan["destroys"].as_array().unwrap().len(), 3);
+        assert!(
+            plan["image"]["sha256Prefix"]
+                .as_str()
+                .is_some_and(|value| value.len() == 64),
+            "{plan}"
+        );
+        let warnings = plan["warnings"].as_array().unwrap();
+        assert!(
+            warnings.contains(&serde_json::json!(
+                "writing_an_image_replaces_every_partition_on_the_target"
+            )),
+            "{plan}"
+        );
+        assert!(
+            warnings.contains(&serde_json::json!("the_write_cannot_be_rolled_back")),
+            "{plan}"
+        );
+
+        // A client cannot smuggle a path in: an unknown field is ignored, and the
+        // plan still points inside the catalogue directory.
+        use tower::ServiceExt;
+        let response = app
+            .oneshot(install_call(
+                "POST",
+                "/api/v1/storage/install/plan",
+                serde_json::json!({
+                    "targetId": "sda",
+                    "imageId": "demo.img",
+                    "imagePath": "/etc/passwd"
+                }),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let plan = install_json(response).await;
+        assert_eq!(
+            plan["image"]["path"].as_str(),
+            Some(expected.display().to_string().as_str()),
+            "{plan}"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_plan_rejects_ids_that_escape_the_catalogue() {
+        let _guard = INSTALL_TEST_LOCK.lock().await;
+        use tower::ServiceExt;
+
+        let _directory = install_fixture_directory();
+        let app = router(Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun));
+        for image_id in [
+            "",
+            ".",
+            "..",
+            "../demo.img",
+            "../../etc/passwd",
+            "sub/demo.img",
+            "demo.img/..",
+            "notes.txt",
+            "/etc/passwd",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(install_call(
+                    "POST",
+                    "/api/v1/storage/install/plan",
+                    serde_json::json!({"targetId": "sda", "imageId": image_id}),
+                    true,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "image id {image_id:?} must be rejected"
+            );
+            let body = install_json(response).await;
+            assert_eq!(
+                body["error"]["code"],
+                serde_json::json!("invalid_install_request"),
+                "image id {image_id:?}: {body}"
+            );
+        }
+        // A catalogue name that simply does not exist is rejected as well.
+        let response = app
+            .oneshot(install_call(
+                "POST",
+                "/api/v1/storage/install/plan",
+                serde_json::json!({"targetId": "sda", "imageId": "absent.img"}),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn install_routes_keep_the_local_boundary_and_stay_mutations() {
+        let _guard = INSTALL_TEST_LOCK.lock().await;
+        use tower::ServiceExt;
+
+        let _directory = install_fixture_directory();
+        let app = router(Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun));
+
+        // The destructive route is a POST behind the non-simple request header,
+        // exactly like every other mutation.
+        for uri in [
+            "/api/v1/storage/install/plan",
+            "/api/v1/storage/install/apply",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(install_call(
+                    "POST",
+                    uri,
+                    serde_json::json!({"targetId": "sda", "imageId": "demo.img"}),
+                    false,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
+            let body = install_json(response).await;
+            assert_eq!(
+                body["error"]["code"],
+                serde_json::json!("request_forbidden")
+            );
+        }
+
+        // It is not reachable through a read-only method either.
+        let response = app
+            .clone()
+            .oneshot(install_call(
+                "GET",
+                "/api/v1/storage/install/apply",
+                serde_json::json!({}),
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        // The read-only targets route answers without the header, but it only
+        // ever reports.
+        let response = app
+            .oneshot(install_call(
+                "GET",
+                "/api/v1/storage/install/targets",
+                serde_json::json!({}),
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn install_apply_checks_the_acknowledgement_in_the_core() {
+        let _guard = INSTALL_TEST_LOCK.lock().await;
+        use tower::ServiceExt;
+
+        let _directory = install_fixture_directory();
+        let app = router(Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun));
+        let (status, plan) = install_plan_token(&app, "sda", "demo.img").await;
+        assert_eq!(status, StatusCode::OK, "{plan}");
+        let token = plan["planToken"].as_str().expect("plan token").to_string();
+
+        for (acknowledgement, expected_code) in [
+            ("", "confirmation_required"),
+            ("   ", "confirmation_required"),
+            ("true", "acknowledgement_mismatch"),
+            ("yes", "acknowledgement_mismatch"),
+            ("sda1", "acknowledgement_mismatch"),
+            ("/dev/sda", "acknowledgement_mismatch"),
+            ("SDA", "acknowledgement_mismatch"),
+            ("mmcblk0", "acknowledgement_mismatch"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(install_call(
+                    "POST",
+                    "/api/v1/storage/install/apply",
+                    serde_json::json!({
+                        "targetId": "sda",
+                        "imageId": "demo.img",
+                        "planToken": token,
+                        "acknowledgement": acknowledgement
+                    }),
+                    true,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::CONFLICT,
+                "{acknowledgement:?}"
+            );
+            let body = install_json(response).await;
+            assert_eq!(
+                body["error"]["code"],
+                serde_json::json!(expected_code),
+                "{acknowledgement:?}: {body}"
+            );
+            if expected_code == "acknowledgement_mismatch" {
+                let message = body["error"]["message"].as_str().unwrap_or_default();
+                assert!(message.contains("sda"), "{acknowledgement:?}: {body}");
+            }
+        }
+    }
+
+    /// The gap this closes: everything an apply needs is in the plan response, so
+    /// a client never has to remember the id it picked.
+    #[tokio::test]
+    async fn an_apply_payload_built_from_the_plan_response_is_accepted() {
+        let _guard = INSTALL_TEST_LOCK.lock().await;
+        use tower::ServiceExt;
+
+        let directory = install_fixture_directory();
+        let app = router(Controller::new(ProbeMode::Demo, ExecutionPolicy::Live));
+
+        let response = app
+            .clone()
+            .oneshot(install_call(
+                "POST",
+                "/api/v1/storage/install/plan",
+                serde_json::json!({"targetId": "sda", "imageId": "demo.img"}),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let plan = install_json(response).await;
+        // The plan echoes the identity apply accepts, and the path it resolved.
+        assert_eq!(plan["image"]["id"], serde_json::json!("demo.img"), "{plan}");
+        assert_eq!(
+            plan["image"]["path"].as_str(),
+            Some(
+                std::fs::canonicalize(directory.join("demo.img"))
+                    .unwrap()
+                    .display()
+                    .to_string()
+                    .as_str()
+            ),
+            "{plan}"
+        );
+
+        // Build the apply payload from the plan response alone: no remembered id,
+        // no remembered path, no client side bookkeeping.
+        let payload = serde_json::json!({
+            "targetId": plan["target"]["id"].clone(),
+            "imageId": plan["image"]["id"].clone(),
+            "planToken": plan["planToken"].clone(),
+            "acknowledgement": plan["target"]["id"].clone(),
+        });
+        assert_eq!(payload["imageId"], serde_json::json!("demo.img"));
+        let response = app
+            .clone()
+            .oneshot(install_call(
+                "POST",
+                "/api/v1/storage/install/apply",
+                payload,
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let result = install_json(response).await;
+        assert_eq!(
+            result["bytesWritten"],
+            serde_json::json!(2 * 1024 * 1024),
+            "{result}"
+        );
+        assert_eq!(result["plan"]["image"]["id"], serde_json::json!("demo.img"));
+    }
+
+    /// The same end to end flow over a real socket: a loopback server is bound and
+    /// spoken to with a raw HTTP/1.1 request, so the middleware, the handlers and
+    /// the serialization are all the production ones. The client is blocking
+    /// (`std::net`), so the runtime keeps serving on its own worker threads.
+    #[test]
+    fn a_real_server_accepts_an_apply_payload_built_from_its_plan() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        fn post(
+            address: std::net::SocketAddr,
+            path: &str,
+            body: &serde_json::Value,
+        ) -> (u16, serde_json::Value) {
+            let mut stream = TcpStream::connect(address).expect("connect to the server");
+            let payload = body.to_string();
+            let request = format!(
+                "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nx-rsetup-request: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                address.port(),
+                payload.len()
+            );
+            stream
+                .write_all(request.as_bytes())
+                .expect("write the request");
+            let mut response = Vec::new();
+            stream
+                .read_to_end(&mut response)
+                .expect("read the response");
+            let text = String::from_utf8(response).expect("utf-8 response");
+            let (head, body) = text.split_once("\r\n\r\n").expect("response headers");
+            let status = head
+                .split_whitespace()
+                .nth(1)
+                .expect("status code")
+                .parse()
+                .expect("numeric status");
+            let value = serde_json::from_str(body)
+                .unwrap_or_else(|error| panic!("the response body must be JSON ({error}): {body}"));
+            (status, value)
+        }
+
+        let _directory = install_fixture_directory();
+        let app = router(Controller::new(ProbeMode::Demo, ExecutionPolicy::Live));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("build the test runtime");
+        // The same serialising lock the async install tests take.
+        let _guard = runtime.block_on(INSTALL_TEST_LOCK.lock());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+        let address = listener.local_addr().expect("bound address");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        // `from_std` registers with the reactor, so it has to run inside the
+        // runtime context.
+        let listener = runtime.block_on(async {
+            tokio::net::TcpListener::from_std(listener).expect("tokio listener")
+        });
+        let server = runtime.spawn(async move { axum::serve(listener, app).await });
+
+        let (status, plan) = post(
+            address,
+            "/api/v1/storage/install/plan",
+            &serde_json::json!({"targetId": "sda", "imageId": "demo.img"}),
+        );
+        assert_eq!(status, 200, "{plan}");
+        println!(
+            "PLAN RESPONSE FRAGMENT: {}",
+            serde_json::json!({
+                "target": {"id": plan["target"]["id"], "path": plan["target"]["path"]},
+                "image": {"id": plan["image"]["id"], "path": plan["image"]["path"],
+                          "sha256Prefix": plan["image"]["sha256Prefix"]},
+                "planToken": plan["planToken"],
+            })
+        );
+
+        // Everything below comes from the response above: no remembered id, no
+        // remembered path.
+        let (status, result) = post(
+            address,
+            "/api/v1/storage/install/apply",
+            &serde_json::json!({
+                "targetId": plan["target"]["id"].clone(),
+                "imageId": plan["image"]["id"].clone(),
+                "planToken": plan["planToken"].clone(),
+                "acknowledgement": plan["target"]["id"].clone(),
+            }),
+        );
+        assert_eq!(status, 200, "{result}");
+        assert_eq!(result["bytesWritten"], serde_json::json!(2 * 1024 * 1024));
+        assert_eq!(result["plan"]["image"]["id"], serde_json::json!("demo.img"));
+
+        // A plan whose image is then changed is refused.
+        let (status, second_plan) = post(
+            address,
+            "/api/v1/storage/install/plan",
+            &serde_json::json!({"targetId": "sda", "imageId": "demo.img"}),
+        );
+        assert_eq!(status, 200, "{second_plan}");
+        let (status, body) = post(
+            address,
+            "/api/v1/storage/install/apply",
+            &serde_json::json!({
+                "targetId": second_plan["target"]["id"].clone(),
+                "imageId": "other.img",
+                "planToken": second_plan["planToken"].clone(),
+                "acknowledgement": second_plan["target"]["id"].clone(),
+            }),
+        );
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["error"]["code"], serde_json::json!("stale_plan"));
+
+        server.abort();
+    }
+
+    /// The contrast case: preview one image, then apply for a different one. The
+    /// token binds the image identity, so the write is refused instead of landing
+    /// the wrong image.
+    #[tokio::test]
+    async fn a_plan_whose_image_changed_is_refused_on_apply() {
+        let _guard = INSTALL_TEST_LOCK.lock().await;
+        use tower::ServiceExt;
+
+        let directory = install_fixture_directory();
+        let app = router(Controller::new(ProbeMode::Demo, ExecutionPolicy::Live));
+        let response = app
+            .clone()
+            .oneshot(install_call(
+                "POST",
+                "/api/v1/storage/install/plan",
+                serde_json::json!({"targetId": "sda", "imageId": "demo.img"}),
+                true,
+            ))
+            .await
+            .unwrap();
+        let plan = install_json(response).await;
+        assert_eq!(plan["image"]["id"], serde_json::json!("demo.img"));
+
+        // A different catalogue image: same field shapes, different content.
+        let response = app
+            .clone()
+            .oneshot(install_call(
+                "POST",
+                "/api/v1/storage/install/apply",
+                serde_json::json!({
+                    "targetId": plan["target"]["id"].clone(),
+                    "imageId": "other.img",
+                    "planToken": plan["planToken"].clone(),
+                    "acknowledgement": plan["target"]["id"].clone(),
+                }),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = install_json(response).await;
+        assert_eq!(
+            body["error"]["code"],
+            serde_json::json!("stale_plan"),
+            "{body}"
+        );
+
+        // The same plan still applies the image it was made for, so the refusal
+        // above is about the changed image and not a burned token.
+        let response = app
+            .oneshot(install_call(
+                "POST",
+                "/api/v1/storage/install/apply",
+                serde_json::json!({
+                    "targetId": plan["target"]["id"].clone(),
+                    "imageId": plan["image"]["id"].clone(),
+                    "planToken": plan["planToken"].clone(),
+                    "acknowledgement": plan["target"]["id"].clone(),
+                }),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(directory.join("other.img").is_file());
+    }
+
+    #[tokio::test]
+    async fn install_apply_refuses_the_write_without_live_execution() {
+        let _guard = INSTALL_TEST_LOCK.lock().await;
+        use tower::ServiceExt;
+
+        let _directory = install_fixture_directory();
+        let app = router(Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun));
+        let (_, plan) = install_plan_token(&app, "sda", "demo.img").await;
+        let token = plan["planToken"].as_str().expect("plan token").to_string();
+
+        // A correct typed name still cannot write: this surface refuses instead of
+        // simulating, so a client can never mistake the answer for a real write.
+        let response = app
+            .clone()
+            .oneshot(install_call(
+                "POST",
+                "/api/v1/storage/install/apply",
+                serde_json::json!({
+                    "targetId": "sda",
+                    "imageId": "demo.img",
+                    "planToken": token,
+                    "acknowledgement": "sda"
+                }),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = install_json(response).await;
+        assert_eq!(
+            body["error"]["code"],
+            serde_json::json!("install_unsupported")
+        );
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.to_lowercase().contains("live execution")),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_apply_writes_when_the_policy_is_live() {
+        let _guard = INSTALL_TEST_LOCK.lock().await;
+        use tower::ServiceExt;
+
+        let _directory = install_fixture_directory();
+        // Demo provider plus the live policy: the write is real code but lands in
+        // the demo provider, never on a device.
+        let app = router(Controller::new(ProbeMode::Demo, ExecutionPolicy::Live));
+        let response = app
+            .clone()
+            .oneshot(install_call(
+                "GET",
+                "/api/v1/storage/install/targets",
+                serde_json::json!({}),
+                false,
+            ))
+            .await
+            .unwrap();
+        let options = install_json(response).await;
+        assert_eq!(options["liveAllowed"], serde_json::json!(true));
+
+        let (status, plan) = install_plan_token(&app, "sda", "demo.img").await;
+        assert_eq!(status, StatusCode::OK, "{plan}");
+        let token = plan["planToken"].as_str().expect("plan token").to_string();
+        let response = app
+            .clone()
+            .oneshot(install_call(
+                "POST",
+                "/api/v1/storage/install/apply",
+                serde_json::json!({
+                    "targetId": "sda",
+                    "imageId": "demo.img",
+                    "planToken": token,
+                    "acknowledgement": "sda"
+                }),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let result = install_json(response).await;
+        assert_eq!(
+            result["bytesWritten"],
+            serde_json::json!(2 * 1024 * 1024),
+            "{result}"
+        );
+        assert_eq!(result["run"]["synthetic"], serde_json::json!(true));
+
+        // The core's running-system gate holds over HTTP too.
+        let (_, plan) = install_plan_token(&app, "mmcblk1", "demo.img").await;
+        assert_eq!(
+            plan["error"]["code"],
+            serde_json::json!("writes_running_system"),
+            "{plan}"
+        );
     }
 
     #[tokio::test]
