@@ -327,6 +327,144 @@ pub struct StorageStatus {
     pub mmc: MmcStatus,
 }
 
+/// Physical kind of a mass-storage device. UFS and eMMC are onboard, an SD card
+/// is removable, and NVMe is an add-in module.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BlockDeviceKind {
+    Ufs,
+    Emmc,
+    Sd,
+    Nvme,
+    Other,
+}
+
+/// How the planned image file has to be read before writing.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum InstallImageFormat {
+    /// A plain disk image: the bytes in the file are the bytes on the device.
+    Raw,
+    /// An `.xz`-compressed disk image: needs a decompressor while streaming.
+    Xz,
+}
+
+/// One partition of a block device, or one entry of a disk image.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemInstallPartition {
+    pub name: String,
+    pub number: u32,
+    pub start_bytes: u64,
+    pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount_point: Option<String>,
+}
+
+/// A whole block device that an image could be written to.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemInstallTarget {
+    /// Kernel device name, e.g. `sda`. This is the name a user must type to confirm.
+    pub id: String,
+    /// Device node, e.g. `/dev/sda`.
+    pub path: String,
+    pub model: String,
+    pub size_bytes: u64,
+    pub kind: BlockDeviceKind,
+    /// Removable media (an SD card or a USB disk) as reported by the kernel.
+    pub removable: bool,
+    /// Whether the device itself, or one of its partitions, is mounted.
+    pub mounted: bool,
+    pub mount_points: Vec<String>,
+    /// The device carries the running root or boot filesystem. Writing it is
+    /// refused permanently; no confirmation can override it.
+    pub holds_running_system: bool,
+    pub partitions: Vec<SystemInstallPartition>,
+}
+
+/// The verified identity of the image that would be written.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemInstallImage {
+    /// Resolved absolute path of the image file.
+    pub path: String,
+    /// Catalog identifier, when the image came from a catalog instead of a path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub format: InstallImageFormat,
+    /// Size of the file on disk (compressed size for an `.xz` image).
+    pub size_bytes: u64,
+    /// Size of the bytes that would be written to the device.
+    pub uncompressed_bytes: u64,
+    /// SHA-256 over the first `prefix_bytes` of the file.
+    pub sha256_prefix: String,
+    pub prefix_bytes: u64,
+    /// Partition table kind of a raw image: `mbr` or `gpt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_table: Option<String>,
+    /// Partitions the image declares. Empty for an `.xz` image, whose inner
+    /// partition table can only be read after decompression.
+    pub partitions: Vec<SystemInstallPartition>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemInstallRequest {
+    pub target_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_id: Option<String>,
+}
+
+/// Everything a user must see before confirming an irreversible write.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemInstallPlan {
+    pub synthetic: bool,
+    /// Identity of the whole observed device state; any change invalidates plans.
+    pub revision: String,
+    pub plan_token: String,
+    pub created_at: DateTime<Utc>,
+    pub request: SystemInstallRequest,
+    pub target: SystemInstallTarget,
+    pub image: SystemInstallImage,
+    /// Existing partitions of the target that the write destroys.
+    pub destroys: Vec<SystemInstallPartition>,
+    pub warnings: Vec<String>,
+    pub requires_root: bool,
+    pub chunk_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SystemInstallVerificationState {
+    Matched,
+    Mismatched,
+    Unsupported,
+}
+
+/// Outcome of re-reading the partition table after the write.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemInstallVerification {
+    pub state: SystemInstallVerificationState,
+    pub expected: Vec<SystemInstallPartition>,
+    pub observed: Option<Vec<SystemInstallPartition>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemInstallApplyResult {
+    pub run: ActionRun,
+    pub plan: SystemInstallPlan,
+    pub bytes_written: u64,
+    pub verification: SystemInstallVerification,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

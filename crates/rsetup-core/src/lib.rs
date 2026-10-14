@@ -12,6 +12,7 @@ mod probe;
 mod sources;
 mod spi_flash;
 pub mod storage;
+mod system_install;
 mod transaction;
 mod video;
 
@@ -29,11 +30,14 @@ pub use hardware::{
 pub use health::{mmc_health_state, nvme_health_state};
 pub use mmc::{MmcError, MmcManager};
 pub use model::{
-    ActionRun, ActionSpec, ActionStatus, ActivityEvent, Alert, AlertLevel, Capability,
-    DeviceIdentity, DeviceSnapshot, HealthState, MetricSet, MmcDevice, MmcHealth, MmcStatus,
-    NetworkInterface, NvmeDevice, NvmeSmartLog, NvmeStatus, ProbeMetadata, ProbeMode, RiskLevel,
-    ServiceState, ServiceSummary, StorageMetric, StorageStatus, TelemetryError, TelemetryErrorKind,
-    TelemetryReadState, TelemetryStatus,
+    ActionRun, ActionSpec, ActionStatus, ActivityEvent, Alert, AlertLevel, BlockDeviceKind,
+    Capability, DeviceIdentity, DeviceSnapshot, HealthState, InstallImageFormat, MetricSet,
+    MmcDevice, MmcHealth, MmcStatus, NetworkInterface, NvmeDevice, NvmeSmartLog, NvmeStatus,
+    ProbeMetadata, ProbeMode, RiskLevel, ServiceState, ServiceSummary, StorageMetric,
+    StorageStatus, SystemInstallApplyResult, SystemInstallImage, SystemInstallPartition,
+    SystemInstallPlan, SystemInstallRequest, SystemInstallTarget, SystemInstallVerification,
+    SystemInstallVerificationState, TelemetryError, TelemetryErrorKind, TelemetryReadState,
+    TelemetryStatus,
 };
 pub use nvme::{NvmeError, NvmeManager};
 pub use probe::collect_snapshot;
@@ -47,3 +51,7 @@ pub use spi_flash::{
     SpiFlashRequest, SpiFlashStatus,
 };
 pub use storage::{StorageReader, SystemStorageReader};
+pub use system_install::{
+    BlockDeviceBackend, ImageOpener, SyntheticBackend, SystemBlockBackend, SystemImageOpener,
+    SystemInstallError, SystemInstallManager, SystemMount,
+};
