@@ -2271,15 +2271,42 @@ mod tests {
     /// "unsupported": a compressed image (the table was re-read, there was nothing
     /// to compare it against) and a host that cannot re-read a table at all.
     fn finished_install(locale: Locale, observed: bool) -> App {
+        finished_install_with(
+            locale,
+            rsetup_core::SystemInstallVerification {
+                state: SystemInstallVerificationState::Unsupported,
+                expected: Vec::new(),
+                observed: observed.then(|| {
+                    vec![rsetup_core::SystemInstallPartition {
+                        name: "sda1".into(),
+                        number: 1,
+                        start_bytes: 1024 * 1024,
+                        size_bytes: 4 * 1024 * 1024,
+                        mount_point: None,
+                    }]
+                }),
+                detail: Some(if observed {
+                    "the image is compressed and was not parsed before writing, so the re-read partition table was not compared".into()
+                } else {
+                    "this host cannot re-read partition tables".into()
+                }),
+            },
+        )
+    }
+
+    /// A finished write whose verification is supplied by the test.
+    fn finished_install_with(
+        locale: Locale,
+        verification: rsetup_core::SystemInstallVerification,
+    ) -> App {
         // A unique scratch name per call: these tests run in parallel in one
         // process, and a shared directory would be removed by whichever finishes
         // first.
         static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let scratch = install_scratch(&format!(
-            "verification-{}-{call}",
-            if observed { "compressed" } else { "platform" }
-        ));
+        // The counter alone makes the name unique; the shape no longer needs to be
+        // part of it.
+        let scratch = install_scratch(&format!("verification-{call}"));
         let image = scratch.join("system.img");
         std::fs::write(&image, install_image_bytes()).expect("write the fixture image");
         let (mut panel, _) = recording_panel();
@@ -2303,28 +2330,69 @@ mod tests {
                     .map(|plan| plan.plan_token.clone())
             )
         });
-        // Keep the run itself: a compressed image is a successful write, only the
-        // comparison is unavailable.
-        result.verification = rsetup_core::SystemInstallVerification {
-            state: SystemInstallVerificationState::Unsupported,
-            expected: Vec::new(),
-            observed: observed.then(|| {
-                vec![rsetup_core::SystemInstallPartition {
-                    name: "sda1".into(),
-                    number: 1,
-                    start_bytes: 1024 * 1024,
-                    size_bytes: 4 * 1024 * 1024,
-                    mount_point: None,
-                }]
-            }),
-            detail: Some(if observed {
-                "the image is compressed and was not parsed before writing, so the re-read partition table was not compared".into()
-            } else {
-                "this host cannot re-read partition tables".into()
-            }),
-        };
+        // Keep the run itself: the write is done, only the verification differs.
+        result.verification = verification;
         app.install.result = Some(result);
         app
+    }
+
+    /// The board's case, rendered: the kernel refused the re-read (EINVAL) after a
+    /// write that did complete. The panel must not print the mismatch wording, and
+    /// the honest reason has to reach the operator.
+    #[test]
+    fn a_failed_reread_is_rendered_as_unverified_not_as_a_mismatch() {
+        /// Compare on letters and digits only: the panel folds long lines and the
+        /// folds carry border cells between the halves.
+        fn letters(text: &str) -> String {
+            text.chars()
+                .filter(|character| character.is_alphanumeric())
+                .collect()
+        }
+        for locale in [Locale::En, Locale::ZhCn] {
+            let failed = render_app(
+                &mut finished_install_with(
+                    locale,
+                    rsetup_core::SystemInstallVerification {
+                        state: SystemInstallVerificationState::Unsupported,
+                        expected: Vec::new(),
+                        observed: None,
+                        detail: Some(
+                            "the kernel could not re-read the partition table of /dev/sda after the image was written, so the write could not be verified: unable to write the system image: the kernel did not re-read /dev/sda: Invalid argument (os error 22)".into(),
+                        ),
+                    },
+                ),
+                150,
+                60,
+            );
+            let failed_letters = letters(&failed);
+            for expected in [
+                "could not re-read the partition table of /dev/sda",
+                "after the image was written",
+                "could not be verified",
+                "did not re-read /dev/sda",
+                "Invalid argument (os error 22)",
+            ] {
+                assert!(
+                    failed_letters.contains(&letters(expected)),
+                    "{locale:?} must render {expected:?}: {failed}"
+                );
+            }
+            for forbidden in [
+                locale.text("install_verification_mismatched"),
+                "differs from the image",
+                locale.text("install_verification_compressed_not_compared"),
+            ] {
+                assert!(
+                    !failed_letters.contains(&letters(forbidden)),
+                    "{locale:?} must not render {forbidden:?}: {failed}"
+                );
+            }
+            // And it stays a success: the image was written.
+            assert!(
+                failed_letters.contains(&letters(locale.text("install_written"))),
+                "{failed}"
+            );
+        }
     }
 
     /// Both `Unsupported` shapes, rendered: the compressed image says why it could

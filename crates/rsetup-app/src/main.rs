@@ -2449,6 +2449,91 @@ mod tests {
         }
     }
 
+    /// The board's misleading line, at the CLI: a re-read that failed must not be
+    /// printed as a mismatch, while a genuine mismatch keeps its wording.
+    #[test]
+    fn a_failed_reread_is_not_printed_as_a_mismatch() {
+        let scratch = install_scratch("cli-reread-failure");
+        let image = scratch.join("system.img");
+        fs::write(&image, mbr_image()).expect("write image");
+        let manager = demo_install_manager(true);
+        let (result, _) = run_install(&manager, "sda", &image, Some("sda"), "", false);
+        let result = result.expect("the write runs");
+
+        for locale in [Locale::En, Locale::ZhCn] {
+            // What the board saw: the re-read failed, the write had completed.
+            let mut failed = result.clone();
+            failed.verification = rsetup_core::SystemInstallVerification {
+                state: SystemInstallVerificationState::Unsupported,
+                expected: Vec::new(),
+                observed: None,
+                detail: Some(
+                    "the kernel could not re-read the partition table of /dev/sda after the image was written, so the write could not be verified: unable to write the system image: the kernel did not re-read /dev/sda: Invalid argument (os error 22)".into(),
+                ),
+            };
+            let mut out = Vec::new();
+            write_install_result(&failed, locale, &mut out).expect("render the result");
+            let text = String::from_utf8(out).expect("utf-8");
+            assert!(
+                text.contains("could not re-read the partition table of /dev/sda"),
+                "{locale:?}: {text}"
+            );
+            assert!(
+                text.contains("after the image was written"),
+                "{locale:?} must say the write completed: {text}"
+            );
+            assert!(
+                text.contains("Invalid argument (os error 22)"),
+                "{locale:?} must carry the kernel's reason: {text}"
+            );
+            assert!(
+                !text.contains(locale.text("install_verification_mismatched")),
+                "{locale:?}: the board's misleading line must be gone: {text}"
+            );
+            assert!(!text.contains("DOES NOT match"), "{locale:?}: {text}");
+            assert!(
+                !text.contains("differs from the image"),
+                "{locale:?}: {text}"
+            );
+
+            // The genuine mismatch — the table was read and differs — is unchanged.
+            let mut mismatched = result.clone();
+            mismatched.verification = rsetup_core::SystemInstallVerification {
+                state: SystemInstallVerificationState::Mismatched,
+                expected: vec![rsetup_core::SystemInstallPartition {
+                    name: "sda1".into(),
+                    number: 1,
+                    start_bytes: 1024 * 1024,
+                    size_bytes: 4 * 1024 * 1024,
+                    mount_point: None,
+                }],
+                observed: Some(vec![rsetup_core::SystemInstallPartition {
+                    name: "p1".into(),
+                    number: 1,
+                    start_bytes: 4096,
+                    size_bytes: 8 * 1024 * 1024,
+                    mount_point: None,
+                }]),
+                detail: Some("the re-read partition table differs from the image".into()),
+            };
+            let mut out = Vec::new();
+            write_install_result(&mismatched, locale, &mut out).expect("render the result");
+            let text = String::from_utf8(out).expect("utf-8");
+            assert!(
+                text.contains(locale.text("install_verification_mismatched")),
+                "{locale:?} keeps the mismatch wording: {text}"
+            );
+            assert!(
+                text.contains("differs from the image"),
+                "{locale:?}: {text}"
+            );
+            assert!(
+                !text.contains("could not re-read"),
+                "{locale:?}: the two cases stay distinguishable: {text}"
+            );
+        }
+    }
+
     #[test]
     fn install_error_codes_are_stable_across_surfaces() {
         let cases: Vec<(SystemInstallError, &str)> = vec![

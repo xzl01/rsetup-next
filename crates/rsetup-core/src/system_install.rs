@@ -679,10 +679,19 @@ impl SystemInstallManager {
                 detail: Some(reason),
             },
             Err(error) => SystemInstallVerification {
-                state: SystemInstallVerificationState::Mismatched,
+                // The re-read itself failed, so nothing was compared at all.
+                // Claiming the table "does not match" would assert something the
+                // observation cannot support — a kernel refusing BLKRRPART with
+                // EINVAL on an image that was in fact written in full is exactly
+                // the case that exposed this. The write is already done (this runs
+                // after the sync), which the detail says too.
+                state: SystemInstallVerificationState::Unsupported,
                 expected: plan.image.partitions.clone(),
                 observed: None,
-                detail: Some(error.to_string()),
+                detail: Some(format!(
+                    "the kernel could not re-read the partition table of {} after the image was written, so the write could not be verified: {error}",
+                    plan.target.path
+                )),
             },
         }
     }
@@ -2103,6 +2112,8 @@ mod tests {
         Matches,
         Differs,
         Unsupported,
+        /// The kernel refuses the re-read itself (EINVAL on the board).
+        Fails,
     }
 
     /// Fixture backend: writes into an ordinary file under `target/`, and can be
@@ -2162,6 +2173,9 @@ mod tests {
             match *self.behavior.lock().expect("behavior lock") {
                 RereadBehavior::Unsupported => Err(SystemInstallError::Unsupported(
                     "the fixture host does not re-read partition tables".into(),
+                )),
+                RereadBehavior::Fails => Err(SystemInstallError::Io(
+                    "the kernel did not re-read /dev/sda: Invalid argument (os error 22)".into(),
                 )),
                 RereadBehavior::Differs => Ok(vec![SystemInstallPartition {
                     name: "p1".into(),
@@ -3110,6 +3124,83 @@ mod tests {
             mbr_partitions(8 * MIB),
             "the image layout is reported for comparison"
         );
+    }
+
+    /// The board's case: the kernel refused the re-read itself (EINVAL) on a
+    /// device whose image had just been written in full. That is "could not be
+    /// verified", never "does not match", and the two must stay distinguishable.
+    #[test]
+    fn a_failed_reread_is_unverified_and_not_a_mismatch() {
+        let harness = fixture("verify-reread-fails", boot_mounts(), RereadBehavior::Fails);
+        let image_bytes = mbr_image(2, 8 * MIB);
+        write_file(&harness.image, &image_bytes);
+        let plan = harness
+            .manager
+            .plan(&install_request(&harness.image))
+            .expect("plan");
+        let result = harness
+            .manager
+            .apply_live(&install_request(&harness.image), &plan.plan_token, "sda")
+            .expect("the write itself succeeds");
+
+        assert_eq!(
+            result.verification.state,
+            SystemInstallVerificationState::Unsupported,
+            "a failed re-read must not be reported as a mismatch: {result:?}"
+        );
+        assert!(result.verification.observed.is_none());
+        let detail = result.verification.detail.as_deref().unwrap_or_default();
+        assert!(detail.contains("could not re-read"), "{detail}");
+        assert!(detail.contains("/dev/sda"), "{detail}");
+        assert!(
+            detail.contains("Invalid argument (os error 22)"),
+            "the kernel's own reason is reported: {detail}"
+        );
+        assert!(
+            detail.contains("after the image was written"),
+            "the write completed and the detail says so: {detail}"
+        );
+        assert!(detail.contains("could not be verified"), "{detail}");
+        assert!(
+            !detail.contains("differs from the image"),
+            "the mismatch wording must not be reused here: {detail}"
+        );
+
+        // The write really did finish: the device holds the image.
+        assert_eq!(result.bytes_written, image_bytes.len() as u64);
+        assert_eq!(
+            &fs::read(&harness.device).expect("read the fixture device")[..image_bytes.len()],
+            &image_bytes[..],
+            "the image reached the device"
+        );
+        // And the run is a success, not the failure a mismatch reports.
+        assert_eq!(result.run.status, ActionStatus::Succeeded);
+        let output = result.run.output.clone().unwrap_or_default();
+        assert!(!output.contains("DOES NOT match"), "{output}");
+
+        // The genuine mismatch — the table was read and differs — keeps its own
+        // state, status and wording, so the two cases cannot be conflated.
+        let differs = fixture(
+            "verify-reread-differs",
+            boot_mounts(),
+            RereadBehavior::Differs,
+        );
+        let plan = differs
+            .manager
+            .plan(&install_request(&differs.image))
+            .expect("plan");
+        let mismatched = differs
+            .manager
+            .apply_live(&install_request(&differs.image), &plan.plan_token, "sda")
+            .expect("the write completes");
+        assert_eq!(
+            mismatched.verification.state,
+            SystemInstallVerificationState::Mismatched
+        );
+        assert_eq!(mismatched.run.status, ActionStatus::Failed);
+        assert!(mismatched.verification.observed.is_some());
+        assert_ne!(result.verification.state, mismatched.verification.state);
+        assert_ne!(result.verification.detail, mismatched.verification.detail);
     }
 
     #[test]
