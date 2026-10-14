@@ -454,9 +454,15 @@ Write complete
 ```
 
 - For a **raw `.img`** the last line reads
-  `the re-read partition table matches the image`. **Pending on-board** (the
-  Linux `BLKRRPART` re-read cannot run on the development host, where the line
-  reads `this host cannot re-read partition tables`).
+  `the re-read partition table matches the image` when the kernel re-read
+  succeeds. On the verified Cubie A7Z UFS (2026-10-14) the kernel **refused** the
+  re-read with `Invalid argument (os error 22)`, so the line reported
+  `the kernel could not re-read the partition table of /dev/sda after the image was written, so the write could not be verified: … Invalid argument (os error 22)`
+  instead — the honest wording since `a310400` (before that fix the same case was
+  reported as a mismatch). `blockdev --rereadpt /dev/sda` from a shell succeeded on
+  the same device, and the write was confirmed byte-identical by `dd` read-back;
+  see the `BLKRRPART` row in "What is verified today". The development host cannot
+  run the re-read at all and prints `this host cannot re-read partition tables`.
 - For a **compressed `.img.xz`** the layout is never read before writing, so
   there is nothing to compare: the run reports its verification state as
   `unsupported` and names that reason, rather than claiming a mismatch. The CLI
@@ -616,10 +622,10 @@ without output is not evidence.
 | TUI panel (entry, focus routing, consequence render, core-decided confirmation) | **Covered by tests** | `cargo test --workspace --locked` (app suite), including render and key-routing cases with a `TestBackend`. Not hand-driven here. |
 | Tauri commands (`system_install_targets/plan/apply`) | **Covered by tests** | Desktop crate tests: dispatch through the mock runtime, acknowledgement required, registry guard intact. The GUI was not launched here. |
 | Browser page (consequence list, typed-name gating, payload shape, per-code copy) | **Covered by tests** | `node --test ui/*.test.mjs` → 88 passed, 0 failed (twelve cases in `ui/system-install.test.mjs`). The page was not clicked through here. |
-| Real write to UFS/eMMC on a Cubie A7Z | **Verified on-board** (2026-10-14) | A 10 GiB image written to a 119.1 GiB UFS (4096-byte sectors) booted the board from that UFS and grew `sda3` from 9.5G to 118.6G — see the background note after step 5. The rows below still have no hardware run. |
+| Real write to UFS/eMMC on a Cubie A7Z | **Verified on-board** (2026-10-14) | A 10 GiB image written to a 119.1 GiB UFS (4096-byte sectors) booted the board from that UFS and grew `sda3` from 9.5G to 118.6G — see the background note after step 5. The rows still marked **Pending on-board** have no hardware run. |
 | Live write through the TUI, HTTP, Tauri, or Web surfaces on a board | **Pending on-board** | All four need live execution enabled on the host; never exercised on hardware. |
-| `BLKRRPART` re-read of a real device, and the post-write verification line | **Pending on-board** | Not executable on the development host. |
-| Removable-media warning, mount conflict against real `/proc/mounts` | **Pending on-board** | Detected by injected fixtures only. |
+| `BLKRRPART` re-read of a real device, and the post-write verification line | **Verified on-board** (2026-10-14) | Two writes to the Cubie A7Z UFS (119.1 GiB, 4096-byte sectors). The kernel **refused** the re-read with `Invalid argument (os error 22)` (EINVAL), so the post-write line read `the kernel could not re-read the partition table of /dev/sda after the image was written, so the write could not be verified: … Invalid argument (os error 22)` — the honest wording since `a310400`; before that fix the same case was reported as a mismatch. The write itself was confirmed by an independent read-back: `dd` of the first 64 MiB and the last 16 MiB was byte-identical to the decompressed image. `blockdev --rereadpt /dev/sda` from a shell succeeded on the same kernel, so the refusal is a property of this device, not of the image or this tool. |
+| Removable-media warning, mount conflict against real `/proc/mounts` | **Verified on-board** (partly) | Verified on the board: device enumeration against the board's real sysfs, and the running-system refusal driven by the real `/proc/mounts` (`mmcblk0` → `writes_running_system`). **Not** verified: a genuine mount conflict, where the target is not the running system but one of its partitions is mounted — that path is still covered by injected fixtures only. |
 | Recovery after an interrupted write | **Pending on-board** | The "no rollback" behaviour is tested with a failing fixture writer; the real recovery procedure is untested. |
 
 ## Device-level testing in CI

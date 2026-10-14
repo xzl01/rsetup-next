@@ -381,8 +381,14 @@ core 完成而非 CLI，因此该规则对后续的 TUI 与 API 同样成立。
   分区表校验: <见下>
 ```
 
-- **raw `.img`**：最后一行应为 `重读的分区表与镜像一致`。**待真机验证**——Linux 的
-  `BLKRRPART` 重读在开发主机上无法执行，那里显示的是 `当前主机无法重读分区表`。
+- **raw `.img`**：若内核重读成功，最后一行应为 `重读的分区表与镜像一致`。在本次验证的
+  Cubie A7Z UFS（2026-10-14）上，内核**拒绝**重读并返回 `Invalid argument (os error 22)`，
+  因此该行呈现为 `the kernel could not re-read the partition table of /dev/sda after the
+  image was written, so the write could not be verified: … Invalid argument (os error 22)`
+  —— 这是 `a310400` 之后的诚实文案（修复前同一情形会被误报为"不一致"）；同一设备上在
+  shell 里执行 `blockdev --rereadpt /dev/sda` 反而成功，且写入已由 `dd` 回读确认逐字节
+  相同（见"目前的验证范围"中的 `BLKRRPART` 一行）。开发主机根本无法执行该重读，那里显示
+  `当前主机无法重读分区表`。
 - **压缩 `.img.xz`**：压缩镜像在写入前从不读取布局，因此没有可比对的对象——运行会把校验
   状态报告为 `unsupported` 并给出原因，而**不是**声称“不一致”。CLI 与 TUI 会区分两种情形：
   压缩镜像打印压缩镜像专属文案并附上 core 给出的原因；而根本无法重读分区表的主机（非 Linux
@@ -517,10 +523,10 @@ sudo dd if=/dev/sda bs=1M count=4 status=none | sha256sum   # 必须完全相同
 | TUI 面板（入口、焦点路由、后果清单渲染、由 core 判定的确认） | **由测试覆盖** | `cargo test --workspace --locked`（app 套件）含 `TestBackend` 的渲染与按键路由用例；本文未手工驱动。 |
 | Tauri 命令（`system_install_targets/plan/apply`） | **由测试覆盖** | 桌面 crate 测试：经 mock 运行时真实派发、必须带 acknowledgement、注册表守卫完好。本文未启动 GUI。 |
 | 浏览器页面（后果清单、键入名称门控、payload 形状、逐码文案） | **由测试覆盖** | `node --test ui/*.test.mjs` → 88 passed、0 failed（其中 `ui/system-install.test.mjs` 12 个用例）。本文未在浏览器中点击。 |
-| 在 Cubie A7Z 上真实写入 UFS/eMMC | **已真机验证**（2026-10-14） | 把 10 GiB 镜像写入 119.1 GiB、4096 字节扇区的 UFS 后，板卡从该 UFS 启动，`sda3` 自动从 9.5G 增长到 118.6G——见步骤 5 之后的背景说明。以下各行仍无硬件运行记录。 |
+| 在 Cubie A7Z 上真实写入 UFS/eMMC | **已真机验证**（2026-10-14） | 把 10 GiB 镜像写入 119.1 GiB、4096 字节扇区的 UFS 后，板卡从该 UFS 启动，`sda3` 自动从 9.5G 增长到 118.6G——见步骤 5 之后的背景说明。仍标记 **待真机验证** 的各行仍无硬件运行记录。 |
 | 通过 TUI、HTTP、Tauri 或 Web 界面在板卡上真实写入 | **待真机验证** | 四者都需要在主机上启用 live 执行；从未在硬件上执行过。 |
-| 真实设备的 `BLKRRPART` 重读与写入后校验行 | **待真机验证** | 开发主机无法执行。 |
-| 可移动介质警告、对真实 `/proc/mounts` 的挂载冲突 | **待真机验证** | 目前仅由注入夹具覆盖。 |
+| 真实设备的 `BLKRRPART` 重读与写入后校验行 | **已真机验证**（2026-10-14） | 对 Cubie A7Z 的 UFS（119.1 GiB、4096 字节扇区）执行过两次写入：内核**拒绝**重读并返回 `Invalid argument (os error 22)`（EINVAL），因此写后校验行输出 `the kernel could not re-read the partition table of /dev/sda after the image was written, so the write could not be verified: … Invalid argument (os error 22)` —— 这是 `a310400` 之后的诚实文案（修复前同一情形被误报为"不一致"）。写入本身已由独立手段确认：`dd` 回读前 64 MiB 与末 16 MiB，与解压后的镜像逐字节相同。同一内核下在 shell 里执行 `blockdev --rereadpt /dev/sda` 反而成功，因此这是该设备的特性，不是镜像或本工具的问题。 |
+| 可移动介质警告、对真实 `/proc/mounts` 的挂载冲突 | **已真机验证**（部分） | 已验：对板卡真实 sysfs 的设备枚举；基于真实 `/proc/mounts` 的运行系统拒绝（`mmcblk0` → `writes_running_system`）。**未验**：目标不是运行系统、但其某分区已被挂载的真正 mount 冲突——该路径目前仍仅由注入夹具覆盖。 |
 | 写入中断后的恢复 | **待真机验证** | "不回滚"行为由失败夹具写入器测试；真实恢复流程未测试。 |
 
 ## CI 能否做设备级测试
