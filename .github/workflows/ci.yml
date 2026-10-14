@@ -73,8 +73,31 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@1.85.0
+      # The action installs 1.85.0 and makes it the default toolchain, which is
+      # how the rustup proxies on PATH come to answer with it. Nothing below
+      # relies on that inference any more: the version the shell actually
+      # resolves is printed and asserted, and the gate itself runs through the
+      # 1.85.0 cargo and rustc resolved by path. A newer compiler earlier in
+      # PATH (a Homebrew or distro rustc) would otherwise answer for 1.85 and
+      # let a 1.88-only construct through unnoticed.
+      - name: Assert the resolved toolchain is the minimum supported version
+        run: |
+          set -eu
+          rustc -vV
+          rustup show active-toolchain
+          for pair in "rustc 1.85." "cargo 1.85." "rustdoc 1.85."; do
+            name="${pair%% *}"
+            prefix="${pair#* }"
+            case "$("$name" --version)" in
+              "$prefix"*) ;;
+              *)
+                echo "::error::the MSRV job resolved $("$name" --version); expected $prefix"x
+                exit 1
+                ;;
+            esac
+          done
       - name: Test minimum supported Rust version
-        run: cargo test --workspace --locked
+        run: make msrv-check
 
   # apps/desktop/src-tauri is listed in Cargo.toml's `workspace.exclude`, so no
   # other job here ever compiles it: the workspace commands skip it and the
