@@ -225,6 +225,59 @@ impl Locale {
             (Self::ZhCn, "storage_nvme_enum_failed") => "NVMe 设备枚举失败",
             (Self::ZhCn, "storage_mmc_enum_failed") => "MMC 设备枚举失败",
             (Self::ZhCn, "storage_unknown") => "未知",
+            (Self::ZhCn, "install_plan_title") => "系统镜像写入预览",
+            (Self::ZhCn, "install_target") => "目标设备",
+            (Self::ZhCn, "install_capacity") => "容量",
+            (Self::ZhCn, "install_removable") => "可移动介质",
+            (Self::ZhCn, "install_mounted") => "已挂载",
+            (Self::ZhCn, "install_running_system") => "承载正在运行的系统",
+            (Self::ZhCn, "install_destroyed_partitions") => "将被清除的现有分区",
+            (Self::ZhCn, "install_no_partitions") => "无现有分区",
+            (Self::ZhCn, "install_partition_mounted_at") => "挂载于",
+            (Self::ZhCn, "install_image") => "镜像",
+            (Self::ZhCn, "install_image_format") => "格式",
+            (Self::ZhCn, "install_image_size") => "文件大小",
+            (Self::ZhCn, "install_image_uncompressed") => "写入大小",
+            (Self::ZhCn, "install_image_sha256") => "SHA-256（前 1 MiB）",
+            (Self::ZhCn, "install_partition_table") => "分区表",
+            (Self::ZhCn, "install_partition_table_unknown") => "未读取（压缩镜像）",
+            (Self::ZhCn, "install_requires_root") => "写入需要管理员授权",
+            (Self::ZhCn, "install_dry_run_notice") => {
+                "预演模式：不会写入任何设备；加 --live-execution 才会真正写入。"
+            }
+            (Self::ZhCn, "install_confirm_prompt") => "请键入目标设备名以确认写入",
+            (Self::ZhCn, "install_confirm_hint") => "必须与上面的目标设备名完全一致；留空即放弃。",
+            (Self::ZhCn, "install_not_a_terminal") => {
+                "标准输入不是终端：可以用 --acknowledge <设备名>，或把设备名通过管道输入。"
+            }
+            (Self::ZhCn, "install_written") => "写入完成",
+            (Self::ZhCn, "install_bytes_written") => "已写入字节",
+            (Self::ZhCn, "install_verification") => "分区表校验",
+            (Self::ZhCn, "install_verification_matched") => "重读的分区表与镜像一致",
+            (Self::ZhCn, "install_verification_mismatched") => "重读的分区表与镜像不一致",
+            (Self::ZhCn, "install_verification_unsupported") => "当前主机无法重读分区表",
+            (Self::ZhCn, "install_verification_compressed_not_compared") => {
+                "压缩镜像的布局未在写入前解析，因此未比较重读的分区表"
+            }
+            (Self::ZhCn, "install_synthetic_notice") => "演示目标：未写入任何真实设备",
+            (Self::ZhCn, "install_panel_title") => "系统镜像安装",
+            (Self::ZhCn, "install_step_targets") => "1 选择目标设备",
+            (Self::ZhCn, "install_step_image") => "2 镜像路径（绝对路径）",
+            (Self::ZhCn, "install_step_confirm") => "3 键入目标设备名确认",
+            (Self::ZhCn, "install_field_image") => "镜像路径",
+            (Self::ZhCn, "install_field_confirm") => "键入设备名",
+            (Self::ZhCn, "install_not_planned") => "请先按 Enter 载入写入计划",
+            (Self::ZhCn, "install_disabled") => "已禁用：键入的设备名尚未匹配目标",
+            (Self::ZhCn, "install_ready") => "可以写入：按 Enter 执行（不可回滚）",
+            (Self::ZhCn, "install_dry_run_ready") => {
+                "预演模式：按 Enter 只会模拟写入，不会触碰设备"
+            }
+            (Self::ZhCn, "install_no_targets") => "未检测到可写入的块设备",
+            (Self::ZhCn, "install_open_hint") => "I 系统镜像安装",
+            (Self::ZhCn, "install_panel_footer") => {
+                "TAB 切换字段  J/K 选择设备  ENTER 载入计划或执行  BACKSPACE 删除  ESC 返回"
+            }
+            (Self::ZhCn, "install_plan_hint") => "选择设备后按 Enter 载入计划",
             (_, "live_linux_only") => "live execution is only supported on Linux SBC hosts",
             (_, "not_available") => "n/a",
             (_, "synthetic_data") => "SYNTHETIC DATA",
@@ -334,6 +387,65 @@ impl Locale {
             (_, "storage_nvme_enum_failed") => "NVMe device enumeration failed",
             (_, "storage_mmc_enum_failed") => "MMC device enumeration failed",
             (_, "storage_unknown") => "Unknown",
+            (_, "install_plan_title") => "System image write preview",
+            (_, "install_target") => "Target device",
+            (_, "install_capacity") => "Capacity",
+            (_, "install_removable") => "Removable media",
+            (_, "install_mounted") => "Mounted",
+            (_, "install_running_system") => "Hosts the running system",
+            (_, "install_destroyed_partitions") => "Existing partitions destroyed",
+            (_, "install_no_partitions") => "No existing partitions",
+            (_, "install_partition_mounted_at") => "mounted at",
+            (_, "install_image") => "Image",
+            (_, "install_image_format") => "Format",
+            (_, "install_image_size") => "File size",
+            (_, "install_image_uncompressed") => "Write size",
+            (_, "install_image_sha256") => "SHA-256 (first 1 MiB)",
+            (_, "install_partition_table") => "Partition table",
+            (_, "install_partition_table_unknown") => "not read (compressed image)",
+            (_, "install_requires_root") => "Administrator authorization required",
+            (_, "install_dry_run_notice") => {
+                "Dry run: nothing is written; add --live-execution to write."
+            }
+            (_, "install_confirm_prompt") => "Type the target device name to confirm",
+            (_, "install_confirm_hint") => {
+                "It must match the target device name exactly; leave it empty to cancel."
+            }
+            (_, "install_not_a_terminal") => {
+                "Standard input is not a terminal: pass --acknowledge <device>, or pipe the device name in."
+            }
+            (_, "install_written") => "Write complete",
+            (_, "install_bytes_written") => "Bytes written",
+            (_, "install_verification") => "Partition table verification",
+            (_, "install_verification_matched") => "the re-read partition table matches the image",
+            (_, "install_verification_mismatched") => {
+                "the re-read partition table DOES NOT match the image"
+            }
+            (_, "install_verification_unsupported") => "this host cannot re-read partition tables",
+            (_, "install_verification_compressed_not_compared") => {
+                "the image is compressed, so its layout was not parsed before writing and the re-read table was not compared"
+            }
+            (_, "install_synthetic_notice") => "Synthetic target: no real device was written",
+            (_, "install_panel_title") => "System image install",
+            (_, "install_step_targets") => "1 Choose the target device",
+            (_, "install_step_image") => "2 Image path (absolute)",
+            (_, "install_step_confirm") => "3 Type the target device name to confirm",
+            (_, "install_field_image") => "Image path",
+            (_, "install_field_confirm") => "Type the device name",
+            (_, "install_not_planned") => "Press Enter to load the write plan first",
+            (_, "install_disabled") => {
+                "Disabled: the typed device name does not match the target yet"
+            }
+            (_, "install_ready") => "Ready: press Enter to write (no rollback)",
+            (_, "install_dry_run_ready") => {
+                "Dry run: Enter only simulates the write and never touches the device"
+            }
+            (_, "install_no_targets") => "No writable block device was detected",
+            (_, "install_open_hint") => "I system image install",
+            (_, "install_panel_footer") => {
+                "TAB field  J/K device  ENTER plan or write  BACKSPACE delete  ESC back"
+            }
+            (_, "install_plan_hint") => "Press Enter to load the plan for the selected device",
             _ => "",
         }
     }
@@ -616,6 +728,89 @@ impl Locale {
         }
     }
 
+    /// Localized message for a system-install failure. The stable code that goes
+    /// with it is locale-independent and lives in `main.rs`, so every surface
+    /// reports the same code.
+    pub fn install_error(self, error: &rsetup_core::SystemInstallError) -> String {
+        use rsetup_core::SystemInstallError;
+        if !self.is_zh() {
+            return error.to_string();
+        }
+        match error {
+            SystemInstallError::Unsupported(detail) => {
+                format!("当前系统无法安装系统镜像：{detail}")
+            }
+            SystemInstallError::InvalidInput(detail) => format!("无效的安装请求：{detail}"),
+            SystemInstallError::ConfirmationRequired => {
+                "写入系统镜像前需要键入目标设备名确认".into()
+            }
+            SystemInstallError::AcknowledgementMismatch {
+                expected,
+                target,
+                provided,
+            } => format!(
+                "输入的设备名与目标不一致：要写入 {target} 必须键入“{expected}”，收到的是“{provided}”"
+            ),
+            SystemInstallError::PlanRequired => "请先预览写入计划，再使用返回的计划令牌".into(),
+            SystemInstallError::StalePlan => "目标或镜像在预览后发生变化，请重新预览".into(),
+            SystemInstallError::RootRequired => "写入系统镜像需要管理员权限".into(),
+            SystemInstallError::Conflict(detail) => format!("目标无法写入：{detail}"),
+            SystemInstallError::RunningSystem(path) => {
+                format!("拒绝写入 {path}：它承载着正在运行的根或启动文件系统")
+            }
+            SystemInstallError::Io(detail) => format!("写入系统镜像失败：{detail}"),
+        }
+    }
+
+    pub fn install_warning(self, warning: &str) -> String {
+        match (self, warning) {
+            (Self::ZhCn, "writing_an_image_replaces_every_partition_on_the_target") => {
+                "写入会替换目标设备上的全部分区。".into()
+            }
+            (Self::ZhCn, "the_write_cannot_be_rolled_back") => "此写入无法回滚。".into(),
+            (Self::ZhCn, "the_target_is_removable_media") => {
+                "目标是可移动介质，请确认它就是要覆盖的设备。".into()
+            }
+            (Self::ZhCn, "the_image_is_compressed_and_is_decompressed_while_writing") => {
+                "镜像是压缩的，会在写入时解压（需要 xz）。".into()
+            }
+            (_, "writing_an_image_replaces_every_partition_on_the_target") => {
+                "Writing replaces every partition on the target.".into()
+            }
+            (_, "the_write_cannot_be_rolled_back") => "This write cannot be rolled back.".into(),
+            (_, "the_target_is_removable_media") => {
+                "The target is removable media; confirm it is the device to overwrite.".into()
+            }
+            (_, "the_image_is_compressed_and_is_decompressed_while_writing") => {
+                "The image is compressed and is decompressed while writing (requires xz).".into()
+            }
+            _ => warning.into(),
+        }
+    }
+
+    pub fn install_device_kind(self, kind: rsetup_core::BlockDeviceKind) -> &'static str {
+        use rsetup_core::BlockDeviceKind;
+        match kind {
+            BlockDeviceKind::Ufs => "UFS",
+            BlockDeviceKind::Emmc => "eMMC",
+            BlockDeviceKind::Sd => {
+                if self.is_zh() {
+                    "SD 卡"
+                } else {
+                    "SD card"
+                }
+            }
+            BlockDeviceKind::Nvme => "NVMe",
+            BlockDeviceKind::Other => {
+                if self.is_zh() {
+                    "其它"
+                } else {
+                    "Other"
+                }
+            }
+        }
+    }
+
     pub fn source_warning(self, warning: &str) -> String {
         match (self, warning) {
             (Self::ZhCn, "radxa_only") => {
@@ -689,6 +884,215 @@ mod tests {
             assert_eq!(Locale::ZhCn.text(key), zh, "ZhCn translation for {key}");
             assert_eq!(Locale::En.text(key), en, "En translation for {key}");
         }
+    }
+
+    /// The system-install vocabulary must exist in both locales: a key that is
+    /// only in one of them renders as an empty string on that surface.
+    #[test]
+    fn test_system_install_dictionary_keys() {
+        let expected = [
+            (
+                "install_plan_title",
+                "系统镜像写入预览",
+                "System image write preview",
+            ),
+            ("install_target", "目标设备", "Target device"),
+            ("install_capacity", "容量", "Capacity"),
+            ("install_removable", "可移动介质", "Removable media"),
+            ("install_mounted", "已挂载", "Mounted"),
+            (
+                "install_running_system",
+                "承载正在运行的系统",
+                "Hosts the running system",
+            ),
+            (
+                "install_destroyed_partitions",
+                "将被清除的现有分区",
+                "Existing partitions destroyed",
+            ),
+            (
+                "install_no_partitions",
+                "无现有分区",
+                "No existing partitions",
+            ),
+            ("install_partition_mounted_at", "挂载于", "mounted at"),
+            ("install_image", "镜像", "Image"),
+            ("install_image_format", "格式", "Format"),
+            ("install_image_size", "文件大小", "File size"),
+            ("install_image_uncompressed", "写入大小", "Write size"),
+            (
+                "install_image_sha256",
+                "SHA-256（前 1 MiB）",
+                "SHA-256 (first 1 MiB)",
+            ),
+            ("install_partition_table", "分区表", "Partition table"),
+            (
+                "install_partition_table_unknown",
+                "未读取（压缩镜像）",
+                "not read (compressed image)",
+            ),
+            (
+                "install_requires_root",
+                "写入需要管理员授权",
+                "Administrator authorization required",
+            ),
+            (
+                "install_dry_run_notice",
+                "预演模式：不会写入任何设备；加 --live-execution 才会真正写入。",
+                "Dry run: nothing is written; add --live-execution to write.",
+            ),
+            (
+                "install_confirm_prompt",
+                "请键入目标设备名以确认写入",
+                "Type the target device name to confirm",
+            ),
+            (
+                "install_confirm_hint",
+                "必须与上面的目标设备名完全一致；留空即放弃。",
+                "It must match the target device name exactly; leave it empty to cancel.",
+            ),
+            (
+                "install_not_a_terminal",
+                "标准输入不是终端：可以用 --acknowledge <设备名>，或把设备名通过管道输入。",
+                "Standard input is not a terminal: pass --acknowledge <device>, or pipe the device name in.",
+            ),
+            ("install_written", "写入完成", "Write complete"),
+            ("install_bytes_written", "已写入字节", "Bytes written"),
+            (
+                "install_verification",
+                "分区表校验",
+                "Partition table verification",
+            ),
+            (
+                "install_verification_matched",
+                "重读的分区表与镜像一致",
+                "the re-read partition table matches the image",
+            ),
+            (
+                "install_verification_mismatched",
+                "重读的分区表与镜像不一致",
+                "the re-read partition table DOES NOT match the image",
+            ),
+            (
+                "install_verification_unsupported",
+                "当前主机无法重读分区表",
+                "this host cannot re-read partition tables",
+            ),
+            (
+                "install_verification_compressed_not_compared",
+                "压缩镜像的布局未在写入前解析，因此未比较重读的分区表",
+                "the image is compressed, so its layout was not parsed before writing and the re-read table was not compared",
+            ),
+            (
+                "install_synthetic_notice",
+                "演示目标：未写入任何真实设备",
+                "Synthetic target: no real device was written",
+            ),
+            (
+                "install_panel_title",
+                "系统镜像安装",
+                "System image install",
+            ),
+            (
+                "install_step_targets",
+                "1 选择目标设备",
+                "1 Choose the target device",
+            ),
+            (
+                "install_step_image",
+                "2 镜像路径（绝对路径）",
+                "2 Image path (absolute)",
+            ),
+            (
+                "install_step_confirm",
+                "3 键入目标设备名确认",
+                "3 Type the target device name to confirm",
+            ),
+            ("install_field_image", "镜像路径", "Image path"),
+            (
+                "install_field_confirm",
+                "键入设备名",
+                "Type the device name",
+            ),
+            (
+                "install_not_planned",
+                "请先按 Enter 载入写入计划",
+                "Press Enter to load the write plan first",
+            ),
+            (
+                "install_disabled",
+                "已禁用：键入的设备名尚未匹配目标",
+                "Disabled: the typed device name does not match the target yet",
+            ),
+            (
+                "install_ready",
+                "可以写入：按 Enter 执行（不可回滚）",
+                "Ready: press Enter to write (no rollback)",
+            ),
+            (
+                "install_dry_run_ready",
+                "预演模式：按 Enter 只会模拟写入，不会触碰设备",
+                "Dry run: Enter only simulates the write and never touches the device",
+            ),
+            (
+                "install_no_targets",
+                "未检测到可写入的块设备",
+                "No writable block device was detected",
+            ),
+            (
+                "install_open_hint",
+                "I 系统镜像安装",
+                "I system image install",
+            ),
+            (
+                "install_panel_footer",
+                "TAB 切换字段  J/K 选择设备  ENTER 载入计划或执行  BACKSPACE 删除  ESC 返回",
+                "TAB field  J/K device  ENTER plan or write  BACKSPACE delete  ESC back",
+            ),
+            (
+                "install_plan_hint",
+                "选择设备后按 Enter 载入计划",
+                "Press Enter to load the plan for the selected device",
+            ),
+        ];
+        for (key, zh, en) in expected {
+            assert_eq!(Locale::ZhCn.text(key), zh, "ZhCn translation for {key}");
+            assert_eq!(Locale::En.text(key), en, "En translation for {key}");
+        }
+
+        for warning in [
+            "writing_an_image_replaces_every_partition_on_the_target",
+            "the_write_cannot_be_rolled_back",
+            "the_target_is_removable_media",
+            "the_image_is_compressed_and_is_decompressed_while_writing",
+        ] {
+            let zh = Locale::ZhCn.install_warning(warning);
+            let en = Locale::En.install_warning(warning);
+            assert!(
+                !zh.is_empty() && zh != warning,
+                "ZhCn warning for {warning}"
+            );
+            assert!(!en.is_empty() && en != warning, "En warning for {warning}");
+            assert_ne!(zh, en, "the warning is localized for {warning}");
+        }
+
+        use rsetup_core::BlockDeviceKind;
+        assert_eq!(
+            Locale::ZhCn.install_device_kind(BlockDeviceKind::Sd),
+            "SD 卡"
+        );
+        assert_eq!(
+            Locale::En.install_device_kind(BlockDeviceKind::Sd),
+            "SD card"
+        );
+        assert_eq!(
+            Locale::ZhCn.install_device_kind(BlockDeviceKind::Ufs),
+            "UFS"
+        );
+        assert_eq!(
+            Locale::En.install_device_kind(BlockDeviceKind::Other),
+            "Other"
+        );
     }
 
     #[test]
