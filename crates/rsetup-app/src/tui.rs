@@ -2336,54 +2336,6 @@ mod tests {
         app
     }
 
-    /// The same notice inside the TUI panel: it is part of the plan the operator
-    /// confirms, and it does not turn the write into a failure.
-    #[test]
-    fn the_backup_gpt_notice_is_rendered_in_the_panel() {
-        const NOTICE: &str = "the_backup_gpt_table_stays_at_the_end_of_the_image";
-        fn letters(text: &str) -> String {
-            text.chars()
-                .filter(|character| character.is_alphanumeric())
-                .collect()
-        }
-        let scratch = install_scratch("gpt-notice-panel");
-        let image = scratch.join("system.img");
-        std::fs::write(&image, install_image_bytes()).expect("write the fixture image");
-        for locale in [Locale::En, Locale::ZhCn] {
-            let (mut panel, _) = recording_panel();
-            panel.open_panel();
-            let mut app = demo_app(locale);
-            app.install = panel;
-            select_target(&mut app.install, "sda");
-            app.install.focus_next();
-            type_into(&mut app.install, &image.display().to_string());
-            app.install.confirm(&app.locale);
-            let plan = app
-                .install
-                .plan
-                .as_mut()
-                .expect("the plan is loaded before the notice can be shown");
-            assert!(
-                !plan.warnings.contains(&NOTICE.to_owned()),
-                "an MBR image says nothing about a backup GPT: {:?}",
-                plan.warnings
-            );
-            plan.warnings.push(NOTICE.to_owned());
-
-            let text = render_app(&mut app, 160, 70);
-            let compact = letters(&text);
-            assert!(
-                compact.contains(&letters(&app.locale.install_warning(NOTICE))),
-                "{locale:?} must render the notice in the plan: {text}"
-            );
-            // It stays advice: the panel still asks for the typed name.
-            assert!(
-                compact.contains(&letters(app.locale.text("install_step_confirm"))),
-                "{text}"
-            );
-        }
-    }
-
     /// The board's case, rendered: the kernel refused the re-read (EINVAL) after a
     /// write that did complete. The panel must not print the mismatch wording, and
     /// the honest reason has to reach the operator.

@@ -2534,62 +2534,6 @@ mod tests {
         }
     }
 
-    /// The backup-GPT notice reaches the operator in the plan the CLI prints, and
-    /// only when the plan carries it. The token is produced by the core (proved
-    /// there); this checks the surface that shows it.
-    #[test]
-    fn the_backup_gpt_notice_is_printed_with_the_plan() {
-        const NOTICE: &str = "the_backup_gpt_table_stays_at_the_end_of_the_image";
-        let scratch = install_scratch("gpt-notice");
-        let image = scratch.join("system.img");
-        fs::write(&image, mbr_image()).expect("write image");
-        let manager = demo_install_manager(false);
-        let mut plan = manager
-            .plan(&install_request_for("sda", &image))
-            .expect("plan");
-        assert!(
-            !plan.warnings.contains(&NOTICE.to_owned()),
-            "an MBR image says nothing about a backup GPT: {:?}",
-            plan.warnings
-        );
-
-        for locale in [Locale::En, Locale::ZhCn] {
-            let notice = locale.install_warning(NOTICE);
-            assert!(
-                notice.contains("sgdisk -e"),
-                "the advice names the optional fix: {notice}"
-            );
-            let mut out = Vec::new();
-            write_install_plan(&plan, locale, &mut out).expect("render the plan");
-            let text = String::from_utf8(out).expect("utf-8");
-            assert!(
-                !text.contains(&notice),
-                "{locale:?} must not invent a GPT notice: {text}"
-            );
-        }
-
-        plan.warnings.push(NOTICE.to_owned());
-        for locale in [Locale::En, Locale::ZhCn] {
-            let mut out = Vec::new();
-            write_install_plan(&plan, locale, &mut out).expect("render the plan");
-            let text = String::from_utf8(out).expect("utf-8");
-            let notice = locale.install_warning(NOTICE);
-            assert!(
-                text.contains(&format!("! {notice}")),
-                "{locale:?} must show the notice where the plan is read: {text}"
-            );
-            for fragment in match locale {
-                Locale::En => vec!["primary GPT", "backup GPT", "end of the device"],
-                Locale::ZhCn => vec!["主 GPT", "备份 GPT", "设备末尾"],
-            } {
-                assert!(
-                    text.contains(fragment),
-                    "{locale:?}: missing {fragment}: {notice}"
-                );
-            }
-        }
-    }
-
     #[test]
     fn install_error_codes_are_stable_across_surfaces() {
         let cases: Vec<(SystemInstallError, &str)> = vec![

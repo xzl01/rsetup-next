@@ -503,16 +503,6 @@ impl SystemInstallManager {
         if image.format == InstallImageFormat::Xz {
             warnings.push("the_image_is_compressed_and_is_decompressed_while_writing".to_owned());
         }
-        // A GPT image written onto a bigger device keeps its backup GPT at the end
-        // of the image instead of the end of the device. The primary table is
-        // valid and the partitions are usable, so this is advice for later — the
-        // write, the verification and the exit status are unchanged, and nothing
-        // rewrites the partition table afterwards.
-        if image.partition_table.as_deref() == Some("gpt")
-            && image.uncompressed_bytes < target.size_bytes
-        {
-            warnings.push("the_backup_gpt_table_stays_at_the_end_of_the_image".to_owned());
-        }
         Ok(SystemInstallPlan {
             synthetic: self.synthetic,
             revision,
@@ -3133,88 +3123,6 @@ mod tests {
             result.verification.expected,
             mbr_partitions(8 * MIB),
             "the image layout is reported for comparison"
-        );
-    }
-
-    /// A GPT image written onto a bigger device keeps its backup GPT at the end of
-    /// the image. That is worth telling the operator, as advice only: the write,
-    /// the verification and the status are untouched.
-    #[test]
-    fn a_smaller_gpt_image_is_flagged_with_the_backup_table_notice() {
-        const NOTICE: &str = "the_backup_gpt_table_stays_at_the_end_of_the_image";
-        let harness = fixture("gpt-backup-notice", boot_mounts(), RereadBehavior::Matches);
-
-        // A GPT image whose two partitions have the geometry the fixture's re-read
-        // reports, so the write is the only thing under test (the image is 24 MiB
-        // inside the fixture's 64 MiB target, so the notice applies).
-        let entries = [(2048u64, 2048 + 16384 - 1), (18432, 18432 + 16384 - 1)];
-        let gpt = harness.root.join("gpt.img");
-        let mut gpt_bytes = gpt_image(&entries);
-        gpt_bytes.resize(24 * MIB as usize, 0);
-        write_file(&gpt, &gpt_bytes);
-        let plan = harness
-            .manager
-            .plan(&install_request(&gpt))
-            .expect("plan the GPT image");
-        assert!(
-            plan.warnings.contains(&NOTICE.to_owned()),
-            "the notice must be part of the plan: {:?}",
-            plan.warnings
-        );
-        // The same field the HTTP and desktop surfaces serialize.
-        let json = serde_json::to_value(&plan).expect("serialize the plan");
-        assert!(
-            json["warnings"]
-                .as_array()
-                .expect("warnings array")
-                .iter()
-                .any(|warning| warning == NOTICE),
-            "{json}"
-        );
-        // Advice, not a blocker: the layout matches what the re-read reports, so
-        // the write completes and the run succeeds exactly as it would without the
-        // notice.
-        assert_eq!(plan.image.partitions.len(), 2);
-        let result = harness
-            .manager
-            .apply_live(&install_request(&gpt), &plan.plan_token, "sda")
-            .expect("the write completes");
-        assert_eq!(result.run.status, ActionStatus::Succeeded);
-        assert_eq!(
-            result.verification.state,
-            SystemInstallVerificationState::Matched
-        );
-        assert!(result.plan.warnings.contains(&NOTICE.to_owned()));
-
-        // The image fills the device: the backup GPT lands at the device end, so
-        // there is nothing to report.
-        let equal = harness.root.join("equal.img");
-        let mut bytes = gpt_image(&entries);
-        bytes.resize(64 * MIB as usize, 0);
-        write_file(&equal, bytes);
-        let plan = harness
-            .manager
-            .plan(&install_request(&equal))
-            .expect("plan an image as large as the device");
-        assert_eq!(plan.image.uncompressed_bytes, plan.target.size_bytes);
-        assert!(
-            !plan.warnings.contains(&NOTICE.to_owned()),
-            "an image as large as the device needs no notice: {:?}",
-            plan.warnings
-        );
-
-        // No GPT at all: nothing to say.
-        let mbr = harness.root.join("mbr.img");
-        write_file(&mbr, mbr_image(2, 8 * MIB));
-        let plan = harness
-            .manager
-            .plan(&install_request(&mbr))
-            .expect("plan the MBR image");
-        assert_eq!(plan.image.partition_table.as_deref(), Some("mbr"));
-        assert!(
-            !plan.warnings.contains(&NOTICE.to_owned()),
-            "an MBR image needs no GPT notice: {:?}",
-            plan.warnings
         );
     }
 
