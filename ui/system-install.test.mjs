@@ -65,6 +65,8 @@ const INSTALL_FUNCTIONS = [
   "renderInstallResult", "renderSystemInstallBody", "renderSystemInstallPage", "wireInstallEvents",
   "onInstallAcknowledgementInput", "openSystemInstallPage", "loadInstallOptions",
   "planSystemInstall", "applySystemInstall",
+  "installPickerAvailable", "installSelectableImages", "pickInstallImage", "installHandleProblem",
+  "renderInstallPickNotice",
 ];
 
 const INITIAL_STATE = {
@@ -75,6 +77,9 @@ const INITIAL_STATE = {
   installLoadError: null,
   installTargetId: "",
   installImageId: "",
+  installPickedImage: null,
+  installPicking: false,
+  installPickNotice: null,
   installPlan: null,
   installPlanning: false,
   installAcknowledgement: "",
@@ -83,7 +88,10 @@ const INITIAL_STATE = {
   installResult: null,
 };
 
-function createContext({ language = "en-US", state = {}, transport = {} } = {}) {
+// `shell: true` injects the same capability the desktop shell provides
+// (`window.__TAURI__.core.invoke`); without it the page must behave exactly like
+// the browser, which has no chooser at all.
+function createContext({ language = "en-US", state = {}, transport = {}, shell = false } = {}) {
   const elements = new Map();
   function getElement(selector) {
     if (!elements.has(selector)) {
@@ -121,6 +129,8 @@ function createContext({ language = "en-US", state = {}, transport = {} } = {}) 
     toast: (title, detail, error) => toasts.push({ title, detail, error }),
     setText: () => {},
   };
+  if (shell) context.tauriInvoke = (...args) => context.invocations.push(args);
+  context.invocations = [];
   vm.createContext(context);
   vm.runInContext(INSTALL_FUNCTIONS.map(handler).join("\n"), context);
   return { context, getElement, elements, toasts, i18n };
@@ -623,6 +633,313 @@ test("a legacy plan without an echoed id is refused, never silently patched", as
   assert.doesNotMatch(html, /install-result/);
 });
 
+const PICK_HANDLE = "pick-0123456789abcdef0123456789abcdef-demo.img";
+
+function pickedResponse(overrides = {}) {
+  return { cancelled: false, handle: PICK_HANDLE, name: "demo.img", sizeBytes: 2097152, ...overrides };
+}
+
+test("the desktop shell offers the native chooser and adopts its opaque handle", async () => {
+  const calls = [];
+  const { context, getElement } = createContext({
+    shell: true,
+    state: { installOptions: demoOptions(), installTargetId: "sda", installImageId: "demo.img" },
+    transport: { pickInstallImage: async () => { calls.push("pick"); return pickedResponse(); } },
+  });
+  assert.equal(context.installPickerAvailable(), true);
+
+  context.renderSystemInstallPage();
+  const before = getElement("[data-install-body]").innerHTML;
+  assert.match(before, /data-install-pick-image/, "the desktop shell offers the chooser");
+  assert.match(before, /Choose image file/);
+  assert.match(before, /native file chooser/);
+  assert.doesNotMatch(before, /data-install-picked-image/, "nothing is chosen yet");
+
+  const selection = await context.pickInstallImage();
+  assert.equal(calls.length, 1, "the chooser command is called exactly once");
+  assert.equal(selection, PICK_HANDLE, "the handle becomes the plan selection");
+  assert.equal(context.state.installImageId, PICK_HANDLE);
+  assert.equal(context.state.installPickedImage.handle, PICK_HANDLE);
+  assert.equal(context.state.installPickedImage.name, "demo.img");
+  assert.equal(context.state.installPickedImage.sizeBytes, 2097152);
+  assert.equal(context.state.installPickedImage.path, undefined, "the pick response carries no path");
+  assert.equal(context.state.installPlan, null, "a new choice invalidates the previous plan");
+  assert.equal(PICK_HANDLE.includes("/"), false, "a handle is never a path");
+
+  const after = getElement("[data-install-body]").innerHTML;
+  assert.match(after, /data-install-picked-image/, "the chosen file is shown");
+  assert.match(after, /data-install-picked-name="demo\.img"/, "the file name is shown");
+  assert.match(after, /Chosen file: demo\.img · 2\.0 MiB/, "the file name and size are shown");
+  assert.match(after, new RegExp(`<option value="${PICK_HANDLE}" selected data-install-image-picked>`), "the choice is one entry in the same list");
+  assert.doesNotMatch(after, /\/tmp\/|\.\.\//, "no local path is rendered from the pick response");
+
+  // The chooser command itself is the desktop shell's, and takes no arguments.
+  assert.match(source, /tauriInvoke\("system_install_pick_image"\)/);
+  assert.doesNotMatch(source, /tauriInvoke\("system_install_pick_image",/);
+});
+
+test("a chosen file is planned and applied like any other source, with the plan's identity", async () => {
+  const plan = demoPlan();
+  plan.image.id = PICK_HANDLE;
+  const applied = [];
+  const { context, getElement } = createContext({
+    shell: true,
+    state: {
+      installOptions: demoOptions(), installTargetId: "sda", installImageId: PICK_HANDLE,
+      installPickedImage: { handle: PICK_HANDLE, name: "demo.img", sizeBytes: 2097152 },
+      installPlan: plan,
+    },
+    transport: { installApply: async (payload) => { applied.push(payload); return applySucceeded(plan); } },
+  });
+  context.renderSystemInstallPage();
+
+  // The existing disabled logic is untouched by the new source.
+  const host = getElement("[data-install-body]");
+  assert.equal(getElement("[data-install-apply]").disabled, true, "disabled before the name matches");
+  context.onInstallAcknowledgementInput(`${PICK_HANDLE.slice(0, 12)}`, host);
+  assert.equal(getElement("[data-install-apply]").disabled, true);
+  context.onInstallAcknowledgementInput("sda", host);
+  assert.equal(getElement("[data-install-apply]").disabled, false, "enabled once the target name matches");
+
+  await context.applySystemInstall();
+  assert.equal(applied.length, 1);
+  assert.equal(applied[0].imageId, plan.image.id, "imageId == plan.image.id for the handle source");
+  assert.equal(applied[0].imageId, PICK_HANDLE);
+  assert.deepEqual(Object.keys(applied[0]).sort(), ["acknowledgement", "imageId", "planToken", "targetId"]);
+  assert.equal(typeof applied[0].acknowledgement, "string");
+
+  const html = getElement("[data-install-body]").innerHTML;
+  assert.match(html, new RegExp(PICK_HANDLE), "the plan echoes the handle back");
+  assert.match(html, /data-install-result/);
+});
+
+test("the browser keeps the catalogue only and never shows a local file chooser", async () => {
+  const picks = [];
+  const { context, getElement } = createContext({
+    state: { installOptions: demoOptions(), installTargetId: "sda", installImageId: "demo.img" },
+    transport: { pickInstallImage: async () => { picks.push("pick"); return pickedResponse(); } },
+  });
+  assert.equal(context.installPickerAvailable(), false, "no desktop shell in the browser");
+
+  context.renderSystemInstallPage();
+  const html = getElement("[data-install-body]").innerHTML;
+  assert.doesNotMatch(html, /data-install-pick-image/, "no chooser entry in the browser");
+  assert.doesNotMatch(html, /data-install-pick-hint/);
+  assert.doesNotMatch(html, /type="file"/, "no file input in the browser");
+  assert.doesNotMatch(html, /Choose image file/);
+  assert.doesNotMatch(html, /install-pick-button/);
+  assert.match(html, /data-install-images/, "the fixed catalogue list stays");
+  assert.match(html, /demo\.img/, "the catalogue id is still the source");
+
+  // Even a direct call performs no selection and no I/O in the browser.
+  assert.equal(await context.pickInstallImage(), null);
+  assert.equal(picks.length, 0, "the browser never invokes the picker");
+
+  // And a picked entry cannot appear in the browser list, even if state were
+  // polluted: the entry is gated on the same capability.
+  context.state.installPickedImage = { handle: PICK_HANDLE, name: "demo.img", sizeBytes: 2097152 };
+  context.renderSystemInstallPage();
+  const polluted = getElement("[data-install-body]").innerHTML;
+  assert.doesNotMatch(polluted, /data-install-image-picked/);
+  assert.doesNotMatch(polluted, /data-install-picked-image/);
+  assert.equal(context.installSelectableImages(demoOptions().images).length, 1, "only the catalogue is selectable");
+
+  // The browser plan request still submits a catalogue id only.
+  const payload = context.installApplyRequest(demoPlan(), "sda");
+  assert.equal(payload.imageId, "demo.img");
+  assert.deepEqual(Object.keys(payload).sort(), ["acknowledgement", "imageId", "planToken", "targetId"]);
+});
+
+test("both image sources share one payload shape with no path and no confirm", () => {
+  const { context } = createContext({ shell: true });
+  const idPlan = demoPlan();
+  const handlePlan = demoPlan();
+  handlePlan.image.id = PICK_HANDLE;
+  for (const plan of [idPlan, handlePlan]) {
+    const payload = context.installApplyRequest(plan, "sda");
+    assert.deepEqual(Object.keys(payload).sort(), ["acknowledgement", "imageId", "planToken", "targetId"]);
+    assert.equal(payload.imageId, plan.image.id);
+    for (const forbidden of ["confirm", "path", "imagePath", "file", "handle", "acknowledgementConfirmed"]) {
+      assert.equal(forbidden in payload, false, `${forbidden} must never be sent`);
+    }
+  }
+  // A chosen file in state never becomes a second identity for the payload.
+  context.state.installPickedImage = { handle: "pick-ffffffffffffffffffffffffffffffff-other.img", name: "other.img", sizeBytes: 1 };
+  assert.equal(context.installApplyRequest(handlePlan, "sda").imageId, handlePlan.image.id);
+  assert.equal(context.installApplyRequest(idPlan, "sda").imageId, idPlan.image.id);
+});
+
+test("cancelling the chooser is reported as an answer, never as an error or a success", async () => {
+  const expectations = {
+    "en-US": /No image file was chosen/,
+    "zh-CN": /未选择任何镜像文件/,
+  };
+  for (const [language, expected] of Object.entries(expectations)) {
+    const { context, getElement, toasts } = createContext({
+      language,
+      shell: true,
+      state: {
+        installOptions: demoOptions(), installTargetId: "sda", installImageId: "demo.img",
+        installResult: applySucceeded(),
+      },
+      transport: { pickInstallImage: async () => ({ cancelled: true, handle: null, name: null, sizeBytes: null }) },
+    });
+    assert.equal(await context.pickInstallImage(), null);
+    assert.equal(context.state.installError, null, "a cancellation is not an error");
+    assert.equal(context.state.installResult, null, "an older success panel must not survive a cancellation");
+    assert.equal(context.state.installImageId, "demo.img", "the previous selection stands");
+
+    const html = getElement("[data-install-body]").innerHTML;
+    assert.match(html, /data-install-pick-notice="cancelled"/, language);
+    assert.match(html, expected, language);
+    assert.doesNotMatch(html, /data-install-error/, `${language}: cancellation is not an error`);
+    assert.doesNotMatch(html, /install-result/, `${language}: cancellation is not a success`);
+    assert.equal(toasts.length, 0, language);
+  }
+});
+
+test("a broken chooser or a rejected file is explained without a success panel", async () => {
+  const cases = [
+    {
+      code: "install_unsupported",
+      message: "zenity is not available: No such file or directory",
+      title: /The file chooser could not run|无法启动文件选择器/,
+    },
+    {
+      code: "invalid_install_request",
+      message: "the chosen file is not a regular file",
+      title: /That file cannot be used as a system image|该文件不能作为系统镜像使用/,
+    },
+  ];
+  for (const language of ["en-US", "zh-CN"]) {
+    for (const item of cases) {
+      const failure = new Error(item.message);
+      failure.code = item.code;
+      const { context, getElement } = createContext({
+        language,
+        shell: true,
+        state: {
+          installOptions: demoOptions(), installTargetId: "sda", installImageId: "demo.img",
+          installPlan: demoPlan(), installAcknowledgement: "sda",
+        },
+        transport: { pickInstallImage: async () => { throw failure; } },
+      });
+      assert.equal(await context.pickInstallImage(), null);
+      assert.equal(context.state.installResult, null, language);
+      assert.equal(context.state.installError.code, item.code, language);
+
+      const html = getElement("[data-install-body]").innerHTML;
+      assert.match(html, new RegExp(`data-install-error-code="${item.code}"`), `${language} ${item.code}`);
+      assert.match(html, item.title, `${language} ${item.code}`);
+      assert.match(html, /zenity is not available|not a regular file/, `${language}: the surface reason is shown`);
+      assert.match(html, /data-install-repick/, `${language}: the desktop offers "choose again"`);
+      assert.doesNotMatch(html, /install-result/, `${language}: a failure is never a success`);
+    }
+  }
+});
+
+test("a refused or expired handle is explained next to its unchanged stable code", async () => {
+  const cases = [
+    {
+      message: "invalid system install request: the image handle is not one this process issued; choose the image through the desktop shell",
+      title: /The image handle was not issued by this session|该镜像句柄不是本次会话签发的/,
+      hint: /Choose the image file again|请重新选择镜像文件/,
+    },
+    {
+      message: "invalid system install request: the image handle has expired; choose the image again",
+      title: /The image handle has expired|该镜像句柄已过期/,
+      hint: /Choose the image file again|请重新选择镜像文件/,
+    },
+  ];
+  for (const language of ["en-US", "zh-CN"]) {
+    for (const item of cases) {
+      const failure = new Error(item.message);
+      failure.code = "invalid_install_request";
+      const { context, getElement } = createContext({
+        language,
+        shell: true,
+        state: {
+          installOptions: demoOptions(), installTargetId: "sda", installImageId: PICK_HANDLE,
+          installPickedImage: { handle: PICK_HANDLE, name: "demo.img", sizeBytes: 2097152 },
+        },
+        transport: { installPlan: async () => { throw failure; } },
+      });
+      assert.equal(await context.planSystemInstall(), null);
+      assert.equal(context.state.installError.code, "invalid_install_request", language);
+      assert.equal(context.state.installResult, null, language);
+      assert.equal(context.state.installPlan, null, language);
+
+      const html = getElement("[data-install-body]").innerHTML;
+      assert.match(html, /data-install-error-code="invalid_install_request"/, `${language}: the stable code is still shown`);
+      assert.match(html, item.title, language);
+      assert.match(html, item.hint, language);
+      assert.match(html, /data-install-repick/, language);
+      assert.doesNotMatch(html, /install-result/, language);
+    }
+  }
+
+  // The chooser introduces no new error code: the vocabulary is unchanged.
+  const { context } = createContext({ shell: true });
+  assert.equal(context.installErrorCodeList().join(","), [
+    "confirmation_required", "acknowledgement_mismatch", "plan_required", "stale_plan",
+    "root_required", "install_conflict", "writes_running_system", "install_unsupported",
+    "invalid_install_request", "internal_error",
+  ].join(","));
+  assert.equal(context.installHandleProblem("the image handle has expired"), "expired");
+  assert.equal(context.installHandleProblem("the image handle is not one this process issued"), "unknown");
+  assert.equal(context.installHandleProblem("a plan conflict"), null, "unrelated failures keep their own copy");
+});
+
+// The real `transport` object, lifted out of app.js verbatim so the command
+// names and wire shapes are exercised as shipped rather than as stubbed.
+function transportSource() {
+  const start = source.indexOf("const transport = {");
+  assert.ok(start >= 0, "the transport object must exist");
+  const end = source.indexOf("\n};", start);
+  assert.ok(end > start, "the transport object must be terminated");
+  return source.slice(start, end + 3);
+}
+
+test("the picker goes through the shared transport, and only in the desktop shell", async () => {
+  const shell = { request: async () => ({}), installPlanRequest: (targetId, imageId) => ({ targetId, imageId }), invocations: [] };
+  shell.tauriInvoke = (...args) => { shell.invocations.push(args); return { cancelled: true, handle: null, name: null, sizeBytes: null }; };
+  vm.createContext(shell);
+  vm.runInContext(`${transportSource()}\nglobalThis.__transport = transport;`, shell);
+
+  const picked = await shell.__transport.pickInstallImage();
+  assert.equal(shell.invocations.length, 1);
+  assert.equal(shell.invocations[0].length, 1, "the chooser command takes no arguments");
+  assert.equal(shell.invocations[0][0], "system_install_pick_image");
+  assert.equal(picked.cancelled, true);
+
+  // The handle travels as the same `imageId` field a catalogue id uses.
+  await shell.__transport.installPlan("sda", PICK_HANDLE);
+  const planCall = shell.invocations.at(-1);
+  assert.equal(planCall[0], "system_install_plan");
+  assert.equal(planCall[1].imageId, PICK_HANDLE);
+  assert.equal("imagePath" in planCall[1], false, "no path field is ever sent");
+  assert.deepEqual(Object.keys(planCall[1]).sort(), ["imageId", "targetId"]);
+
+  // The browser: no shell, no chooser, no invocation, and the plan request is
+  // still a plain JSON body with the catalogue id.
+  const browserCalls = [];
+  const browser = { request: async (path, options) => { browserCalls.push({ path, options }); return {}; }, installPlanRequest: (targetId, imageId) => ({ targetId, imageId }) };
+  vm.createContext(browser);
+  // In the browser `tauriInvoke` exists and is undefined (it is read from
+  // `window.__TAURI__`), so the transport branch is `!undefined`, not a missing
+  // binding.
+  vm.runInContext("const tauriInvoke = undefined;", browser);
+  vm.runInContext(`${transportSource()}\nglobalThis.__transport = transport;`, browser);
+  assert.equal(await browser.__transport.pickInstallImage(), null, "the browser has no chooser");
+  assert.equal(browserCalls.length, 0, "the browser performs no pick request");
+  await browser.__transport.installPlan("sda", "demo.img");
+  assert.equal(browserCalls[0].path, "/api/v1/storage/install/plan");
+  const body = JSON.parse(browserCalls[0].options.body);
+  assert.deepEqual(Object.keys(body).sort(), ["imageId", "targetId"]);
+  assert.equal(body.imageId, "demo.img");
+  assert.equal("imagePath" in body, false);
+});
+
 test("a fresh catalogue read discards the plan and the acknowledgement", async () => {
   const { context, getElement } = createContext({
     state: {
@@ -678,7 +995,19 @@ test("the page keeps the hardened i18n and transport style and never fetches dev
   assert.match(source, /tauriInvoke\("system_install_targets"/);
   assert.match(source, /tauriInvoke\("system_install_plan"/);
   assert.match(source, /tauriInvoke\("system_install_apply"/);
+  assert.match(source, /tauriInvoke\("system_install_pick_image"\)/);
+  assert.doesNotMatch(source, /tauriInvoke\("system_install_pick_image",/, "the chooser command takes no arguments");
   assert.doesNotMatch(block, /\sstyle="/, "the page must not emit inline styles");
+
+  // The chooser is desktop-only and never becomes a second identity: both its
+  // entry points sit behind the shell capability, and the apply payload builder
+  // knows nothing about paths or handles.
+  assert.match(block, /installPickerAvailable\(\)/);
+  assert.ok(block.includes("${canPick ? `"), "the chooser entry is rendered only in the desktop shell");
+  assert.ok(block.includes("${canPick && picked ? `"), "the chosen file is displayed only in the desktop shell");
+  assert.match(codeOnly(handler("installSelectableImages")), /installPickerAvailable\(\)/);
+  assert.doesNotMatch(codeOnly(handler("installApplyRequest")), /path|handle/i, "no path or handle field may exist in the payload");
+  assert.doesNotMatch(codeOnly(handler("pickInstallImage")), /imagePath|href|fetch\(/);
 
   // Every key the page uses exists in both dictionaries, with placeholders that
   // match, so nothing silently falls back to "Details unavailable".
@@ -696,7 +1025,12 @@ test("the page keeps the hardened i18n and transport style and never fetches dev
   for (const key of ["install.result.verification.matched", "install.result.verification.mismatched", "install.result.verification.unsupported"]) {
     literals.add(key);
   }
-  const params = { expected: "sda", provided: "x", target: "/dev/sda", mounts: "/boot", number: 1, size: "2.0 MiB", warning: "core warning", expectedCount: 2, observed: 2 };
+  // Keys the page builds dynamically for the chooser and for a refused handle.
+  for (const key of ["install.pickFailed", "install.pickRejected", "install.handleUnknown", "install.handleExpired"]) {
+    literals.add(key);
+    literals.add(`${key}.hint`);
+  }
+  const params = { expected: "sda", provided: "x", target: "/dev/sda", mounts: "/boot", number: 1, size: "2.0 MiB", name: "demo.img", warning: "core warning", expectedCount: 2, observed: 2 };
   for (const key of literals) {
     assert.ok(i18nSource.includes(`"${key}"`), `${key} must be declared in i18n.js`);
     for (const i18n of [english, chinese]) {
@@ -712,6 +1046,13 @@ test("the page keeps the hardened i18n and transport style and never fetches dev
   assert.match(english.t("install.error.stale_plan.hint", params), /Build a fresh plan/);
   assert.match(chinese.t("install.apply"), /替换全部分区/);
   assert.match(english.t("install.apply"), /replace all partitions/);
+  // The chooser copy is bilingual as well.
+  assert.match(chinese.t("install.pickImage"), /选择镜像文件/);
+  assert.match(english.t("install.pickImage"), /Choose image file/);
+  assert.match(chinese.t("install.pickedFile", params), /已选择文件：demo\.img · 2\.0 MiB/);
+  assert.match(english.t("install.pickedFile", params), /Chosen file: demo\.img · 2\.0 MiB/);
+  assert.match(chinese.t("install.pickCancelledHint", params), /保持不变/);
+  assert.match(english.t("install.pickCancelledHint", params), /unchanged/);
 
   // The hardening suite is the contract this page must not weaken.
   const hardening = fs.readFileSync(new URL("./hardening.test.mjs", import.meta.url), "utf8");

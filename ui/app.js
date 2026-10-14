@@ -177,6 +177,12 @@ const state = {
   installLoadError: null,
   installTargetId: "",
   installImageId: "",
+  // Display metadata for a file the desktop shell picked (name + size; a path
+  // never reaches the WebView). Never used as an apply identity: that is always
+  // the `image.id` the plan response echoes.
+  installPickedImage: null,
+  installPicking: false,
+  installPickNotice: null,
   installPlan: null,
   installPlanning: false,
   installAcknowledgement: "",
@@ -383,6 +389,13 @@ const transport = {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
     });
+  },
+  // Desktop shell only: the native chooser runs in Rust and answers with an
+  // opaque handle plus display metadata. The browser never has this capability
+  // and the page never renders an entry for it there.
+  async pickInstallImage() {
+    if (!tauriInvoke) return null;
+    return tauriInvoke("system_install_pick_image");
   },
 };
 
@@ -2909,6 +2922,36 @@ function installErrorCopy(failure) {
   const expected = state.installPlan?.target?.id || "";
   const target = state.installPlan?.target?.path || "";
   const provided = String(state.installAcknowledgement ?? "").trim();
+  // A failure raised by the desktop chooser, or a refusal that explains an image
+  // handle, gets additional actionable copy. The stable code never changes, so a
+  // reader still sees `install_unsupported` / `invalid_install_request`.
+  const handleProblem = installHandleProblem(failure?.message);
+  if (failure?.pick) {
+    const pickKey = key === "install_unsupported" ? "install.pickFailed" : "install.pickRejected";
+    return {
+      code: key === "generic" ? "internal_error" : key,
+      key,
+      title: t(pickKey),
+      detail: String(failure?.message || ""),
+      hint: t(`${pickKey}.hint`),
+      replan: false,
+      liveDisabled: false,
+      repick: true,
+    };
+  }
+  if (handleProblem) {
+    const handleKey = handleProblem === "expired" ? "install.handleExpired" : "install.handleUnknown";
+    return {
+      code: key === "generic" ? "internal_error" : key,
+      key,
+      title: t(handleKey),
+      detail: String(failure?.message || ""),
+      hint: t(`${handleKey}.hint`),
+      replan: false,
+      liveDisabled: false,
+      repick: true,
+    };
+  }
   return {
     code: key === "generic" ? "internal_error" : key,
     key,
@@ -2919,6 +2962,7 @@ function installErrorCopy(failure) {
     hint: t(`install.error.${key}.hint`),
     replan: key === "stale_plan" || key === "plan_required",
     liveDisabled: key === "install_unsupported",
+    repick: false,
   };
 }
 
@@ -3007,7 +3051,94 @@ function installTargetOptions(targets, selected) {
 
 function installImageOptions(images) {
   if (!images.length) return "";
-  return images.map((image) => `<option value="${escapeHtml(image.id)}"${image.id === state.installImageId ? " selected" : ""}>${escapeHtml(`${image.id} · ${byteUnit(image.sizeBytes)}`)}</option>`).join("");
+  const picked = state.installPickedImage || {};
+  return images.map((image) => {
+    // A chosen file is one more entry in the same list: same value shape, same
+    // single selection, only the label differs (name and size, never a path).
+    const label = image.picked
+      ? t("install.pickedFile", { name: picked.name || image.id, size: byteUnit(image.sizeBytes) })
+      : `${image.id} · ${byteUnit(image.sizeBytes)}`;
+    const pickedAttribute = image.picked ? " data-install-image-picked" : "";
+    const selected = image.id === state.installImageId ? " selected" : "";
+    return `<option value="${escapeHtml(image.id)}"${selected}${pickedAttribute}>${escapeHtml(label)}</option>`;
+  }).join("");
+}
+
+// ---------------------------------------------------------------------------
+// Image source: the desktop shell's native chooser, or the fixed catalogue.
+//
+// The browser only ever sees the server's catalogue of ids. The desktop shell
+// additionally offers its native file chooser (`system_install_pick_image`),
+// which keeps the chosen path inside the Rust process and hands the WebView an
+// opaque handle plus a display name and size. Both sources are the same shape
+// here: one selection value that is submitted to plan, and — for the apply
+// payload — only the identity the plan response echoes back.
+// ---------------------------------------------------------------------------
+
+// The shell detection is the same one the shared IPC layer uses: the browser has
+// no `window.__TAURI__.core.invoke`, so it has no chooser and gets no entry.
+function installPickerAvailable() {
+  return typeof tauriInvoke !== "undefined" && Boolean(tauriInvoke);
+}
+
+// Catalogue ids plus, in the desktop shell, the file the user just chose. One
+// list, so the selection logic never has to ask which kind of value it holds.
+// The picked entry is gated on the shell capability as well: a browser can never
+// show a locally chosen file, even if some state were carried over.
+function installSelectableImages(images) {
+  const entries = Array.isArray(images) ? [...images] : [];
+  const picked = state.installPickedImage;
+  if (picked && picked.handle && installPickerAvailable()) {
+    entries.push({ id: picked.handle, sizeBytes: picked.sizeBytes, picked: true });
+  }
+  return entries;
+}
+
+async function pickInstallImage() {
+  if (!installPickerAvailable() || state.installPicking) return null;
+  state.installPicking = true;
+  state.installPickNotice = null;
+  state.installError = null;
+  renderSystemInstallPage();
+  let selection = null;
+  try {
+    const picked = await transport.pickInstallImage();
+    if (picked && !picked.cancelled && picked.handle) {
+      // Display metadata only: the handle is the plan selection, the name and
+      // size are what the page may show. No path ever reaches this layer.
+      state.installPickedImage = {
+        handle: String(picked.handle),
+        name: String(picked.name || picked.handle),
+        sizeBytes: Number(picked.sizeBytes || 0),
+      };
+      state.installImageId = state.installPickedImage.handle;
+      state.installPlan = null;
+      state.installAcknowledgement = "";
+      state.installResult = null;
+      selection = state.installImageId;
+    } else {
+      // A cancelled chooser is an answer, not an error: nothing was chosen, so
+      // the previous selection stands and no result panel may appear.
+      state.installPickNotice = "cancelled";
+      state.installResult = null;
+    }
+  } catch (error) {
+    state.installError = { ...installErrorFrom(error), pick: true };
+    state.installResult = null;
+  } finally {
+    state.installPicking = false;
+    renderSystemInstallPage();
+  }
+  return selection;
+}
+
+// Presentation-only: a refused plan/apply whose explanation is about the image
+// handle gets an actionable hint next to the unchanged stable code. This decides
+// copy, never identity.
+function installHandleProblem(message) {
+  const text = String(message ?? "");
+  if (!/image handle/i.test(text)) return null;
+  return /expired/i.test(text) ? "expired" : "unknown";
 }
 
 function renderInstallTargetCard(target) {
@@ -3128,6 +3259,7 @@ function renderInstallErrorBox() {
         ${copy.detail ? `<span data-install-error-detail>${escapeHtml(copy.detail)}</span>` : ""}
         ${copy.hint ? `<span data-install-error-hint>${escapeHtml(copy.hint)}</span>` : ""}
         ${copy.replan ? `<button class="secondary-button" type="button" data-install-replan>${escapeHtml(t("install.replan"))}</button>` : ""}
+        ${copy.repick && installPickerAvailable() ? `<button class="secondary-button" type="button" data-install-repick>${escapeHtml(t("install.chooseAgain"))}</button>` : ""}
       </div>
     </section>
   `;
@@ -3169,6 +3301,9 @@ function renderSystemInstallBody() {
 
   const targets = options.targets || [];
   const images = options.images || [];
+  const selectables = installSelectableImages(images);
+  const picked = state.installPickedImage;
+  const canPick = installPickerAvailable();
   const selectable = targets.filter(installTargetSelectable);
   const chosen = installSelectedTarget();
   const target = installTargetSelectable(chosen) ? chosen : (selectable[0] || null);
@@ -3184,10 +3319,17 @@ function renderSystemInstallBody() {
       </div>
       <div class="install-field">
         <label for="install-image-select">${escapeHtml(t("install.image"))}</label>
-        <select id="install-image-select" data-install-images${images.length ? "" : " disabled"}>${installImageOptions(images)}</select>
+        <select id="install-image-select" data-install-images${selectables.length ? "" : " disabled"}>${installImageOptions(selectables)}</select>
+        ${canPick ? `
+          <button class="secondary-button install-pick-button" type="button" data-install-pick-image${state.installPicking ? " disabled" : ""}>
+            ${icon("plus")}<span>${escapeHtml(state.installPicking ? t("install.picking") : t("install.pickImage"))}</span>
+          </button>
+          <p data-install-pick-hint>${escapeHtml(t("install.pickHint"))}</p>
+        ` : ""}
+        ${canPick && picked ? `<p class="install-picked" data-install-picked-image data-install-picked-name="${escapeHtml(picked.name)}">${escapeHtml(t("install.pickedFile", { name: picked.name, size: byteUnit(picked.sizeBytes) }))}</p>` : ""}
         <p>${escapeHtml(t("install.imageHint"))}</p>
       </div>
-      <button class="primary-button" type="button" data-install-plan-button${target && images.length ? "" : " disabled"}>
+      <button class="primary-button" type="button" data-install-plan-button${target && selectables.length ? "" : " disabled"}>
         ${escapeHtml(state.installPlanning ? t("install.previewing") : (plan ? t("install.replan") : t("install.preview")))}
       </button>
     </section>
@@ -3196,8 +3338,24 @@ function renderSystemInstallBody() {
       : `<div class="hardware-tool-empty" data-install-no-target>${escapeHtml(targets.length ? t("install.noSelectableTargets") : t("install.noTargets"))}</div>`}
     ${plan ? renderInstallConsequences(plan) : `<p class="install-hint" data-install-no-plan>${escapeHtml(t("install.noPlan"))}</p>`}
     ${plan ? renderInstallConfirmation(plan) : ""}
+    ${renderInstallPickNotice()}
     ${renderInstallErrorBox()}
     ${state.installResult ? `<section class="install-card install-result" data-install-result><header><strong>${escapeHtml(t("install.result.title"))}</strong></header>${renderInstallResult(state.installResult)}</section>` : ""}
+  `;
+}
+
+// A cancelled chooser is reported as the user's answer: a neutral note, never an
+// error and never a success panel.
+function renderInstallPickNotice() {
+  if (state.installPickNotice !== "cancelled") return "";
+  return `
+    <div class="install-notice" data-install-pick-notice="cancelled" role="status">
+      ${icon("pulse")}
+      <div>
+        <strong>${escapeHtml(t("install.pickCancelled"))}</strong>
+        <span>${escapeHtml(t("install.pickCancelledHint"))}</span>
+      </div>
+    </div>
   `;
 }
 
@@ -3224,12 +3382,19 @@ function wireInstallEvents(host) {
   if (imageSelect) {
     imageSelect.onchange = () => {
       state.installImageId = imageSelect.value;
+      // Choosing from the list replaces a previously chosen file.
+      if (state.installPickedImage && state.installPickedImage.handle !== state.installImageId) {
+        state.installPickedImage = null;
+      }
+      state.installPickNotice = null;
       state.installPlan = null;
       state.installAcknowledgement = "";
       state.installError = null;
       renderSystemInstallPage();
     };
   }
+  const pickButton = $("[data-install-pick-image]", host);
+  if (pickButton) pickButton.onclick = () => void pickInstallImage();
   const planButton = $("[data-install-plan-button]", host);
   if (planButton) planButton.onclick = () => void planSystemInstall();
   const acknowledge = $("[data-install-acknowledge]", host);
@@ -3241,6 +3406,8 @@ function wireInstallEvents(host) {
   }
   const replan = $("[data-install-replan]", host);
   if (replan) replan.onclick = () => void planSystemInstall();
+  const repick = $("[data-install-repick]", host);
+  if (repick) repick.onclick = () => void pickInstallImage();
   const retry = $("[data-install-retry]", host);
   if (retry) retry.onclick = () => void loadInstallOptions();
 }
@@ -3277,12 +3444,16 @@ async function loadInstallOptions() {
     state.installOptions = options;
     state.installLiveAllowed = Boolean(options?.liveAllowed);
     const targets = options?.targets || [];
-    const images = options?.images || [];
+    const selectables = installSelectableImages(options?.images || []);
     if (!targets.some((target) => target.id === state.installTargetId)) {
       state.installTargetId = (targets.find(installTargetSelectable) || targets[0])?.id || "";
     }
-    if (!images.some((image) => image.id === state.installImageId)) {
-      state.installImageId = images[0]?.id || "";
+    // The selection is normalised against the same combined list the page shows,
+    // so a chosen file survives a catalogue refresh and a vanished catalogue id
+    // does not.
+    if (!selectables.some((image) => image.id === state.installImageId)) {
+      state.installImageId = selectables[0]?.id || "";
+      state.installPickedImage = null;
     }
     // A fresh catalogue read invalidates any plan built from the previous one.
     state.installPlan = null;
@@ -3363,6 +3534,9 @@ async function applySystemInstall() {
       state.installPlan = null;
       state.installAcknowledgement = "";
     }
+    // A refused or expired handle is not silently dropped here: the error box
+    // names the problem and offers "choose again" in the desktop shell, and the
+    // apply path stays free of any second image identity.
   } finally {
     state.installRunning = false;
     renderSystemInstallPage();

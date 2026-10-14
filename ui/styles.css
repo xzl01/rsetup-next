@@ -3092,3 +3092,30 @@ body.is-resolving .core-node { animation: core-resolve 820ms var(--ease-soft) bo
   .install-picker { grid-template-columns: 1fr; }
   .install-partition-list li { grid-template-columns: 1fr 1fr; }
 }
+
+/* Image source: the desktop shell's native chooser sits inside the same image
+   field as the catalogue list, and a cancelled chooser is reported as a neutral
+   note rather than an error. */
+.install-pick-button { justify-self: start; margin-top: 2px; }
+.install-picked {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line-dim);
+  border-radius: 9px;
+  background: var(--signal-soft);
+  color: var(--bone);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+.install-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--field);
+}
+.install-notice svg { width: 18px; height: 18px; flex: 0 0 auto; margin-top: 2px; }
+.install-notice strong { display: block; color: var(--bone); font-size: 13px; }
+.install-notice span { display: block; margin-top: 4px; color: var(--bone-muted); font-size: 12.5px; line-height: 1.6; }
