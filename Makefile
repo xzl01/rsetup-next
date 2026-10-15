@@ -32,7 +32,7 @@ MSRV_TARGET_DIR ?= target/msrv-ci
 # and `cargo fmt --package rsetup-desktop` would not resolve. It is covered by
 # the desktop-test/desktop-check targets below instead, which go through
 # --manifest-path, and by the desktop-tauri-ipc CI job.
-FMT_PACKAGES := rsetup-core rsetup-next
+FMT_PACKAGES := rsetup-core rsetup-next rsetup-controller rsetup-protocol
 
 build:
 	cargo build --workspace --locked
