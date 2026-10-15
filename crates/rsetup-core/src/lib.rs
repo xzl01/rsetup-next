@@ -16,7 +16,9 @@ mod system_install;
 mod transaction;
 mod video;
 
-pub use actions::{ActionError, Controller, ExecutionPolicy};
+pub use actions::{
+    ActionError, Controller, ExecutionPolicy, effective_uid, pkexec_path, privileged_helper_path,
+};
 pub use fan_curve::{
     FanCurveApplyResult, FanCurveConfig, FanCurveDevice, FanCurvePlan, FanCurvePoint,
     FanCurveRequest, FanCurveResolvedPoint, FanCurveStatus, FanCurveTick, FanCurveZone,
@@ -53,5 +55,5 @@ pub use spi_flash::{
 pub use storage::{StorageReader, SystemStorageReader};
 pub use system_install::{
     BlockDeviceBackend, ImageOpener, SyntheticBackend, SystemBlockBackend, SystemImageOpener,
-    SystemInstallError, SystemInstallManager, SystemMount,
+    SystemInstallError, SystemInstallManager, SystemMount, install_needs_privilege,
 };

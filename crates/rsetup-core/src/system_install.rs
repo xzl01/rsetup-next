@@ -60,7 +60,7 @@
 //!
 //! # Compressed images: what is checked, and where
 //!
-//! A `.xz` image is measured, not decompressed, while planning:
+//! A `.xz` image is measured and its payload header is parsed while planning:
 //!
 //! * Its size is the sum of **every** stream in the file, because concatenating
 //!   streams is valid and measuring only the last one would describe half an
@@ -68,8 +68,15 @@
 //! * The three frames xz itself checksum — the stream header, the index and the
 //!   stream footer — are verified, so a damaged file is refused before anything is
 //!   written rather than after.
-//! * Block data is not parsed while planning (that would mean decompressing a
-//!   multi-gigabyte image twice). It is checked by the tool: the decompressor's
+//! * A valid container is not evidence that the payload is a disk image: a
+//!   compressed text file satisfies every container check. A bounded prefix of the
+//!   decompressed content is therefore parsed as an MBR/GPT before a plan can
+//!   exist, so a payload that would overwrite the target with something unbootable
+//!   is refused instead of being written and only then found unverifiable. Damage
+//!   inside that prefix is caught while planning; damage past it is still caught by
+//!   the tool while writing.
+//! * Only that prefix is decompressed while planning, so a multi-gigabyte image is
+//!   not decompressed twice. The rest is checked by the tool: the decompressor's
 //!   output is only treated as a complete stream once the child has exited
 //!   successfully, and a non-zero exit is a hard failure that reports how many
 //!   bytes were read and written, with the tool's own reason. Draining the output
@@ -78,10 +85,6 @@
 //! * The declared size is a bound, never the only stop: after writing it, one more
 //!   read must be end-of-output, so a stream with more data fails as a conflict
 //!   instead of being truncated.
-//! * Since the uncompressed layout is never parsed, the partition-table
-//!   comparison after a compressed write is reported as an "unsupported"
-//!   verification with its reason (the table was re-read but there is nothing to
-//!   compare it against) rather than as a mismatch.
 //!
 //! # No rollback
 //!
@@ -103,10 +106,12 @@
 //! with the comparison itself living in the abstraction so it is testable on any
 //! host.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::hash::{BuildHasher, Hasher};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -174,6 +179,37 @@ const BLKRRPART: libc::c_ulong = 0x1251;
 /// Virtual devices an image must never be written to.
 const VIRTUAL_DEVICE_PREFIXES: [&str; 7] = ["loop", "ram", "zram", "sr", "dm-", "md", "fd"];
 
+impl SystemInstallError {
+    /// Stable code for this failure. This is the vocabulary every surface
+    /// reports — the CLI, the HTTP envelope, the Tauri command error and the
+    /// privileged helper's error envelope — so a script reads one code whichever
+    /// door it came through.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Unsupported(_) => "install_unsupported",
+            Self::InvalidInput(_) => "invalid_install_request",
+            Self::ConfirmationRequired => "confirmation_required",
+            Self::AcknowledgementMismatch { .. } => "acknowledgement_mismatch",
+            Self::PlanRequired => "plan_required",
+            Self::StalePlan => "stale_plan",
+            Self::RootRequired => "root_required",
+            Self::Conflict(_) => "install_conflict",
+            Self::RunningSystem(_) => "writes_running_system",
+            Self::Io(_) => "internal_error",
+        }
+    }
+}
+
+/// Whether a real write has to be delegated to the fixed-verb helper.
+///
+/// The demo provider writes to nothing, and root opens the device itself;
+/// anything else is refused by the kernel when it opens the target, so routing it
+/// through `pkexec` is what turns a `PermissionDenied` into an administrator
+/// prompt. Every surface shares this one rule instead of restating it.
+pub fn install_needs_privilege(live: bool, synthetic: bool, effective_uid: Option<u32>) -> bool {
+    live && !synthetic && effective_uid != Some(0)
+}
+
 #[derive(Debug, Error)]
 pub enum SystemInstallError {
     #[error("system image installation is unavailable: {0}")]
@@ -239,6 +275,13 @@ pub trait BlockDeviceBackend: Send + Sync {
         &self,
         target: &SystemInstallTarget,
     ) -> Result<Vec<SystemInstallPartition>, SystemInstallError>;
+
+    /// Directory that holds the per-target write lock, or `None` when this backend
+    /// cannot overwrite a real device. A real backend must answer `Some`: two plans
+    /// naming the same target would otherwise be free to interleave their chunks.
+    fn lock_root(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// Opens the image as a byte stream, decompressing when the format says so.
@@ -340,6 +383,12 @@ impl SystemInstallManager {
         if plan_token.trim().is_empty() {
             return Err(SystemInstallError::PlanRequired);
         }
+        // One writer per target for the whole sequence. The lock is taken before
+        // the plan is rebuilt, so the gates are judged against the state left by
+        // any previous writer, and it is held across verify, write, flush and
+        // re-read. Without it two tokens for the same device are both accepted and
+        // their chunks interleave, which leaves neither image on the device.
+        let _target_lock = self.acquire_target_lock(&request.target_id)?;
         let plan = self.build_plan(request)?;
         // The presented token must be one this process signed and issued. The
         // signature covers the binding, the issuance time and the nonce, so no
@@ -435,6 +484,39 @@ impl SystemInstallManager {
             plan,
             bytes_written,
             verification,
+        })
+    }
+
+    /// Takes the cross-process write lock for one target.
+    ///
+    /// The lock file name is derived from a caller supplied id, so only the
+    /// characters a kernel block device name can contain are allowed through; the
+    /// name is a single path component because separators are refused.
+    fn acquire_target_lock(
+        &self,
+        target_id: &str,
+    ) -> Result<Option<crate::transaction::ProcessLock>, SystemInstallError> {
+        let Some(root) = self.backend.lock_root() else {
+            return Ok(None);
+        };
+        if target_id.is_empty()
+            || !target_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(SystemInstallError::InvalidInput(format!(
+                "invalid target device identifier {target_id}"
+            )));
+        }
+        crate::transaction::ProcessLock::acquire(
+            &root,
+            &format!("rsetup-next-install-{target_id}.lock"),
+        )
+        .map(Some)
+        .map_err(|error| {
+            SystemInstallError::Conflict(format!(
+                "another write to {target_id} is already running: {error}"
+            ))
         })
     }
 
@@ -570,25 +652,81 @@ impl SystemInstallManager {
                 SystemInstallError::Io(format!("unable to read the image header: {error}"))
             })?;
         let sha256_prefix = hex(&sha256(&header));
-        let (format, uncompressed_bytes, partition_table, partitions) =
-            if header.starts_with(&XZ_MAGIC) {
-                let uncompressed = read_xz_size(&mut file)?;
-                (InstallImageFormat::Xz, uncompressed, None, Vec::new())
-            } else {
-                let (table, partitions) = read_partition_table(&mut file)?;
-                (InstallImageFormat::Raw, size_bytes, Some(table), partitions)
+        // Read from the handle that was just opened, not from the path again: the
+        // plan must describe the bytes this file holds now, and a path-based
+        // second look could describe a different file.
+        let handle = file.metadata().map_err(|error| {
+            SystemInstallError::Io(format!("unable to stat the image header: {error}"))
+        })?;
+        let file_identity = file_identity(&handle);
+        if header.starts_with(&XZ_MAGIC) {
+            let uncompressed = read_xz_size(&mut file)?;
+            let mut image = SystemInstallImage {
+                path: path.to_owned(),
+                id: request.image_id.clone(),
+                format: InstallImageFormat::Xz,
+                size_bytes,
+                uncompressed_bytes: uncompressed,
+                file_identity: file_identity.clone(),
+                sha256_prefix,
+                prefix_bytes: header.len() as u64,
+                partition_table: None,
+                partitions: Vec::new(),
             };
+            // A valid xz container is not evidence that the payload is a disk
+            // image: a compressed text file is a valid container too. Parse the
+            // decompressed header before a plan can exist, so a payload that
+            // would overwrite the target with something unbootable is refused
+            // instead of being written and only then found unverifiable.
+            let (table, partitions) = self.decompressed_partition_table(&image)?;
+            image.partition_table = Some(table);
+            image.partitions = partitions;
+            return Ok(image);
+        }
+        let (table, partitions) = read_partition_table(&mut file)?;
         Ok(SystemInstallImage {
             path: path.to_owned(),
             id: request.image_id.clone(),
-            format,
+            format: InstallImageFormat::Raw,
             size_bytes,
-            uncompressed_bytes,
+            uncompressed_bytes: size_bytes,
+            file_identity,
             sha256_prefix,
             prefix_bytes: header.len() as u64,
-            partition_table,
+            partition_table: Some(table),
             partitions,
         })
+    }
+
+    /// Parses the partition table of a compressed image from a bounded prefix of
+    /// its decompressed content.
+    ///
+    /// The prefix is capped at [`IMAGE_PREFIX_BYTES`], which covers the MBR, the
+    /// GPT header and the whole 128 entry table the parser reads even at the
+    /// largest entry size it accepts. Only a prefix is decompressed, so a
+    /// multi-gigabyte image is not decompressed twice; the whole stream is still
+    /// validated by the decompressor's exit status while writing.
+    fn decompressed_partition_table(
+        &self,
+        image: &SystemInstallImage,
+    ) -> Result<(String, Vec<SystemInstallPartition>), SystemInstallError> {
+        let mut stream = self.opener.open(image)?;
+        let mut prefix = vec![0u8; image.uncompressed_bytes.min(IMAGE_PREFIX_BYTES) as usize];
+        let mut filled = 0usize;
+        while filled < prefix.len() {
+            match stream.read(&mut prefix[filled..]) {
+                Ok(0) => break,
+                Ok(read) => filled += read,
+                Err(error) => {
+                    return Err(SystemInstallError::InvalidInput(format!(
+                        "the compressed image {} could not be decompressed to read its partition table: {error}",
+                        image.path
+                    )));
+                }
+            }
+        }
+        prefix.truncate(filled);
+        read_partition_table(&mut Cursor::new(prefix))
     }
 
     /// Streams the image in bounded chunks. A short stream is a failure because
@@ -602,7 +740,7 @@ impl SystemInstallManager {
         let mut buffer = vec![0u8; CHUNK_BYTES.min(limit) as usize];
         let mut written = 0u64;
         while written < limit {
-            let want = buffer.len().min((limit - written) as usize);
+            let want = chunk_len(buffer.len(), limit - written);
             let read = stream
                 .read(&mut buffer[..want])
                 .map_err(|error| self.partial_failure(written, limit, &error.to_string()))?;
@@ -642,20 +780,6 @@ impl SystemInstallManager {
     fn verify(&self, plan: &SystemInstallPlan) -> SystemInstallVerification {
         match self.backend.reread_partitions(&plan.target) {
             Ok(observed) => {
-                if plan.image.format == InstallImageFormat::Xz {
-                    // A compressed image is never decompressed while planning, so
-                    // there is no expected layout to compare: report that honestly
-                    // instead of claiming the re-read table does not match.
-                    return SystemInstallVerification {
-                        state: SystemInstallVerificationState::Unsupported,
-                        expected: Vec::new(),
-                        observed: Some(observed),
-                        detail: Some(
-                            "the image is compressed and was not parsed before writing, so the re-read partition table was not compared"
-                                .into(),
-                        ),
-                    };
-                }
                 let matched = same_partition_layout(&plan.image.partitions, &observed);
                 SystemInstallVerification {
                     state: if matched {
@@ -800,6 +924,139 @@ fn annotate_mounts(target: &mut SystemInstallTarget, mounts: &[SystemMount]) {
 
 fn is_running_system_mount(mount_point: &str) -> bool {
     mount_point == "/" || mount_point == "/boot" || mount_point.starts_with("/boot/")
+}
+
+/// Rewrites every mount source into the kernel block device names it lives on.
+///
+/// `/proc/mounts` reports the source the kernel was handed, which is frequently
+/// not a kernel device name: `/dev/root`, a `/dev/disk/by-uuid/...` symlink, or a
+/// device-mapper node whose real storage is a partition of the target disk.
+/// Comparing those strings against a target id misses exactly the case the
+/// running-system gate exists for — the gate then reports the disk as unmounted
+/// and plannable while it is the disk the system booted from.
+///
+/// Resolution therefore goes through the mount's `major:minor` from
+/// `/proc/self/mountinfo`, then follows the slave chain so a filesystem on LVM or
+/// md is attributed to the disk underneath it.
+///
+/// A running-system mount that cannot be resolved is refused rather than left
+/// unattributed: not knowing which disk backs `/` means nothing proves the chosen
+/// target is safe to overwrite.
+fn expand_mounts(root: &Path, mounts: &mut Vec<SystemMount>) -> Result<(), SystemInstallError> {
+    let index = block_index(root);
+    let mountinfo = read_mountinfo(root);
+    let mut expanded = Vec::with_capacity(mounts.len());
+    for mount in mounts.drain(..) {
+        let names = resolve_mount_names(root, &index, &mountinfo, &mount);
+        if names.is_empty() {
+            if is_running_system_mount(&mount.mount_point) {
+                return Err(SystemInstallError::Unsupported(format!(
+                    "the running system is mounted at {} from {}, and that source could not be resolved to a block device, so the target cannot be proven safe to overwrite",
+                    mount.mount_point, mount.device
+                )));
+            }
+            expanded.push(mount);
+            continue;
+        }
+        for name in names {
+            expanded.push(SystemMount {
+                device: format!("/dev/{name}"),
+                mount_point: mount.mount_point.clone(),
+                file_system: mount.file_system.clone(),
+            });
+        }
+    }
+    *mounts = expanded;
+    Ok(())
+}
+
+/// Kernel block device names under the injected root.
+fn block_names(root: &Path) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    if let Ok(entries) = fs::read_dir(root.join("sys/class/block")) {
+        for entry in entries.flatten() {
+            names.insert(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    names
+}
+
+/// `major:minor` to kernel name, as `/proc/self/mountinfo` spells the number.
+fn block_index(root: &Path) -> BTreeMap<String, String> {
+    let mut index = BTreeMap::new();
+    if let Ok(entries) = fs::read_dir(root.join("sys/class/block")) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(number) = read_attr(&entry.path().join("dev")) {
+                index.insert(number, name);
+            }
+        }
+    }
+    index
+}
+
+/// Mount point to `major:minor`, from the kernel's own mount table.
+fn read_mountinfo(root: &Path) -> BTreeMap<String, String> {
+    let mut table = BTreeMap::new();
+    let Ok(text) = fs::read_to_string(root.join("proc/self/mountinfo")) else {
+        return table;
+    };
+    for line in text.lines() {
+        // mountinfo: id parent major:minor root mount-point options [optional...]
+        // The device number is field 3 and the mount point is field 5; the root
+        // field between them is usually `/` for every mount, so reading it as the
+        // mount point collapses the whole table onto one key.
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 5 {
+            continue;
+        }
+        table.insert(unescape_mount(fields[4]), fields[2].to_owned());
+    }
+    table
+}
+
+fn resolve_mount_names(
+    root: &Path,
+    index: &BTreeMap<String, String>,
+    mountinfo: &BTreeMap<String, String>,
+    mount: &SystemMount,
+) -> Vec<String> {
+    let known = block_names(root);
+    let mut names = Vec::new();
+    if let Some(number) = mountinfo.get(&mount.mount_point) {
+        if let Some(name) = index.get(number) {
+            collect_slaves(root, name, &known, &mut names);
+            return names;
+        }
+    }
+    // No usable mount table entry: a source that already is a kernel name, or a
+    // fixture root. `/dev/root` and by-uuid symlinks need the table above.
+    let name = mount.device.trim_start_matches("/dev/");
+    if !name.is_empty() && known.contains(name) {
+        collect_slaves(root, name, &known, &mut names);
+    }
+    names
+}
+
+/// Adds a device and every device underneath it, so a filesystem on device-mapper
+/// or md is attributed to the disk that really stores it.
+fn collect_slaves(root: &Path, name: &str, known: &BTreeSet<String>, names: &mut Vec<String>) {
+    if names.iter().any(|existing| existing == name) {
+        return;
+    }
+    names.push(name.to_owned());
+    let mut children: Vec<String> =
+        fs::read_dir(root.join("sys/class/block").join(name).join("slaves"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|child| known.contains(child))
+            .collect();
+    children.sort();
+    for child in children {
+        collect_slaves(root, &child, known, names);
+    }
 }
 
 /// Whether a mount device (a device node or a kernel name) belongs to a target.
@@ -990,6 +1247,7 @@ fn token_binding(revision: &str, target: &SystemInstallTarget, image: &SystemIns
     bytes.extend_from_slice(image.path.as_bytes());
     bytes.extend_from_slice(&image.size_bytes.to_le_bytes());
     bytes.extend_from_slice(&image.uncompressed_bytes.to_le_bytes());
+    bytes.extend_from_slice(image.file_identity.as_bytes());
     bytes.extend_from_slice(image.sha256_prefix.as_bytes());
     // The expected acknowledgement is part of the token, so a plan cannot be
     // replayed against a different device name.
@@ -1031,6 +1289,33 @@ fn stable_hash(bytes: &[u8]) -> u64 {
 
 /// Compares partitions by geometry: names differ between an image and the
 /// kernel's view, but the layout a system boots from does not.
+/// Identity of an image file, from an open handle rather than a path.
+///
+/// The prefix digest only covers `prefix_bytes`, so this is what notices an edit
+/// further into the file; device and inode notice a replacement.
+fn file_identity(metadata: &fs::Metadata) -> String {
+    format!(
+        "{}:{}:{}:{}:{}:{}",
+        metadata.dev(),
+        metadata.ino(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec()
+    )
+}
+
+/// Bytes to ask the image stream for next.
+///
+/// The remainder is compared in `u64` and narrowed only afterwards. Narrowing
+/// first truncated at 4 GiB on a 32-bit target (ARMv7, i686): an exact multiple
+/// of 4 GiB became zero, which read no bytes and was reported as "the image
+/// ended before the size it declares", and a remainder just over 4 GiB became a
+/// tiny chunk that wrote a partial image before failing.
+fn chunk_len(buffer_len: usize, remaining: u64) -> usize {
+    (buffer_len as u64).min(remaining) as usize
+}
+
 fn same_partition_layout(
     expected: &[SystemInstallPartition],
     observed: &[SystemInstallPartition],
@@ -1150,7 +1435,13 @@ impl BlockDeviceBackend for SystemBlockBackend {
         let text = fs::read_to_string(&path).map_err(|error| {
             SystemInstallError::Unsupported(format!("{} is unavailable: {error}", path.display()))
         })?;
-        Ok(parse_mounts(&text))
+        let mut mounts = parse_mounts(&text);
+        expand_mounts(&self.root, &mut mounts)?;
+        Ok(mounts)
+    }
+
+    fn lock_root(&self) -> Option<PathBuf> {
+        Some(self.root.clone())
     }
 
     fn write_chunk(
@@ -1166,11 +1457,22 @@ impl BlockDeviceBackend for SystemBlockBackend {
             .unwrap_or(true);
         if needs_open {
             let path = self.device_path(&target.id);
+            // O_EXCL asks the kernel for an exclusive open, so a device another
+            // process already holds cannot be written behind its back. On a
+            // regular file (a fixture root) the flag has no effect.
             let file = OpenOptions::new()
                 .write(true)
+                .custom_flags(libc::O_EXCL)
                 .open(&path)
-                .map_err(|error| {
-                    SystemInstallError::Io(format!("unable to open {}: {error}", path.display()))
+                .map_err(|error| match error.raw_os_error() {
+                    Some(libc::EBUSY) => SystemInstallError::Conflict(format!(
+                        "{} is already open by another process",
+                        path.display()
+                    )),
+                    _ => SystemInstallError::Io(format!(
+                        "unable to open {}: {error}",
+                        path.display()
+                    )),
                 })?;
             *handles = Some((target.id.clone(), file));
         }
@@ -1334,19 +1636,33 @@ fn reread_partition_table(path: &Path) -> Result<(), SystemInstallError> {
 pub struct SystemImageOpener;
 
 impl ImageOpener for SystemImageOpener {
+    /// Opens the image and refuses it when the file is no longer the one the plan
+    /// described.
+    ///
+    /// The plan bound the file's identity, but binding it is only useful if the
+    /// bytes that reach the device come from the same file: a replacement between
+    /// the check and the write would otherwise be written and reported as a
+    /// success. The identity is therefore checked on the handle that is actually
+    /// read, and a compressed image is decompressed from that handle rather than
+    /// from the path a second time.
     fn open(&self, image: &SystemInstallImage) -> Result<Box<dyn Read + Send>, SystemInstallError> {
+        let file = File::open(&image.path).map_err(|error| {
+            SystemInstallError::Io(format!("unable to open {}: {error}", image.path))
+        })?;
+        let observed = file.metadata().map_err(|error| {
+            SystemInstallError::Io(format!("unable to stat {}: {error}", image.path))
+        })?;
+        if file_identity(&observed) != image.file_identity {
+            return Err(SystemInstallError::StalePlan);
+        }
         match image.format {
-            InstallImageFormat::Raw => {
-                let file = File::open(&image.path).map_err(|error| {
-                    SystemInstallError::Io(format!("unable to open {}: {error}", image.path))
-                })?;
-                Ok(Box::new(file))
-            }
+            InstallImageFormat::Raw => Ok(Box::new(file)),
             InstallImageFormat::Xz => {
                 let mut command = Command::new("xz");
                 command
-                    .args(["-dc", &image.path])
-                    .stdin(Stdio::null())
+                    .arg("-dc")
+                    // Decompress the verified handle, not the path.
+                    .stdin(Stdio::from(file))
                     .stdout(Stdio::piped())
                     // The reason for a failure is on stderr, so it is captured
                     // rather than discarded.
@@ -1602,8 +1918,8 @@ impl BlockDeviceKind {
 
 /// Reads the partition table of a raw image: MBR, or GPT behind a protective
 /// MBR.
-fn read_partition_table(
-    file: &mut File,
+fn read_partition_table<R: Read + Seek>(
+    file: &mut R,
 ) -> Result<(String, Vec<SystemInstallPartition>), SystemInstallError> {
     let mut sector = [0u8; 512];
     if file
@@ -1655,7 +1971,9 @@ fn read_partition_table(
     Ok(("mbr".into(), primary))
 }
 
-fn read_gpt(file: &mut File) -> Result<Vec<SystemInstallPartition>, SystemInstallError> {
+fn read_gpt<R: Read + Seek>(
+    file: &mut R,
+) -> Result<Vec<SystemInstallPartition>, SystemInstallError> {
     let mut header = [0u8; 92];
     if file
         .seek(SeekFrom::Start(SECTOR_BYTES))
@@ -2044,6 +2362,20 @@ mod tests {
         write_file(path, value.as_bytes());
     }
 
+    #[test]
+    fn chunk_length_is_narrowed_only_after_the_comparison() {
+        let buffer = CHUNK_BYTES as usize;
+        // Exactly 4 GiB: narrowing the remainder first produced a zero-length
+        // read, which the write loop reported as a short image.
+        assert_eq!(chunk_len(buffer, u64::from(u32::MAX) + 1), buffer);
+        assert_eq!(chunk_len(buffer, 4 * GIB + 1), buffer);
+        assert_eq!(chunk_len(buffer, 8 * GIB), buffer);
+        // Small remainders still bound the read.
+        assert_eq!(chunk_len(buffer, buffer as u64 - 1), buffer - 1);
+        assert_eq!(chunk_len(buffer, 10), 10);
+        assert_eq!(chunk_len(buffer, 0), 0);
+    }
+
     /// A raw image with an MBR and `count` partitions of `partition_bytes`.
     fn mbr_image(count: usize, partition_bytes: u64) -> Vec<u8> {
         let mut image = vec![0u8; (partition_bytes * count as u64 + 2 * MIB) as usize];
@@ -2057,6 +2389,57 @@ mod tests {
             image[base + 12..base + 16]
                 .copy_from_slice(&((partition_bytes / SECTOR_BYTES) as u32).to_le_bytes());
         }
+        image
+    }
+
+    /// Two plans naming the same target cannot both enter the write sequence. The
+    /// lock is held across verify, write, flush and re-read, so chunks from two
+    /// different images can never interleave on one device; without it both tokens
+    /// are accepted and the device ends up holding neither image.
+    #[test]
+    fn a_second_write_to_the_same_target_is_refused_while_one_is_held() {
+        let harness = fixture("install-lock", boot_mounts(), RereadBehavior::Matches);
+        let lock_root = harness
+            .backend
+            .lock_root()
+            .expect("a fixture root is lockable");
+        let held =
+            crate::transaction::ProcessLock::acquire(&lock_root, "rsetup-next-install-sda.lock")
+                .expect("hold the target lock");
+        let request = install_request(&harness.image);
+        let plan = harness.manager.plan(&request).expect("plan");
+        match harness
+            .manager
+            .apply_live(&request, &plan.plan_token, "sda")
+        {
+            Err(SystemInstallError::Conflict(message)) => {
+                assert!(message.contains("already running"), "{message}");
+            }
+            other => panic!("a concurrent write must be refused: {other:?}"),
+        }
+        // The refused attempt never consumed the token, so the reviewed plan is
+        // still usable once the other writer finishes.
+        drop(held);
+        assert!(
+            harness
+                .manager
+                .apply_live(&request, &plan.plan_token, "sda")
+                .is_ok(),
+            "the plan survives a refused concurrent write"
+        );
+    }
+
+    /// A valid MBR disk image of exactly `len` bytes, for openers that stand in
+    /// for a decompressor. The payload header has to parse now that a compressed
+    /// image's table is read while planning.
+    fn mbr_bytes(len: usize) -> Vec<u8> {
+        assert!(len >= SECTOR_BYTES as usize, "an MBR needs one sector");
+        let mut image = vec![0u8; len];
+        image[510] = 0x55;
+        image[511] = 0xAA;
+        image[446 + 4] = 0x83;
+        image[446 + 8..446 + 12].copy_from_slice(&2048u32.to_le_bytes());
+        image[446 + 12..446 + 16].copy_from_slice(&1024u32.to_le_bytes());
         image
     }
 
@@ -2096,16 +2479,26 @@ mod tests {
         image
     }
 
-    /// A real `.xz` stream: `printf 'hello world\n' | xz -9`, i.e. 12 bytes
+    /// A real `.xz` stream wrapping a 512 byte MBR disk image with one 0x83
+    /// partition (LBA 2048, 1024 sectors), i.e. [`XZ_FIXTURE_BYTES`]
     /// uncompressed. Pinned here so the parser is tested without a compression
     /// dependency and without running a tool.
+    ///
+    /// The payload is a disk image on purpose: a compressed text file is a valid
+    /// `.xz` container, so a fixture that decompressed to prose would no longer
+    /// be plannable now that the payload header is parsed.
     const XZ_FIXTURE: &[u8] = &[
-        0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00, 0x00, 0x04, 0xE6, 0xD6, 0xB4, 0x46, 0x02, 0x00, 0x21,
-        0x01, 0x1C, 0x00, 0x00, 0x00, 0x10, 0xCF, 0x58, 0xCC, 0x01, 0x00, 0x0B, 0x68, 0x65, 0x6C,
-        0x6C, 0x6F, 0x20, 0x77, 0x6F, 0x72, 0x6C, 0x64, 0x0A, 0x00, 0xA1, 0xF2, 0xFF, 0xC4, 0x6A,
-        0x7F, 0xBF, 0xCF, 0x00, 0x01, 0x24, 0x0C, 0xA6, 0x18, 0xD8, 0xD8, 0x1F, 0xB6, 0xF3, 0x7D,
-        0x01, 0x00, 0x00, 0x00, 0x00, 0x04, 0x59, 0x5A,
+        0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00, 0x00, 0x04, 0xE6, 0xD6, 0xB4, 0x46, 0x04, 0xC0, 0x1B,
+        0x80, 0x04, 0x21, 0x01, 0x1C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xB1, 0x1F,
+        0x34, 0xD4, 0xE0, 0x01, 0xFF, 0x00, 0x13, 0x5D, 0x00, 0x00, 0x6F, 0xFD, 0xFC, 0x9F, 0x2F,
+        0x12, 0x9F, 0xA0, 0x86, 0x59, 0x2A, 0xA2, 0x11, 0x28, 0x99, 0x85, 0x40, 0x00, 0x00, 0x00,
+        0x58, 0x96, 0x4C, 0x17, 0xCF, 0xA3, 0x7F, 0xE2, 0x00, 0x01, 0x37, 0x80, 0x04, 0x00, 0x00,
+        0x00, 0x0D, 0xC4, 0xAE, 0xE4, 0xB1, 0xC4, 0x67, 0xFB, 0x02, 0x00, 0x00, 0x00, 0x00, 0x04,
+        0x59, 0x5A,
     ];
+
+    /// Uncompressed length of [`XZ_FIXTURE`].
+    const XZ_FIXTURE_BYTES: u64 = 512;
 
     #[derive(Clone, Copy, PartialEq)]
     enum RereadBehavior {
@@ -2131,6 +2524,13 @@ mod tests {
     impl BlockDeviceBackend for FixtureBackend {
         fn targets(&self) -> Result<Vec<SystemInstallTarget>, SystemInstallError> {
             Ok(self.targets.lock().expect("targets lock").clone())
+        }
+
+        fn lock_root(&self) -> Option<PathBuf> {
+            // The device is <root>/device.img, so its parent is this test's own
+            // root and the lock lands in <root>/run/lock. Deriving one level too
+            // far would put every test on the shared parent directory.
+            self.device.parent().map(Path::to_path_buf)
         }
 
         fn mounts(&self) -> Result<Vec<SystemMount>, SystemInstallError> {
@@ -2322,13 +2722,26 @@ mod tests {
         write_attr(&root.join("sys/class/block/mmcblk1/removable"), "1\n");
         write_attr(&root.join("sys/class/block/mmcblk1/device/name"), "SD32G\n");
         write_attr(&root.join("sys/class/block/mmcblk1/device/type"), "SD\n");
+        write_attr(&root.join("sys/class/block/mmcblk1/dev"), "179:0\n");
+        write_attr(&root.join("sys/class/block/mmcblk1p1/dev"), "179:1\n");
         write_attr(&root.join("sys/class/block/mmcblk1p1/partition"), "1\n");
         write_attr(&root.join("sys/class/block/mmcblk1p1/start"), "8192\n");
         write_attr(&root.join("sys/class/block/mmcblk1p1/size"), "524288\n");
+        write_attr(&root.join("sys/class/block/mmcblk1p2/dev"), "179:2\n");
+        write_attr(&root.join("sys/class/block/mmcblk1p2/partition"), "2\n");
+        write_attr(&root.join("sys/class/block/mmcblk1p2/start"), "540672\n");
+        write_attr(&root.join("sys/class/block/mmcblk1p2/size"), "819200\n");
+        write_attr(&root.join("sys/class/block/mmcblk0/dev"), "179:32\n");
         write_attr(&root.join("sys/class/block/loop0/size"), "1024\n");
         write_file(
             &root.join("proc/mounts"),
             b"/dev/mmcblk1p1 /boot vfat rw 0 0\n/dev/mmcblk1p2 / ext4 rw 0 0\n",
+        );
+        // The kernel's own table carries the device number for each mount, which
+        // is how a `/dev/root` or by-uuid source is attributed to its disk.
+        write_file(
+            &root.join("proc/self/mountinfo"),
+            b"36 35 179:1 / /boot rw,relatime - vfat /dev/mmcblk1p1 rw\n37 35 179:2 / / rw,relatime - ext4 /dev/mmcblk1p2 rw\n",
         );
 
         let manager = SystemInstallManager::new(Some(&root), false);
@@ -2600,20 +3013,30 @@ mod tests {
         // Offset 30 sits in the compressed data, so the frames stay valid and the
         // plan is accepted: only the decompressor's exit status reveals the damage.
         for (name, bytes, offset, expected) in [
-            ("single.img.xz", XZ_FIXTURE.to_vec(), 30, 12u64),
+            ("single.img.xz", XZ_FIXTURE.to_vec(), 30, XZ_FIXTURE_BYTES),
             (
                 "two.img.xz",
                 [XZ_FIXTURE, XZ_FIXTURE].concat(),
                 XZ_FIXTURE.len() + 30,
-                24,
+                XZ_FIXTURE_BYTES * 2,
             ),
         ] {
             let path = harness.root.join(name);
             write_file(&path, flip(&bytes, offset));
-            let plan = harness
-                .manager
-                .plan(&install_request(&path))
-                .unwrap_or_else(|error| panic!("{name} plans (frames are intact): {error}"));
+            // Damage inside the prefix the planner decompresses is now caught
+            // while planning; damage past it still surfaces while writing. Either
+            // way the file is never reported as a successful install.
+            let plan = match harness.manager.plan(&install_request(&path)) {
+                Ok(plan) => plan,
+                Err(SystemInstallError::InvalidInput(message)) => {
+                    assert!(
+                        message.contains("could not be decompressed"),
+                        "{name}: {message}"
+                    );
+                    continue;
+                }
+                Err(other) => panic!("{name} must be refused with a reason: {other}"),
+            };
             assert_eq!(plan.image.uncompressed_bytes, expected, "{name}");
             match harness
                 .manager
@@ -2649,10 +3072,14 @@ mod tests {
         for (name, offset) in [("early.img.xz", 16), ("partial.img.xz", 25)] {
             let path = harness.root.join(name);
             write_file(&path, flip(XZ_FIXTURE, offset));
-            let plan = harness
-                .manager
-                .plan(&install_request(&path))
-                .unwrap_or_else(|error| panic!("{name} plans: {error}"));
+            // Corrupting the block the planner has to decompress is refused while
+            // planning; a stream that survives the prefix read is still caught
+            // while writing. Both are hard failures.
+            let plan = match harness.manager.plan(&install_request(&path)) {
+                Ok(plan) => plan,
+                Err(SystemInstallError::InvalidInput(_)) => continue,
+                Err(other) => panic!("{name} must be refused with a reason: {other}"),
+            };
             let outcome =
                 harness
                     .manager
@@ -3005,6 +3432,116 @@ mod tests {
         ));
     }
 
+    /// The reproduction from the finding: the plan bound the file's identity, but
+    /// the write re-opened the path without checking the handle it got, so a
+    /// replacement between the check and the write was written and reported as a
+    /// success. The opener below swaps the file at exactly that moment.
+    #[test]
+    fn a_replacement_between_the_check_and_the_write_is_refused() {
+        struct SwappingOpener {
+            path: PathBuf,
+            replacement: Vec<u8>,
+        }
+        impl ImageOpener for SwappingOpener {
+            fn open(
+                &self,
+                image: &SystemInstallImage,
+            ) -> Result<Box<dyn Read + Send>, SystemInstallError> {
+                // The window the finding is about: the plan has been checked and
+                // the write is about to open the image.
+                write_file(&self.path, &self.replacement);
+                SystemImageOpener.open(image)
+            }
+        }
+
+        let root = scratch("swap-after-check");
+        fs::create_dir_all(root.join("sys/class/block/sda")).expect("create class directory");
+        write_attr(&root.join("sys/class/block/sda/size"), "131072\n");
+        write_attr(&root.join("sys/class/block/sda/dev"), "8:0\n");
+        write_file(&root.join("dev/sda"), vec![0u8; 4 * MIB as usize]);
+        // Nothing is mounted, so the only gate in play is the image's identity.
+        write_file(&root.join("proc/mounts"), b"");
+
+        let image = root.join("system.img");
+        write_file(&image, mbr_image(1, 2 * MIB));
+        // Same length and a change past the hashed prefix, so nothing but the
+        // file's identity can tell the replacement from the original.
+        let mut replacement = mbr_image(1, 2 * MIB);
+        let offset = (IMAGE_PREFIX_BYTES + IMAGE_PREFIX_BYTES / 2) as usize;
+        replacement[offset] ^= 0xFF;
+        assert_eq!(replacement.len(), mbr_image(1, 2 * MIB).len());
+        let request = SystemInstallRequest {
+            target_id: "sda".into(),
+            image_path: Some(image.display().to_string()),
+            image_id: None,
+        };
+
+        // Control: the same setup with the real opener writes normally, so the
+        // refusal below is about the swap and not about the fixture.
+        let plain = SystemInstallManager::with_backend(
+            Arc::new(SystemBlockBackend::new(Some(&root))),
+            Arc::new(SystemImageOpener),
+            false,
+        );
+        let plan = plain.plan(&request).expect("plan");
+        assert!(plain.apply_live(&request, &plan.plan_token, "sda").is_ok());
+
+        // The swap happens after the plan was accepted and before the write.
+        let swapping = SystemInstallManager::with_backend(
+            Arc::new(SystemBlockBackend::new(Some(&root))),
+            Arc::new(SwappingOpener {
+                path: image.clone(),
+                replacement,
+            }),
+            false,
+        );
+        let plan = swapping.plan(&request).expect("plan");
+        match swapping.apply_live(&request, &plan.plan_token, "sda") {
+            Err(SystemInstallError::StalePlan) => {}
+            other => panic!("a replaced image must not be written: {other:?}"),
+        }
+    }
+
+    /// The reproduction from the finding: the token only digested the first
+    /// `IMAGE_PREFIX_BYTES`, so editing data beyond that while keeping the length
+    /// left an old token valid and the plan would write bytes nobody reviewed.
+    #[test]
+    fn an_edit_past_the_hashed_prefix_invalidates_the_plan() {
+        let harness = fixture("edit-past-prefix", boot_mounts(), RereadBehavior::Matches);
+        let mut bytes = mbr_image(2, 8 * MIB);
+        assert!(bytes.len() as u64 > IMAGE_PREFIX_BYTES * 3 / 2);
+        write_file(&harness.image, &bytes);
+        let request = install_request(&harness.image);
+        let plan = harness.manager.plan(&request).expect("plan");
+
+        // Change a byte at 1.5 MiB, past the 1 MiB the digest covers, and keep the
+        // length identical. The modification time moves, so the binding must too.
+        let offset = (IMAGE_PREFIX_BYTES + IMAGE_PREFIX_BYTES / 2) as usize;
+        bytes[offset] ^= 0xFF;
+        write_file(&harness.image, &bytes);
+        assert_eq!(
+            fs::metadata(&harness.image).expect("stat").len(),
+            plan.image.size_bytes,
+            "the length is unchanged, so only identity can catch this"
+        );
+        assert!(matches!(
+            harness
+                .manager
+                .apply_live(&request, &plan.plan_token, "sda"),
+            Err(SystemInstallError::StalePlan)
+        ));
+
+        // Re-planning the edited file is accepted: the gate is drift, not the edit.
+        let fresh = harness.manager.plan(&request).expect("re-plan");
+        assert_ne!(fresh.plan_token, plan.plan_token);
+        assert!(
+            harness
+                .manager
+                .apply_live(&request, &fresh.plan_token, "sda")
+                .is_ok()
+        );
+    }
+
     #[test]
     fn streams_the_image_in_bounded_chunks_with_exact_bytes() {
         let harness = fixture("stream", boot_mounts(), RereadBehavior::Matches);
@@ -3355,11 +3892,16 @@ mod tests {
             .expect("plan an xz image");
         assert_eq!(plan.image.format, InstallImageFormat::Xz);
         assert_eq!(
-            plan.image.uncompressed_bytes, 12,
+            plan.image.uncompressed_bytes, XZ_FIXTURE_BYTES,
             "the xz index declares it"
         );
         assert_eq!(plan.image.size_bytes, XZ_FIXTURE.len() as u64);
-        assert!(plan.image.partition_table.is_none());
+        assert_eq!(
+            plan.image.partition_table.as_deref(),
+            Some("mbr"),
+            "the decompressed payload header is parsed while planning"
+        );
+        assert_eq!(plan.image.partitions.len(), 1);
         assert!(
             plan.warnings
                 .contains(&"the_image_is_compressed_and_is_decompressed_while_writing".to_owned())
@@ -3382,24 +3924,25 @@ mod tests {
     }
 
     /// One `.xz` stream whose index holds four block records (made with
-    /// `xz --block-size=256` over 1024 bytes, so the per-record summing is
-    /// exercised too). The last stream of a concatenation is what a
+    /// `xz --block-size=256` over a 1024 byte MBR image, so the per-record
+    /// summing is exercised too). The last stream of a concatenation is what a
     /// last-stream-only parser reports, which is the truncation this guards.
     const XZ_MULTI_BLOCK_FIXTURE: &[u8] = &[
         0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00, 0x00, 0x04, 0xE6, 0xD6, 0xB4, 0x46, 0x03, 0xC0, 0x0E,
-        0x80, 0x02, 0x21, 0x01, 0x16, 0x00, 0x00, 0x00, 0x00, 0xC1, 0x8C, 0x6D, 0xDA, 0xE0, 0x00,
-        0xFF, 0x00, 0x06, 0x5D, 0x00, 0x20, 0xEF, 0xD6, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x66,
-        0xDD, 0x4D, 0xCC, 0xD4, 0x27, 0x12, 0x9A, 0x03, 0xC0, 0x0E, 0x80, 0x02, 0x21, 0x01, 0x16,
-        0x00, 0x00, 0x00, 0x00, 0xC1, 0x8C, 0x6D, 0xDA, 0xE0, 0x00, 0xFF, 0x00, 0x06, 0x5D, 0x00,
-        0x20, 0xEF, 0xD6, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x66, 0xDD, 0x4D, 0xCC, 0xD4, 0x27,
-        0x12, 0x9A, 0x03, 0xC0, 0x0E, 0x80, 0x02, 0x21, 0x01, 0x16, 0x00, 0x00, 0x00, 0x00, 0xC1,
-        0x8C, 0x6D, 0xDA, 0xE0, 0x00, 0xFF, 0x00, 0x06, 0x5D, 0x00, 0x20, 0xEF, 0xD6, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x66, 0xDD, 0x4D, 0xCC, 0xD4, 0x27, 0x12, 0x9A, 0x03, 0xC0, 0x0E,
-        0x80, 0x02, 0x21, 0x01, 0x16, 0x00, 0x00, 0x00, 0x00, 0xC1, 0x8C, 0x6D, 0xDA, 0xE0, 0x00,
-        0xFF, 0x00, 0x06, 0x5D, 0x00, 0x20, 0xEF, 0xD6, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x66,
-        0xDD, 0x4D, 0xCC, 0xD4, 0x27, 0x12, 0x9A, 0x00, 0x04, 0x26, 0x80, 0x02, 0x26, 0x80, 0x02,
-        0x26, 0x80, 0x02, 0x26, 0x80, 0x02, 0x00, 0x00, 0x1A, 0x5A, 0x71, 0xE3, 0xAC, 0x27, 0x3E,
-        0x2D, 0x04, 0x00, 0x00, 0x00, 0x00, 0x04, 0x59, 0x5A,
+        0x80, 0x02, 0x21, 0x01, 0x1C, 0x00, 0x00, 0x00, 0x00, 0x60, 0x94, 0xDD, 0x90, 0xE0, 0x00,
+        0xFF, 0x00, 0x06, 0x5D, 0x00, 0x00, 0x6F, 0xD8, 0x40, 0x98, 0x00, 0x00, 0x00, 0x00, 0xDC,
+        0xCE, 0x17, 0xE2, 0x4C, 0x2C, 0xD5, 0xD0, 0x03, 0xC0, 0x19, 0x80, 0x02, 0x21, 0x01, 0x1C,
+        0x00, 0x00, 0x00, 0x00, 0xF1, 0x0E, 0xAF, 0x55, 0xE0, 0x00, 0xFF, 0x00, 0x11, 0x5D, 0x00,
+        0x00, 0x6F, 0x5C, 0xC6, 0x0E, 0x32, 0x06, 0xA7, 0xE0, 0x80, 0x91, 0xFA, 0x7A, 0x74, 0x4A,
+        0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0xE8, 0xA4, 0x00, 0x59, 0xA1, 0x64, 0x38, 0x5B, 0x03,
+        0xC0, 0x0E, 0x80, 0x02, 0x21, 0x01, 0x1C, 0x00, 0x00, 0x00, 0x00, 0x60, 0x94, 0xDD, 0x90,
+        0xE0, 0x00, 0xFF, 0x00, 0x06, 0x5D, 0x00, 0x00, 0x6F, 0xD8, 0x40, 0x98, 0x00, 0x00, 0x00,
+        0x00, 0xDC, 0xCE, 0x17, 0xE2, 0x4C, 0x2C, 0xD5, 0xD0, 0x03, 0xC0, 0x0E, 0x80, 0x02, 0x21,
+        0x01, 0x1C, 0x00, 0x00, 0x00, 0x00, 0x60, 0x94, 0xDD, 0x90, 0xE0, 0x00, 0xFF, 0x00, 0x06,
+        0x5D, 0x00, 0x00, 0x6F, 0xD8, 0x40, 0x98, 0x00, 0x00, 0x00, 0x00, 0xDC, 0xCE, 0x17, 0xE2,
+        0x4C, 0x2C, 0xD5, 0xD0, 0x00, 0x04, 0x26, 0x80, 0x02, 0x31, 0x80, 0x02, 0x26, 0x80, 0x02,
+        0x26, 0x80, 0x02, 0x00, 0x00, 0x52, 0x8B, 0xBC, 0x64, 0xAC, 0x27, 0x3E, 0x2D, 0x04, 0x00,
+        0x00, 0x00, 0x00, 0x04, 0x59, 0x5A,
     ];
 
     /// Every fixture's uncompressed size is compared against the reference
@@ -3407,11 +3950,11 @@ mod tests {
     ///
     /// ```text
     /// fixture                                     streams        xz -dc | wc -c
-    /// XZ_FIXTURE                                  1                     12
-    /// XZ_FIXTURE + XZ_FIXTURE                     2                     24
-    /// XZ_FIXTURE + 0x00 * 4 + XZ_FIXTURE          2 (stream padding)    24
-    /// XZ_FIXTURE + 0x00 * 4 + XZ_FIXTURE * 2      3 (stream padding)    36
-    /// XZ_FIXTURE + 0x00 * 4                       1 (trailing padding)  12
+    /// XZ_FIXTURE                                  1                     512
+    /// XZ_FIXTURE + XZ_FIXTURE                     2                     1024
+    /// XZ_FIXTURE + 0x00 * 4 + XZ_FIXTURE          2 (stream padding)    1024
+    /// XZ_FIXTURE + 0x00 * 4 + XZ_FIXTURE * 2      3 (stream padding)    1536
+    /// XZ_FIXTURE + 0x00 * 4                       1 (trailing padding)  512
     /// XZ_MULTI_BLOCK_FIXTURE                      1 (4 blocks)        1024
     /// ```
     #[test]
@@ -3419,19 +3962,27 @@ mod tests {
         let harness = fixture("xz-streams", boot_mounts(), RereadBehavior::Matches);
         let padding = [0u8; 4];
         let cases: Vec<(&str, Vec<u8>, u64)> = vec![
-            ("single.img.xz", XZ_FIXTURE.to_vec(), 12),
-            ("two.img.xz", [XZ_FIXTURE, XZ_FIXTURE].concat(), 24),
+            ("single.img.xz", XZ_FIXTURE.to_vec(), XZ_FIXTURE_BYTES),
+            (
+                "two.img.xz",
+                [XZ_FIXTURE, XZ_FIXTURE].concat(),
+                XZ_FIXTURE_BYTES * 2,
+            ),
             (
                 "padded.img.xz",
                 [XZ_FIXTURE, &padding, XZ_FIXTURE].concat(),
-                24,
+                XZ_FIXTURE_BYTES * 2,
             ),
             (
                 "three.img.xz",
                 [XZ_FIXTURE, &padding, XZ_FIXTURE, XZ_FIXTURE].concat(),
-                36,
+                XZ_FIXTURE_BYTES * 3,
             ),
-            ("trailing.img.xz", [XZ_FIXTURE, &padding].concat(), 12),
+            (
+                "trailing.img.xz",
+                [XZ_FIXTURE, &padding].concat(),
+                XZ_FIXTURE_BYTES,
+            ),
             ("multi-block.img.xz", XZ_MULTI_BLOCK_FIXTURE.to_vec(), 1024),
         ];
         for (name, bytes, expected) in cases {
@@ -3467,7 +4018,7 @@ mod tests {
     }
 
     /// The reproduction from the finding, end to end: two concatenated streams
-    /// plan as 24 bytes and are written as 24 bytes. A last-stream-only size (12)
+    /// plan as the sum of both and are written in full. A last-stream-only size
     /// would have written half the image and reported success.
     #[test]
     fn a_concatenated_image_is_planned_and_written_in_full() {
@@ -3477,12 +4028,10 @@ mod tests {
                 &self,
                 _image: &SystemInstallImage,
             ) -> Result<Box<dyn Read + Send>, SystemInstallError> {
-                Ok(Box::new(std::io::Cursor::new(vec![
-                    0x5Au8;
-                    self.0 as usize
-                ])))
+                Ok(Box::new(std::io::Cursor::new(mbr_bytes(self.0 as usize))))
             }
         }
+        let total = XZ_FIXTURE_BYTES * 2;
         let harness = fixture(
             "xz-two-streams-write",
             boot_mounts(),
@@ -3492,22 +4041,23 @@ mod tests {
         write_file(&xz, [XZ_FIXTURE, XZ_FIXTURE].concat());
         let manager = SystemInstallManager::with_backend(
             harness.backend.clone(),
-            Arc::new(TotalOpener(24)),
+            Arc::new(TotalOpener(total)),
             false,
         );
         let request = install_request(&xz);
         let plan = manager.plan(&request).expect("plan");
         assert_eq!(
-            plan.image.uncompressed_bytes, 24,
+            plan.image.uncompressed_bytes, total,
             "both streams are counted, so the plan describes the whole image"
         );
         let result = manager
             .apply_live(&request, &plan.plan_token, "sda")
             .expect("write the concatenated image");
-        assert_eq!(result.bytes_written, 24);
+        assert_eq!(result.bytes_written, total);
+        let device = fs::read(&harness.device).expect("read the fixture device");
         assert_eq!(
-            &fs::read(&harness.device).expect("read the fixture device")[..24],
-            &[0x5Au8; 24],
+            &device[510..512],
+            &[0x55, 0xAA],
             "both streams reached the device"
         );
     }
@@ -3554,47 +4104,83 @@ mod tests {
         assert_eq!(written, declared, "the write stops at the declared size");
     }
 
+    /// A compressed image's header is parsed while planning, so its table is now
+    /// compared like a raw image's. The opener returns a valid MBR and the fixture
+    /// device re-reads a different table, so the result must be a mismatch — the
+    /// "unsupported, nothing to compare" this used to report is what let a
+    /// compressed non-image be written and only then found unverifiable.
     #[test]
-    fn a_compressed_image_reports_that_the_table_was_not_compared() {
-        struct TwelveByteOpener;
-        impl ImageOpener for TwelveByteOpener {
+    fn a_compressed_image_table_is_parsed_and_compared() {
+        struct MbrOpener;
+        impl ImageOpener for MbrOpener {
             fn open(
                 &self,
                 _image: &SystemInstallImage,
             ) -> Result<Box<dyn Read + Send>, SystemInstallError> {
-                Ok(Box::new(std::io::Cursor::new(vec![0x5Au8; 12])))
+                Ok(Box::new(std::io::Cursor::new(mbr_bytes(
+                    XZ_FIXTURE_BYTES as usize,
+                ))))
             }
         }
-        // The host does re-read the table here, so a mismatch would have been
-        // reported before: a compressed image has no expected layout to compare.
-        let harness = fixture("xz-verify", boot_mounts(), RereadBehavior::Matches);
+        let harness = fixture("xz-verify", boot_mounts(), RereadBehavior::Differs);
         let xz = harness.root.join("system.img.xz");
         write_file(&xz, XZ_FIXTURE);
-        let manager = SystemInstallManager::with_backend(
-            harness.backend.clone(),
-            Arc::new(TwelveByteOpener),
-            false,
-        );
+        let manager =
+            SystemInstallManager::with_backend(harness.backend.clone(), Arc::new(MbrOpener), false);
         let request = install_request(&xz);
         let plan = manager.plan(&request).expect("plan");
+        assert_eq!(
+            plan.image.partition_table.as_deref(),
+            Some("mbr"),
+            "the decompressed header was parsed while planning"
+        );
+        assert_eq!(plan.image.partitions.len(), 1);
         let result = manager
             .apply_live(&request, &plan.plan_token, "sda")
             .expect("write the compressed image");
         assert_eq!(
             result.verification.state,
-            SystemInstallVerificationState::Unsupported,
-            "not Matched and not Mismatched: {result:?}"
+            SystemInstallVerificationState::Mismatched,
+            "{result:?}"
         );
-        let detail = result.verification.detail.as_deref().unwrap_or_default();
-        assert!(detail.contains("compressed"), "{detail}");
-        assert!(detail.contains("not compared"), "{detail}");
         assert!(
-            result.verification.observed.is_some(),
-            "the table was re-read, it just has nothing to be compared against"
+            !result.verification.expected.is_empty(),
+            "there is an expected layout to compare against"
         );
-        assert!(result.verification.expected.is_empty());
         let output = result.run.output.clone().unwrap_or_default();
-        assert!(!output.contains("DOES NOT match"), "{output}");
+        assert!(output.contains("DOES NOT match"), "{output}");
+    }
+
+    /// A compressed payload that is not a disk image must be refused while
+    /// planning. A valid `.xz` container is not evidence of a bootable image: a
+    /// compressed text file satisfies every container check.
+    #[test]
+    fn a_compressed_payload_that_is_not_a_disk_image_is_refused() {
+        struct TextOpener;
+        impl ImageOpener for TextOpener {
+            fn open(
+                &self,
+                _image: &SystemInstallImage,
+            ) -> Result<Box<dyn Read + Send>, SystemInstallError> {
+                Ok(Box::new(std::io::Cursor::new(
+                    b"this is not a disk image\n".to_vec(),
+                )))
+            }
+        }
+        let harness = fixture("xz-not-an-image", boot_mounts(), RereadBehavior::Matches);
+        let xz = harness.root.join("notes.txt.xz");
+        write_file(&xz, XZ_FIXTURE);
+        let manager = SystemInstallManager::with_backend(
+            harness.backend.clone(),
+            Arc::new(TextOpener),
+            false,
+        );
+        match manager.plan(&install_request(&xz)) {
+            Err(SystemInstallError::InvalidInput(detail)) => {
+                assert!(detail.contains("partition table"), "{detail}");
+            }
+            other => panic!("a compressed text file must never be plannable: {other:?}"),
+        }
     }
 
     #[test]
@@ -3605,11 +4191,10 @@ mod tests {
                 &self,
                 _image: &SystemInstallImage,
             ) -> Result<Box<dyn Read + Send>, SystemInstallError> {
-                // Stands in for `xz -dc` without needing the tool installed.
-                Ok(Box::new(std::io::Cursor::new(vec![
-                    0x5Au8;
-                    self.0 as usize
-                ])))
+                // Stands in for `xz -dc` without needing the tool installed. The
+                // payload must be a parseable disk image, because a compressed
+                // image's header is read while planning.
+                Ok(Box::new(std::io::Cursor::new(mbr_bytes(self.0 as usize))))
             }
         }
         let harness = fixture("opener-write", boot_mounts(), RereadBehavior::Unsupported);
@@ -3619,18 +4204,20 @@ mod tests {
         // issued by the planning instance.
         let manager = SystemInstallManager::with_backend(
             harness.backend.clone(),
-            Arc::new(FixtureOpener(12)),
+            Arc::new(FixtureOpener(XZ_FIXTURE_BYTES)),
             false,
         );
         let plan = manager.plan(&install_request(&xz)).expect("plan");
-        assert_eq!(plan.image.uncompressed_bytes, 12);
+        assert_eq!(plan.image.uncompressed_bytes, XZ_FIXTURE_BYTES);
         let result = manager
             .apply_live(&install_request(&xz), &plan.plan_token, "sda")
             .expect("stream from the injected opener");
-        assert_eq!(result.bytes_written, 12);
+        assert_eq!(result.bytes_written, XZ_FIXTURE_BYTES);
+        let device = fs::read(&harness.device).expect("read device");
         assert_eq!(
-            fs::read(&harness.device).expect("read device")[..4],
-            [0x5Au8; 4]
+            &device[510..512],
+            &[0x55, 0xAA],
+            "the MBR reached the device"
         );
         assert_eq!(
             result.verification.state,
@@ -3670,6 +4257,149 @@ mod tests {
         }
     }
 
+    /// The regression from the finding: `/` reached through `/dev/root` or a
+    /// by-uuid symlink must still be attributed to the disk that backs it. Before
+    /// this, only the raw source string was compared, so the running system's own
+    /// disk was reported as unmounted and produced a plan that would overwrite it.
+    #[test]
+    fn an_aliased_root_source_still_protects_the_running_disk() {
+        let root = scratch("aliased-root");
+        fs::create_dir_all(root.join("sys/class/block")).expect("create class directory");
+        for (name, dev, size) in [("mmcblk1", "179:0", "62333952"), ("sda", "8:0", "131072")] {
+            let class = root.join("sys/class/block").join(name);
+            write_attr(&class.join("size"), &format!("{size}\n"));
+            write_attr(&class.join("removable"), "0\n");
+            write_attr(&class.join("dev"), &format!("{dev}\n"));
+        }
+        let partition = root.join("sys/class/block/mmcblk1p2");
+        write_attr(&partition.join("dev"), "179:2\n");
+        write_attr(&partition.join("partition"), "2\n");
+        write_attr(&partition.join("start"), "540672\n");
+        write_attr(&partition.join("size"), "819200\n");
+        write_file(&root.join("dev/sda"), vec![0u8; 4 * MIB as usize]);
+        // The source is not a kernel device name at all.
+        write_file(&root.join("proc/mounts"), b"/dev/root / ext4 rw 0 0\n");
+        write_file(
+            &root.join("proc/self/mountinfo"),
+            b"37 35 179:2 / / rw,relatime - ext4 /dev/root rw\n",
+        );
+
+        let manager = SystemInstallManager::new(Some(&root), false);
+        let targets = manager.targets().expect("enumerate the fixture");
+        let running = targets
+            .iter()
+            .find(|target| target.id == "mmcblk1")
+            .expect("the running disk is enumerated");
+        assert!(running.mounted, "{running:?}");
+        assert!(running.holds_running_system, "{running:?}");
+
+        let image = root.join("system.img");
+        write_file(&image, mbr_image(1, 2 * MIB));
+        let request = |target: &str| SystemInstallRequest {
+            target_id: target.into(),
+            image_path: Some(image.display().to_string()),
+            image_id: None,
+        };
+        match manager.plan(&request("mmcblk1")) {
+            Err(SystemInstallError::RunningSystem(path)) => {
+                assert!(path.contains("mmcblk1"), "{path}");
+            }
+            other => panic!("the running disk must never be plannable: {other:?}"),
+        }
+        // A different disk is still writable, so the gate is not simply refusing.
+        assert!(manager.plan(&request("sda")).is_ok());
+    }
+
+    /// Two mounts on two different disks must each be attributed to their own
+    /// disk. The mount table lists the device number in field 3 and the mount
+    /// point in field 5; reading the `root` field between them as the mount point
+    /// keys every mount under `/`, so the last line wins and a disk that really
+    /// hosts the running system is reported as free.
+    #[test]
+    fn mounts_on_different_disks_are_each_attributed() {
+        let root = scratch("two-disks");
+        fs::create_dir_all(root.join("sys/class/block")).expect("create class directory");
+        for (name, dev, size) in [("sda", "8:0", "131072"), ("sdb", "8:16", "131072")] {
+            let class = root.join("sys/class/block").join(name);
+            write_attr(&class.join("size"), &format!("{size}\n"));
+            write_attr(&class.join("removable"), "0\n");
+            write_attr(&class.join("dev"), &format!("{dev}\n"));
+        }
+        for (name, dev, number) in [("sda2", "8:2", "2"), ("sdb2", "8:18", "2")] {
+            let partition = root.join("sys/class/block").join(name);
+            write_attr(&partition.join("dev"), &format!("{dev}\n"));
+            write_attr(&partition.join("partition"), &format!("{number}\n"));
+            write_attr(&partition.join("start"), "540672\n");
+            write_attr(&partition.join("size"), "819200\n");
+        }
+        // `/` is named through a source that is not a kernel device name, so only
+        // the mount table can attribute it; `/boot` is named directly.
+        write_file(
+            &root.join("proc/mounts"),
+            b"/dev/root / ext4 rw 0 0\n/dev/sdb2 /boot vfat rw 0 0\n",
+        );
+        // `/` first and `/boot` second: a parser that keys both under `/` keeps the
+        // boot disk and loses the root disk.
+        write_file(
+            &root.join("proc/self/mountinfo"),
+            b"36 35 8:2 / / rw,relatime - ext4 /dev/root rw\n37 36 8:18 / /boot rw,relatime - vfat /dev/sdb2 rw\n",
+        );
+
+        let manager = SystemInstallManager::new(Some(&root), false);
+        let targets = manager.targets().expect("enumerate the fixture");
+        let by_id = |id: &str| {
+            targets
+                .iter()
+                .find(|target| target.id == id)
+                .unwrap_or_else(|| panic!("{id} is enumerated"))
+        };
+        let sda = by_id("sda");
+        assert!(sda.holds_running_system, "sda hosts /: {sda:?}");
+        assert!(sda.mounted, "sda has a mounted partition: {sda:?}");
+        let sdb = by_id("sdb");
+        assert!(sdb.holds_running_system, "sdb hosts /boot: {sdb:?}");
+        assert_eq!(sdb.mount_points, vec!["/boot".to_owned()], "{sdb:?}");
+        assert_eq!(sda.mount_points, vec!["/".to_owned()], "{sda:?}");
+
+        // The root disk must not be plannable; the other one is only refused
+        // because it also hosts a running-system mount.
+        let image = root.join("system.img");
+        write_file(&image, mbr_image(1, 2 * MIB));
+        for target in ["sda", "sdb"] {
+            let request = SystemInstallRequest {
+                target_id: target.into(),
+                image_path: Some(image.display().to_string()),
+                image_id: None,
+            };
+            assert!(
+                matches!(
+                    manager.plan(&request),
+                    Err(SystemInstallError::RunningSystem(_))
+                ),
+                "{target} hosts a running-system mount and must be refused"
+            );
+        }
+    }
+
+    /// A running-system mount that cannot be resolved must refuse rather than
+    /// assume the target is a different disk.
+    #[test]
+    fn an_unresolvable_running_mount_refuses_every_target() {
+        let root = scratch("unresolvable-root");
+        fs::create_dir_all(root.join("sys/class/block/sda")).expect("create class directory");
+        write_attr(&root.join("sys/class/block/sda/size"), "131072\n");
+        write_attr(&root.join("sys/class/block/sda/dev"), "8:0\n");
+        // No mount table entry, and the source is not a kernel device name.
+        write_file(&root.join("proc/mounts"), b"/dev/root / ext4 rw 0 0\n");
+        let manager = SystemInstallManager::new(Some(&root), false);
+        match manager.targets() {
+            Err(SystemInstallError::Unsupported(message)) => {
+                assert!(message.contains("could not be resolved"), "{message}");
+            }
+            other => panic!("an unresolvable running root must refuse: {other:?}"),
+        }
+    }
+
     /// The live backend must resolve the device node under its root, so a fixture
     /// root can be written without any real block device being involved.
     #[test]
@@ -3686,7 +4416,16 @@ mod tests {
         )
         .expect("symlink ufs host");
         write_file(&root.join("dev/sda"), vec![0u8; 4 * MIB as usize]);
-        write_file(&root.join("proc/mounts"), b"/dev/mmcblk1p2 / ext4 rw 0 0\n");
+        write_attr(&root.join("sys/class/block/sda/dev"), "8:0\n");
+        // The running system is on the SD card, named through a source that is not
+        // a kernel device name, so only the mount table attributes it correctly.
+        write_attr(&root.join("sys/class/block/mmcblk1/dev"), "179:0\n");
+        write_attr(&root.join("sys/class/block/mmcblk1p2/dev"), "179:2\n");
+        write_file(&root.join("proc/mounts"), b"/dev/root / ext4 rw 0 0\n");
+        write_file(
+            &root.join("proc/self/mountinfo"),
+            b"37 35 179:2 / / rw,relatime - ext4 /dev/root rw\n",
+        );
 
         let image = root.join("system.img");
         write_file(&image, mbr_image(1, 2 * MIB));

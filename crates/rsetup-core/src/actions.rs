@@ -1258,7 +1258,19 @@ fn sleep_targets() -> [&'static str; 5] {
     ]
 }
 
-fn effective_uid() -> Option<u32> {
+/// The narrow privileged helper every surface delegates a fixed verb to.
+pub const fn privileged_helper_path() -> &'static str {
+    PRIVILEGED_HELPER
+}
+
+/// `pkexec`, which is the only way a surface asks for administrator rights.
+pub const fn pkexec_path() -> &'static str {
+    PKEXEC
+}
+
+/// The caller's effective uid, read without spawning a process or consulting
+/// `PATH`.
+pub fn effective_uid() -> Option<u32> {
     // SAFETY: geteuid has no preconditions and does not depend on PATH.
     Some(unsafe { libc::geteuid() })
 }

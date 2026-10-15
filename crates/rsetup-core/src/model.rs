@@ -397,6 +397,10 @@ pub struct SystemInstallImage {
     pub size_bytes: u64,
     /// Size of the bytes that would be written to the device.
     pub uncompressed_bytes: u64,
+    /// File identity at plan time: device, inode and the modification and status
+    /// change timestamps. The prefix digest below only covers `prefix_bytes`, so
+    /// without this an edit further into the file left the plan token valid.
+    pub file_identity: String,
     /// SHA-256 over the first `prefix_bytes` of the file.
     pub sha256_prefix: String,
     pub prefix_bytes: u64,
