@@ -85,13 +85,15 @@ jobs:
           set -eu
           rustc -vV
           rustup show active-toolchain
-          for pair in "rustc 1.85." "cargo 1.85." "rustdoc 1.85."; do
-            name="${pair%% *}"
-            prefix="${pair#* }"
+          for expected in "rustc 1.85." "cargo 1.85." "rustdoc 1.85."; do
+            name="${expected%% *}"
+            # Compare against the whole expected prefix. Splitting the version off
+            # the tool name produced the pattern `1.85.*`, which can never match
+            # `rustc 1.85.0 (...)` — the assertion failed on a correct toolchain.
             case "$("$name" --version)" in
-              "$prefix"*) ;;
+              "$expected"*) ;;
               *)
-                echo "::error::the MSRV job resolved $("$name" --version); expected $prefix"x
+                echo "::error::the MSRV job resolved $("$name" --version); expected ${expected}x"
                 exit 1
                 ;;
             esac
