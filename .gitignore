@@ -35,6 +35,10 @@
 .env.*
 !.env.example
 
+# Multi-agent orchestration scratch (team roster, inboxes, task leases). Local
+# tooling state, never part of the tree.
+/.agent-teams/
+
 # SDD subagent-driven-development scratch workspace (briefs, reports, ledger).
 # One task's ledger is tracked on purpose: the MMC storage TUI run is the audit
 # trail behind the TUI commits and is cited by the test report.
