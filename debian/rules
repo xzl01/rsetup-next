@@ -34,7 +34,15 @@ endif
 # installs debian/rsetup-next.tmpfiles to the same destination; the explicit line
 # keeps every packaged path visible in one place and does not depend on that
 # helper being part of the dh sequence in use.
+# The static binaries are built immediately before they are installed, not only in
+# dh_auto_build. `dh_auto_test` runs `cargo test --workspace --release`, and any
+# integration test that uses `CARGO_BIN_EXE_*` makes cargo produce the plain
+# `target/release/rsetup-next` binary — without `+crt-static` — overwriting the
+# static one that was built above. Installing from the freshly rebuilt pair makes
+# the packaged artifact independent of what the test step happened to build.
 override_dh_auto_install:
+	cargo rustc -p rsetup-next --release --bin rsetup-next --locked --offline -- -C target-feature=+crt-static
+	cargo rustc -p rsetup-next --release --bin rsetup-next-helper --locked --offline -- -C target-feature=+crt-static
 	install -Dm755 target/release/rsetup-next debian/rsetup-next/usr/bin/rsetup-next
 	install -Dm755 target/release/rsetup-next-helper debian/rsetup-next/usr/libexec/rsetup-next-helper
 	install -Dm644 data/com.radxa.rsetup-next.policy debian/rsetup-next/usr/share/polkit-1/actions/com.radxa.rsetup-next.policy
