@@ -959,7 +959,11 @@ mod tests {
                 "Standard input is not a terminal: pass --acknowledge <device>, or pipe the device name in.",
             ),
             ("install_written", "写入完成", "Write complete"),
-            ("install_planned", "已计划（未写入）", "Planned, not written"),
+            (
+                "install_planned",
+                "已计划（未写入）",
+                "Planned, not written",
+            ),
             ("install_bytes_written", "已写入字节", "Bytes written"),
             (
                 "install_verification",
