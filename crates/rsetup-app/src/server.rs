@@ -934,6 +934,30 @@ impl InstallSurface {
         })
     }
 
+    /// Writes the image the way the CLI does: in this process when it may, and
+    /// through the fixed-verb helper when it may not.
+    ///
+    /// The server runs unprivileged by design, so without this the browser's
+    /// apply would be the one live write in the product that never asks the
+    /// administrator: opening the device would simply fail with EACCES. The
+    /// helper re-plans, re-gates and re-judges the typed name, and this surface's
+    /// token is the advisory preview it is meant to be.
+    fn apply(
+        &self,
+        request: &SystemInstallRequest,
+        plan_token: &str,
+        acknowledgement: &str,
+    ) -> Result<SystemInstallApplyResult, ApiError> {
+        let mode = self.mode()?;
+        if crate::install_needs_privilege(mode.live, mode.synthetic, crate::effective_uid()) {
+            return crate::run_privileged_system_install(request, plan_token, acknowledgement)
+                .map_err(ApiError::from_install_apply);
+        }
+        self.manager()?
+            .apply_live(request, plan_token, acknowledgement)
+            .map_err(|error| self.install_error(error))
+    }
+
     /// Maps a core error, recognising this surface's own write refusal so a dry
     /// run reports the policy instead of "a partial image was written".
     fn install_error(&self, error: SystemInstallError) -> ApiError {
@@ -1054,25 +1078,24 @@ async fn apply_system_install(
         // acknowledgement is judged inside the core, so this surface cannot drift
         // from the CLI or the TUI.
         surface
-            .manager()?
-            .apply_live(&install, &request.plan_token, &request.acknowledgement)
+            .apply(&install, &request.plan_token, &request.acknowledgement)
             .map(Json)
-            .map_err(|error| surface.install_error(error))
     })
     .await
 }
 
 struct ApiError {
     status: StatusCode,
-    code: &'static str,
+    /// Owned, because a code that crossed the helper boundary is not a literal.
+    code: String,
     message: String,
 }
 
 impl ApiError {
-    fn new(status: StatusCode, code: &'static str, message: String) -> Self {
+    fn new(status: StatusCode, code: impl Into<String>, message: String) -> Self {
         Self {
             status,
-            code,
+            code: code.into(),
             message,
         }
     }
@@ -1145,6 +1168,46 @@ impl ApiError {
             crate::system_install_error_code(&error),
             error.to_string(),
         )
+    }
+
+    /// A delegated install can also end in a dismissed administrator prompt.
+    /// That keeps its own code so a page can tell a cancel from a failure, the
+    /// way every other privileged operation already does.
+    fn from_install_apply(error: crate::InstallApplyError) -> Self {
+        match error {
+            crate::InstallApplyError::Core(error) => Self::from_install(error),
+            crate::InstallApplyError::AuthorizationCanceled => Self::new(
+                StatusCode::FORBIDDEN,
+                "authorization_canceled",
+                // The envelope carries the code; a page replaces this with its own
+                // translation, so the wording here is the fallback for a reader
+                // without a catalogue.
+                "Administrator authorization canceled.".to_owned(),
+            ),
+            // The helper classified it with the same vocabulary, so the status is
+            // recovered from the code instead of being guessed from the prose.
+            crate::InstallApplyError::Helper { code, message } => {
+                Self::new(Self::install_status_for_code(&code), code, message)
+            }
+        }
+    }
+
+    /// The HTTP status for a code the helper reported. The helper runs the same
+    /// core, so these are the statuses `from_install` would have chosen had the
+    /// failure happened in this process.
+    fn install_status_for_code(code: &str) -> StatusCode {
+        match code {
+            "install_unsupported" => StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_install_request" => StatusCode::BAD_REQUEST,
+            "root_required" | "authorization_canceled" => StatusCode::FORBIDDEN,
+            "confirmation_required"
+            | "acknowledgement_mismatch"
+            | "plan_required"
+            | "stale_plan"
+            | "install_conflict"
+            | "writes_running_system" => StatusCode::CONFLICT,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        }
     }
 
     fn from_hardware(error: rsetup_core::HardwareError) -> Self {
@@ -1943,6 +2006,97 @@ mod tests {
             serde_json::json!("writes_running_system"),
             "{plan}"
         );
+    }
+
+    /// The reported defect, at this surface: a live write the server may not
+    /// perform itself has to be delegated to the helper.
+    ///
+    /// The mode is set directly, so the assertion needs no root, no `pkexec`, no
+    /// device and no environment: delegation is observable because the helper's
+    /// own precondition fails first on a host that does not ship it. A board that
+    /// does ship it, or a test run as root, would take the other branch, so those
+    /// hosts skip.
+    #[test]
+    fn install_apply_delegates_when_the_process_may_not_write() {
+        if std::path::Path::new(crate::PRIVILEGED_HELPER).is_file()
+            || crate::effective_uid() == Some(0)
+        {
+            return;
+        }
+        let surface = InstallSurface {
+            controller: Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun),
+            image_directory: PathBuf::from("/nonexistent-install-images"),
+            mode: OnceLock::from(InstallMode {
+                synthetic: false,
+                live: true,
+            }),
+            manager: OnceLock::new(),
+        };
+        let request = SystemInstallRequest {
+            target_id: "sda".into(),
+            image_path: Some("/nonexistent-install-images/demo.img".into()),
+            image_id: None,
+        };
+        let error = surface
+            .apply(&request, "preview-token", "sda")
+            .expect_err("an unprivileged live write must not run in this process");
+        assert_eq!(
+            error.code, "root_required",
+            "the delegated route was not taken: {} {}",
+            error.code, error.message
+        );
+    }
+
+    /// A dismissed administrator prompt keeps its own code and status instead of
+    /// being reported as a failed write.
+    #[test]
+    fn install_apply_cancel_keeps_its_own_code() {
+        let canceled =
+            ApiError::from_install_apply(crate::InstallApplyError::AuthorizationCanceled);
+        assert_eq!(canceled.status, StatusCode::FORBIDDEN);
+        assert_eq!(canceled.code, "authorization_canceled");
+
+        // A core error must still travel as itself through the same mapping.
+        let stale = ApiError::from_install_apply(crate::InstallApplyError::Core(
+            SystemInstallError::StalePlan,
+        ));
+        assert_eq!(stale.status, StatusCode::CONFLICT);
+        assert_eq!(stale.code, "stale_plan");
+    }
+
+    /// Before the helper's error envelope, every delegated refusal arrived here as
+    /// a generic `internal_error`, so a stale plan read as a server fault and the
+    /// page offered no way to recover.
+    #[test]
+    fn delegated_refusals_keep_their_code_and_status() {
+        for (code, status) in [
+            ("stale_plan", StatusCode::CONFLICT),
+            ("confirmation_required", StatusCode::CONFLICT),
+            ("acknowledgement_mismatch", StatusCode::CONFLICT),
+            ("plan_required", StatusCode::CONFLICT),
+            ("install_conflict", StatusCode::CONFLICT),
+            ("writes_running_system", StatusCode::CONFLICT),
+            ("invalid_install_request", StatusCode::BAD_REQUEST),
+            ("install_unsupported", StatusCode::UNPROCESSABLE_ENTITY),
+            ("root_required", StatusCode::FORBIDDEN),
+        ] {
+            let mapped = ApiError::from_install_apply(crate::InstallApplyError::Helper {
+                code: code.to_owned(),
+                message: "the helper's own explanation".to_owned(),
+            });
+            assert_eq!(mapped.status, status, "{code}");
+            assert_eq!(mapped.code, code, "{code}");
+            assert_eq!(mapped.message, "the helper's own explanation", "{code}");
+        }
+
+        // An unknown code from a newer helper stays an internal error rather than
+        // being invented into the wrong class.
+        let unknown = ApiError::from_install_apply(crate::InstallApplyError::Helper {
+            code: "something_new".to_owned(),
+            message: "?".to_owned(),
+        });
+        assert_eq!(unknown.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(unknown.code, "something_new");
     }
 
     #[tokio::test]

@@ -41,14 +41,73 @@ enum HelperRequest {
     },
 }
 
-fn main() -> Result<()> {
+/// A failure the caller can classify without parsing prose.
+///
+/// The helper is a separate process, so an error has to cross the boundary as
+/// data: a non-zero exit plus anyhow text on stderr flattens every distinct
+/// refusal (`stale_plan`, `acknowledgement_mismatch`, an unknown verb) into one
+/// generic code at the caller. The envelope below keeps the stable code the core
+/// already assigned, and the prose stays as the human explanation.
+struct HelperFailure {
+    code: &'static str,
+    message: String,
+}
+
+impl From<anyhow::Error> for HelperFailure {
+    fn from(error: anyhow::Error) -> Self {
+        // A typed core error carries its own stable code; anything else is a
+        // helper-level failure with no finer classification to preserve.
+        if let Some(install) = error.downcast_ref::<rsetup_core::SystemInstallError>() {
+            return Self {
+                code: install.code(),
+                message: error.to_string(),
+            };
+        }
+        Self {
+            code: "helper_failed",
+            message: error.to_string(),
+        }
+    }
+}
+
+fn main() {
+    let arguments = env::args().skip(1).collect::<Vec<_>>();
+    match run(&arguments) {
+        Ok(response) => match serde_json::to_string(&response) {
+            Ok(encoded) => println!("{encoded}"),
+            Err(error) => emit_failure(&HelperFailure {
+                code: "helper_failed",
+                message: error.to_string(),
+            }),
+        },
+        Err(error) => emit_failure(&HelperFailure::from(error)),
+    }
+}
+
+/// The error envelope: the stable code plus the human explanation.
+fn failure_envelope(failure: &HelperFailure) -> serde_json::Value {
+    serde_json::json!({"error": {"code": failure.code, "message": failure.message}})
+}
+
+/// Reports a failure and exits non-zero.
+///
+/// The envelope goes to stdout, where a caller looks for the result, so a caller
+/// that understands it can classify the refusal. The same prose also goes to
+/// stderr, because the callers that predate the envelope — the source, overlay,
+/// SPI, fan and LED operations in `rsetup-core` — report `stderr` as the reason
+/// and would otherwise collapse every one of them into a bare exit status.
+fn emit_failure(failure: &HelperFailure) {
+    println!("{}", failure_envelope(failure));
+    eprintln!("{}", failure.message);
+    std::process::exit(1);
+}
+
+fn run(arguments: &[String]) -> Result<serde_json::Value> {
     if !cfg!(target_os = "linux") || effective_uid() != Some(0) {
         bail!("rsetup-next-helper must run as root through Polkit");
     }
-
-    let arguments = env::args().skip(1).collect::<Vec<_>>();
     let controller = Controller::new(ProbeMode::Live, ExecutionPolicy::Live);
-    let response = match parse_request(&arguments)? {
+    let response = match parse_request(arguments)? {
         HelperRequest::OverlaysInspect => serde_json::to_value(controller.overlay_status()?)?,
         HelperRequest::Action(action_id) => {
             serde_json::to_value(controller.execute(&action_id, true)?)?
@@ -114,9 +173,7 @@ fn main() -> Result<()> {
             )?)?
         }
     };
-
-    println!("{}", serde_json::to_string(&response)?);
-    Ok(())
+    Ok(response)
 }
 
 fn parse_request(arguments: &[String]) -> Result<HelperRequest> {
@@ -253,6 +310,30 @@ fn effective_uid() -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A core refusal must reach the caller as the same code the other surfaces
+    /// use, not as one generic helper failure.
+    #[test]
+    fn a_core_refusal_keeps_its_stable_code_in_the_envelope() {
+        let failure = HelperFailure::from(anyhow::Error::from(
+            rsetup_core::SystemInstallError::StalePlan,
+        ));
+        assert_eq!(failure.code, "stale_plan");
+        let envelope = failure_envelope(&failure);
+        assert_eq!(envelope["error"]["code"], "stale_plan");
+        assert!(
+            !envelope["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty(),
+            "the prose is kept as the explanation"
+        );
+
+        // Anything the core did not classify is a helper-level failure.
+        let failure = HelperFailure::from(anyhow::anyhow!("invalid helper request"));
+        assert_eq!(failure.code, "helper_failed");
+        assert_eq!(failure_envelope(&failure)["error"]["code"], "helper_failed");
+    }
 
     /// Scratch directory under `target/`, removed when the test ends.
     struct HelperScratch(std::path::PathBuf);

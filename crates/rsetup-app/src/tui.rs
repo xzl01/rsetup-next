@@ -118,10 +118,13 @@ impl App {
                 Some(provider.id.as_str()) == source_status.current_system_provider.as_deref()
             })
             .unwrap_or(0);
-        let live_write = controller.policy() == ExecutionPolicy::Live && !snapshot.synthetic;
+        let live = controller.policy() == ExecutionPolicy::Live;
+        let synthetic = snapshot.synthetic;
+        let live_write = live && !synthetic;
         let install = InstallPanel::from_manager(
-            system_install_manager(snapshot.synthetic, live_write),
+            system_install_manager(synthetic, live_write),
             live_write,
+            crate::install_needs_privilege(live, synthetic, crate::effective_uid()),
         );
         let mut app = Self {
             controller,
@@ -394,6 +397,15 @@ enum InstallStatus {
     Error(SystemInstallError),
     Info(&'static str),
     Written,
+    /// The administrator dismissed the authorization prompt. Kept apart from
+    /// `Error` because nothing failed: the write was declined.
+    Canceled,
+    /// A refusal the privileged helper classified and reported over its error
+    /// envelope, carrying the helper's own stable code and explanation.
+    Helper {
+        code: String,
+        message: String,
+    },
 }
 
 /// The install panel. It owns a core manager, so every gate, every image check
@@ -413,13 +425,18 @@ struct InstallPanel {
     /// Whether Enter on a matching name really writes (policy live and a real
     /// device backend). The hint is only a label; the core still decides.
     live_write: bool,
+    /// Whether that write has to go through the fixed-verb helper instead of
+    /// this process. Fixed for the session: neither the policy, the provider nor
+    /// the uid can change while the panel is open.
+    privileged: bool,
 }
 
 impl InstallPanel {
-    fn from_manager(manager: SystemInstallManager, live_write: bool) -> Self {
+    fn from_manager(manager: SystemInstallManager, live_write: bool, privileged: bool) -> Self {
         let mut panel = Self {
             manager,
             live_write,
+            privileged,
             open: false,
             targets: Vec::new(),
             selected: 0,
@@ -559,14 +576,33 @@ impl InstallPanel {
         };
         let request = plan.request.clone();
         let plan_token = plan.plan_token.clone();
-        match self.manager.apply_live(&request, &plan_token, &self.typed) {
+        // Same routing as the CLI: an ordinary user's live write is handed to the
+        // helper, which asks the administrator, rather than being attempted here
+        // and failing on the device node. The typed name still travels with it
+        // and is judged by the core on the other side.
+        let applied = if self.privileged {
+            crate::run_privileged_system_install(&request, &plan_token, &self.typed)
+        } else {
+            self.manager
+                .apply_live(&request, &plan_token, &self.typed)
+                .map_err(crate::InstallApplyError::Core)
+        };
+        match applied {
             Ok(result) => {
                 self.result = Some(result);
                 self.status = Some(InstallStatus::Written);
             }
             Err(error) => {
                 self.result = None;
-                self.status = Some(InstallStatus::Error(error));
+                self.status = Some(match error {
+                    crate::InstallApplyError::Core(error) => InstallStatus::Error(error),
+                    crate::InstallApplyError::AuthorizationCanceled => InstallStatus::Canceled,
+                    // The helper classified it; keep its code and wording rather
+                    // than collapsing them into a generic failure.
+                    crate::InstallApplyError::Helper { code, message } => {
+                        InstallStatus::Helper { code, message }
+                    }
+                });
             }
         }
     }
@@ -968,6 +1004,24 @@ fn render_install_panel(frame: &mut Frame, app: &App, area: Rect) {
                         locale.install_error(error)
                     ),
                     Style::default().fg(CORAL),
+                )));
+            }
+            InstallStatus::Helper { code, message } => {
+                lines.push(Line::from(Span::styled(
+                    format!("{code}: {message}"),
+                    Style::default().fg(CORAL),
+                )));
+            }
+            InstallStatus::Canceled => {
+                // Amber like the informational lines, not coral: the write was
+                // declined, so there is no error code to name.
+                lines.push(Line::from(Span::styled(
+                    if locale.is_zh() {
+                        "已取消管理员授权，未写入任何数据。"
+                    } else {
+                        "Administrator authorization canceled. Nothing was written."
+                    },
+                    Style::default().fg(AMBER),
                 )));
             }
             InstallStatus::Info(key) => {
@@ -2071,7 +2125,8 @@ mod tests {
             std::sync::Arc::new(SystemImageOpener),
             true,
         );
-        (InstallPanel::from_manager(manager, false), writes)
+        // Never privileged: this panel exists to observe an in-process write.
+        (InstallPanel::from_manager(manager, false, false), writes)
     }
 
     fn demo_app(locale: Locale) -> App {
@@ -2482,6 +2537,55 @@ mod tests {
             panel.status
         );
         assert_eq!(written(&writes), 0);
+    }
+
+    /// The reported defect, at this surface: when the panel is told the write has
+    /// to be delegated, Enter must not touch the in-process backend at all.
+    ///
+    /// The helper is absent on a development host, so delegation is observable as
+    /// `root_required` before `pkexec` is reached and the write counter stays at
+    /// zero. A board that ships the helper, or a run as root, skips instead of
+    /// starting a real authorization prompt.
+    #[test]
+    fn a_privileged_panel_delegates_instead_of_writing_in_process() {
+        if std::path::Path::new(crate::PRIVILEGED_HELPER).is_file()
+            || crate::effective_uid() == Some(0)
+        {
+            return;
+        }
+        let scratch = install_scratch("panel-privileged");
+        let image = scratch.join("radxa.img");
+        std::fs::write(&image, install_image_bytes()).expect("write fixture image");
+        let (mut panel, writes) = recording_panel();
+        panel.privileged = true;
+        panel.open_panel();
+        panel.selected = panel
+            .targets
+            .iter()
+            .position(|target| target.id == "sda")
+            .expect("the demo target list carries sda");
+        panel.focus_next();
+        type_into(&mut panel, &image.display().to_string());
+        panel.confirm(&Locale::En);
+        assert!(panel.plan.is_some(), "{:?}", panel.status);
+
+        panel.focus_next();
+        type_into(&mut panel, "sda");
+        panel.confirm(&Locale::En);
+
+        assert_eq!(
+            written(&writes),
+            0,
+            "a delegated write must not reach the in-process backend"
+        );
+        assert!(
+            matches!(
+                panel.status,
+                Some(InstallStatus::Error(SystemInstallError::RootRequired))
+            ),
+            "{:?}",
+            panel.status
+        );
     }
 
     #[test]
