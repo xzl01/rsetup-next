@@ -13,7 +13,7 @@
 
 | 界面 | 入口 | 用途 |
 | --- | --- | --- |
-| CLI | `rsetup-next status`, `actions`, `run`, `sources`, `hardware`, `doctor` | 面向自动化与恢复场景的输出，包括 JSON |
+| CLI | `rsetup-next status`, `actions`, `run`, `sources`, `hardware`, `system`, `doctor` | 面向自动化与恢复场景的输出，包括 JSON |
 | TUI | `rsetup-next tui` | 可通过键盘操作的本地任务控制中心 |
 | Web GUI | `rsetup-next serve` | 响应式浏览器控制中心与 JSON API |
 | Desktop GUI | `apps/desktop` | 使用相同静态 UI 与 `rsetup-core` 的 Tauri 外壳 |
@@ -42,6 +42,19 @@ APT 软件源管理以引导式工作流的形式实现在 CLI、TUI、Web 和 T
 并忽略 curl 配置文件。不会发生 APT 刷新、文件写入
 或自动镜像选择。演示模式使用带标注的合成结果。
 选择某个已测速的镜像仍然需要在应用前进行预览和确认。
+
+把系统镜像写入板卡的 UFS、eMMC、SD 卡或 NVMe 由
+`rsetup-next system targets|plan|install` 提供。`targets` 与 `plan` 是只读的：它们列出
+候选设备、写入将清除的全部分区、镜像格式、未压缩的写入大小，以及前 1 MiB 的 SHA-256
+绑定。`install` 在 Linux 上除非给出 `--live-execution`，否则始终只是预演；并且只有在
+精确键入目标设备名之后才会执行。承载正在运行的根或 `/boot` 文件系统的设备被永久拒绝，
+已挂载目标会被拒绝并列出挂载点。写入无法回滚，失败时会报告设备上已存在的字节数。
+`.img.xz` 由纯 Rust 解析器预览，仅在写入过程中通过 `xz -dc`（即 `xz-utils` 依赖）解压。
+同一套流程可从 CLI、TUI 面板（按 `i`）、环回 HTTP API
+（`GET/POST /api/v1/storage/install/…`，镜像只接受固定服务器目录中的 id，变更类调用需带
+`x-rsetup-request: 1`）、Tauri 桌面外壳以及浏览器 **系统安装 / Install** 页面执行。任何界面
+在未启用实时写入时都会拒绝写入，因此演示或预演会话不可能写盘。完整流程、稳定错误码以及
+Radxa Cubie A7Z 的板上验证清单见 [docs/system-install.zh.md](docs/system-install.zh.md)。
 
 原生硬件管理器现已覆盖七个已迁移的工作流：
 
@@ -97,6 +110,9 @@ rsetup 将观察与变更分离：
 - 变更操作在所有主机上默认执行演练。
 - 实时执行需要 Linux、按声明处以 root 运行，以及显式选择 `RSETUP_EXECUTION=live` 或 `--live-execution`。
 - 受保护的、高风险的和关键的操作需要确认。
+- 写入系统镜像是破坏性且不可逆的：在 Linux 上需要 `--live-execution`、需要精确键入设备
+  名，并且永远不会选中承载正在运行的根或 `/boot` 文件系统的设备。写入失败时会报告设备上
+  已存在的字节数；没有任何回滚。
 - HTTP API 只接受来自固定目录的操作标识符；它不暴露任意 shell 执行。
 - Web 服务器默认绑定到 `127.0.0.1:8788`。
 - fan-curve 的 apply 和 disable 在最终状态重新校验之前获取排他性的跨进程锁。精确的请求以及包含已持久化 `previous_policy` 的修订版本会绑定到预览令牌，并要求显式确认。
@@ -218,6 +234,11 @@ scripts/import-pinouts.mjs 用于本地 pin-out checkout 的可复现导入器
 
 该软件包安装 `rsetup-next` CLI/TUI/Web 二进制文件、其最小特权的 helper、配套的 Polkit 策略、thermal、fan-curve 和 LED 单元，以及固定 SPI 操作使用的 `mtd-utils` 依赖。风扇服务将 root 可写、用户可读的配置持久化到 `/etc/rsetup-next/fan-curve.json`，并作为 `rsetup-next-fan-curve.service` 运行。它不安装已移除的 Bash 实现，也不以 root 身份运行浏览器进程。可选的 `device-tree-compiler`、`gpiod`、`v4l-utils` 和 `ffmpeg` 软件包可增强对应的硬件工具。
 
+该软件包依赖 `xz-utils`：写入压缩的 `.img.xz` 系统镜像时通过 `xz -dc` 解压。选择硬依赖
+而非 `Recommends` 的取舍，以及缺少该工具时的回退行为，记录在
+[`debian/README.source`](debian/README.source)。系统镜像指南随包安装到
+`/usr/share/doc/rsetup-next/system-install.md`。
+
 ```bash
 make deb-prepare
 make deb
@@ -233,7 +254,7 @@ make deb
 
 ## 硬件验证边界
 
-Rust workspace、demo provider、CLI、HTTP API 和浏览器 GUI 可以在开发主机上测试。Q8B 实时只读探测已在 Ubuntu 26.04.1（UEFI + DT）上验证；结果与限制见[测试报告](docs/testing/q8b-2026-09-07/report.md)。其他受支持的 SBC 仍需要实时验证。overlay 事务、Overlay-to-Pinout 映射、真实摄像头采集、sysfs thermal/LED 写入、启动时恢复以及带备份的 SPI NOR 操作均已实现，但尚未在物理硬件上执行过。特别是，温度驱动的曲线尚未用真实的 Linux SBC `pwm-fan` 冷却设备进行物理验证。Overlay 文件名和 mux 模式仍需在受支持的 Pinout profile 范围内对照真实软件包进行验证；未知的通用 pin header 有意保持未分配。Bootloader、SPI/eMMC、GPIO、overlay、thermal、网络以及改变电源的操作必须在可恢复的硬件上逐一测试之后，才能被视为生产可用。
+Rust workspace、demo provider、CLI、HTTP API 和浏览器 GUI 可以在开发主机上测试。Q8B 实时只读探测已在 Ubuntu 26.04.1（UEFI + DT）上验证；结果与限制见[测试报告](docs/testing/q8b-2026-09-07/report.md)。其他受支持的 SBC 仍需要实时验证。把系统镜像写入真实 UFS/eMMC/SD/NVMe 存储的功能已实现，并由注入式夹具与预演测试覆盖，但尚未在任何物理板卡上执行过写入；完整命令序列、期望输出、失败判据以及"已本地验证／待真机验证"的划分见 [docs/system-install.zh.md](docs/system-install.zh.md)，主机侧证据见[本地验证报告](docs/testing/system-install-2026-10-13/report.md)。设备级检查无法在 CI 中执行，也不作为 CI 门禁。overlay 事务、Overlay-to-Pinout 映射、真实摄像头采集、sysfs thermal/LED 写入、启动时恢复以及带备份的 SPI NOR 操作均已实现，但尚未在物理硬件上执行过。特别是，温度驱动的曲线尚未用真实的 Linux SBC `pwm-fan` 冷却设备进行物理验证。Overlay 文件名和 mux 模式仍需在受支持的 Pinout profile 范围内对照真实软件包进行验证；未知的通用 pin header 有意保持未分配。Bootloader、SPI/eMMC、GPIO、overlay、thermal、网络以及改变电源的操作必须在可恢复的硬件上逐一测试之后，才能被视为生产可用。
 
 ## 许可证
 

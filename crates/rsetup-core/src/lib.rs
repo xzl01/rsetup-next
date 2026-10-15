@@ -1,4 +1,5 @@
 mod actions;
+mod deviceinfo_probe;
 mod efi_overlay;
 mod fan_curve;
 mod hardware;
@@ -11,10 +12,13 @@ mod probe;
 mod sources;
 mod spi_flash;
 pub mod storage;
+mod system_install;
 mod transaction;
 mod video;
 
-pub use actions::{ActionError, Controller, ExecutionPolicy};
+pub use actions::{
+    ActionError, Controller, ExecutionPolicy, effective_uid, pkexec_path, privileged_helper_path,
+};
 pub use fan_curve::{
     FanCurveApplyResult, FanCurveConfig, FanCurveDevice, FanCurvePlan, FanCurvePoint,
     FanCurveRequest, FanCurveResolvedPoint, FanCurveStatus, FanCurveTick, FanCurveZone,
@@ -28,11 +32,14 @@ pub use hardware::{
 pub use health::{mmc_health_state, nvme_health_state};
 pub use mmc::{MmcError, MmcManager};
 pub use model::{
-    ActionRun, ActionSpec, ActionStatus, ActivityEvent, Alert, AlertLevel, Capability,
-    DeviceIdentity, DeviceSnapshot, HealthState, MetricSet, MmcDevice, MmcHealth, MmcStatus,
-    NetworkInterface, NvmeDevice, NvmeSmartLog, NvmeStatus, ProbeMode, RiskLevel, ServiceState,
-    ServiceSummary, StorageMetric, StorageStatus, TelemetryError, TelemetryErrorKind,
-    TelemetryReadState, TelemetryStatus,
+    ActionRun, ActionSpec, ActionStatus, ActivityEvent, Alert, AlertLevel, BlockDeviceKind,
+    Capability, DeviceIdentity, DeviceSnapshot, HealthState, InstallImageFormat, MetricSet,
+    MmcDevice, MmcHealth, MmcStatus, NetworkInterface, NvmeDevice, NvmeSmartLog, NvmeStatus,
+    ProbeMetadata, ProbeMode, RiskLevel, ServiceState, ServiceSummary, StorageMetric,
+    StorageStatus, SystemInstallApplyResult, SystemInstallImage, SystemInstallPartition,
+    SystemInstallPlan, SystemInstallRequest, SystemInstallTarget, SystemInstallVerification,
+    SystemInstallVerificationState, TelemetryError, TelemetryErrorKind, TelemetryReadState,
+    TelemetryStatus,
 };
 pub use nvme::{NvmeError, NvmeManager};
 pub use probe::collect_snapshot;
@@ -46,3 +53,7 @@ pub use spi_flash::{
     SpiFlashRequest, SpiFlashStatus,
 };
 pub use storage::{StorageReader, SystemStorageReader};
+pub use system_install::{
+    BlockDeviceBackend, ImageOpener, SyntheticBackend, SystemBlockBackend, SystemImageOpener,
+    SystemInstallError, SystemInstallManager, SystemMount, install_needs_privilege,
+};

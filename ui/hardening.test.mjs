@@ -283,6 +283,53 @@ test("runtime markup contains no CSP-blocked style attributes", () => {
   assert.match(source, /"x-rsetup-request": "1"/);
 });
 
+test("a short route rail scrolls internally and a mobile rail has one column per route", () => {
+  const styles = fs.readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+  const nav = fs.readFileSync(new URL("./index.html", import.meta.url), "utf8");
+  const rail = styles.match(/\.route-rail\s*\{([\s\S]*?)\}/);
+  assert.ok(rail, "the fixed route rail must exist");
+  assert.match(rail[1], /overflow-y:\s*auto/, "a short viewport must scroll the rail instead of clipping entries");
+  assert.match(rail[1], /overscroll-behavior:\s*contain/, "rail scrolling must not chain to the workspace");
+
+  const routeCount = (nav.match(/class="route-button/g) || []).length;
+  assert.equal(routeCount, 8);
+  const mobile = styles.match(/@media \(max-width: 780px\) \{([\s\S]*?)\n\}/);
+  assert.ok(mobile, "the mobile bottom rail must exist");
+  assert.match(mobile[1], /grid-template-columns:\s*repeat\(8, minmax\(0, 1fr\)\)/,
+    "every visible route needs one bottom-rail column");
+});
+
+test("navigation brings the active route into view in a short rail", () => {
+  const calls = [];
+  function button(route, isRoute) {
+    return {
+      dataset: { route },
+      setAttribute() {},
+      removeAttribute() {},
+      classList: {
+        classes: new Set(isRoute ? ["route-button"] : []),
+        toggle(name, on) { if (on) this.classes.add(name); else this.classes.delete(name); },
+        contains(name) { return this.classes.has(name); },
+      },
+      scrollIntoView() { calls.push(route); },
+    };
+  }
+  const buttons = [button("overview", true), button("help", true), button("contact", false)];
+  const context = {
+    routes: [{ id: "overview" }, { id: "help" }],
+    state: {},
+    $$: (selector) => selector === "[data-route]" ? buttons : [],
+    $: () => ({ scrollTo() {}, open: false }),
+    history: { replaceState() {} },
+    openSystemInstallPage() {},
+    dismissDialog() {},
+  };
+  vm.createContext(context);
+  vm.runInContext(handler("navigate"), context);
+  context.navigate("help");
+  assert.deepEqual(calls, ["help"], "only the active route button is scrolled into view");
+});
+
 test("fan dots use the node collection and apply CSSOM properties", () => {
   const dot = { dataset: { fanX: "28.6", fanY: "80" }, style: { values: {}, setProperty(key, value) { this.values[key] = value; } } };
   const c = { $$: () => [dot] };

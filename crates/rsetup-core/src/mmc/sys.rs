@@ -116,7 +116,9 @@ impl SafeFd {
     fn open_read_only(path: &std::ffi::CStr) -> Result<Self, i32> {
         let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         if fd < 0 {
-            let errno = unsafe { *libc::__errno_location() };
+            let errno = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
             Err(errno)
         } else {
             Ok(Self(fd))
@@ -175,7 +177,9 @@ pub fn read_ext_csd_raw(dev_path: &str) -> Result<[u8; 512], MmcError> {
 
     let ret = unsafe { libc::ioctl(fd.as_raw_fd(), MMC_IOC_CMD, &mut cmd) };
     if ret < 0 {
-        let errno = unsafe { *libc::__errno_location() };
+        let errno = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO);
         return Err(MmcError::IoCode(errno));
     }
 

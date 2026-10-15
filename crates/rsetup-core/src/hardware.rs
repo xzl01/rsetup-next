@@ -720,11 +720,14 @@ impl HardwareManager {
     fn serial_console_detected(&self) -> bool {
         let cmdline = read_trimmed(self.root.join("proc/cmdline")).unwrap_or_default();
         cmdline.split_whitespace().any(|item| {
-            item.starts_with("console=ttyS")
-                || item.starts_with("console=ttyAMA")
-                || item.starts_with("console=ttyAML")
-                || item.starts_with("console=ttyFIQ")
-                || item.starts_with("console=ttyMSM")
+            // A serial console is `console=tty` followed by a driver letter
+            // (`ttyS0`, `ttyAMA0`, `ttyAS0`, `ttyUSB0`); the virtual consoles are
+            // `tty` followed by a digit (`tty0`, `tty1`). Listing SoC prefixes
+            // instead missed Allwinner's `ttyAS`, so a board whose console is on
+            // the header UART reported that it had none.
+            item.strip_prefix("console=tty")
+                .and_then(|rest| rest.chars().next())
+                .is_some_and(|first| first.is_ascii_alphabetic())
         })
     }
 
@@ -1329,36 +1332,40 @@ impl HardwareManager {
             return Ok(demo_thermal_status());
         }
         let thermal_root = self.root.join("sys/class/thermal");
-        let mut zones = Vec::new();
-        let mut cooling_devices = Vec::new();
-        if let Ok(entries) = fs::read_dir(&thermal_root) {
-            for entry in entries.flatten() {
-                let id = entry.file_name().to_string_lossy().into_owned();
-                if id.starts_with("thermal_zone") {
-                    let available_policies = read_trimmed(entry.path().join("available_policies"))
+        let observed =
+            deviceinfo::observe_thermal(&self.root, &deviceinfo::ThermalOptions::default());
+        let mut zones: Vec<_> = observed
+            .data
+            .temperatures
+            .iter()
+            .filter(|sensor| sensor.origin == deviceinfo::TemperatureOrigin::ThermalZone)
+            .map(|sensor| {
+                let base = thermal_root.join(&sensor.device);
+                ThermalZone {
+                    id: sensor.device.clone(),
+                    kind: sensor
+                        .label
+                        .clone()
+                        .unwrap_or_else(|| sensor.device.clone()),
+                    temperature_c: sensor.temperature_millicelsius.map(|v| v as f32 / 1000.0),
+                    policy: read_trimmed(base.join("policy")),
+                    available_policies: read_trimmed(base.join("available_policies"))
                         .map(|value| value.split_whitespace().map(str::to_owned).collect())
-                        .unwrap_or_default();
-                    zones.push(ThermalZone {
-                        id: id.clone(),
-                        kind: read_trimmed(entry.path().join("type")).unwrap_or(id),
-                        temperature_c: read_trimmed(entry.path().join("temp"))
-                            .and_then(|value| value.parse::<f32>().ok())
-                            .map(|value| value / 1000.0),
-                        policy: read_trimmed(entry.path().join("policy")),
-                        available_policies,
-                    });
-                } else if id.starts_with("cooling_device") {
-                    cooling_devices.push(CoolingDevice {
-                        id: id.clone(),
-                        kind: read_trimmed(entry.path().join("type")).unwrap_or(id),
-                        current_state: read_trimmed(entry.path().join("cur_state"))
-                            .and_then(|value| value.parse().ok()),
-                        max_state: read_trimmed(entry.path().join("max_state"))
-                            .and_then(|value| value.parse().ok()),
-                    });
+                        .unwrap_or_default(),
                 }
-            }
-        }
+            })
+            .collect();
+        let mut cooling_devices: Vec<_> = observed
+            .data
+            .cooling_devices
+            .iter()
+            .map(|device| CoolingDevice {
+                id: device.device.clone(),
+                kind: device.kind.clone().unwrap_or_else(|| device.device.clone()),
+                current_state: device.current_state.and_then(|v| u32::try_from(v).ok()),
+                max_state: device.maximum_state.and_then(|v| u32::try_from(v).ok()),
+            })
+            .collect();
         zones.sort_by(|left, right| left.id.cmp(&right.id));
         cooling_devices.sort_by(|left, right| left.id.cmp(&right.id));
         let pwm_fan_detected = cooling_devices.iter().any(|device| {
@@ -2615,6 +2622,34 @@ mod tests {
         fs::write(root.join("proc/cmdline"), "root=UUID=example console=tty0").unwrap();
         assert!(!HardwareManager::at_root(root.clone()).serial_console_detected());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The flag drives a "the console owns these pins" warning, so it must not be a
+    /// list of the SoC names someone happened to think of.
+    #[test]
+    fn a_serial_console_is_recognised_whatever_the_soc_calls_it() {
+        let root = std::env::temp_dir().join(format!("rsetup-serial-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("proc")).expect("create proc");
+        for (cmdline, expected) in [
+            ("root=UUID=x console=ttyS0,115200n8", true),
+            ("root=UUID=x console=ttyAMA0,115200", true),
+            // The board that exposed this: Allwinner A733.
+            ("root=UUID=x console=ttyAS0,115200n8", true),
+            ("root=UUID=x console=ttyUSB0,115200", true),
+            // Virtual consoles are not serial.
+            ("root=UUID=x console=tty0", false),
+            ("root=UUID=x console=tty1", false),
+            ("root=UUID=x console=ttyS0,115200 console=tty1", true),
+            ("root=UUID=x quiet", false),
+        ] {
+            fs::write(root.join("proc/cmdline"), cmdline).expect("write cmdline");
+            assert_eq!(
+                HardwareManager::at_root(root.clone()).serial_console_detected(),
+                expected,
+                "{cmdline}"
+            );
+        }
+        fs::remove_dir_all(root).expect("remove scratch");
     }
 
     #[test]

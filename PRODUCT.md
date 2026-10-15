@@ -66,6 +66,13 @@ scripts.
 - Mutating and recovery-sensitive actions must show impact, prerequisites, and
   confirmation requirements. Arbitrary shell execution is not a product
   feature.
+- System-image installation is an explicitly guided, irreversible procedure:
+  read-only preview first, typed device-name confirmation, a permanent refusal
+  to write the device that carries the running system, and honest reporting of
+  a partial write. The CLI, TUI panel, loopback HTTP API, Tauri shell, and
+  browser page share that one procedure, and each of them refuses the write
+  unless live execution is enabled. Live writes are Linux-only, and compressed
+  images need `xz-utils`.
 - Development on non-SBC hosts uses explicit synthetic data and dry-run action
   results. Synthetic state must never be presented as real hardware evidence.
 - Remote multi-device management is an open future decision, not part of the
@@ -88,6 +95,14 @@ be stated with explicit labels, impact copy, and confirmation gates.
 The upstream project history remains available for behavior comparison. The
 working tree contains only the new Rust control plane, shared interface assets,
 and its packaging.
+
+System-image installation (preview, typed confirmation, and the irreversible
+write) exists across the CLI, the TUI panel, the loopback HTTP API, the Tauri
+desktop shell, and the browser page. The evidence is injected-fixture tests, a
+real end-to-end run against the demo HTTP server, and dry runs on a non-Linux
+host; every surface refuses the write unless live execution is enabled. No write
+has been performed on a physical board yet, so the on-board checklist is
+unverified evidence and must not be reported as hardware support.
 
 No approved user research, fleet requirements, production telemetry, or visual
 identity assets beyond the existing rsetup/Radxa association are present.

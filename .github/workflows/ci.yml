@@ -12,6 +12,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
       - name: Reject legacy runtime files
         run: |
           test ! -e src/usr/bin/rsetup
@@ -23,11 +25,18 @@ jobs:
         with:
           components: clippy,rustfmt
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: make fmt-check
       - name: Lint Rust workspace
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test Rust workspace
         run: cargo test --workspace
+      # The pinned deviceinfo crate is excluded from our workspace, so the
+      # workspace commands above never compile or test it, even though it owns
+      # the system/thermal/storage sampling and the difference logic.
+      - name: Test pinned deviceinfo
+        run: cargo test --manifest-path externals/devicesinfo/Cargo.toml -p deviceinfo --locked
+        env:
+          CARGO_TARGET_DIR: target/deviceinfo-check
       - name: Test native EFI Overlay validation
         run: |
           sudo apt-get update
@@ -47,6 +56,8 @@ jobs:
           - x86_64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -57,9 +68,73 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
       - uses: dtolnay/rust-toolchain@1.85.0
+      # The action installs 1.85.0 and makes it the default toolchain, which is
+      # how the rustup proxies on PATH come to answer with it. Nothing below
+      # relies on that inference any more: the version the shell actually
+      # resolves is printed and asserted, and the gate itself runs through the
+      # 1.85.0 cargo and rustc resolved by path. A newer compiler earlier in
+      # PATH (a Homebrew or distro rustc) would otherwise answer for 1.85 and
+      # let a 1.88-only construct through unnoticed.
+      - name: Assert the resolved toolchain is the minimum supported version
+        run: |
+          set -eu
+          rustc -vV
+          rustup show active-toolchain
+          for expected in "rustc 1.85." "cargo 1.85." "rustdoc 1.85."; do
+            name="${expected%% *}"
+            # Compare against the whole expected prefix. Splitting the version off
+            # the tool name produced the pattern `1.85.*`, which can never match
+            # `rustc 1.85.0 (...)` — the assertion failed on a correct toolchain.
+            case "$("$name" --version)" in
+              "$expected"*) ;;
+              *)
+                echo "::error::the MSRV job resolved $("$name" --version); expected ${expected}x"
+                exit 1
+                ;;
+            esac
+          done
       - name: Test minimum supported Rust version
-        run: cargo test --workspace --locked
+        run: make msrv-check
+
+  # apps/desktop/src-tauri is listed in Cargo.toml's `workspace.exclude`, so no
+  # other job here ever compiles it: the workspace commands skip it and the
+  # Debian job never installs WebKitGTK. Build and test it explicitly with the
+  # Linux Tauri stack, so the Tauri IPC regression tests run in CI instead of
+  # only on a developer machine.
+  desktop-tauri-ipc:
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_TARGET_DIR: target/desktop-ci
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Install Tauri Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config \
+            libgtk-3-dev libglib2.0-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev patchelf \
+            libxdo-dev libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      # `make desktop-test` runs this same command locally.
+      - name: Test Tauri IPC commands
+        run: cargo test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml
+      - name: Check rsetup-desktop formatting
+        run: cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check
+      # `make desktop-check` runs the formatting and lint commands locally.
+      - name: Lint rsetup-desktop
+        run: cargo clippy --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
 
   debian-package:
     strategy:
@@ -79,6 +154,8 @@ jobs:
           build-essential ca-certificates cargo debhelper devscripts dpkg-dev
           git lintian nodejs rustc
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
       - name: Prepare offline Cargo cache
         run: CARGO_HOME="$GITHUB_WORKSPACE/debian/cargo-home" cargo fetch --locked
       - name: Build Debian package

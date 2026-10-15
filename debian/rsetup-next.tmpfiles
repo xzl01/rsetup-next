@@ -1,0 +1,10 @@
+# rsetup-next runtime state under /run.
+#
+# The SPI boot-flash manager stages its private work tree in
+# /run/rsetup-next/spi (crates/rsetup-core/src/spi_flash.rs), so the parent is
+# root-only. /run is a tmpfs, so systemd-tmpfiles recreates this on every boot;
+# debian/postinst does the same at configure time. Managers that need their own
+# subdirectories create them on demand as root.
+#
+# Type Path                            Mode User Group Age Argument
+d /run/rsetup-next 0700 root root - -

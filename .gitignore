@@ -7,6 +7,12 @@
 /apps/desktop/dist
 /apps/desktop/src-tauri/target
 /apps/desktop/src-tauri/gen/schemas
+# Frontend staging for the desktop build script. It normally lives under
+# src-tauri/target (ignored above); these cover the last-resort root beside
+# dist and the retired per-pid layout, so an interrupted build never shows up
+# as untracked noise even before the next build reclaims it.
+/apps/desktop/rsetup-dist-staging/
+/apps/desktop/.rsetup-dist-staging-*
 
 # Debian build output and package-local Cargo cache
 /debian/.debhelper
@@ -29,6 +35,10 @@
 .env.*
 !.env.example
 secret/
+
+# Multi-agent orchestration scratch (team roster, inboxes, task leases). Local
+# tooling state, never part of the tree.
+/.agent-teams/
 
 # SDD subagent-driven-development scratch workspace (briefs, reports, ledger).
 # One task's ledger is tracked on purpose: the MMC storage TUI run is the audit
