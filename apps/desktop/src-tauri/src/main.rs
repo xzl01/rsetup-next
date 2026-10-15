@@ -475,6 +475,129 @@ struct InstallMode {
     live: bool,
 }
 
+/// Path of the root-only helper and the authorizer that starts it. Both come from
+/// `rsetup-core`, which owns the helper protocol, so this shell cannot drift from
+/// the CLI's idea of which binary and which authorizer are meant.
+const PRIVILEGED_HELPER: &str = rsetup_core::privileged_helper_path();
+const PKEXEC: &str = rsetup_core::pkexec_path();
+
+/// Whether a real write has to be delegated to that helper. The rule lives in
+/// `rsetup-core` so every surface decides it once.
+fn install_needs_privilege(live: bool, synthetic: bool, effective_uid: Option<u32>) -> bool {
+    rsetup_core::install_needs_privilege(live, synthetic, effective_uid)
+}
+
+/// The caller's effective uid, from the core that already calls `geteuid`.
+///
+/// This shell does not depend on `libc`, and declaring `geteuid` by hand here was
+/// a third copy of a binding the core already owns.
+fn effective_uid() -> Option<u32> {
+    rsetup_core::effective_uid()
+}
+
+/// Runs the helper's fixed install verb and parses its typed result.
+///
+/// The token is the preview this process issued. The helper treats it as the
+/// advisory preview it is, then issues and consumes its own before writing, so
+/// nothing here can widen what may be written.
+/// Reads the helper's error envelope: `{"error":{"code","message"}}`.
+fn helper_error_envelope(stdout: &[u8]) -> Option<(String, String)> {
+    let value: serde_json::Value = serde_json::from_slice(stdout).ok()?;
+    let error = value.get("error")?;
+    let code = error.get("code")?.as_str()?.to_owned();
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    Some((code, message))
+}
+
+/// Maps a code that crossed the helper boundary back into the closed vocabulary.
+///
+/// `CommandError::code` is a `&'static str` at every other construction site, so
+/// the owned code is matched against the shared vocabulary. An unrecognised code
+/// keeps the pre-existing generic classification rather than being guessed into
+/// the wrong class.
+fn install_code_static(code: &str) -> &'static str {
+    match code {
+        "install_unsupported" => "install_unsupported",
+        "invalid_install_request" => "invalid_install_request",
+        "confirmation_required" => "confirmation_required",
+        "acknowledgement_mismatch" => "acknowledgement_mismatch",
+        "plan_required" => "plan_required",
+        "stale_plan" => "stale_plan",
+        "root_required" => "root_required",
+        "install_conflict" => "install_conflict",
+        "writes_running_system" => "writes_running_system",
+        "authorization_canceled" => "authorization_canceled",
+        _ => "internal_error",
+    }
+}
+
+fn run_privileged_system_install(
+    request: &SystemInstallRequest,
+    plan_token: &str,
+    acknowledgement: &str,
+) -> Result<SystemInstallApplyResult, CommandError> {
+    if !FsPath::new(PRIVILEGED_HELPER).is_file() {
+        return Err(CommandError {
+            code: "root_required",
+            message: "writing a system image requires root privileges".into(),
+        });
+    }
+    let Some(image_path) = request.image_path.as_deref() else {
+        return Err(CommandError {
+            code: "plan_required",
+            message: "preview the system image write before applying it".into(),
+        });
+    };
+    let output = Command::new(PKEXEC)
+        .args([
+            PRIVILEGED_HELPER,
+            "system-install-apply",
+            &request.target_id,
+            image_path,
+            plan_token,
+            acknowledgement,
+            "--confirmed",
+        ])
+        .output()
+        .map_err(CommandError::internal)?;
+    if output.status.code() == Some(126) {
+        // polkit's "not authorized": the administrator dismissed the prompt.
+        // That is a decision, so it keeps the same code the other privileged
+        // commands report instead of looking like a failed write.
+        return Err(CommandError {
+            code: "authorization_canceled",
+            message: "Administrator authorization canceled.".into(),
+        });
+    }
+    if !output.status.success() {
+        // The helper classifies its own failures, so its code is reused rather
+        // than flattened into one generic error. A helper built before the
+        // envelope, or one that died before printing it, still degrades to the
+        // exit status and stderr.
+        if let Some((code, message)) = helper_error_envelope(&output.stdout) {
+            return Err(CommandError {
+                code: install_code_static(&code),
+                message,
+            });
+        }
+        return Err(CommandError {
+            code: "internal_error",
+            message: format!(
+                "the privileged helper failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
+    }
+    serde_json::from_slice(&output.stdout).map_err(|error| CommandError {
+        code: "internal_error",
+        message: format!("invalid helper response: {error}"),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Desktop image picking: the Rust side owns the path
 // ---------------------------------------------------------------------------
@@ -848,6 +971,28 @@ impl InstallSurface {
         Ok(self.manager.get_or_init(|| install_manager(mode)))
     }
 
+    /// Writes the image the way the CLI does: here when this process may, and
+    /// through the fixed-verb helper when it may not.
+    ///
+    /// The shell is meant to run unprivileged, so without this a real write from
+    /// the desktop would be the one apply in the product that never asks the
+    /// administrator — opening the device would just fail. The helper re-plans,
+    /// re-gates and re-judges the typed name on the other side.
+    fn apply(
+        &self,
+        request: &SystemInstallRequest,
+        plan_token: &str,
+        acknowledgement: &str,
+    ) -> Result<SystemInstallApplyResult, CommandError> {
+        let mode = self.mode()?;
+        if install_needs_privilege(mode.live, mode.synthetic, effective_uid()) {
+            return run_privileged_system_install(request, plan_token, acknowledgement);
+        }
+        self.manager()?
+            .apply_live(request, plan_token, acknowledgement)
+            .map_err(|error| self.install_error(error))
+    }
+
     /// Turns a UI supplied image id into the absolute catalogue path the core
     /// validates. The core resolves ids only when a catalogue is configured, so
     /// the surface resolves the id here and hands the core a path inside its own
@@ -1053,10 +1198,7 @@ async fn system_install_apply(
         // The token is opaque: it is the core's to issue and to check. The
         // acknowledgement is judged inside the core, so the shell cannot drift
         // from the CLI, the TUI or the HTTP surface.
-        surface
-            .manager()?
-            .apply_live(&request, &plan_token, &acknowledgement)
-            .map_err(|error| surface.install_error(error))
+        surface.apply(&request, &plan_token, &acknowledgement)
     })
     .await
     .map_err(CommandError::internal)?
@@ -1211,7 +1353,13 @@ mod tests {
                 tauri::utils::acl::ExecutionContext::Local,
             );
         }
-        let surface = Arc::new(InstallSurface::new(controller.clone()));
+        // The registry test dispatches every command, including the image picker.
+        // A scripted answer keeps that synchronous and never opens a dialog, so no
+        // test can block waiting for a human to dismiss one.
+        let surface = Arc::new(InstallSurface::with_picker(
+            controller.clone(),
+            ScriptedPicker::cancelling(),
+        ));
         let app = tauri::test::mock_builder()
             .manage(controller)
             .manage(surface)
@@ -2140,5 +2288,91 @@ mod tests {
     fn desktop_pick_image_is_registered_but_not_read_only() {
         assert!(IPC_COMMANDS.contains(&"system_install_pick_image"));
         assert!(!READ_ONLY_COMMANDS.contains(&"system_install_pick_image"));
+    }
+
+    /// This crate keeps its own copy of the routing rule, because the CLI's lives
+    /// in a binary crate it does not depend on. The table is the guard against
+    /// the two copies drifting.
+    /// The delegated path must keep the helper's classification instead of
+    /// reporting every refusal as an internal error.
+    #[test]
+    fn the_helper_error_envelope_preserves_the_code() {
+        let envelope = br#"{"error":{"code":"stale_plan","message":"the target changed"}}"#;
+        assert_eq!(
+            helper_error_envelope(envelope),
+            Some(("stale_plan".to_owned(), "the target changed".to_owned()))
+        );
+        assert_eq!(helper_error_envelope(br#"{"bytesWritten":1}"#), None);
+        assert_eq!(helper_error_envelope(b"Error: prose\n"), None);
+        for code in [
+            "install_unsupported",
+            "invalid_install_request",
+            "confirmation_required",
+            "acknowledgement_mismatch",
+            "plan_required",
+            "stale_plan",
+            "root_required",
+            "install_conflict",
+            "writes_running_system",
+            "authorization_canceled",
+        ] {
+            assert_eq!(install_code_static(code), code, "{code}");
+        }
+        assert_eq!(install_code_static("something_new"), "internal_error");
+    }
+
+    #[test]
+    fn install_privilege_routing_follows_policy_provider_and_uid() {
+        let cases = [
+            (true, false, Some(1000), true),
+            (true, false, Some(0), false),
+            (true, true, Some(1000), false),
+            (false, false, Some(1000), false),
+            (true, false, None, true),
+        ];
+        for (live, synthetic, uid, expected) in cases {
+            assert_eq!(
+                install_needs_privilege(live, synthetic, uid),
+                expected,
+                "live={live} synthetic={synthetic} uid={uid:?}"
+            );
+        }
+    }
+
+    /// The reported defect, at this surface: a live write the shell may not
+    /// perform itself has to be delegated to the helper.
+    ///
+    /// The mode is set directly, so this needs no root, no `pkexec`, no device
+    /// and no environment: delegation is observable because the helper's own
+    /// precondition fails first on a host that does not ship it. A board that
+    /// does ship it, or a run as root, would take the other branch and skips.
+    #[test]
+    fn install_apply_delegates_when_the_process_may_not_write() {
+        if FsPath::new(PRIVILEGED_HELPER).is_file() || effective_uid() == Some(0) {
+            return;
+        }
+        let surface = InstallSurface {
+            controller: Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun),
+            image_directory: PathBuf::from("/nonexistent-install-images"),
+            mode: OnceLock::from(InstallMode {
+                synthetic: false,
+                live: true,
+            }),
+            manager: OnceLock::new(),
+            picks: PickedImages::new(),
+            picker: Arc::new(SystemImagePicker),
+        };
+        let request = SystemInstallRequest {
+            target_id: "sda".into(),
+            image_path: Some("/nonexistent-install-images/demo.img".into()),
+            image_id: None,
+        };
+        let error = surface
+            .apply(&request, "preview-token", "sda")
+            .expect_err("an unprivileged live write must not run in this process");
+        assert_eq!(
+            error.code, "root_required",
+            "the delegated route was not taken: {error:?}"
+        );
     }
 }
