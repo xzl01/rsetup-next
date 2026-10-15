@@ -1586,6 +1586,10 @@ impl BlockDeviceBackend for DryRunBackend {
             "dry run: the partition table was not re-read".into(),
         ))
     }
+
+    fn is_dry_run(&self) -> bool {
+        true
+    }
 }
 
 fn system_install_request(target: &str, image: &Path) -> SystemInstallRequest {

@@ -956,6 +956,34 @@ test("a fresh catalogue read discards the plan and the acknowledgement", async (
   assert.doesNotMatch(getElement("[data-install-body]").innerHTML, /data-install-apply/);
 });
 
+test("a dry run is rendered as a preview, not a completed write", () => {
+  // The CLI without --live-execution returns a real target and a byte count while
+  // writing nothing. Rendering that as a finished write is what a script or an
+  // operator would act on.
+  // A real dry run: the target is live, only the write is withheld.
+  const dry = {
+    ...applySucceeded(demoPlan({ synthetic: false })),
+    dryRun: true,
+  };
+  const { context } = createContext({
+    state: { installResult: dry, installOptions: demoOptions() },
+  });
+  const html = context.renderInstallResult(dry);
+  assert.match(html, /data-install-result-dry-run/, "the dry run is stated");
+  assert.match(html, /Bytes planned/, "the count is not labelled as written");
+  assert.doesNotMatch(html, /data-install-result-synthetic/, "the target is real, not demo");
+
+  // The panel header must not announce a finished write either.
+  const page = context.renderSystemInstallBody();
+  assert.match(page, /Preview only/);
+
+  // A payload from a surface that predates the field keeps its old rendering.
+  const written = applySucceeded();
+  const writtenHtml = context.renderInstallResult(written);
+  assert.doesNotMatch(writtenHtml, /data-install-result-dry-run/);
+  assert.match(writtenHtml, /Bytes written/);
+});
+
 test("a catalogue refresh discards a preview that is still in flight", async () => {
   // The finding: the refresh cleared the plan but did not invalidate the version,
   // so a preview that was already in flight came back and restored a confirmation

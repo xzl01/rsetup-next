@@ -3270,6 +3270,7 @@ function renderInstallErrorBox() {
 }
 
 function renderInstallResult(result) {
+  const dryRun = Boolean(result?.dryRun);
   const verification = result?.verification || {};
   const verificationState = String(verification.state || "unsupported").toLowerCase();
   const stateKey = ["matched", "mismatched", "unsupported"].includes(verificationState) ? verificationState : "unsupported";
@@ -3277,10 +3278,11 @@ function renderInstallResult(result) {
   const expected = Array.isArray(verification.expected) ? verification.expected.length : null;
   return `
     <div class="install-facts" data-install-result-facts>
-      ${installFact("install.result.bytes", byteUnit(result?.bytesWritten))}
+      ${installFact(dryRun ? "install.result.bytesPlanned" : "install.result.bytes", byteUnit(result?.bytesWritten))}
       ${installFact("install.result.verification", t(`install.result.verification.${stateKey}`))}
       ${observed !== null && expected !== null ? installFact("install.result.partitions", t("install.result.partitionCount", { expected, observed })) : ""}
     </div>
+    ${result?.dryRun ? `<p class="install-hint" data-install-result-dry-run>${escapeHtml(t("install.result.dryRun"))}</p>` : ""}
     ${result?.plan?.synthetic ? `<p class="install-hint" data-install-result-synthetic>${escapeHtml(t("install.result.synthetic"))}</p>` : ""}
     ${verification.detail ? `<p class="install-hint" data-install-result-detail>${escapeHtml(verification.detail)}</p>` : ""}
   `;
@@ -3344,7 +3346,7 @@ function renderSystemInstallBody() {
     ${plan ? renderInstallConfirmation(plan) : ""}
     ${renderInstallPickNotice()}
     ${renderInstallErrorBox()}
-    ${state.installResult ? `<section class="install-card install-result" data-install-result><header><strong>${escapeHtml(t("install.result.title"))}</strong></header>${renderInstallResult(state.installResult)}</section>` : ""}
+    ${state.installResult ? `<section class="install-card install-result" data-install-result><header><strong>${escapeHtml(t(state.installResult?.dryRun ? "install.result.titleDryRun" : "install.result.title"))}</strong></header>${renderInstallResult(state.installResult)}</section>` : ""}
   `;
 }
 

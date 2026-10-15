@@ -465,7 +465,13 @@ pub struct SystemInstallVerification {
 pub struct SystemInstallApplyResult {
     pub run: ActionRun,
     pub plan: SystemInstallPlan,
+    /// Bytes the write would have produced. On a dry run nothing was written, so
+    /// this is a count, not evidence.
     pub bytes_written: u64,
+    /// True when the target is real but the write was only planned. Callers must
+    /// not report `bytes_written` as written when this is set.
+    #[serde(default)]
+    pub dry_run: bool,
     pub verification: SystemInstallVerification,
 }
 

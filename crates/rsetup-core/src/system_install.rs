@@ -282,6 +282,15 @@ pub trait BlockDeviceBackend: Send + Sync {
     fn lock_root(&self) -> Option<PathBuf> {
         None
     }
+
+    /// True when this backend describes a real target but never writes to it.
+    ///
+    /// A dry run must not be reported as a completed write: the caller asked for a
+    /// preview, and a script reading the result has no other way to tell a counted
+    /// byte from a written one.
+    fn is_dry_run(&self) -> bool {
+        false
+    }
 }
 
 /// Opens the image as a byte stream, decompressing when the format says so.
@@ -436,10 +445,18 @@ impl SystemInstallManager {
         self.backend.sync_device(&plan.target)?;
         let verification = self.verify(&plan);
 
-        let mut summary = format!(
-            "Wrote {} of {} bytes to {}.",
-            bytes_written, plan.image.uncompressed_bytes, plan.target.path
-        );
+        let dry_run = self.backend.is_dry_run();
+        let mut summary = if dry_run {
+            format!(
+                "Planned {} bytes for {}; nothing was written (dry run).",
+                plan.image.uncompressed_bytes, plan.target.path
+            )
+        } else {
+            format!(
+                "Wrote {} of {} bytes to {}.",
+                bytes_written, plan.image.uncompressed_bytes, plan.target.path
+            )
+        };
         if self.synthetic {
             summary = format!("{summary} Synthetic target: no device was written.");
         }
@@ -468,7 +485,11 @@ impl SystemInstallManager {
             id: Uuid::new_v4().to_string(),
             action_id: INSTALL_ACTION_ID.to_owned(),
             action_title: INSTALL_ACTION_TITLE.to_owned(),
-            status: if verification.state == SystemInstallVerificationState::Mismatched {
+            // A dry run is planned, not executed: saying "succeeded" would claim a
+            // write that never happened.
+            status: if dry_run {
+                ActionStatus::Planned
+            } else if verification.state == SystemInstallVerificationState::Mismatched {
                 ActionStatus::Failed
             } else {
                 ActionStatus::Succeeded
@@ -483,6 +504,7 @@ impl SystemInstallManager {
             run,
             plan,
             bytes_written,
+            dry_run,
             verification,
         })
     }
@@ -4402,6 +4424,108 @@ mod tests {
 
     /// The live backend must resolve the device node under its root, so a fixture
     /// root can be written without any real block device being involved.
+    /// A backend that reads a real target but never writes, like the CLI's
+    /// `--live-execution`-less wrapper.
+    struct DryRunFixture {
+        inner: Arc<FixtureBackend>,
+        counted: Mutex<u64>,
+    }
+
+    impl BlockDeviceBackend for DryRunFixture {
+        fn targets(&self) -> Result<Vec<SystemInstallTarget>, SystemInstallError> {
+            self.inner.targets()
+        }
+
+        fn mounts(&self) -> Result<Vec<SystemMount>, SystemInstallError> {
+            self.inner.mounts()
+        }
+
+        fn write_chunk(
+            &self,
+            _target: &SystemInstallTarget,
+            _offset: u64,
+            chunk: &[u8],
+        ) -> Result<(), SystemInstallError> {
+            *self.counted.lock().expect("dry-run counter") += chunk.len() as u64;
+            Ok(())
+        }
+
+        fn reread_partitions(
+            &self,
+            _target: &SystemInstallTarget,
+        ) -> Result<Vec<SystemInstallPartition>, SystemInstallError> {
+            Err(SystemInstallError::Unsupported(
+                "dry run: the partition table was not re-read".into(),
+            ))
+        }
+
+        fn lock_root(&self) -> Option<PathBuf> {
+            self.inner.lock_root()
+        }
+
+        fn is_dry_run(&self) -> bool {
+            true
+        }
+    }
+
+    /// A preview must not come back as a completed write. The CLI's dry run
+    /// reports a real target and counts the bytes, so without this the result said
+    /// "Wrote 512 of 512 bytes" and a script had no way to tell that nothing had
+    /// been written.
+    #[test]
+    fn a_dry_run_is_reported_as_planned_rather_than_written() {
+        // Nothing is mounted, so the target is writable and the only difference
+        // between the two runs is whether the backend writes.
+        let fixture = fixture("dry-run-reporting", Vec::new(), RereadBehavior::Unsupported);
+        let request = SystemInstallRequest {
+            target_id: "sda".into(),
+            image_path: Some(fixture.image.display().to_string()),
+            image_id: None,
+        };
+
+        let dry = SystemInstallManager::with_backend(
+            Arc::new(DryRunFixture {
+                inner: fixture.backend.clone(),
+                counted: Mutex::new(0),
+            }),
+            Arc::new(SystemImageOpener),
+            // The target is real; only the write is withheld.
+            false,
+        );
+        let plan = dry.plan(&request).expect("plan");
+        let result = dry
+            .apply_live(&request, &plan.plan_token, "sda")
+            .expect("a dry run applies");
+
+        assert!(result.dry_run, "the result must say it was a dry run");
+        assert!(!result.run.synthetic, "the target is real, not synthetic");
+        assert_eq!(result.run.status, ActionStatus::Planned);
+        assert!(
+            !result.run.summary.contains("Wrote"),
+            "a dry run must not claim a write: {}",
+            result.run.summary
+        );
+        assert!(
+            result.run.summary.contains("nothing was written"),
+            "{}",
+            result.run.summary
+        );
+
+        // The same plan through a writing backend still reports a write.
+        let plan = fixture.manager.plan(&request).expect("plan");
+        let result = fixture
+            .manager
+            .apply_live(&request, &plan.plan_token, "sda")
+            .expect("a real write applies");
+        assert!(!result.dry_run);
+        assert_eq!(result.run.status, ActionStatus::Succeeded);
+        assert!(
+            result.run.summary.contains("Wrote"),
+            "{}",
+            result.run.summary
+        );
+    }
+
     #[test]
     fn the_live_backend_writes_only_under_the_injected_root() {
         let root = scratch("live-root");

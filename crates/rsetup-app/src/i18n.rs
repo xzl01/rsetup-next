@@ -251,6 +251,7 @@ impl Locale {
                 "标准输入不是终端：可以用 --acknowledge <设备名>，或把设备名通过管道输入。"
             }
             (Self::ZhCn, "install_written") => "写入完成",
+            (Self::ZhCn, "install_planned") => "已计划（未写入）",
             (Self::ZhCn, "install_bytes_written") => "已写入字节",
             (Self::ZhCn, "install_verification") => "分区表校验",
             (Self::ZhCn, "install_verification_matched") => "重读的分区表与镜像一致",
@@ -415,6 +416,7 @@ impl Locale {
                 "Standard input is not a terminal: pass --acknowledge <device>, or pipe the device name in."
             }
             (_, "install_written") => "Write complete",
+            (_, "install_planned") => "Planned, not written",
             (_, "install_bytes_written") => "Bytes written",
             (_, "install_verification") => "Partition table verification",
             (_, "install_verification_matched") => "the re-read partition table matches the image",
@@ -957,6 +959,7 @@ mod tests {
                 "Standard input is not a terminal: pass --acknowledge <device>, or pipe the device name in.",
             ),
             ("install_written", "写入完成", "Write complete"),
+            ("install_planned", "已计划（未写入）", "Planned, not written"),
             ("install_bytes_written", "已写入字节", "Bytes written"),
             (
                 "install_verification",

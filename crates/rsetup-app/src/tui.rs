@@ -397,6 +397,9 @@ enum InstallStatus {
     Error(SystemInstallError),
     Info(&'static str),
     Written,
+    /// The target is real but the write was withheld: `--live-execution` was not
+    /// given, so the bytes were only counted.
+    Planned,
     /// The administrator dismissed the authorization prompt. Kept apart from
     /// `Error` because nothing failed: the write was declined.
     Canceled,
@@ -589,8 +592,14 @@ impl InstallPanel {
         };
         match applied {
             Ok(result) => {
+                // A dry run reports a real target but writes nothing, so the panel
+                // must not announce a write the result itself denies.
+                self.status = Some(if result.dry_run {
+                    InstallStatus::Planned
+                } else {
+                    InstallStatus::Written
+                });
                 self.result = Some(result);
-                self.status = Some(InstallStatus::Written);
             }
             Err(error) => {
                 self.result = None;
@@ -1029,6 +1038,19 @@ fn render_install_panel(frame: &mut Frame, app: &App, area: Rect) {
                     locale.text(key),
                     Style::default().fg(AMBER),
                 )));
+            }
+            InstallStatus::Planned => {
+                if let Some(result) = &panel.result {
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "{}: {} — {}",
+                            locale.text("install_planned"),
+                            locale.text("install_target"),
+                            crate::format_bytes(result.bytes_written),
+                        ),
+                        Style::default().fg(AMBER),
+                    )));
+                }
             }
             InstallStatus::Written => {
                 if let Some(result) = &panel.result {
