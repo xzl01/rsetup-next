@@ -6,6 +6,25 @@ import zh from './locales/zh-CN';
 import en from './locales/en';
 
 const preferenceKey = 'rsetup.controller.locale';
+const TASK4_KEYS = [
+  'common.cancel', 'common.actions',
+  'nav.tasks',
+  'task.list.title', 'task.list.empty', 'task.list.loadMore', 'task.list.columns.device',
+  'task.list.columns.state', 'task.list.columns.revision',
+  'task.preview.title', 'task.preview.selectDevices', 'task.preview.submit', 'task.preview.empty',
+  'task.preview.eligible', 'task.preview.ineligible',
+  'task.submitReboot', 'task.confirmRelease', 'task.releaseLock', 'task.security.csprngUnavailable', 'task.field.releaseReason',
+  'task.risk.confirmBatchReboot', 'task.risk.releaseLockTitle', 'task.risk.releaseWarningDetail',
+  'task.risk.acknowledgeUnknown',
+  'task.held.reviewTitle', 'task.held.reviewResumeOriginalDeadline', 'task.held.reviewExpire',
+  'task.held.reviewExplain', 'task.held.reviewNoHeld', 'task.held.reviewSelfReported',
+  'task.cancel.action', 'task.cancel.notCancellable',
+  'task.detail.title', 'task.detail.children', 'task.detail.evidenceSource', 'task.detail.resultEvidence',
+  'task.timeReview.evidence.reference_deadline_proven', 'task.timeReview.evidence.reference_deadline_expired',
+  'task.timeReview.evidence.inconclusive',
+  'task.scope.authorizedSubset', 'task.scope.unknown',
+  'task.mainState.queued', 'task.mainState.running', 'task.mainState.held', 'task.mainState.completed',
+] as const
 const keys = ['app.title', 'app.foundation', 'app.notConnected', 'nav.skip', 'language.label',
   'button.primary', 'button.secondary', 'button.danger', 'button.loading',
   'field.label', 'field.hint', 'field.error', 'notice.title', 'notice.body',
@@ -31,7 +50,8 @@ const keys = ['app.title', 'app.foundation', 'app.notConnected', 'nav.skip', 'la
   'task.reason.PERMISSION_DENIED', 'task.reason.DEVICE_OFFLINE', 'task.reason.CAPABILITY_UNAVAILABLE', 'task.reason.DEVICE_BUSY',
   'task.reason.QUEUE_EXPIRED', 'task.reason.TIME_UNCERTAIN', 'task.reason.EXECUTION_REJECTED', 'task.reason.OS_ERROR',
   'task.reason.RESULT_TIMEOUT', 'task.reason.JOURNAL_LOST', 'task.reason.PROTOCOL_MISMATCH', 'task.reason.USER_CANCELLED',
-  'task.reason.unknown'];
+  'task.reason.unknown',
+  ...TASK4_KEYS];
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -218,5 +238,28 @@ describe('createI18n', () => {
       delete zh[key];
       delete en[key];
     }
+  });
+});
+
+describe('Task 4 lexicon completeness', () => {
+  it('defines every Task 4 key in both dictionaries with a non-empty value', () => {
+    for (const key of TASK4_KEYS) {
+      expect(zh[key], `zh-CN missing ${key}`).toBeTruthy();
+      expect(en[key], `en missing ${key}`).toBeTruthy();
+    }
+  });
+
+  it('keeps zh-CN and en key sets 1:1 equal in size', () => {
+    expect(Object.keys(zh).sort()).toEqual(Object.keys(en).sort());
+  });
+
+  it('warns that releasing the unknown lock does not undo a possible reboot, in both locales', () => {
+    expect(zh['task.risk.releaseWarningDetail']).toContain('不撤回');
+    expect(en['task.risk.releaseWarningDetail']).toMatch(/does not undo/i);
+  });
+
+  it('never bakes a hidden-target count into the authorized subset notice', () => {
+    expect(zh['task.scope.authorizedSubset']).not.toMatch(/\d/);
+    expect(en['task.scope.authorizedSubset']).not.toMatch(/\d/);
   });
 });
