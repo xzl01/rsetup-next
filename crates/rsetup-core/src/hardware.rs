@@ -720,11 +720,14 @@ impl HardwareManager {
     fn serial_console_detected(&self) -> bool {
         let cmdline = read_trimmed(self.root.join("proc/cmdline")).unwrap_or_default();
         cmdline.split_whitespace().any(|item| {
-            item.starts_with("console=ttyS")
-                || item.starts_with("console=ttyAMA")
-                || item.starts_with("console=ttyAML")
-                || item.starts_with("console=ttyFIQ")
-                || item.starts_with("console=ttyMSM")
+            // A serial console is `console=tty` followed by a driver letter
+            // (`ttyS0`, `ttyAMA0`, `ttyAS0`, `ttyUSB0`); the virtual consoles are
+            // `tty` followed by a digit (`tty0`, `tty1`). Listing SoC prefixes
+            // instead missed Allwinner's `ttyAS`, so a board whose console is on
+            // the header UART reported that it had none.
+            item.strip_prefix("console=tty")
+                .and_then(|rest| rest.chars().next())
+                .is_some_and(|first| first.is_ascii_alphabetic())
         })
     }
 
@@ -2619,6 +2622,34 @@ mod tests {
         fs::write(root.join("proc/cmdline"), "root=UUID=example console=tty0").unwrap();
         assert!(!HardwareManager::at_root(root.clone()).serial_console_detected());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The flag drives a "the console owns these pins" warning, so it must not be a
+    /// list of the SoC names someone happened to think of.
+    #[test]
+    fn a_serial_console_is_recognised_whatever_the_soc_calls_it() {
+        let root = std::env::temp_dir().join(format!("rsetup-serial-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("proc")).expect("create proc");
+        for (cmdline, expected) in [
+            ("root=UUID=x console=ttyS0,115200n8", true),
+            ("root=UUID=x console=ttyAMA0,115200", true),
+            // The board that exposed this: Allwinner A733.
+            ("root=UUID=x console=ttyAS0,115200n8", true),
+            ("root=UUID=x console=ttyUSB0,115200", true),
+            // Virtual consoles are not serial.
+            ("root=UUID=x console=tty0", false),
+            ("root=UUID=x console=tty1", false),
+            ("root=UUID=x console=ttyS0,115200 console=tty1", true),
+            ("root=UUID=x quiet", false),
+        ] {
+            fs::write(root.join("proc/cmdline"), cmdline).expect("write cmdline");
+            assert_eq!(
+                HardwareManager::at_root(root.clone()).serial_console_detected(),
+                expected,
+                "{cmdline}"
+            );
+        }
+        fs::remove_dir_all(root).expect("remove scratch");
     }
 
     #[test]
