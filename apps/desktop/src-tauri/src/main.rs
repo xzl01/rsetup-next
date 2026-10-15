@@ -1908,7 +1908,14 @@ mod tests {
         let error = invoke(&webview, "storage_status", serde_json::json!({}))
             .expect_err("a failing reader must reject the command");
         assert_eq!(error_code(&error), "internal_error");
-        assert_eq!(error["message"], "injected storage failure");
+        // The reason has to reach the caller, but the exact rendering belongs to
+        // the core's `HardwareError` Display and is shared with the HTTP surface.
+        // Pinning the bare text here asserted a message no surface produces.
+        let message = error["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("injected storage failure"),
+            "the reader's reason must be reported: {message}"
+        );
     }
 
     #[test]
