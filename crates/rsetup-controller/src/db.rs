@@ -2644,7 +2644,7 @@ pub(crate) fn next_event_seq(
     counter: &std::sync::atomic::AtomicU64,
 ) -> Result<u64, ControllerError> {
     counter
-        .fetch_update(
+        .try_update(
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
             |n| n.checked_add(1),
