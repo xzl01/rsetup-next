@@ -2643,13 +2643,21 @@ pub(crate) fn system_fallback_time_evidence() -> String {
 pub(crate) fn next_event_seq(
     counter: &std::sync::atomic::AtomicU64,
 ) -> Result<u64, ControllerError> {
-    counter
-        .try_update(
+    let mut current = counter.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        let next = current
+            .checked_add(1)
+            .ok_or(ControllerError::RevisionConflict)?;
+        match counter.compare_exchange_weak(
+            current,
+            next,
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
-            |n| n.checked_add(1),
-        )
-        .map_err(|_| ControllerError::RevisionConflict)
+        ) {
+            Ok(prev) => return Ok(prev),
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 impl AdmissionStore for DbPool {
