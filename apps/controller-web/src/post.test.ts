@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { ApiError, post } from './api'
+import { ApiError, post, type RequestOptions } from './api'
 
 function jsonResponse(body: unknown, status = 200, headers?: HeadersInit): Response {
   return new Response(JSON.stringify(body), {
@@ -128,5 +128,114 @@ describe('authenticated post', () => {
     vi.stubGlobal('fetch', vi.fn(async () => { throw new DOMException('aborted', 'AbortError') }))
     await expect(post('/auth/login', { username: 'a', password: 'b' }, { signal: controller.signal }))
       .rejects.toMatchObject({ code: 'REQUEST_ABORTED', messageKey: 'errors.aborted' })
+  })
+})
+
+describe('idempotency key (POST /tasks header slice)', () => {
+  const VALID_KEY = 'f47ac10b-58cc-4372-a567-0e02b2c3d479'
+  const ANOTHER_VALID_KEY = '123e4567-e89b-42d3-a456-426614174000'
+
+  it('sends canonical lowercase RFC4122 UUIDv4 as HTTP Idempotency-Key header, never in JSON body', async () => {
+    const fetcher = fakeFetch(jsonResponse({ data: { task_id: 't-1', accepted: true }, request_id: 'r-1' }))
+    const payload = { preview_token: 'tok-preview-1', confirm: true }
+    const result = await post('/tasks', payload, { idempotencyKey: VALID_KEY })
+
+    expect(result).toEqual({ data: { task_id: 't-1', accepted: true }, requestId: 'r-1' })
+    expect(fetcher).toHaveBeenCalledOnce()
+    const [calledUrl, calledInit] = fetcher.mock.calls[0] as [string, RequestInit]
+    expect(calledUrl).toBe('/api/v1/tasks')
+    expect(calledInit.headers).toMatchObject({
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      'Idempotency-Key': VALID_KEY,
+    })
+    // Ensure Idempotency-Key is not in the JSON body payload
+    expect(JSON.parse(calledInit.body as string)).toEqual(payload)
+    expect(JSON.stringify(JSON.parse(calledInit.body as string))).not.toContain('idempotency')
+  })
+
+  it('omits Idempotency-Key header when idempotencyKey option is omitted or undefined', async () => {
+    const fetcher = vi.fn(async (_url: string, _init?: RequestInit): Promise<Response> => jsonResponse({ data: { ok: true }, request_id: 'r-2' }))
+    vi.stubGlobal('fetch', fetcher)
+    await post('/tasks', { preview_token: 'tok-preview-2', confirm: true })
+    const initWithoutOption = fetcher.mock.calls[0]?.[1] as RequestInit
+    expect(JSON.stringify(initWithoutOption.headers)).not.toContain('Idempotency-Key')
+
+    await post('/tasks', { preview_token: 'tok-preview-2', confirm: true }, { idempotencyKey: undefined })
+    const initWithUndefined = fetcher.mock.calls[1]?.[1] as RequestInit
+    expect(JSON.stringify(initWithUndefined.headers)).not.toContain('Idempotency-Key')
+  })
+
+  it.each([
+    ['uppercase full', 'F47AC10B-58CC-4372-A567-0E02B2C3D479'],
+    ['uppercase mixed', 'f47ac10b-58cc-4372-A567-0e02b2c3d479'],
+    ['non-v4 (v1)', 'f47ac10b-58cc-1372-a567-0e02b2c3d479'],
+    ['non-v4 (v5)', 'f47ac10b-58cc-5372-a567-0e02b2c3d479'],
+    ['variant error (c)', 'f47ac10b-58cc-4372-c567-0e02b2c3d479'],
+    ['variant error (0)', 'f47ac10b-58cc-4372-0567-0e02b2c3d479'],
+    ['empty string', ''],
+    ['header injection (CRLF)', 'f47ac10b-58cc-4372-a567-0e02b2c3d479\r\nX-Injected: true'],
+    ['header injection (LF)', 'f47ac10b-58cc-4372-a567-0e02b2c3d479\nEvil: 1'],
+    ['SQL injection snippet', "f47ac10b-58cc-4372-a567-0e02b2c3d479'; DROP TABLE tasks;--"],
+    ['non-canonical dashes', 'f47ac10b58cc4372a5670e02b2c3d479'],
+    ['too short', 'f47ac10b-58cc-4372-a567'],
+    ['too long', 'f47ac10b-58cc-4372-a567-0e02b2c3d479-extra'],
+  ])('rejects invalid idempotency key (%s: %j) before fetch', async (_name, invalidKey) => {
+    const fetcher = fakeFetch(jsonResponse({ data: true, request_id: 'r' }))
+    await expect(post('/tasks', { confirm: true }, { idempotencyKey: invalidKey }))
+      .rejects.toMatchObject({ code: 'INVALID_API_PATH', messageKey: 'errors.invalidPath' })
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['number', 12345],
+    ['boolean', true],
+    ['plain object', {}],
+    ['array', [VALID_KEY]],
+    ['null', null],
+  ])('rejects non-string idempotency key / JS escape (%s: %j) before fetch', async (_name, badValue) => {
+    const fetcher = fakeFetch(jsonResponse({ data: true, request_id: 'r' }))
+    await expect(post('/tasks', { confirm: true }, { idempotencyKey: badValue as unknown as string }))
+      .rejects.toMatchObject({ code: 'INVALID_API_PATH', messageKey: 'errors.invalidPath' })
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it('ignores arbitrary options (headers/method/credentials) and retains same-origin transport lockdown', async () => {
+    const fetcher = fakeFetch(jsonResponse({ data: { accepted: true }, request_id: 'r-lock' }))
+    await post('/tasks', { confirm: true }, {
+      idempotencyKey: ANOTHER_VALID_KEY,
+      method: 'PUT',
+      credentials: 'include',
+      headers: { 'X-Custom-Header': 'forbidden' },
+    } as unknown as RequestOptions)
+
+    expect(fetcher).toHaveBeenCalledOnce()
+    const init = fetcher.mock.calls[0]?.[1] as RequestInit
+    expect(init.method).toBe('POST')
+    expect(init.credentials).toBe('same-origin')
+    expect(init.redirect).toBe('error')
+    expect(init.headers).toEqual({
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      'Idempotency-Key': ANOTHER_VALID_KEY,
+    })
+    expect(JSON.stringify(init.headers)).not.toContain('X-Custom-Header')
+  })
+
+  it('supports valid csrfToken and valid idempotencyKey together on POST', async () => {
+    const fetcher = fakeFetch(jsonResponse({ data: { task_id: 't-both', accepted: true }, request_id: 'r-both' }))
+    await post('/tasks', { confirm: true }, {
+      csrfToken: 'csrf-valid-token-123',
+      idempotencyKey: VALID_KEY,
+    })
+
+    expect(fetcher).toHaveBeenCalledOnce()
+    const init = fetcher.mock.calls[0]?.[1] as RequestInit
+    expect(init.headers).toEqual({
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      'X-CSRF-Token': 'csrf-valid-token-123',
+      'Idempotency-Key': VALID_KEY,
+    })
   })
 })

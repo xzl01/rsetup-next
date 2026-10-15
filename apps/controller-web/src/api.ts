@@ -163,15 +163,31 @@ function validCsrfToken(token: string): boolean {
   return /^[A-Za-z0-9_-]{1,256}$/.test(token)
 }
 
+const CANONICAL_UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
+function validIdempotencyKey(key: unknown): key is string {
+  return typeof key === 'string' && CANONICAL_UUID_V4.test(key)
+}
+
+export interface RequestOptions {
+  signal?: AbortSignal
+  csrfToken?: string
+  idempotencyKey?: string
+}
+
 export async function post<T>(path: string, payload: unknown,
-  options?: { signal?: AbortSignal; csrfToken?: string }): Promise<ApiResponse<T>> {
+  options?: RequestOptions): Promise<ApiResponse<T>> {
   const url = safePath(path)
   const signal = options?.signal
   if (options?.csrfToken !== undefined && !validCsrfToken(options.csrfToken)) {
     throw localError('INVALID_API_PATH')
   }
+  if (options?.idempotencyKey !== undefined && !validIdempotencyKey(options.idempotencyKey)) {
+    throw localError('INVALID_API_PATH')
+  }
   const headers: Record<string, string> = { 'Content-Type': 'application/json', Accept: 'application/json' }
   if (options?.csrfToken !== undefined) headers['X-CSRF-Token'] = options.csrfToken
+  if (options?.idempotencyKey !== undefined) headers['Idempotency-Key'] = options.idempotencyKey
   let response: Response
   try {
     response = await fetch(url, {
