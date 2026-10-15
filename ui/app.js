@@ -185,6 +185,7 @@ const state = {
   installPickNotice: null,
   installPlan: null,
   installPlanning: false,
+  installPreviewVersion: 0,
   installAcknowledgement: "",
   installRunning: false,
   installError: null,
@@ -2907,7 +2908,7 @@ function installErrorCodeList() {
   return [
     "confirmation_required", "acknowledgement_mismatch", "plan_required", "stale_plan",
     "root_required", "install_conflict", "writes_running_system", "install_unsupported",
-    "invalid_install_request", "internal_error",
+    "invalid_install_request", "authorization_canceled", "internal_error",
   ];
 }
 
@@ -2916,7 +2917,10 @@ function installErrorCodeList() {
 // and from what the user typed, exactly like the core reports them.
 function installErrorCopy(failure) {
   const codes = installErrorCodeList();
-  const detailCodes = ["confirmation_required", "acknowledgement_mismatch", "stale_plan", "install_unsupported"];
+  const detailCodes = [
+    "confirmation_required", "acknowledgement_mismatch", "stale_plan", "install_unsupported",
+    "authorization_canceled",
+  ];
   const served = typeof failure?.code === "string" ? failure.code : "";
   const key = codes.includes(served) ? served : "generic";
   const expected = state.installPlan?.target?.id || "";
@@ -3112,7 +3116,7 @@ async function pickInstallImage() {
         sizeBytes: Number(picked.sizeBytes || 0),
       };
       state.installImageId = state.installPickedImage.handle;
-      state.installPlan = null;
+      invalidateInstallPlan();
       state.installAcknowledgement = "";
       state.installResult = null;
       selection = state.installImageId;
@@ -3367,13 +3371,21 @@ function renderSystemInstallPage() {
   wireInstallEvents(host);
 }
 
+// A selection change invalidates a preview that is still in flight, so a late
+// response cannot leave the page showing one device and image while the plan
+// underneath it describes another.
+function invalidateInstallPlan() {
+  state.installPreviewVersion = (state.installPreviewVersion || 0) + 1;
+  state.installPlan = null;
+  state.installAcknowledgement = "";
+}
+
 function wireInstallEvents(host) {
   const targetSelect = $("[data-install-targets]", host);
   if (targetSelect) {
     targetSelect.onchange = () => {
       state.installTargetId = targetSelect.value;
-      state.installPlan = null;
-      state.installAcknowledgement = "";
+      invalidateInstallPlan();
       state.installError = null;
       renderSystemInstallPage();
     };
@@ -3387,8 +3399,7 @@ function wireInstallEvents(host) {
         state.installPickedImage = null;
       }
       state.installPickNotice = null;
-      state.installPlan = null;
-      state.installAcknowledgement = "";
+      invalidateInstallPlan();
       state.installError = null;
       renderSystemInstallPage();
     };
@@ -3455,9 +3466,11 @@ async function loadInstallOptions() {
       state.installImageId = selectables[0]?.id || "";
       state.installPickedImage = null;
     }
-    // A fresh catalogue read invalidates any plan built from the previous one.
-    state.installPlan = null;
-    state.installAcknowledgement = "";
+    // A fresh catalogue read invalidates any plan built from the previous one,
+    // and invalidates a preview still in flight: the selection may just have been
+    // normalised against the new catalogue, so a late response would otherwise
+    // restore a plan for a device or image the page no longer shows.
+    invalidateInstallPlan();
     state.installResult = null;
     state.installError = null;
   }).catch((error) => {
@@ -3485,6 +3498,7 @@ async function planSystemInstall() {
     renderSystemInstallPage();
     return null;
   }
+  const version = (state.installPreviewVersion = (state.installPreviewVersion || 0) + 1);
   state.installPlanning = true;
   state.installError = null;
   state.installResult = null;
@@ -3492,10 +3506,14 @@ async function planSystemInstall() {
   let plan = null;
   try {
     plan = await transport.installPlan(targetId, imageId);
+    // The selection moved while this preview was in flight, so this plan
+    // describes a device or image the page no longer shows. Drop it.
+    if (version !== state.installPreviewVersion) return null;
     state.installPlan = plan;
     // A new plan invalidates any acknowledgement typed for the previous one.
     state.installAcknowledgement = "";
   } catch (error) {
+    if (version !== state.installPreviewVersion) return null;
     state.installPlan = null;
     state.installError = installErrorFrom(error);
   } finally {

@@ -64,7 +64,7 @@ const INSTALL_FUNCTIONS = [
   "renderInstallConfirmation", "renderInstallLiveBanner", "renderInstallErrorBox",
   "renderInstallResult", "renderSystemInstallBody", "renderSystemInstallPage", "wireInstallEvents",
   "onInstallAcknowledgementInput", "openSystemInstallPage", "loadInstallOptions",
-  "planSystemInstall", "applySystemInstall",
+  "invalidateInstallPlan", "planSystemInstall", "applySystemInstall",
   "installPickerAvailable", "installSelectableImages", "pickInstallImage", "installHandleProblem",
   "renderInstallPickNotice",
 ];
@@ -883,7 +883,7 @@ test("a refused or expired handle is explained next to its unchanged stable code
   assert.equal(context.installErrorCodeList().join(","), [
     "confirmation_required", "acknowledgement_mismatch", "plan_required", "stale_plan",
     "root_required", "install_conflict", "writes_running_system", "install_unsupported",
-    "invalid_install_request", "internal_error",
+    "invalid_install_request", "authorization_canceled", "internal_error",
   ].join(","));
   assert.equal(context.installHandleProblem("the image handle has expired"), "expired");
   assert.equal(context.installHandleProblem("the image handle is not one this process issued"), "unknown");
@@ -954,6 +954,60 @@ test("a fresh catalogue read discards the plan and the acknowledgement", async (
   assert.equal(context.state.installResult, null);
   assert.equal(context.installApplyDisabled(), true);
   assert.doesNotMatch(getElement("[data-install-body]").innerHTML, /data-install-apply/);
+});
+
+test("a catalogue refresh discards a preview that is still in flight", async () => {
+  // The finding: the refresh cleared the plan but did not invalidate the version,
+  // so a preview that was already in flight came back and restored a confirmation
+  // for the pre-refresh selection.
+  let release = null;
+  const refreshed = demoOptions({
+    targets: [demoTarget({ id: "mmcblk0", path: "/dev/mmcblk0", model: "eMMC 32GB", kind: "emmc", mounted: false, holdsRunningSystem: false })],
+    images: [{ id: "b.img", sizeBytes: 4194304 }],
+  });
+  const { context } = createContext({
+    state: { installOptions: demoOptions(), installTargetId: "sda", installImageId: "demo.img" },
+    transport: {
+      installPlan: () => new Promise((resolve) => {
+        release = () => resolve({ target: { id: "sda" }, image: { id: "demo.img" } });
+      }),
+      installTargets: async () => refreshed,
+    },
+  });
+  const inFlight = context.planSystemInstall();
+  await context.loadInstallOptions();
+  assert.equal(context.state.installTargetId, "mmcblk0", "the refresh moved the selection");
+  release();
+  assert.equal(await inFlight, null, "the stale preview resolves to nothing");
+  assert.equal(
+    context.state.installPlan,
+    null,
+    "no plan is adopted for the selection the refresh replaced",
+  );
+  assert.equal(context.state.installPlanning, false, "the page is not left mid-preview");
+});
+
+test("a preview that lands after the selection moved is discarded", async () => {
+  // The finding: changing the device or image while a preview is in flight used
+  // to leave the page showing one selection and a plan for another, so the
+  // confirmation described a device the operator had already moved away from.
+  let release = null;
+  const { context } = createContext({
+    state: { installOptions: demoOptions(), installTargetId: "sda", installImageId: "demo.img" },
+    transport: {
+      installPlan: () => new Promise((resolve) => {
+        release = () => resolve({ target: { id: "sda" }, image: { id: "demo.img" } });
+      }),
+    },
+  });
+  const inFlight = context.planSystemInstall();
+  // The operator changes the target while the preview is outstanding.
+  context.state.installTargetId = "mmcblk0";
+  context.invalidateInstallPlan();
+  release();
+  assert.equal(await inFlight, null, "the stale preview resolves to nothing");
+  assert.equal(context.state.installPlan, null, "no plan is adopted for the previous selection");
+  assert.equal(context.state.installPlanning, false, "the page is not left mid-preview");
 });
 
 test("a failed plan build is shown with its own code and asks for a retry", async () => {
