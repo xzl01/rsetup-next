@@ -3676,7 +3676,10 @@ function navigate(route) {
   $$('[data-route]').forEach((button) => {
     const active = button.dataset.route === route;
     button.classList.toggle("is-active", active);
-    if (button.classList.contains("route-button")) active ? button.setAttribute("aria-current", "page") : button.removeAttribute("aria-current");
+    if (button.classList.contains("route-button")) {
+      active ? button.setAttribute("aria-current", "page") : button.removeAttribute("aria-current");
+      if (active) button.scrollIntoView({ block: "nearest" });
+    }
   });
   $$('[data-view]').forEach((view) => view.classList.toggle("is-active", view.dataset.view === route));
   $(".workspace").scrollTo({ top: 0, behavior: "instant" });
