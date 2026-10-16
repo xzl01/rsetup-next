@@ -5,6 +5,8 @@ pub mod actions;
 pub mod dispatch;
 pub mod journal;
 pub mod read_only;
+#[cfg(any(test, feature = "test-seam"))]
+pub mod test_seam;
 
 pub use actions::{
     ACTION_ALLOWLIST, ActionKind, ActionSpec, allowed_action_names, is_reserved, lookup_action,

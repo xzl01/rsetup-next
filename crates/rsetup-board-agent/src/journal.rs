@@ -385,9 +385,15 @@ fn validate_loaded_journal(meta: &JournalMeta, logs: &JournalLogs) -> Result<(),
     Ok(())
 }
 
-/// Step 3.1 初始阶段：两阶段落盘骨架就位，临时文件路径严密拒绝非法路径且不 fallback；
-/// 此时各类 IO 错误统一返回 `JournalError::Io`，等待 Step 3.2 失败注入测试建立真实行为 RED 后，
-/// 再替换为精细化状态分类。
+/// 固定两阶段落盘与原子重命名，按失败边界精确分类（Task 3.2）：
+/// 0=create_write, 1=write, 2=sync_file, 3=rename, 4=sync_dir, 5=remove_file, 6=sync_dir。
+///
+/// - (0)(1)(2) rename 调用之前确定失败：磁盘确定未变 → `DefinitelyNotCommitted`；
+/// - (3) rename 调用本身失败：文件系统层状态未知（可能部分提交或已修改目录项）→ `CommitUnknown`；
+/// - (4) rename 之后的父目录 sync 失败：掉电可能导致元数据回滚 → `CommitUnknown`；
+/// - (5)(6) 提交点之后的收尾尽力而为，失败不否定提交。
+///
+/// 临时文件路径严密拒绝非法路径且不 fallback。
 fn write_durable<F: Fs>(
     fs: &F,
     dir: &Path,
@@ -400,20 +406,23 @@ fn write_durable<F: Fs>(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| JournalError::Io("invalid target path for durable write".to_string()))?;
     let tmp = dir.join(format!(".{}.tmp-{}", file_name, uuid::Uuid::new_v4()));
+    // (0)(1)(2) rename 之前确定失败 => DefinitelyNotCommitted
     let mut file = fs
         .create_write(&tmp)
-        .map_err(|e| JournalError::Io(e.to_string()))?;
+        .map_err(|_| JournalError::DefinitelyNotCommitted)?;
     file.write_all(body)
-        .map_err(|e| JournalError::Io(e.to_string()))?;
+        .map_err(|_| JournalError::DefinitelyNotCommitted)?;
     drop(file); // 必须先释放文件句柄，再做 sync
     fs.sync_file(&tmp)
-        .map_err(|e| JournalError::Io(e.to_string()))?;
+        .map_err(|_| JournalError::DefinitelyNotCommitted)?;
+    // (3) rename 调用本身失败：文件系统层状态未知 => CommitUnknown
     fs.rename(&tmp, final_path)
-        .map_err(|e| JournalError::Io(e.to_string()))?;
-    fs.sync_dir(dir)
-        .map_err(|e| JournalError::Io(e.to_string()))?;
-    // 清理临时文件属于提交点之后的收尾：删除失败不否定提交
+        .map_err(|_| JournalError::CommitUnknown)?;
+    // (4) rename 之后的父目录 sync 失败：掉电可能回滚目录项 => CommitUnknown
+    fs.sync_dir(dir).map_err(|_| JournalError::CommitUnknown)?;
+    // (5) 清理临时文件属于提交点之后的收尾：删除失败不否定提交
     let _ = fs.remove_file(&tmp);
+    // (6) 第二次父目录 sync 尽力而为
     let _ = fs.sync_dir(dir);
     Ok(())
 }
@@ -533,18 +542,14 @@ impl<F: Fs> JournalStore<F> {
         controller_key: &[u8; 32],
         sub_task_id: &str,
     ) -> Result<Option<TaskRecord>, JournalError> {
-        if self.uncertain.load(Ordering::SeqCst) {
-            return Err(uncertain_error());
-        }
+        self.ensure_not_uncertain()?;
         let expected_controller_hex = encode_journal_hash32(controller_key);
         let records = match self.records.lock() {
             Ok(guard) => guard,
             // fail-closed：毒锁 → 直接返回（消息去敏，不含记录内容）
             Err(_) => return Err(JournalError::Io("journal.records poisoned".to_string())),
         };
-        if self.uncertain.load(Ordering::SeqCst) {
-            return Err(uncertain_error());
-        }
+        self.ensure_not_uncertain()?;
         let hits: Vec<&StoredRecord> = records
             .iter()
             .filter(|r| r.controller_hex == expected_controller_hex && r.sub_task_id == sub_task_id)
@@ -566,6 +571,36 @@ impl<F: Fs> JournalStore<F> {
         &self.dir
     }
 
+    /// 仅用于测试见证：暴露底层 `Fs` 的共享引用（不是新的行为接口，只是让见证对象可观察）。
+    pub fn fs_handle(&self) -> &F {
+        &self.fs
+    }
+
+    /// 实例提交路径的统一入口（`open` 之外的全部落盘提交都经此函数）。
+    ///
+    /// `write_durable` 返回 `CommitUnknown` 时，必须在把错误返回给调用方**之前**先置
+    /// `uncertain = true`（TR-N2 / 正审 R-02）：磁盘可能已落地新记录而内存未换，本实例进入
+    /// 不可逆隔离态。`DefinitelyNotCommitted` 表示 rename 之前确定失败、磁盘确定未变，不置位。
+    fn commit_durable(&self, final_path: &Path, body: &[u8]) -> Result<(), JournalError> {
+        match write_durable(&self.fs, &self.dir, final_path, body) {
+            Ok(()) => Ok(()),
+            Err(err @ JournalError::CommitUnknown) => {
+                self.uncertain.store(true, Ordering::SeqCst);
+                Err(err)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// uncertain 隔离态入口守卫（TR-N2）：为真即返回固定去敏 `Io`，先于任何加锁与 I/O，
+    /// 绝不返回旧内存快照、绝不发起新写入。
+    fn ensure_not_uncertain(&self) -> Result<(), JournalError> {
+        if self.uncertain.load(Ordering::SeqCst) {
+            return Err(uncertain_error());
+        }
+        Ok(())
+    }
+
     /// accepted：`pre_boot_id` 必须在本次调用内即确定并落盘。
     ///
     /// 去重命名空间 = `controller_key` + `sub_task_id`：命中且载荷哈希相同 → 复用原记录
@@ -579,18 +614,14 @@ impl<F: Fs> JournalStore<F> {
         payload_hash: &[u8; 32],
         pre_boot_id: &str,
     ) -> Result<(TaskRecord, DedupOutcome), JournalError> {
-        if self.uncertain.load(Ordering::SeqCst) {
-            return Err(uncertain_error());
-        }
+        self.ensure_not_uncertain()?;
         let controller_hex = encode_journal_hash32(controller_key);
         let payload_hash_hex = encode_journal_hash32(payload_hash);
         let mut records = match self.records.lock() {
             Ok(guard) => guard,
             Err(_) => return Err(JournalError::Io("journal.records poisoned".to_string())),
         };
-        if self.uncertain.load(Ordering::SeqCst) {
-            return Err(uncertain_error());
-        }
+        self.ensure_not_uncertain()?;
         let hits: Vec<&StoredRecord> = records
             .iter()
             .filter(|r| r.controller_hex == controller_hex && r.sub_task_id == sub_task_id)
@@ -633,7 +664,7 @@ impl<F: Fs> JournalStore<F> {
         };
         let body = serde_json::to_vec(&logs).map_err(|e| JournalError::Decode(e.to_string()))?;
         let logs_path = self.dir.join(Self::LOG_FILE);
-        write_durable(&self.fs, &self.dir, &logs_path, &body)?;
+        self.commit_durable(&logs_path, &body)?;
         // 落盘成功后才替换内存状态
         *records = candidate;
         Ok((task_record_from(&stored.record)?, DedupOutcome::Inserted))
@@ -645,6 +676,7 @@ impl<F: Fs> JournalStore<F> {
         _controller_key: &[u8; 32],
         _sub_task_id: &str,
     ) -> Result<TaskRecord, JournalError> {
+        self.ensure_not_uncertain()?; // uncertain 隔离态先于一切（TR-N2）
         Err(JournalError::NotFound) // 桩
     }
 
@@ -656,6 +688,7 @@ impl<F: Fs> JournalStore<F> {
         _state: TaskState,
         _reason: Option<&str>,
     ) -> Result<TaskRecord, JournalError> {
+        self.ensure_not_uncertain()?; // uncertain 隔离态先于一切（TR-N2）
         Err(JournalError::NotFound) // 桩
     }
 
@@ -666,6 +699,7 @@ impl<F: Fs> JournalStore<F> {
         _sub_task_id: &str,
         _observed_boot_id: &str,
     ) -> Result<TaskRecord, JournalError> {
+        self.ensure_not_uncertain()?; // uncertain 隔离态先于一切（TR-N2）
         Err(JournalError::NotFound) // 桩
     }
 
@@ -674,6 +708,7 @@ impl<F: Fs> JournalStore<F> {
         &self,
         _current_boot_id: &str,
     ) -> Result<Vec<TaskRecord>, JournalError> {
+        self.ensure_not_uncertain()?; // uncertain 隔离态先于一切（TR-N2）
         Err(JournalError::NotFound) // 桩
     }
 
@@ -683,6 +718,7 @@ impl<F: Fs> JournalStore<F> {
         _controller_key: &[u8; 32],
         _incoming: &TaskRecord,
     ) -> Result<EvidenceMerge, JournalError> {
+        self.ensure_not_uncertain()?; // uncertain 隔离态先于一切（TR-N2）
         Err(JournalError::NotFound) // 桩
     }
 }

@@ -22,3 +22,7 @@ uuid.workspace = true
 [features]
 default = []
 test-seam = []
+
+[[test]]
+name = "journal_fault_injection"
+required-features = ["test-seam"]
