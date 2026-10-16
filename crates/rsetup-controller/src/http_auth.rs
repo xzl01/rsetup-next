@@ -1337,6 +1337,8 @@ mod tests {
                 std::io::Error::other("synthetic db fault").into(),
             )),
             ControllerError::Crypto => ControllerError::Crypto,
+            ControllerError::LastAdmin => ControllerError::LastAdmin,
+            ControllerError::InvalidState => ControllerError::InvalidState,
         }
     }
 
