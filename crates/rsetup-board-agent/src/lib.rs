@@ -3,6 +3,7 @@
 
 pub mod actions;
 pub mod dispatch;
+pub mod journal;
 pub mod read_only;
 
 pub use actions::{
@@ -10,5 +11,9 @@ pub use actions::{
 };
 pub use dispatch::{
     BoardAgent, BusinessResponse, BusinessStatus, JournalEpochSource, TaskJournalReader,
+};
+pub use journal::{
+    DedupOutcome, EvidenceMerge, Fs, JOURNAL_MAX_RECORDS, JOURNAL_SCHEMA_VERSION, JournalError,
+    JournalRecovery, JournalStore, RealFs, TaskJournal, TaskRecord, TaskState,
 };
 pub use read_only::{PeerContext, ReadOnlyMutationGuard, ReadOnlySource};
