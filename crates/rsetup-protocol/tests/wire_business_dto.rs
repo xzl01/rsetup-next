@@ -262,6 +262,19 @@ fn capabilities_requires_durable_journal_epoch_uuid() {
         broken.validate(),
         Err(DtoError::EmptyField("journal_epoch"))
     );
+
+    // boot_id 必须是规范小写 UUIDv4：非 UUID、大写 UUID 均拒绝
+    let mut broken = caps.clone();
+    broken.boot_id = String::new();
+    assert_eq!(broken.validate(), Err(DtoError::EmptyField("boot_id")));
+
+    let mut broken = caps.clone();
+    broken.boot_id = "not-a-uuid".to_string();
+    assert_eq!(broken.validate(), Err(DtoError::InvalidUuid("boot_id")));
+
+    let mut broken = caps.clone();
+    broken.boot_id = BOOT.to_uppercase();
+    assert_eq!(broken.validate(), Err(DtoError::InvalidUuid("boot_id")));
 }
 
 #[test]

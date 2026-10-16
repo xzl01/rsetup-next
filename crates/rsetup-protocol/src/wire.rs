@@ -446,7 +446,7 @@ impl BusinessMessage for Capabilities {
     }
     fn validate(&self) -> Result<(), DtoError> {
         require_version(self.schema_version)?;
-        require_non_empty("boot_id", &self.boot_id)?;
+        require_uuid("boot_id", &self.boot_id)?;
         require_non_empty("agent_version", &self.agent_version)?;
         require_uuid("journal_epoch", &self.journal_epoch)?;
         require_max(
