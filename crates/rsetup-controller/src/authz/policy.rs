@@ -136,6 +136,49 @@ pub fn check_admin_demotion_allowed(current_admin_count: i64) -> Result<(), Cont
     }
 }
 
+/// DB 当前 actor 的严格授权状态（同一读事务内读取；HTTP 层 `Session` 只是廉价前置过滤）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotActor {
+    pub id: [u8; 16],
+    pub active: bool,
+    pub is_admin: bool,
+    pub must_change_password: bool,
+}
+
+/// 封闭的 4 权限全集（规格 01 §1：管理员具有全局及全部设备权限）。
+pub const ALL_DEVICE_PERMISSIONS: [Permission; 4] = [
+    Permission::DeviceRead,
+    Permission::DeviceStatusRead,
+    Permission::DeviceReboot,
+    Permission::DeviceTaskRead,
+];
+
+/// DB 当前管理员判定（admin shortcut 条件）：三个严格布尔全部满足。
+pub fn is_current_admin(actor: &SnapshotActor) -> bool {
+    actor.active && actor.is_admin && !actor.must_change_password
+}
+
+/// 目标设备的有效权限集（纯求值，离线 RED→GREEN 目标）。
+/// 语义固定：`!active || must_change_password` → 空集（fail-closed，admin 未改密同样 0 权限）；
+/// `active && is_admin` → `ALL_DEVICE_PERMISSIONS` 全量（admin shortcut，不看 grants）；
+/// 普通用户 → `evaluate_grants(actor.id, device_id, grants, roles, device_groups)`，
+/// 其中 `device_groups` 必须是**目标设备自身**所属 group 集（不得用 actor grant 的 group 全集）。
+pub fn eval_memory_permissions(
+    actor: &SnapshotActor,
+    device_id: [u8; 32],
+    grants: &[GrantRecord],
+    roles: &HashMap<Uuid, RoleRecord>,
+    device_groups: &HashSet<Uuid>,
+) -> HashSet<Permission> {
+    if !actor.active || actor.must_change_password {
+        return HashSet::new();
+    }
+    if actor.is_admin {
+        return HashSet::from(ALL_DEVICE_PERMISSIONS);
+    }
+    evaluate_grants(actor.id, device_id, grants, roles, device_groups)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +436,110 @@ mod tests {
             Err(crate::ControllerError::LastAdmin)
         ));
         assert!(super::check_admin_demotion_allowed(2).is_ok());
+    }
+
+    #[test]
+    fn snapshot_eval_regular_user_group_scope_never_crosses_devices() {
+        // 普通 group 范围不串设备：group 授权只覆盖**该设备自身所属**的 group——
+        // device A 属于 G（有权限），device B 属于另一组（0 权限）；
+        // 不得把 G 套到两个设备，也不得用 actor grant 的 group 全集。
+        let group = uuid::Uuid::from_bytes([0x67; 16]);
+        let actor = SnapshotActor {
+            id: [1u8; 16],
+            active: true,
+            is_admin: false,
+            must_change_password: false,
+        };
+        let grants = vec![GrantRecord {
+            id: uuid::Uuid::from_bytes([0x0a; 16]),
+            user_id: [1u8; 16],
+            source: GrantSource::Direct(vec![Permission::DeviceRead]),
+            scope: GrantScope::Group(group),
+            revision: 1,
+        }];
+        let roles = HashMap::new();
+        let mut groups_a = HashSet::new();
+        groups_a.insert(group);
+        let mut groups_b = HashSet::new();
+        groups_b.insert(uuid::Uuid::from_bytes([0x68; 16]));
+        assert_eq!(
+            eval_memory_permissions(&actor, [0xa1; 32], &grants, &roles, &groups_a),
+            HashSet::from([Permission::DeviceRead])
+        );
+        assert!(
+            eval_memory_permissions(&actor, [0xa2; 32], &grants, &roles, &groups_b).is_empty(),
+            "device B is not in G: the group grant must not cross devices"
+        );
+    }
+
+    #[test]
+    fn snapshot_eval_only_actor_own_grants_apply() {
+        // 本人隔离：他人（即使 All scope 的 direct/reboot）grant 不给本 actor 任何权限。
+        let actor = SnapshotActor {
+            id: [1u8; 16],
+            active: true,
+            is_admin: false,
+            must_change_password: false,
+        };
+        let grants = vec![GrantRecord {
+            id: uuid::Uuid::from_bytes([0x0b; 16]),
+            user_id: [2u8; 16], // ← 他人的 grant
+            source: GrantSource::Direct(vec![Permission::DeviceReboot]),
+            scope: GrantScope::All,
+            revision: 1,
+        }];
+        let roles = HashMap::new();
+        let groups = HashSet::new();
+        assert!(
+            eval_memory_permissions(&actor, [0xb1; 32], &grants, &roles, &groups).is_empty(),
+            "another user's grant must not grant permissions to this actor"
+        );
+    }
+
+    #[test]
+    fn snapshot_eval_admin_must_change_password_has_zero_permissions() {
+        // 管理员当前改密：DB 当前 must_change_password 的 admin 仍是 0 权限（fail-closed）；
+        // admin shortcut 只在 DB 当前 active && is_admin && !must_change_password 时全量。
+        let blocked = SnapshotActor {
+            id: [1u8; 16],
+            active: true,
+            is_admin: true,
+            must_change_password: true,
+        };
+        let inactive = SnapshotActor {
+            id: [1u8; 16],
+            active: false,
+            is_admin: true,
+            must_change_password: false,
+        };
+        let roles = HashMap::new();
+        let groups = HashSet::new();
+        assert!(eval_memory_permissions(&blocked, [0u8; 32], &[], &roles, &groups).is_empty());
+        assert!(eval_memory_permissions(&inactive, [0u8; 32], &[], &roles, &groups).is_empty());
+        let admin = SnapshotActor {
+            id: [1u8; 16],
+            active: true,
+            is_admin: true,
+            must_change_password: false,
+        };
+        assert_eq!(
+            eval_memory_permissions(&admin, [0u8; 32], &[], &roles, &groups),
+            HashSet::from(ALL_DEVICE_PERMISSIONS)
+        );
+    }
+
+    #[test]
+    fn snapshot_eval_no_grants_regular_user_has_legal_empty_permissions() {
+        // 无 grant 是合法空权限（不是错误、不是 503、不降级为"未知"）——
+        // 与"引用污染"（503 Config）严格区分：污染在 build/decode 层拦，空集在求值层放行。
+        let actor = SnapshotActor {
+            id: [1u8; 16],
+            active: true,
+            is_admin: false,
+            must_change_password: false,
+        };
+        let roles = HashMap::new();
+        let groups = HashSet::new();
+        assert!(eval_memory_permissions(&actor, [0xc1; 32], &[], &roles, &groups).is_empty());
     }
 }

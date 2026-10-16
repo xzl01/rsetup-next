@@ -515,7 +515,9 @@ fn validate_identity_fixture_with_meta(
     }
     Ok(())
 }
-fn raw_bool(raw: i64, code: &'static str) -> Result<bool, ControllerError> {
+pub(crate) const SUPPORTED_SCHEMA_VERSION: i32 = 4;
+
+pub(crate) fn raw_bool(raw: i64, code: &'static str) -> Result<bool, ControllerError> {
     match raw {
         0 => Ok(false),
         1 => Ok(true),
