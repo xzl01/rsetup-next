@@ -90,10 +90,12 @@ export function startTaskOperation(previous: TaskOperationState): { key: string;
 }
 
 export function previewFingerprint(preview: TaskPreview): string {
-  const targets = preview.targets
-    .map((target) => `${target.device_id}:${target.eligible ? '1' : '0'}`)
-    .sort()
-    .join(',')
+  // 稳定字符串：preview_token + 排序去重后的固定清单 device_id（含 eligible 状态）；
+  // 重复条目不得改变指纹，否则下游会误判目标清单变更并 reset 幂等 key
+  const targetSet = new Set(
+    preview.targets.map((target) => `${target.device_id}:${target.eligible ? '1' : '0'}`)
+  )
+  const targets = Array.from(targetSet).sort().join(',')
   return `${preview.preview_token}|${targets}`
 }
 

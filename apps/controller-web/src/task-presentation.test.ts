@@ -225,6 +225,49 @@ describe('idempotency key lifecycle for a single confirmation', () => {
   })
 })
 
+describe('previewFingerprint target list is a sorted de-duplicated set', () => {
+  it('produces the identical fingerprint for duplicated targets and the single-entry list', () => {
+    const single = preview({ targets: [{ device_id: DEV_A, eligible: true }] })
+    const duplicated = preview({
+      targets: [
+        { device_id: DEV_A, eligible: true },
+        { device_id: DEV_A, eligible: true },
+      ],
+    })
+    const triplicated = preview({
+      targets: [
+        { device_id: DEV_A, eligible: true },
+        { device_id: DEV_A, eligible: true },
+        { device_id: DEV_A, eligible: true },
+      ],
+    })
+    expect(previewFingerprint(duplicated)).toBe(previewFingerprint(single))
+    expect(previewFingerprint(triplicated)).toBe(previewFingerprint(single))
+  })
+
+  it('produces the identical fingerprint when the target order is reversed', () => {
+    const base = preview()
+    const reversed = preview({ targets: [...base.targets].reverse() })
+    expect(previewFingerprint(reversed)).toBe(previewFingerprint(base))
+  })
+
+  it('produces different fingerprints when an eligible flag changes', () => {
+    const eligible = preview({ targets: [{ device_id: DEV_A, eligible: true }] })
+    const ineligible = preview({ targets: [{ device_id: DEV_A, eligible: false, reason: 'DEVICE_OFFLINE' }] })
+    expect(previewFingerprint(ineligible)).not.toBe(previewFingerprint(eligible))
+    // 同一 device_id 的两种 eligible 状态是不同集合条目，重复去重后仍各自保留
+    const mixed = preview({
+      targets: [
+        { device_id: DEV_A, eligible: true },
+        { device_id: DEV_A, eligible: false },
+        { device_id: DEV_A, eligible: true },
+      ],
+    })
+    expect(previewFingerprint(mixed)).not.toBe(previewFingerprint(eligible))
+    expect(previewFingerprint(mixed)).not.toBe(previewFingerprint(ineligible))
+  })
+})
+
 describe('held time review decisions and preview request body', () => {
   it('offers exactly the two non-extending held decisions with dedicated dictionary keys', () => {
     expect([...TIME_REVIEW_DECISIONS]).toEqual(['resume_original_deadline', 'expire'])
