@@ -16,6 +16,7 @@ pub use wire::{
     ApprovedCodecWitness, BUSINESS_SCHEMA_VERSION, BusinessMessage, BusinessPayload,
     BusinessPayloadKind, Capabilities, ClockSample, Codec, CodecError, DeviceStatus, DtoError,
     MAX_METRIC_KEY_BYTES, MAX_METRIC_UNIT_BYTES, MAX_METRICS, MAX_TICKET_TTL_MS, Metric, NoCodec,
-    Query, RebootExecute, RebootPrepare, RebootTicket, TaskQuery, TaskRecord, decode_business,
-    encode_business, is_canonical_uuid_v4, validate_dto,
+    Query, RebootExecute, RebootPrepare, RebootTicket, TaskQuery, TaskRecord,
+    canonical_reboot_payload_hash, decode_business, encode_business, is_canonical_uuid_v4,
+    validate_dto,
 };

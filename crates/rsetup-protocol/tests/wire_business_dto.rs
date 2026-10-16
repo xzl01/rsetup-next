@@ -1,7 +1,8 @@
 use rsetup_protocol::wire::{
     BUSINESS_SCHEMA_VERSION, BusinessMessage, BusinessPayload, BusinessPayloadKind, Capabilities,
-    ClockSample, CodecError, DeviceStatus, DtoError, Metric, NoCodec, RebootTicket, TaskQuery,
-    TaskRecord, decode_business, encode_business, is_canonical_uuid_v4, validate_dto,
+    ClockSample, CodecError, DeviceStatus, DtoError, Metric, NoCodec, RebootExecute, RebootTicket,
+    TaskQuery, TaskRecord, canonical_reboot_payload_hash, decode_business, encode_business,
+    is_canonical_uuid_v4, validate_dto,
 };
 
 const EPOCH: &str = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
@@ -310,4 +311,66 @@ fn clock_sample_quality_is_restricted_to_observed_or_unstable() {
             ..
         })
     ));
+}
+
+#[test]
+fn canonical_reboot_payload_hash_is_semantic_not_ticket_bound() {
+    // synthetic 输入：token 字节仅用于证明「票据一次性不属于载荷语义」
+    let base = RebootExecute {
+        schema_version: BUSINESS_SCHEMA_VERSION,
+        sub_task_id: SUB_TASK.to_string(),
+        expected_boot_id: BOOT.to_string(),
+        execution_token: [7u8; 32],
+    };
+    // 正例：稳定重复哈希相同（纯函数、无 I/O、无时间源）
+    let h1 = canonical_reboot_payload_hash(&base);
+    let h2 = canonical_reboot_payload_hash(&base);
+    assert_eq!(h1, h2, "稳定重复哈希必须相同");
+    // 表：(用例名, 变更后请求, 与 h1 哈希相同?); token 变更是唯一「相同」用例
+    let cases: [(&str, RebootExecute, bool); 4] = [
+        (
+            "相同语义 token 变更",
+            {
+                let mut r = base.clone();
+                r.execution_token = [8u8; 32];
+                r
+            },
+            true,
+        ),
+        (
+            "schema_version 变更",
+            {
+                let mut r = base.clone();
+                r.schema_version = 2;
+                r
+            },
+            false,
+        ),
+        (
+            "sub_task_id 变更",
+            {
+                let mut r = base.clone();
+                r.sub_task_id = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d".to_string();
+                r
+            },
+            false,
+        ),
+        (
+            "expected_boot_id 变更",
+            {
+                let mut r = base.clone();
+                r.expected_boot_id = "6f8b1c2d-0000-4000-8000-000000000002".to_string();
+                r
+            },
+            false,
+        ),
+    ];
+    for (name, request, same) in &cases {
+        let h = canonical_reboot_payload_hash(request);
+        if *same {
+            assert_eq!(h1, h, "{name}: 同一语义重放不得因临时票据变化冲突");
+        } else {
+            assert_ne!(h1, h, "{name}: 语义字段变更必须哈希不同");
+        }
+    }
 }

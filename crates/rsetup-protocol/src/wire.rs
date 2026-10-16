@@ -554,6 +554,30 @@ impl BusinessMessage for RebootExecute {
     }
 }
 
+/// RebootExecute 规范载荷哈希（规范编码见计划；排除 execution token/nonce）。
+pub fn canonical_reboot_payload_hash(request: &RebootExecute) -> [u8; 32] {
+    // 版本化 domain/action 标签：固定 31B（rsetup + device.reboot.execute + v1）
+    const LABEL: &[u8] = b"rsetup.device.reboot.execute.v1";
+    let mut buf = Vec::with_capacity(128);
+    buf.push(LABEL.len() as u8);
+    buf.extend_from_slice(LABEL);
+    buf.extend_from_slice(&request.schema_version.to_be_bytes());
+    // 长度前缀固定 u64 BE：所有受支持目标 usize ≤ 2^64-1 可证明无损；try_from 为 checked 转换（fail-closed 守卫）、不引新错误枚举
+    let sub_len = u64::try_from(request.sub_task_id.len())
+        .expect("usize fits u64 on all supported Rust targets");
+    buf.extend_from_slice(&sub_len.to_be_bytes());
+    buf.extend_from_slice(request.sub_task_id.as_bytes());
+    let boot_len = u64::try_from(request.expected_boot_id.len())
+        .expect("usize fits u64 on all supported Rust targets");
+    buf.extend_from_slice(&boot_len.to_be_bytes());
+    buf.extend_from_slice(request.expected_boot_id.as_bytes());
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    ctx.update(&buf);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(ctx.finish().as_ref());
+    out
+}
+
 impl BusinessMessage for TaskQuery {
     fn schema_version(&self) -> u32 {
         self.schema_version
