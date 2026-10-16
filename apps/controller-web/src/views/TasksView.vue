@@ -46,14 +46,19 @@ const taskDevices = computed(() => props.devices.filter(
   (device) => device.effective_permissions.includes('device.reboot') ||
     device.effective_permissions.includes('device.task.read'),
 ))
+// 合格设备 ID 集合：watch 它而非 props.devices 引用本身——父级原地修改 effective_permissions
+// 或对数组 splice 时引用不变，浅层 watch 不会触发，selected 会残留已失格设备的 ID
+const validDeviceIds = computed(() => new Set(taskDevices.value.map((device) => device.device_id)))
 // pendingDeviceId 预选必须在 setup 期完成（而非 onMounted）：否则首帧渲染时勾选态尚未生效，
 // 生成预览按钮在挂载后的第一次点击仍是 disabled，来自 #/tasks?device=<hex64> 的入口会静默失效
 const pendingDevice = props.pendingDeviceId
 const selected = ref<string[]>(
-  pendingDevice && taskDevices.value.some((device) => device.device_id === pendingDevice)
+  pendingDevice && validDeviceIds.value.has(pendingDevice)
     ? [pendingDevice]
     : [],
 )
+// 默认预选是否已消费：setup 期已命中并勾选即视为已应用；用户主动取消勾选后不再强行勾回
+let pendingDefaultConsumed = pendingDevice !== null && selected.value.includes(pendingDevice)
 const preview = ref<TaskPreview | null>(null)
 const previewError = ref<string | null>(null)
 const previewBusy = ref(false)
@@ -73,6 +78,8 @@ const isStaleOp = (gen: number, kind: 'preview' | 'submit') =>
   gen !== operationGeneration.value || kind !== operationKind.value
 
 function selectDevice(deviceId: string, checked: boolean) {
+  // 用户主动取消 pendingDeviceId 的勾选 = 默认预选被消费，watcher 不得再强行勾回
+  if (!checked && deviceId === props.pendingDeviceId) pendingDefaultConsumed = true
   selected.value = checked
     ? Array.from(new Set([...selected.value, deviceId]))
     : selected.value.filter((id) => id !== deviceId)
@@ -81,10 +88,16 @@ function selectDevice(deviceId: string, checked: boolean) {
 // CSPRNG 能力门禁：crypto.getRandomValues 不可用即 fail-closed，绝不 fallback 到 randomUUID/Math.random
 const csprngAvailable = typeof globalThis.crypto?.getRandomValues === 'function'
 
-// WEB-N3：props.devices 更新（权限撤销或移出列表）后 taskDevices 不再列出已失格设备，
-// 但 selected 仍会残留其 ID；立即取交集清理，防止残留 ID 被后续操作提交
-watch(() => props.devices, () => {
-  selected.value = selected.value.filter((id) => taskDevices.value.some((device) => device.device_id === id))
+// WEB-N3：直接观察合格设备 ID 集合——无论父级换引用、原地改 effective_permissions 还是 splice，
+// 集合变化即触发：① 立即从 selected 剔除已失格设备 ID，防止残留 ID 被后续操作提交；
+// ② 设备异步到达后补做 pendingDeviceId 默认预选（用户主动取消过则不再勾回）
+watch(validDeviceIds, (ids) => {
+  selected.value = selected.value.filter((id) => ids.has(id))
+  const pending = props.pendingDeviceId
+  if (!pendingDefaultConsumed && pending && ids.has(pending)) {
+    pendingDefaultConsumed = true
+    selected.value = Array.from(new Set([...selected.value, pending]))
+  }
 })
 
 async function loadPreview() {
@@ -197,8 +210,13 @@ onMounted(() => {
   initialLoad()
 })
 
+// pendingDeviceId 变化 = 新的默认预选请求：重置消费标志；命中有效集合立即勾选，
+// 尚未命中（如设备列表还没到）则留给 validDeviceIds watcher 在集合更新时补做
 watch(() => props.pendingDeviceId, (id) => {
-  if (id && taskDevices.value.some((device) => device.device_id === id)) {
+  if (!id) return
+  pendingDefaultConsumed = false
+  if (validDeviceIds.value.has(id)) {
+    pendingDefaultConsumed = true
     selected.value = Array.from(new Set([...selected.value, id]))
   }
 })

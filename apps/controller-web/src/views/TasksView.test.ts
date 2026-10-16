@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/vue'
+import { reactive } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import TasksView from './TasksView.vue'
 import { post } from '../api'
@@ -91,6 +92,57 @@ describe('TasksView preview, idempotency and retry', () => {
     // selected 被 watch 清理后按钮 disabled，loadPreview 交集亦为空：onPreview 绝不被调用
     await fireEvent.click(screen.getByRole('button', { name: name('task.preview.submit') }))
     expect(onPreview).not.toHaveBeenCalled()
+  })
+
+  it('drops an in-place revoked or spliced device from selected without a new array reference', async () => {
+    const onPreview = vi.fn(async (_operation: 'reboot', _deviceIds: string[], _signal?: AbortSignal) => preview)
+    // 父级持有同一 reactive 数组：原地改 effective_permissions / splice 都不换引用，浅层 watch 不会触发
+    const live = reactive([
+      { device_id: DEV_A, display_name: 'Alpha', effective_permissions: ['device.reboot'] },
+      { device_id: DEV_C, display_name: 'Gamma', effective_permissions: ['device.task.read'] },
+    ])
+    mount({ devices: live, pendingDeviceId: DEV_A, onPreview })
+    await fireEvent.click(screen.getByTestId(`task-device-${DEV_C}`))
+    // 原地撤销 Alpha 的 device.reboot：数组引用不变、无 rerender，selected 仍必须立即剔除 DEV_A
+    live[0]!.effective_permissions = ['device.read']
+    await waitFor(() => expect(screen.queryByTestId(`task-device-${DEV_A}`)).toBeNull())
+    await fireEvent.click(screen.getByRole('button', { name: name('task.preview.submit') }))
+    // 精确等于 [DEV_C]：已失格的 DEV_A 绝不残留在发送目标中
+    await waitFor(() => expect(onPreview).toHaveBeenCalledWith('reboot', [DEV_C], expect.any(AbortSignal)))
+    expect(onPreview).toHaveBeenCalledTimes(1)
+    // 原地 splice 移除 Gamma：selected 清空，按钮回到 disabled
+    live.splice(1, 1)
+    await waitFor(() => expect((screen.getByRole('button', {
+      name: name('task.preview.submit'),
+    }) as HTMLButtonElement).disabled).toBe(true))
+    await fireEvent.click(screen.getByRole('button', { name: name('task.preview.submit') }))
+    expect(onPreview).toHaveBeenCalledTimes(1)
+  })
+
+  it('preselects the pending device when the device list arrives asynchronously after mount', async () => {
+    const onPreview = vi.fn(async (_operation: 'reboot', _deviceIds: string[], _signal?: AbortSignal) => preview)
+    const submitButton = () => screen.getByRole('button', { name: name('task.preview.submit') }) as HTMLButtonElement
+    // 初次渲染 devices=[]：setup 期无法匹配 pendingDeviceId，按钮 disabled
+    const { rerender } = mount({ devices: [], pendingDeviceId: DEV_A, onPreview })
+    expect(submitButton().disabled).toBe(true)
+    // 设备异步到达：pendingDeviceId 命中有效集合必须补做默认预选，无需用户再手动勾选
+    await rerender({ devices })
+    await waitFor(() => expect(screen.getByTestId(`task-device-${DEV_A}`)).toBeTruthy())
+    expect((screen.getByTestId(`task-device-${DEV_A}`) as HTMLInputElement).checked).toBe(true)
+    expect(submitButton().disabled).toBe(false)
+    await fireEvent.click(submitButton())
+    await waitFor(() => expect(onPreview).toHaveBeenCalledWith('reboot', [DEV_A], expect.any(AbortSignal)))
+  })
+
+  it('does not force the pending device back on after the user manually unchecks it', async () => {
+    const onPreview = vi.fn(async (_operation: 'reboot', _deviceIds: string[], _signal?: AbortSignal) => preview)
+    const { rerender } = mount({ devices, pendingDeviceId: DEV_A, onPreview })
+    // 用户主动取消 pendingDeviceId 的勾选 = 默认预选已消费
+    await fireEvent.click(screen.getByTestId(`task-device-${DEV_A}`))
+    expect((screen.getByTestId(`task-device-${DEV_A}`) as HTMLInputElement).checked).toBe(false)
+    // devices 更新（新引用、同内容）：watcher 不得把用户刚取消的设备强行勾回
+    await rerender({ devices: [...devices] })
+    expect((screen.getByTestId(`task-device-${DEV_A}`) as HTMLInputElement).checked).toBe(false)
   })
 
   it('shows the frozen preview list with per-target eligibility and reason, and no hidden counts', async () => {
@@ -273,6 +325,49 @@ describe('TasksView preview, idempotency and retry', () => {
     await fireEvent.click(screen.getByTestId('confirm-batch-risk'))
     await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(2))
     expect(onSubmit.mock.calls[1]![1].idempotencyKey as string).not.toBe(firstKey)
+  })
+
+  it('resets the idempotency key when only the target list changes and when only the token changes', async () => {
+    const onSubmit = vi.fn(async (
+      _payload: { preview_token: string; confirm: true },
+      _options: { idempotencyKey: string; signal?: AbortSignal },
+    ) => ({ task_id: TASK_ID, accepted: true }))
+    // 三段预览：tok-123·[A✓,B✗] → tok-123·[A✓]（同 token、清单变化）→ tok-456·[A✓]（同清单、token 变化）
+    const sameTokenNewList: TaskPreview = { preview_token: 'tok-123', expires_in_ms: 60000, targets: [{ device_id: DEV_A, eligible: true }] }
+    const newTokenSameList: TaskPreview = { preview_token: 'tok-456', expires_in_ms: 60000, targets: [{ device_id: DEV_A, eligible: true }] }
+    const onPreview = vi.fn()
+      .mockResolvedValueOnce(preview)
+      .mockResolvedValueOnce(sameTokenNewList)
+      .mockResolvedValueOnce(newTokenSameList)
+    mount({ devices, pendingDeviceId: DEV_A, onPreview, onSubmit })
+    const submitButton = () => screen.getByRole('button', { name: name('task.preview.submit') })
+    const rebootButton = () => screen.getByRole('button', { name: name('task.submitReboot') })
+    async function confirmOnce(expectedCalls: number): Promise<string> {
+      await fireEvent.click(rebootButton())
+      await fireEvent.click(screen.getByRole('checkbox', { name: name('task.risk.confirmBatchReboot') }))
+      await fireEvent.click(screen.getByTestId('confirm-batch-risk'))
+      await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(expectedCalls))
+      return onSubmit.mock.calls[expectedCalls - 1]![1].idempotencyKey as string
+    }
+
+    await fireEvent.click(submitButton())
+    await waitFor(() => expect(rebootButton()).toBeTruthy())
+    const key1 = await confirmOnce(1)
+
+    // 同 token、清单变化：指纹变化，旧幂等键必须作废
+    await fireEvent.click(submitButton())
+    await waitFor(() => expect(onPreview).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.queryByTestId('confirm-batch-risk')).toBeNull())
+    const key2 = await confirmOnce(2)
+    expect(key2).not.toBe(key1)
+
+    // 同清单、token 变化：同样重置，三次提交三个不同的 key
+    await fireEvent.click(submitButton())
+    await waitFor(() => expect(onPreview).toHaveBeenCalledTimes(3))
+    await waitFor(() => expect(screen.queryByTestId('confirm-batch-risk')).toBeNull())
+    const key3 = await confirmOnce(3)
+    expect(key3).not.toBe(key2)
+    expect(key3).not.toBe(key1)
   })
 
   it('fails closed without crypto.getRandomValues: preview stays available, risky submit disabled with visible notice', async () => {
