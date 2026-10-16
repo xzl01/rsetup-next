@@ -32,6 +32,11 @@ use crate::auth::session::{ABSOLUTE, token_digest};
 use crate::db::DbPool;
 use crate::error::ControllerError;
 use crate::http_api::{err_response, ok_response, user_public};
+use crate::http_gate::{
+    MAX_BODY_BYTES, auth_required, backend_error, csrf_invalid, exhausted, get_single_origin,
+    json_content_type, not_ready, origin_host_invalid, password_change_required, rate_limited,
+    session_cookie_value, single_header,
+};
 use crate::http_security::{
     HttpSecurityConfig, LoginRateLimiter, RateLimitError, check_pre_session, check_session_write,
     clear_session_cookie_header, session_cookie_header,
@@ -86,9 +91,6 @@ pub struct CsrfBinding {
     pub issued_at: Instant,
 }
 
-/// JSON write-body cap (spec 02 §3): 1 MiB, any overrun is a fixed 400.
-const MAX_BODY_BYTES: usize = 1_048_576;
-
 /// Password cap (spec 01 A-02): at most 512 UTF-8 bytes, never truncated.
 const MAX_PASSWORD_BYTES: usize = 512;
 
@@ -106,6 +108,22 @@ pub enum WindowRateLimitError {
 pub enum EndpointId {
     Me,
     Sessions,
+    // Identity V1: one bucket per management/task read template (the
+    // handler passes the template variant only, never an object id).
+    UsersRead,
+    EffectivePermissionsRead,
+    RolesRead,
+    GrantsRead,
+    GroupsRead,
+    DevicesRead,
+    DeviceDetailRead,
+    ApprovalsRead,
+    AuditRead,
+    SystemStatusRead,
+    TaskList,
+    TaskDetail,
+    TaskChildren,
+    DeviceStatusRead,
 }
 
 /// Fixed sliding rate-window duration: 1 second.
@@ -984,69 +1002,6 @@ async fn me(State(state): State<Arc<HttpAuthState>>, headers: HeaderMap) -> Resp
     }))
 }
 
-/// Exactly one `rsc_session` cookie value (exactly 64 lowercase hex chars)
-/// across all `Cookie` headers. Other cookie names are ignored; empty
-/// pairs (e.g. a trailing `;`) carry no cookie and are skipped; a missing
-/// header, a non-ASCII header, a pair without `=`, an empty/short/long/
-/// non-hex/uppercase value, or two-or-more `rsc_session` occurrences all
-/// fail closed as `None`.
-fn session_cookie_value(headers: &HeaderMap) -> Option<String> {
-    let mut found: Option<String> = None;
-    for value in headers.get_all(header::COOKIE).iter() {
-        let text = value.to_str().ok()?;
-        for pair in text.split(';') {
-            // An empty pair has no name and no value; skipping it must not
-            // mask a duplicate, because every non-empty `rsc_session` pair
-            // is still counted by the fail-closed check below.
-            if pair.trim().is_empty() {
-                continue;
-            }
-            let (name, cookie) = pair.split_once('=')?;
-            if name.trim() != "rsc_session" {
-                continue;
-            }
-            if found.is_some() {
-                return None;
-            }
-            if cookie.len() != 64
-                || !cookie
-                    .bytes()
-                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-            {
-                return None;
-            }
-            found = Some(cookie.to_string());
-        }
-    }
-    found
-}
-
-/// Fixed 401 for every missing/duplicated/malformed/invalid session.
-fn auth_required() -> Response {
-    err_response(
-        StatusCode::UNAUTHORIZED,
-        "AUTH_REQUIRED",
-        "auth.required",
-        json!({}),
-    )
-}
-
-/// Fixed 503 for backend faults that are NOT a definitive
-/// `InvalidArgument` (which the caller maps to 401): Database is
-/// `STORAGE_UNAVAILABLE`, every other variant is `NOT_READY`. No raw error
-/// text ever reaches the body.
-fn backend_error(error: &ControllerError) -> Response {
-    match error {
-        ControllerError::Database(_) => err_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "STORAGE_UNAVAILABLE",
-            "system.storage_unavailable",
-            json!({}),
-        ),
-        _ => not_ready(),
-    }
-}
-
 /// Remove CSRF bindings whose 12h absolute lifetime
 /// (`auth::session::ABSOLUTE`) has elapsed under the monotonic clock.
 /// A binding whose issue instant lies AFTER `now` is anomalous (a
@@ -1224,15 +1179,6 @@ fn bad_logout_body() -> Response {
     )
 }
 
-fn csrf_invalid() -> Response {
-    err_response(
-        StatusCode::FORBIDDEN,
-        "CSRF_INVALID",
-        "security.csrf",
-        json!({}),
-    )
-}
-
 fn bad_sessions_query() -> Response {
     err_response(
         StatusCode::BAD_REQUEST,
@@ -1269,15 +1215,6 @@ fn invalid_sessions_request() -> Response {
     )
 }
 
-fn password_change_required() -> Response {
-    err_response(
-        StatusCode::FORBIDDEN,
-        "PASSWORD_CHANGE_REQUIRED",
-        "auth.password_change_required",
-        json!({}),
-    )
-}
-
 fn sessions_not_found() -> Response {
     err_response(
         StatusCode::NOT_FOUND,
@@ -1285,90 +1222,6 @@ fn sessions_not_found() -> Response {
         "system.not_found",
         json!({}),
     )
-}
-
-fn origin_host_invalid() -> Response {
-    err_response(
-        StatusCode::FORBIDDEN,
-        "CSRF_INVALID",
-        "security.origin_host",
-        json!({}),
-    )
-}
-
-/// Checked origin header: 0 occurrences is Ok(None); exactly 1 ASCII value
-/// is Ok(Some(&str)); 2+ occurrences or non-ASCII fails as Err(()).
-fn get_single_origin(headers: &HeaderMap) -> Result<Option<&str>, ()> {
-    let mut values = headers.get_all(header::ORIGIN).iter();
-    let Some(first) = values.next() else {
-        return Ok(None);
-    };
-    if values.next().is_some() {
-        return Err(());
-    }
-    let text = first.to_str().map_err(|_| ())?;
-    Ok(Some(text))
-}
-
-fn not_ready() -> Response {
-    err_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "NOT_READY",
-        "system.not_ready",
-        json!({}),
-    )
-}
-
-/// Fixed 503 + `Retry-After: 60` for a fail-closed resource cap.
-fn exhausted() -> Response {
-    let mut response = err_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "RESOURCE_EXHAUSTED",
-        "system.resource_exhausted",
-        json!({}),
-    );
-    response
-        .headers_mut()
-        .insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
-    response
-}
-
-/// Fixed 429 + `Retry-After` in whole seconds (ceil, clamped to 1..=900).
-fn rate_limited(remaining: Duration) -> Response {
-    let seconds = (remaining.as_secs_f64().ceil() as u64).clamp(1, 900);
-    let mut response = err_response(
-        StatusCode::TOO_MANY_REQUESTS,
-        "RATE_LIMITED",
-        "auth.rate_limited",
-        json!({}),
-    );
-    response
-        .headers_mut()
-        .insert(header::RETRY_AFTER, HeaderValue::from(seconds));
-    response
-}
-
-/// Exactly one header value, as a str. A missing header, a duplicated
-/// header (any number of values above one), or a non-ASCII value all
-/// fail closed as `None`; the caller maps that to its fixed rejection
-/// (403 for Host/Origin, 400 for Content-Type). Repeated values must
-/// never be reduced to "take the first".
-fn single_header(headers: &HeaderMap, key: HeaderName) -> Option<&str> {
-    let mut values = headers.get_all(key).iter();
-    let value = values.next()?;
-    if values.next().is_some() {
-        return None;
-    }
-    value.to_str().ok()
-}
-
-/// JSON Content-Type: the media type must be exactly `application/json`
-/// (parameters such as charset are tolerated).
-fn json_content_type(content_type: Option<&str>) -> bool {
-    content_type
-        .and_then(|value| value.split(';').next())
-        .map(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"))
-        .unwrap_or(false)
 }
 
 /// Exactly `{username: string, password: string}`, both non-empty.

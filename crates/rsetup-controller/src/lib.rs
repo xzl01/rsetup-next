@@ -7,6 +7,7 @@ pub mod devices;
 pub mod error;
 pub mod http_api;
 pub mod http_auth;
+pub mod http_gate;
 pub mod http_live;
 pub mod http_security;
 pub mod integrity;
