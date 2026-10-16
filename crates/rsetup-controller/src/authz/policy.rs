@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
+use crate::ControllerError;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Permission {
     #[serde(rename = "device.read")]
@@ -121,6 +123,17 @@ pub fn minimum_device_projection(
         "display_name": display_name,
         "effective_permissions": perm_strings,
     })
+}
+
+/// 严格最后管理员规则：当前活跃管理员数 ≤ 1 时，任何"停用或降级活跃
+/// 管理员"的操作必须拒绝。调用方必须只在 target 当前 `active && is_admin`
+/// 且本次变更确实移除该状态时才调用本函数（见 Task 4 的事务契约）。
+pub fn check_admin_demotion_allowed(current_admin_count: i64) -> Result<(), ControllerError> {
+    if current_admin_count <= 1 {
+        Err(ControllerError::LastAdmin)
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -367,5 +380,18 @@ mod tests {
         assert_eq!(json, "\"device.reboot\"");
         let deserialized: Permission = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, Permission::DeviceReboot);
+    }
+
+    #[test]
+    fn last_admin_rule_rejects_demoting_the_only_active_admin() {
+        assert!(matches!(
+            super::check_admin_demotion_allowed(1),
+            Err(crate::ControllerError::LastAdmin)
+        ));
+        assert!(matches!(
+            super::check_admin_demotion_allowed(0),
+            Err(crate::ControllerError::LastAdmin)
+        ));
+        assert!(super::check_admin_demotion_allowed(2).is_ok());
     }
 }

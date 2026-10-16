@@ -18,4 +18,8 @@ pub enum ControllerError {
     Database(#[from] sqlx::Error),
     #[error("cryptography error")]
     Crypto,
+    #[error("last administrator cannot be deactivated or demoted")]
+    LastAdmin,
+    #[error("invalid state for this operation")]
+    InvalidState,
 }

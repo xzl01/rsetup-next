@@ -106,9 +106,10 @@ pub(crate) fn auth_required() -> Response {
     )
 }
 
-/// Fixed 503 for backend faults that are NOT a definitive
+/// Fixed responses for backend faults that are NOT a definitive
 /// `InvalidArgument` (which the caller maps to 401): Database is
-/// `STORAGE_UNAVAILABLE`, every other variant is `NOT_READY`. No raw error
+/// `STORAGE_UNAVAILABLE` (503), `LastAdmin` and `InvalidState` are state
+/// conflicts (409), every other variant is `NOT_READY` (503). No raw error
 /// text ever reaches the body.
 pub(crate) fn backend_error(error: &ControllerError) -> Response {
     match error {
@@ -116,6 +117,18 @@ pub(crate) fn backend_error(error: &ControllerError) -> Response {
             StatusCode::SERVICE_UNAVAILABLE,
             "STORAGE_UNAVAILABLE",
             "system.storage_unavailable",
+            json!({}),
+        ),
+        ControllerError::LastAdmin => err_response(
+            StatusCode::CONFLICT,
+            "LAST_ADMIN",
+            "identity.last_admin",
+            json!({}),
+        ),
+        ControllerError::InvalidState => err_response(
+            StatusCode::CONFLICT,
+            "INVALID_STATE",
+            "identity.invalid_state",
             json!({}),
         ),
         _ => not_ready(),
@@ -656,5 +669,23 @@ mod tests {
         assert_eq!(body["error"]["message_key"], "permission.denied");
 
         assert!(require_admin_session(&fixture_session()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn last_admin_and_invalid_state_map_to_409_not_503() {
+        let last_admin = backend_error(&ControllerError::LastAdmin);
+        assert_eq!(last_admin.status(), StatusCode::CONFLICT);
+        let bytes = to_bytes(last_admin.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "LAST_ADMIN");
+        assert_eq!(body["error"]["message_key"], "identity.last_admin");
+
+        let invalid_state = backend_error(&ControllerError::InvalidState);
+        assert_eq!(invalid_state.status(), StatusCode::CONFLICT);
+        let bytes = to_bytes(invalid_state.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "INVALID_STATE");
     }
 }
