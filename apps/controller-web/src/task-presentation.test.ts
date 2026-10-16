@@ -4,7 +4,15 @@ import {
   reasonCodeLabel,
   taskStateLabel,
   type SubTaskState,
+  TIME_REVIEW_DECISIONS,
+  buildTaskPreviewRequest,
+  mainTaskStateLabel,
+  previewFingerprint,
+  resetTaskOperation,
+  startTaskOperation,
+  timeReviewDecisionKeys,
 } from './task-presentation'
+import type { TaskPreview } from './task-ops'
 import { createI18n } from './i18n'
 
 describe('taskStateLabel', () => {
@@ -168,5 +176,97 @@ describe('generateUuidV4', () => {
   it('throws when crypto exists but getRandomValues is not a function', () => {
     vi.stubGlobal('crypto', {} as any)
     expect(() => generateUuidV4()).toThrow(/CSPRNG unavailable/i)
+  })
+})
+
+const DEV_A = 'a'.repeat(64)
+const DEV_B = 'b'.repeat(64)
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
+function preview(overrides: Partial<TaskPreview> = {}): TaskPreview {
+  return {
+    preview_token: 'tok-123',
+    expires_in_ms: 60000,
+    targets: [{ device_id: DEV_A, eligible: true }, { device_id: DEV_B, eligible: false, reason: 'DEVICE_OFFLINE' }],
+    ...overrides,
+  }
+}
+
+describe('idempotency key lifecycle for a single confirmation', () => {
+  it('generates a canonical UUIDv4 on first confirmation and reuses the same key on retry', () => {
+    const first = startTaskOperation(resetTaskOperation())
+    expect(first.key).toMatch(UUID_V4)
+    expect(first.inFlight).toBe(true)
+
+    // 请求结果不明后的重试：先落下 busy，再以同一 key 重试，key 必须保持不变
+    const afterUnknownResult = { key: first.key, inFlight: false }
+    const retry = startTaskOperation(afterUnknownResult)
+    expect(retry.key).toBe(first.key)
+    expect(retry.key).toMatch(UUID_V4)
+  })
+
+  it('refuses a second concurrent submission while the operation is in flight', () => {
+    const busy = { key: '0f8fad5b-d9cb-469f-a165-70867728950e', inFlight: true }
+    expect(() => startTaskOperation(busy)).toThrowError('TASK_OPERATION_BUSY')
+  })
+
+  it('resets key and busy state when the preview token or target list changes', () => {
+    const started = startTaskOperation(resetTaskOperation())
+    const tokenChanged = previewFingerprint(preview()) !== previewFingerprint(preview({ preview_token: 'tok-456' }))
+    const listChanged = previewFingerprint(preview()) !==
+      previewFingerprint(preview({ targets: [{ device_id: DEV_B, eligible: true }] }))
+    expect(tokenChanged).toBe(true)
+    expect(listChanged).toBe(true)
+    expect(previewFingerprint(preview())).toBe(previewFingerprint(preview()))
+
+    const reset = resetTaskOperation()
+    expect(reset).toEqual({ key: null, inFlight: false })
+    expect(reset.key).not.toBe(started.key)
+  })
+})
+
+describe('held time review decisions and preview request body', () => {
+  it('offers exactly the two non-extending held decisions with dedicated dictionary keys', () => {
+    expect([...TIME_REVIEW_DECISIONS]).toEqual(['resume_original_deadline', 'expire'])
+    expect(timeReviewDecisionKeys()).toEqual({
+      resume_original_deadline: 'task.held.reviewResumeOriginalDeadline',
+      expire: 'task.held.reviewExpire',
+    })
+    expect(JSON.stringify(TIME_REVIEW_DECISIONS)).not.toMatch(/extend|deadline\+|longer/i)
+  })
+
+  it('builds the frozen reboot preview body with de-duplicated hex64 device ids and rejects empty targets', () => {
+    expect(buildTaskPreviewRequest('reboot', [DEV_A, DEV_B, DEV_A]))
+      .toEqual({ operation: 'reboot', device_ids: [DEV_A, DEV_B] })
+    expect(() => buildTaskPreviewRequest('reboot', [])).toThrowError('EMPTY_TASK_TARGETS')
+    expect(() => buildTaskPreviewRequest('reboot', ['A'.repeat(64)])).toThrowError('INVALID_DEVICE_ID')
+  })
+})
+
+describe('mainTaskStateLabel is the independent main four-state dictionary', () => {
+  const i18n = createI18n({ initialLocale: 'zh-CN', storage: null, document: null })
+  const identity = (key: string) => key
+
+  it('maps each of the four main states to its dedicated task.mainState.* key and never to the child task.state.* key', () => {
+    for (const state of ['queued', 'running', 'held', 'completed'] as const) {
+      expect(mainTaskStateLabel(state, identity)).toBe(`task.mainState.${state}`)
+      expect(mainTaskStateLabel(state, identity)).not.toBe(`task.state.${state}`)
+    }
+  })
+
+  it('resolves the four main-state labels in zh-CN', () => {
+    i18n.setLocale('zh-CN')
+    expect(mainTaskStateLabel('queued', i18n.t)).toBe('排队中')
+    expect(mainTaskStateLabel('running', i18n.t)).toBe('运行中')
+    expect(mainTaskStateLabel('held', i18n.t)).toBe('等待核验')
+    expect(mainTaskStateLabel('completed', i18n.t)).toBe('已完成')
+  })
+
+  it('resolves the four main-state labels in en', () => {
+    i18n.setLocale('en')
+    expect(mainTaskStateLabel('queued', i18n.t)).toBe('Queued')
+    expect(mainTaskStateLabel('running', i18n.t)).toBe('Running')
+    expect(mainTaskStateLabel('held', i18n.t)).toBe('Awaiting verification')
+    expect(mainTaskStateLabel('completed', i18n.t)).toBe('Completed')
   })
 })

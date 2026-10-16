@@ -1,3 +1,5 @@
+import type { MainTaskState, TaskPreview } from './task-ops'
+
 export const SUBTASK_STATES = [
   'queued',
   'held',
@@ -61,4 +63,56 @@ export function generateUuidV4(): string {
   bytes[8] = (bytes[8] & 0x3f) | 0x80 // RFC 4122 variant 1
   const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
+
+export type TimeReviewDecision = 'resume_original_deadline' | 'expire'
+
+export const TIME_REVIEW_DECISIONS: readonly TimeReviewDecision[] = ['resume_original_deadline', 'expire']
+
+export function timeReviewDecisionKeys(): Record<TimeReviewDecision, string> {
+  return {
+    resume_original_deadline: 'task.held.reviewResumeOriginalDeadline',
+    expire: 'task.held.reviewExpire',
+  }
+}
+
+export interface TaskOperationState { key: string | null; inFlight: boolean }
+
+export function resetTaskOperation(): TaskOperationState {
+  return { key: null, inFlight: false }
+}
+
+export function startTaskOperation(previous: TaskOperationState): { key: string; inFlight: boolean } {
+  if (previous.inFlight) throw new Error('TASK_OPERATION_BUSY')
+  // 一次确认只生成一次 key：重试（inFlight 已落下）必须沿用原 key，绝不重新生成
+  const key = previous.key ?? generateUuidV4()
+  return { key, inFlight: true }
+}
+
+export function previewFingerprint(preview: TaskPreview): string {
+  const targets = preview.targets
+    .map((target) => `${target.device_id}:${target.eligible ? '1' : '0'}`)
+    .sort()
+    .join(',')
+  return `${preview.preview_token}|${targets}`
+}
+
+const DEVICE_ID_HEX64 = /^[0-9a-f]{64}$/
+
+export function buildTaskPreviewRequest(operation: 'reboot', deviceIds: string[]): { operation: 'reboot'; device_ids: string[] } {
+  const seen = new Set<string>()
+  const device_ids: string[] = []
+  for (const id of deviceIds) {
+    if (!DEVICE_ID_HEX64.test(id)) throw new Error('INVALID_DEVICE_ID')
+    if (!seen.has(id)) {
+      seen.add(id)
+      device_ids.push(id)
+    }
+  }
+  if (device_ids.length === 0) throw new Error('EMPTY_TASK_TARGETS')
+  return { operation, device_ids }
+}
+
+export function mainTaskStateLabel(state: MainTaskState, t: (key: string) => string): string {
+  return t(`task.mainState.${state}`)
 }
