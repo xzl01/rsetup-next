@@ -5,6 +5,7 @@ members = [
     "crates/rsetup-app",
     "crates/rsetup-controller",
     "crates/rsetup-protocol",
+    "crates/rsetup-board-agent",
 ]
 exclude = ["apps/desktop/src-tauri", "externals/devicesinfo"]
 
