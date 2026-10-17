@@ -5,6 +5,7 @@ use uuid::Uuid;
 use crate::auth::service::Session;
 use crate::authz::policy::{
     GrantRecord, GrantScope, GrantSource, Permission, RoleRecord, SnapshotActor,
+    check_admin_demotion_allowed,
 };
 use crate::db::DbPool;
 use crate::devices::repository::DeviceAdminView;
@@ -116,6 +117,71 @@ pub trait AuthzRepository: Send + Sync {
         actor: &'a Session,
         group_id: Uuid,
     ) -> RepoFuture<'a, Vec<[u8; 32]>>;
+
+    // ---- 管理写方法（Task 4）：统一事务骨架 guard → 行锁顺序 → CAS →
+    // LastAdmin → 审计同事务插入 → commit；任一错误 drop 局部 tx 自动回滚。----
+    fn create_user<'a>(
+        &'a self,
+        actor: &'a Session,
+        username: &'a str,
+        display_name: &'a str,
+        is_admin: bool,
+        next_hash: &'a str,
+    ) -> RepoFuture<'a, UserRecord>;
+    fn patch_user<'a>(
+        &'a self,
+        actor: &'a Session,
+        user_id: [u8; 16],
+        expected_revision: u64,
+        active: Option<bool>,
+        is_admin: Option<bool>,
+        display_name: Option<&'a str>,
+    ) -> RepoFuture<'a, UserRecord>;
+    fn reset_user_password<'a>(
+        &'a self,
+        actor: &'a Session,
+        user_id: [u8; 16],
+        expected_revision: u64,
+        next_hash: &'a str,
+    ) -> RepoFuture<'a, UserRecord>;
+    fn create_role<'a>(
+        &'a self,
+        actor: &'a Session,
+        name: &'a str,
+        permissions: &'a [Permission],
+    ) -> RepoFuture<'a, RoleRecord>;
+    fn patch_role<'a>(
+        &'a self,
+        actor: &'a Session,
+        id: Uuid,
+        expected_revision: u64,
+        name: Option<&'a str>,
+        permissions: Option<&'a [Permission]>,
+        archived: Option<bool>,
+    ) -> RepoFuture<'a, RoleRecord>;
+    fn create_grant<'a>(
+        &'a self,
+        actor: &'a Session,
+        user_id: [u8; 16],
+        source: GrantSource,
+        scope: GrantScope,
+    ) -> RepoFuture<'a, GrantRecord>;
+    fn delete_grant<'a>(
+        &'a self,
+        actor: &'a Session,
+        id: Uuid,
+        expected_revision: u64,
+    ) -> RepoFuture<'a, ()>;
+    fn create_group<'a>(&'a self, actor: &'a Session, name: &'a str)
+    -> RepoFuture<'a, GroupRecord>;
+    fn patch_group<'a>(
+        &'a self,
+        actor: &'a Session,
+        id: Uuid,
+        expected_revision: u64,
+        name: Option<&'a str>,
+        archived: Option<bool>,
+    ) -> RepoFuture<'a, GroupRecord>;
 }
 
 pub trait AuthorizationSnapshotRepository: Send + Sync {
@@ -200,6 +266,147 @@ pub fn validate_display_name(value: &str) -> Result<(), ControllerError> {
         return Err(ControllerError::InvalidArgument);
     }
     Ok(())
+}
+
+/// `VARCHAR(128)+utf8mb4` 的 name 门禁：按 Unicode 字符数（与
+/// `validate_display_name` 的字节 255 规则不同）。
+pub(crate) fn validate_group_name(value: &str) -> Result<(), ControllerError> {
+    if value.trim().is_empty()
+        || value.chars().count() > 128
+        || value.chars().any(|c| c.is_control())
+    {
+        return Err(ControllerError::InvalidArgument);
+    }
+    Ok(())
+}
+
+/// 用户行锁顺序：按 UUID 字节序确定性排序；同一用户只锁一行，禁止自锁两次。
+pub(crate) fn ordered_user_ids(actor: [u8; 16], target: [u8; 16]) -> ([u8; 16], Option<[u8; 16]>) {
+    if actor <= target {
+        (actor, (actor != target).then_some(target))
+    } else {
+        (target, Some(actor))
+    }
+}
+
+/// LastAdmin 触发判定：仅"当前活跃管理员且本次变更确实移除该状态"才触发
+/// （停用或降级活跃管理员），与既有六条断言一致。
+pub(crate) fn admin_change_removes_admin_state(
+    target_active: bool,
+    target_is_admin: bool,
+    next_active: bool,
+    next_is_admin: bool,
+) -> bool {
+    target_active && target_is_admin && (!next_active || !next_is_admin)
+}
+
+/// 归档恢复门禁（方案 A）：从归档恢复必须携带合法非空权限集，否则 UPDATE 前
+/// `InvalidArgument`(400) 拒绝，绝不留下 active 空权限非法状态。
+/// 非恢复分支（归档、active 原地编辑、保持归档）不受限；与同事务重建+回读
+/// 共同保证永不产生 active 空权限角色。
+fn validate_role_restore(
+    locked_archived: bool,
+    next_archived: bool,
+    permissions: Option<&[Permission]>,
+) -> Result<(), ControllerError> {
+    if locked_archived && !next_archived {
+        match permissions {
+            None => Err(ControllerError::InvalidArgument),
+            Some(perms) => crate::authz::policy::validate_permission_list(perms),
+        }
+    } else {
+        Ok(())
+    }
+}
+
+/// 目标为 users 行时的行锁快照（`FOR UPDATE`），解码为安全 `UserRecord`。
+type UserRow = UserRecord;
+
+async fn select_user_for_update(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    id: [u8; 16],
+) -> Result<Option<UserRow>, ControllerError> {
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT id,username,display_name,CAST(active AS SIGNED) AS active,CAST(is_admin AS SIGNED) AS is_admin,CAST(must_change_password AS SIGNED) AS must_change_password,revision FROM users WHERE id=? FOR UPDATE",
+    )
+    .bind(id.as_slice())
+    .fetch_optional(&mut **tx)
+    .await?;
+    row.map(|row| {
+        decode_user(
+            row.try_get("id")?,
+            row.try_get("username")?,
+            row.try_get("display_name")?,
+            row.try_get("active")?,
+            row.try_get("is_admin")?,
+            row.try_get("must_change_password")?,
+            row.try_get("revision")?,
+        )
+    })
+    .transpose()
+}
+
+/// 管理写事务统一入口：begin 后立即取 schema guard 行锁（期望版本固定为
+/// 编译期 `SUPPORTED_SCHEMA_VERSION`），串行化全部管理写。
+async fn begin_guard(db: &DbPool) -> Result<sqlx::Transaction<'_, sqlx::MySql>, ControllerError> {
+    let mut tx = db.0.begin().await?;
+    crate::integrity::lock_integrity_guard(&mut tx).await?;
+    Ok(tx)
+}
+
+/// 目标为 users 行时：guard → 按 UUID 字节序锁 actor/target → 用**锁定行**
+/// 严格重验 actor 仍为有效管理员 → 返回目标行（缺失即 NotFound）。
+async fn lock_user_pair_and_verify_actor(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    actor: [u8; 16],
+    target: [u8; 16],
+) -> Result<Option<UserRow>, ControllerError> {
+    let (first, second) = ordered_user_ids(actor, target);
+    let first_row = select_user_for_update(tx, first).await?;
+    let second_row = match second {
+        Some(id) => select_user_for_update(tx, id).await?,
+        None => None,
+    };
+    let actor_row = if first == actor {
+        first_row.as_ref()
+    } else {
+        second_row.as_ref()
+    };
+    let actor_row = actor_row.ok_or(ControllerError::PermissionDenied)?;
+    if !(actor_row.active && actor_row.is_admin && !actor_row.must_change_password) {
+        return Err(ControllerError::PermissionDenied);
+    }
+    Ok(if first == target {
+        first_row
+    } else {
+        second_row
+    })
+}
+
+/// `authz_epoch` checked CAS 自增；singleton 行已被 guard 锁定，CAS 仍防未走 guard 的写者。
+pub(crate) async fn bump_authz_epoch(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+) -> Result<u64, ControllerError> {
+    let current: u64 =
+        sqlx::query_scalar("SELECT authz_epoch FROM schema_meta WHERE singleton = 1")
+            .fetch_one(&mut **tx)
+            .await?;
+    let next = current
+        .checked_add(1)
+        .ok_or(ControllerError::RevisionConflict)?;
+    let changed = sqlx::query(
+        "UPDATE schema_meta SET authz_epoch = ? WHERE singleton = 1 AND authz_epoch = ?",
+    )
+    .bind(next)
+    .bind(current)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    if changed != 1 {
+        return Err(ControllerError::RevisionConflict);
+    }
+    Ok(next)
 }
 
 /// source 与 scope 必须成对；`validate_grant_fields` 是唯一权威判定。
@@ -1810,6 +2017,862 @@ impl AuthzRepository for SqlxAuthzRepository {
             Ok(out)
         })
     }
+
+    // ---- Task 4 管理写方法：统一事务骨架 guard → 行锁顺序 → CAS →
+    // LastAdmin → 审计同事务插入 → commit；任一错误 drop 局部 tx 自动回滚。----
+    fn create_user<'a>(
+        &'a self,
+        actor: &'a Session,
+        username: &'a str,
+        display_name: &'a str,
+        is_admin: bool,
+        next_hash: &'a str,
+    ) -> RepoFuture<'a, UserRecord> {
+        Box::pin(async move {
+            // 门禁1：display_name 合法（复用既有 validate_display_name）。
+            validate_display_name(display_name)?;
+            // 门禁2：next_hash 非空（Argon2id 临时密码哈希，事务前即拒绝空串）。
+            if next_hash.is_empty() {
+                return Err(ControllerError::InvalidArgument);
+            }
+            // 门禁3：username 规范（复用 crate::db::valid_username：非空、无空白/控制符）。
+            if !crate::db::valid_username(username) {
+                return Err(ControllerError::InvalidArgument);
+            }
+            let mut tx = begin_guard(&self.db).await?;
+            crate::integrity::require_active_admin(&mut tx, actor.user.id).await?;
+            // 新行插入无实体行锁（guard 行锁已串行化全部管理员写）。
+            let id = Uuid::new_v4();
+            if let Err(error) = sqlx::query(
+                "INSERT INTO users (id, username, display_name, password_hash, active, is_admin, must_change_password, revision, created_time) VALUES (?, ?, ?, ?, TRUE, ?, TRUE, 1, NOW(6))",
+            )
+            .bind(id.as_bytes().as_slice())
+            .bind(username)
+            .bind(display_name)
+            .bind(next_hash)
+            .bind(is_admin)
+            .execute(&mut *tx)
+            .await
+            {
+                // 唯一冲突固定 InvalidState(409)，不回显 driver 原文；其他 SQL 错误透传
+                // Database（既有 backend error 统一 503 去敏）。username 唯一键
+                // uq_users_username 与 id 主键均为唯一冲突，不识别具体索引。
+                let unique_conflict = error
+                    .as_database_error()
+                    .is_some_and(|e| e.is_unique_violation());
+                return Err(if unique_conflict {
+                    ControllerError::InvalidState
+                } else {
+                    error.into()
+                });
+            }
+            bump_authz_epoch(&mut tx).await?;
+            crate::audit::insert_audit(
+                &mut tx,
+                &crate::audit::AuditInsert {
+                    actor_kind: "user",
+                    actor_user_id: Some(actor.user.id),
+                    event_type: "identity.user.create",
+                    target_kind: "user",
+                    target_id: Some(hex::encode(id.as_bytes())),
+                    params_redacted: "{}",
+                    outcome: "success",
+                },
+            )
+            .await?;
+            // commit 前构造安全 UserRecord 全部 7 字段（绝不含 password_hash）；仅 commit 成功才 Ok(record)。
+            let record = UserRecord {
+                id: id.into_bytes(),
+                username: username.to_string(),
+                display_name: display_name.to_string(),
+                active: true,
+                is_admin,
+                must_change_password: true,
+                revision: 1,
+            };
+            tx.commit().await?;
+            Ok(record)
+        })
+    }
+
+    fn patch_user<'a>(
+        &'a self,
+        actor: &'a Session,
+        user_id: [u8; 16],
+        expected_revision: u64,
+        active: Option<bool>,
+        is_admin: Option<bool>,
+        display_name: Option<&'a str>,
+    ) -> RepoFuture<'a, UserRecord> {
+        Box::pin(async move {
+            let mut tx = begin_guard(&self.db).await?;
+            let target = lock_user_pair_and_verify_actor(&mut tx, actor.user.id, user_id)
+                .await?
+                .ok_or(ControllerError::NotFound)?;
+            if target.revision != expected_revision {
+                return Err(ControllerError::RevisionConflict);
+            }
+            let next_active = active.unwrap_or(target.active);
+            let next_admin = is_admin.unwrap_or(target.is_admin);
+            let next_display = match display_name {
+                Some(value) => {
+                    validate_display_name(value)?;
+                    value.to_string()
+                }
+                None => target.display_name.clone(),
+            };
+            if admin_change_removes_admin_state(
+                target.active,
+                target.is_admin,
+                next_active,
+                next_admin,
+            ) {
+                let count: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM users WHERE active = TRUE AND is_admin = TRUE",
+                )
+                .fetch_one(&mut *tx)
+                .await?;
+                // guard 行锁已串行化全部管理员写，故此计数在本事务内稳定。
+                if let Err(error) = check_admin_demotion_allowed(count) {
+                    // 此时尚无业务UPDATE：只提交拒绝审计，不bump epoch/不撤销sessions；
+                    // 错误路径唯一明确 commit 例外（其余错误靠 drop 局部 tx 自动回滚）。
+                    crate::audit::insert_audit(
+                        &mut tx,
+                        &crate::audit::AuditInsert {
+                            actor_kind: "user",
+                            actor_user_id: Some(actor.user.id),
+                            event_type: "identity.user.last_admin_blocked",
+                            target_kind: "user",
+                            target_id: Some(hex::encode(user_id)),
+                            params_redacted: "{}",
+                            outcome: "denied",
+                        },
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    return Err(error);
+                }
+            }
+            let next_revision = target
+                .revision
+                .checked_add(1)
+                .ok_or(ControllerError::RevisionConflict)?;
+            let changed = sqlx::query(
+                "UPDATE users SET active = ?, is_admin = ?, display_name = ?, revision = ? WHERE id = ? AND revision = ?",
+            )
+            .bind(next_active)
+            .bind(next_admin)
+            .bind(&next_display)
+            .bind(next_revision)
+            .bind(user_id.as_slice())
+            .bind(expected_revision)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if changed != 1 {
+                return Err(ControllerError::RevisionConflict);
+            }
+            if target.active && !next_active {
+                // 停用必须在同事务撤销该用户全部会话。
+                let revoked = sqlx::query(
+                    "UPDATE sessions SET revoked = TRUE WHERE user_id = ? AND revoked = FALSE",
+                )
+                .bind(user_id.as_slice())
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+                crate::audit::insert_audit(
+                    &mut tx,
+                    &crate::audit::AuditInsert {
+                        actor_kind: "user",
+                        actor_user_id: Some(actor.user.id),
+                        event_type: "identity.sessions.revoke",
+                        target_kind: "user",
+                        target_id: Some(hex::encode(user_id)),
+                        params_redacted: "{}",
+                        outcome: if revoked > 0 {
+                            "success"
+                        } else {
+                            "no_active_sessions"
+                        },
+                    },
+                )
+                .await?;
+            }
+            bump_authz_epoch(&mut tx).await?;
+            crate::audit::insert_audit(
+                &mut tx,
+                &crate::audit::AuditInsert {
+                    actor_kind: "user",
+                    actor_user_id: Some(actor.user.id),
+                    event_type: "identity.user.patch",
+                    target_kind: "user",
+                    target_id: Some(hex::encode(user_id)),
+                    params_redacted: "{}",
+                    outcome: "success",
+                },
+            )
+            .await?;
+            // commit 前构造安全 UserRecord 全部 7 字段（无 password_hash）；仅 commit 成功才 Ok(updated)。
+            let updated = UserRecord {
+                id: user_id,
+                username: target.username,
+                display_name: next_display,
+                active: next_active,
+                is_admin: next_admin,
+                must_change_password: target.must_change_password,
+                revision: next_revision,
+            };
+            tx.commit().await?;
+            Ok(updated)
+        })
+    }
+
+    fn reset_user_password<'a>(
+        &'a self,
+        actor: &'a Session,
+        user_id: [u8; 16],
+        expected_revision: u64,
+        next_hash: &'a str,
+    ) -> RepoFuture<'a, UserRecord> {
+        Box::pin(async move {
+            // 空哈希直接 InvalidArgument，不进入事务。
+            if next_hash.is_empty() {
+                return Err(ControllerError::InvalidArgument);
+            }
+            let mut tx = begin_guard(&self.db).await?;
+            // 按 UUID 字节序锁 actor 与 target 行，并由锁定行重验 actor 仍为有效管理员；行缺失 → NotFound。
+            let target = lock_user_pair_and_verify_actor(&mut tx, actor.user.id, user_id)
+                .await?
+                .ok_or(ControllerError::NotFound)?;
+            if target.revision != expected_revision {
+                return Err(ControllerError::RevisionConflict);
+            }
+            let next_revision = target
+                .revision
+                .checked_add(1)
+                .ok_or(ControllerError::RevisionConflict)?;
+            let changed = sqlx::query(
+                "UPDATE users SET password_hash = ?, must_change_password = TRUE, revision = ? WHERE id = ? AND revision = ?",
+            )
+            .bind(next_hash)
+            .bind(next_revision)
+            .bind(user_id.as_slice())
+            .bind(expected_revision)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if changed != 1 {
+                return Err(ControllerError::RevisionConflict);
+            }
+            // 同事务无条件强制撤销该目标用户全部活动会话。
+            sqlx::query("UPDATE sessions SET revoked = TRUE WHERE user_id = ? AND revoked = FALSE")
+                .bind(user_id.as_slice())
+                .execute(&mut *tx)
+                .await?;
+            bump_authz_epoch(&mut tx).await?;
+            crate::audit::insert_audit(
+                &mut tx,
+                &crate::audit::AuditInsert {
+                    actor_kind: "user",
+                    actor_user_id: Some(actor.user.id),
+                    event_type: "identity.user.reset_password",
+                    target_kind: "user",
+                    target_id: Some(hex::encode(user_id)),
+                    params_redacted: "{}",
+                    outcome: "success",
+                },
+            )
+            .await?;
+            // commit 前构造安全 UserRecord 全部 7 字段（无 password_hash）；
+            // must_change_password 恒 true；仅 commit 成功才 Ok(record)。
+            let record = UserRecord {
+                id: user_id,
+                username: target.username,
+                display_name: target.display_name,
+                active: target.active,
+                is_admin: target.is_admin,
+                must_change_password: true,
+                revision: next_revision,
+            };
+            tx.commit().await?;
+            Ok(record)
+        })
+    }
+
+    fn create_role<'a>(
+        &'a self,
+        actor: &'a Session,
+        name: &'a str,
+        permissions: &'a [Permission],
+    ) -> RepoFuture<'a, RoleRecord> {
+        Box::pin(async move {
+            // 权限列表门禁复用 validate_permission_list（非空、无重复），不复制第二份 helper。
+            crate::authz::policy::validate_permission_list(permissions)?;
+            // name 门禁与 validate_group_name/validate_display_name 同款规则：非空、≤128 Unicode 字符、无控制字符。
+            if name.is_empty() || name.chars().count() > 128 || name.chars().any(char::is_control) {
+                return Err(ControllerError::InvalidArgument);
+            }
+            let mut tx = begin_guard(&self.db).await?;
+            crate::integrity::require_active_admin(&mut tx, actor.user.id).await?;
+            // 新行插入，无实体行锁；id 主键与 name 唯一键 uq_roles_name 均为唯一冲突来源。
+            let id = Uuid::new_v4();
+            if let Err(error) = sqlx::query(
+                "INSERT INTO roles (id, name, builtin, archived, revision) VALUES (?, ?, FALSE, FALSE, 1)",
+            )
+            .bind(id.as_bytes().as_slice())
+            .bind(name)
+            .execute(&mut *tx)
+            .await
+            {
+                // 唯一冲突固定 InvalidState(409)，不回显 driver 原文；其他 SQL 错误透传
+                // Database。用驱动 unique-violation 分类（kind()==UniqueViolation）：不解析
+                // driver message 文本，也不依赖 Postgres-only 的 constraint() 名称映射。
+                let unique_conflict = error
+                    .as_database_error()
+                    .is_some_and(|e| e.is_unique_violation());
+                return Err(if unique_conflict {
+                    ControllerError::InvalidState
+                } else {
+                    error.into()
+                });
+            }
+            // 全部权限逐条插入 role_permissions（permission 文本与 Permission::parse 互逆）。
+            for permission in permissions {
+                sqlx::query("INSERT INTO role_permissions (role_id, permission) VALUES (?, ?)")
+                    .bind(id.as_bytes().as_slice())
+                    .bind(permission.as_str())
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            bump_authz_epoch(&mut tx).await?;
+            crate::audit::insert_audit(
+                &mut tx,
+                &crate::audit::AuditInsert {
+                    actor_kind: "user",
+                    actor_user_id: Some(actor.user.id),
+                    event_type: "identity.role.create",
+                    target_kind: "role",
+                    target_id: Some(hex::encode(id.as_bytes())),
+                    params_redacted: "{}",
+                    outcome: "success",
+                },
+            )
+            .await?;
+            // commit 前安全组装 RoleRecord 全部 6 字段；仅 commit 成功才 Ok(record)。
+            let record = RoleRecord {
+                id,
+                name: name.to_string(),
+                builtin: false,
+                archived: false,
+                revision: 1,
+                permissions: permissions.to_vec(),
+            };
+            tx.commit().await?;
+            Ok(record)
+        })
+    }
+
+    fn patch_role<'a>(
+        &'a self,
+        actor: &'a Session,
+        id: Uuid,
+        expected_revision: u64,
+        name: Option<&'a str>,
+        permissions: Option<&'a [Permission]>,
+        archived: Option<bool>,
+    ) -> RepoFuture<'a, RoleRecord> {
+        Box::pin(async move {
+            use sqlx::Row;
+            if let Some(perms) = permissions {
+                crate::authz::policy::validate_permission_list(perms)?;
+            }
+            if let Some(n) = name {
+                if n.is_empty() || n.chars().count() > 128 || n.chars().any(char::is_control) {
+                    return Err(ControllerError::InvalidArgument);
+                }
+            }
+            let mut tx = begin_guard(&self.db).await?;
+            crate::integrity::require_active_admin(&mut tx, actor.user.id).await?;
+            let (locked_name, locked_builtin, locked_archived, current_revision) = sqlx::query(
+                "SELECT name, CAST(builtin AS SIGNED) AS builtin, CAST(archived AS SIGNED) AS archived, revision FROM roles WHERE id = ? FOR UPDATE",
+            )
+            .bind(id.as_bytes().as_slice())
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(|r| {
+                Ok::<_, ControllerError>((
+                    r.try_get::<String, _>("name")?,
+                    crate::integrity::raw_bool(r.try_get("builtin")?, "roles.builtin")?,
+                    crate::integrity::raw_bool(r.try_get("archived")?, "roles.archived")?,
+                    r.try_get::<u64, _>("revision")?,
+                ))
+            })
+            .transpose()?
+            .ok_or(ControllerError::NotFound)?;
+
+            if current_revision != expected_revision {
+                return Err(ControllerError::RevisionConflict);
+            }
+            if locked_builtin && archived == Some(true) {
+                return Err(ControllerError::InvalidState);
+            }
+
+            let next_name = name.map(str::to_string).unwrap_or(locked_name);
+            let next_archived = archived.unwrap_or(locked_archived);
+            // 恢复分支门禁（方案 A）：从归档恢复必须携带合法非空 permissions，否则 UPDATE 前
+            // `InvalidArgument`(400) 拒绝，绝不留下 active 空权限非法状态。
+            validate_role_restore(locked_archived, next_archived, permissions)?;
+            let next_revision = current_revision
+                .checked_add(1)
+                .ok_or(ControllerError::RevisionConflict)?;
+
+            if next_archived && !locked_archived {
+                sqlx::query("DELETE FROM grants WHERE source_kind = 'role' AND role_id = ?")
+                    .bind(id.as_bytes().as_slice())
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("DELETE FROM role_permissions WHERE role_id = ?")
+                    .bind(id.as_bytes().as_slice())
+                    .execute(&mut *tx)
+                    .await?;
+            }
+
+            let updated = sqlx::query(
+                "UPDATE roles SET name = ?, archived = ?, revision = ? WHERE id = ? AND revision = ?",
+            )
+            .bind(&next_name)
+            .bind(next_archived)
+            .bind(next_revision)
+            .bind(id.as_bytes().as_slice())
+            .bind(expected_revision)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                // 驱动 unique-violation 分类（同 create_role 口径：不解析 message 文本）。
+                if error
+                    .as_database_error()
+                    .is_some_and(|e| e.is_unique_violation())
+                {
+                    ControllerError::InvalidState
+                } else {
+                    error.into()
+                }
+            })?;
+            if updated.rows_affected() != 1 {
+                return Err(ControllerError::RevisionConflict);
+            }
+
+            if let Some(perms) = permissions {
+                if !next_archived {
+                    sqlx::query("DELETE FROM role_permissions WHERE role_id = ?")
+                        .bind(id.as_bytes().as_slice())
+                        .execute(&mut *tx)
+                        .await?;
+                    for p in perms {
+                        sqlx::query(
+                            "INSERT INTO role_permissions (role_id, permission) VALUES (?, ?)",
+                        )
+                        .bind(id.as_bytes().as_slice())
+                        .bind(p.as_str())
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                }
+            }
+
+            let permissions: Vec<Permission> = if next_archived {
+                Vec::new()
+            } else {
+                sqlx::query("SELECT permission FROM role_permissions WHERE role_id = ?")
+                    .bind(id.as_bytes().as_slice())
+                    .fetch_all(&mut *tx)
+                    .await?
+                    .into_iter()
+                    .map(|r| {
+                        Permission::parse(&r.try_get::<String, _>("permission")?)
+                            .ok_or(ControllerError::InvalidState)
+                    })
+                    .collect::<Result<_, _>>()?
+            };
+
+            bump_authz_epoch(&mut tx).await?;
+            crate::audit::insert_audit(
+                &mut tx,
+                &crate::audit::AuditInsert {
+                    actor_kind: "user",
+                    actor_user_id: Some(actor.user.id),
+                    event_type: "identity.role.patch",
+                    target_kind: "role",
+                    target_id: Some(hex::encode(id.as_bytes())),
+                    params_redacted: "{}",
+                    outcome: "success",
+                },
+            )
+            .await?;
+
+            tx.commit().await?;
+            Ok(RoleRecord {
+                id,
+                name: next_name,
+                builtin: locked_builtin,
+                archived: next_archived,
+                revision: next_revision,
+                permissions,
+            })
+        })
+    }
+
+    fn create_grant<'a>(
+        &'a self,
+        actor: &'a Session,
+        user_id: [u8; 16],
+        source: GrantSource,
+        scope: GrantScope,
+    ) -> RepoFuture<'a, GrantRecord> {
+        Box::pin(async move {
+            // 前置校验：纯函数先做 source/scope 互斥与列映射，失败不进入事务。
+            let cols = grant_columns(&source, &scope)?;
+            let mut tx = begin_guard(&self.db).await?;
+            // 锁 1：复用共享助手，按 UUID 字节序锁定 actor 与 target（同一用户仅锁一次），
+            // 并在 guard 内重新从行核验 actor active && is_admin（对齐管理写事务契约）。
+            let target = lock_user_pair_and_verify_actor(&mut tx, actor.user.id, user_id)
+                .await?
+                .ok_or(ControllerError::NotFound)?;
+            if !target.active {
+                return Err(ControllerError::InvalidState);
+            }
+
+            if cols.source_kind == "role" {
+                let role_id = cols
+                    .role_id
+                    .expect("source=role 时 grant_columns 必给出 role_id");
+                let archived: i64 = sqlx::query_scalar(
+                    "SELECT CAST(archived AS SIGNED) FROM roles WHERE id = ? FOR UPDATE",
+                )
+                .bind(role_id.as_bytes().as_slice())
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(ControllerError::NotFound)?;
+                if crate::integrity::raw_bool(archived, "roles.archived")? {
+                    return Err(ControllerError::InvalidState);
+                }
+            }
+
+            // 锁 2：依 scope_kind 锁定唯一对应实体行 FOR UPDATE；行缺失 → NotFound，archived → InvalidState。
+            // （`grant_columns` 已按 scope 保证相应列恰有其一，此处不做第二种 scope 解析。）
+            match cols.scope_kind {
+                "all" => {
+                    // All 范围无需锁实体行
+                }
+                "group" => {
+                    let group_id = cols
+                        .scope_group_id
+                        .expect("scope=group 时 grant_columns 必给出 scope_group_id");
+                    let archived: i64 = sqlx::query_scalar(
+                        "SELECT CAST(archived AS SIGNED) FROM device_groups WHERE id = ? FOR UPDATE",
+                    )
+                    .bind(group_id.as_bytes().as_slice())
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .ok_or(ControllerError::NotFound)?;
+                    if crate::integrity::raw_bool(archived, "device_groups.archived")? {
+                        return Err(ControllerError::InvalidState);
+                    }
+                }
+                "device" => {
+                    let device_id = cols
+                        .scope_device_id
+                        .expect("scope=device 时 grant_columns 必给出 scope_device_id");
+                    let archived: i64 = sqlx::query_scalar(
+                        "SELECT CAST(archived AS SIGNED) FROM devices WHERE public_key = ? FOR UPDATE",
+                    )
+                    .bind(device_id.as_slice())
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .ok_or(ControllerError::NotFound)?;
+                    if crate::integrity::raw_bool(archived, "devices.archived")? {
+                        return Err(ControllerError::InvalidState);
+                    }
+                }
+                _ => unreachable!("grant_columns 只产生 all/group/device 三种 scope_kind"),
+            }
+
+            // 写入：revision 恒 1；主键/唯一冲突按驱动分类固定 InvalidState(409)，
+            // 其余 SQL 错误透传 Database（既有 backend error 统一 503 去敏）。
+            let id = Uuid::new_v4();
+            let role_binding = cols.role_id.map(|r| r.as_bytes().to_vec());
+            let group_binding = cols.scope_group_id.map(|g| g.as_bytes().to_vec());
+            let device_binding = cols.scope_device_id.map(|k| k.to_vec());
+            if let Err(error) = sqlx::query(
+                "INSERT INTO grants (id, user_id, source_kind, role_id, permissions, scope_kind, scope_group_id, scope_device_id, revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
+            )
+            .bind(id.as_bytes().as_slice())
+            .bind(user_id.as_slice())
+            .bind(cols.source_kind)
+            .bind(&role_binding)
+            .bind(&cols.permissions_json)
+            .bind(cols.scope_kind)
+            .bind(&group_binding)
+            .bind(&device_binding)
+            .execute(&mut *tx)
+            .await
+            {
+                // 用驱动 unique-violation 分类（同 create_group 口径：kind()==UniqueViolation，
+                // 不解析 driver message、不依赖 constraint 名称）。
+                let unique_conflict = error
+                    .as_database_error()
+                    .is_some_and(|e| e.is_unique_violation());
+                return Err(if unique_conflict {
+                    ControllerError::InvalidState
+                } else {
+                    error.into()
+                });
+            }
+            bump_authz_epoch(&mut tx).await?;
+            crate::audit::insert_audit(
+                &mut tx,
+                &crate::audit::AuditInsert {
+                    actor_kind: "user",
+                    actor_user_id: Some(actor.user.id),
+                    event_type: "identity.grant.create",
+                    target_kind: "grant",
+                    target_id: Some(hex::encode(id.as_bytes())),
+                    params_redacted: "{}",
+                    outcome: "success",
+                },
+            )
+            .await?;
+            // commit 前安全组装（source/scope 为入参原样持有；user_id 与 INSERT 绑定同源）。
+            let record = GrantRecord {
+                id,
+                user_id,
+                source,
+                scope,
+                revision: 1,
+            };
+            tx.commit().await?;
+            Ok(record)
+        })
+    }
+
+    fn delete_grant<'a>(
+        &'a self,
+        actor: &'a Session,
+        id: Uuid,
+        expected_revision: u64,
+    ) -> RepoFuture<'a, ()> {
+        Box::pin(async move {
+            let mut tx = begin_guard(&self.db).await?;
+            crate::integrity::require_active_admin(&mut tx, actor.user.id).await?;
+            // `grants` 行 `FOR UPDATE`（按 `id.as_bytes().as_slice()` 定位）：行缺失 → `NotFound`，行锁持有至事务结束。
+            let current_revision =
+                sqlx::query_scalar::<_, u64>("SELECT revision FROM grants WHERE id = ? FOR UPDATE")
+                    .bind(id.as_bytes().as_slice())
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .ok_or(ControllerError::NotFound)?;
+            // expected_revision CAS（与 DELETE 的 WHERE revision=? + rows_affected==1 双保险）。
+            if current_revision != expected_revision {
+                return Err(ControllerError::RevisionConflict);
+            }
+            // 物理删除：id + revision 双条件，影响行非恰 1 即视为并发修订漂移。
+            let deleted = sqlx::query("DELETE FROM grants WHERE id = ? AND revision = ?")
+                .bind(id.as_bytes().as_slice())
+                .bind(expected_revision)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            if deleted != 1 {
+                return Err(ControllerError::RevisionConflict);
+            }
+            bump_authz_epoch(&mut tx).await?;
+            crate::audit::insert_audit(
+                &mut tx,
+                &crate::audit::AuditInsert {
+                    actor_kind: "user",
+                    actor_user_id: Some(actor.user.id),
+                    event_type: "identity.grant.delete",
+                    target_kind: "grant",
+                    target_id: Some(hex::encode(id.as_bytes())),
+                    params_redacted: "{}",
+                    outcome: "success",
+                },
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(())
+        })
+    }
+
+    fn create_group<'a>(
+        &'a self,
+        actor: &'a Session,
+        name: &'a str,
+    ) -> RepoFuture<'a, GroupRecord> {
+        Box::pin(async move {
+            validate_group_name(name)?;
+            let mut tx = begin_guard(&self.db).await?;
+            crate::integrity::require_active_admin(&mut tx, actor.user.id).await?;
+            let id = Uuid::new_v4();
+            if let Err(error) = sqlx::query(
+                "INSERT INTO device_groups (id, name, archived, revision) VALUES (?, ?, FALSE, 1)",
+            )
+            .bind(id.as_bytes().as_slice())
+            .bind(name)
+            .execute(&mut *tx)
+            .await
+            {
+                // 唯一冲突固定 InvalidState(409)，不回显 driver 原文；其他 SQL 错误透传
+                // Database。group 名唯一键 uq_device_groups_name 与 id 主键均为唯一冲突来源，
+                // 按驱动 is_unique_violation() 分类，不识别具体索引。
+                let unique_conflict = error
+                    .as_database_error()
+                    .is_some_and(|e| e.is_unique_violation());
+                return Err(if unique_conflict {
+                    ControllerError::InvalidState
+                } else {
+                    error.into()
+                });
+            }
+            bump_authz_epoch(&mut tx).await?;
+            crate::audit::insert_audit(
+                &mut tx,
+                &crate::audit::AuditInsert {
+                    actor_kind: "user",
+                    actor_user_id: Some(actor.user.id),
+                    event_type: "identity.group.create",
+                    target_kind: "group",
+                    target_id: Some(hex::encode(id.as_bytes())),
+                    params_redacted: "{}",
+                    outcome: "success",
+                },
+            )
+            .await?;
+            // commit 前构造安全 GroupRecord 全部 5 字段；仅 commit 成功才 Ok(record)。
+            let record = GroupRecord {
+                id,
+                name: name.to_string(),
+                archived: false,
+                revision: 1,
+                member_count: 0,
+            };
+            tx.commit().await?;
+            Ok(record)
+        })
+    }
+
+    fn patch_group<'a>(
+        &'a self,
+        actor: &'a Session,
+        id: Uuid,
+        expected_revision: u64,
+        name: Option<&'a str>,
+        archived: Option<bool>,
+    ) -> RepoFuture<'a, GroupRecord> {
+        Box::pin(async move {
+            use sqlx::Row;
+            // 改名门禁复用 create_group 的 validate_group_name，不复制第二份 helper。
+            if let Some(name) = name {
+                validate_group_name(name)?;
+            }
+            let mut tx = begin_guard(&self.db).await?;
+            crate::integrity::require_active_admin(&mut tx, actor.user.id).await?;
+            // 1) 行锁快照当前 name/archived/revision，行缺失 → NotFound。
+            let locked = sqlx::query(
+                "SELECT name, CAST(archived AS SIGNED) AS archived, revision FROM device_groups WHERE id = ? FOR UPDATE",
+            )
+            .bind(id.as_bytes().as_slice())
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(|r| {
+                Ok::<_, ControllerError>((
+                    r.try_get::<String, _>("name")?,
+                    crate::integrity::raw_bool(r.try_get("archived")?, "device_groups.archived")?,
+                    r.try_get::<u64, _>("revision")?,
+                ))
+            })
+            .transpose()?
+            .ok_or(ControllerError::NotFound)?;
+            let (current_name, current_archived, current_revision) = locked;
+            if current_revision != expected_revision {
+                return Err(ControllerError::RevisionConflict);
+            }
+            let next_revision = current_revision
+                .checked_add(1)
+                .ok_or(ControllerError::RevisionConflict)?;
+            let next_name: String = name.map(str::to_string).unwrap_or(current_name);
+            let next_archived = archived.unwrap_or(current_archived);
+            // 2) 归档时物理删成员与 group 作用域 grants（保留历史父 group 行、不删其它组）。
+            if next_archived {
+                sqlx::query("DELETE FROM group_members WHERE group_id = ?")
+                    .bind(id.as_bytes().as_slice())
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("DELETE FROM grants WHERE scope_kind = 'group' AND scope_group_id = ?")
+                    .bind(id.as_bytes().as_slice())
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            // 3) CAS UPDATE 影响恰 1 行，否则 RevisionConflict；改名唯一冲突 → InvalidState(409)。
+            let updated = sqlx::query(
+                "UPDATE device_groups SET name = ?, archived = ?, revision = ? WHERE id = ? AND revision = ?",
+            )
+            .bind(&next_name)
+            .bind(next_archived)
+            .bind(next_revision)
+            .bind(id.as_bytes().as_slice())
+            .bind(expected_revision)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                // 驱动 unique-violation 分类（同 create_group 口径：不解析 message 文本、不依赖 constraint 名称）。
+                if error
+                    .as_database_error()
+                    .is_some_and(|e| e.is_unique_violation())
+                {
+                    ControllerError::InvalidState
+                } else {
+                    error.into()
+                }
+            })?;
+            if updated.rows_affected() != 1 {
+                return Err(ControllerError::RevisionConflict);
+            }
+            // 4) 同事务 COUNT(*) 真实回读 member_count（归档后恒 0），不从参数臆造。
+            let member_count = sqlx::query(
+                "SELECT COUNT(*) AS member_count FROM group_members WHERE group_id = ?",
+            )
+            .bind(id.as_bytes().as_slice())
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get::<u64, _>("member_count")?;
+            bump_authz_epoch(&mut tx).await?;
+            crate::audit::insert_audit(
+                &mut tx,
+                &crate::audit::AuditInsert {
+                    actor_kind: "user",
+                    actor_user_id: Some(actor.user.id),
+                    event_type: "identity.group.patch",
+                    target_kind: "group",
+                    target_id: Some(hex::encode(id.as_bytes())),
+                    params_redacted: "{}",
+                    outcome: "success",
+                },
+            )
+            .await?;
+            // commit 前安全组装 GroupRecord 全部 5 字段；仅 commit 成功才 Ok(record)。
+            let record = GroupRecord {
+                id,
+                name: next_name,
+                archived: next_archived,
+                revision: next_revision,
+                member_count,
+            };
+            tx.commit().await?;
+            Ok(record)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -2534,6 +3597,82 @@ mod tests {
                 require_snapshot_isolation(bad),
                 Err(ControllerError::Config(_))
             ));
+        }
+    }
+
+    #[test]
+    fn user_lock_order_is_deterministic_by_uuid_bytes() {
+        let low = [1u8; 16];
+        let high = [2u8; 16];
+        assert_eq!(ordered_user_ids(high, low), (low, Some(high)));
+        assert_eq!(ordered_user_ids(low, high), (low, Some(high)));
+        // 同一用户只锁一行，禁止自锁两次。
+        assert_eq!(ordered_user_ids(low, low), (low, None));
+    }
+
+    #[test]
+    fn only_removing_active_admin_state_triggers_last_admin_rule() {
+        // 停用活跃管理员 / 降级活跃管理员 → 需要检查
+        assert!(admin_change_removes_admin_state(true, true, false, true));
+        assert!(admin_change_removes_admin_state(true, true, true, false));
+        // 已是停用或非管理员 → 不触发（不得误报 LAST_ADMIN）
+        assert!(!admin_change_removes_admin_state(false, true, false, true));
+        assert!(!admin_change_removes_admin_state(true, false, true, false));
+        // 不变更或升级 → 不触发
+        assert!(!admin_change_removes_admin_state(true, true, true, true));
+        assert!(!admin_change_removes_admin_state(false, false, true, true));
+    }
+
+    #[test]
+    fn permission_list_must_be_non_empty_and_unique() {
+        use crate::authz::policy::Permission::*;
+        assert!(crate::authz::policy::validate_permission_list(&[]).is_err());
+        assert!(crate::authz::policy::validate_permission_list(&[DeviceRead, DeviceRead]).is_err());
+        assert!(
+            crate::authz::policy::validate_permission_list(&[DeviceRead, DeviceReboot]).is_ok()
+        );
+    }
+
+    #[test]
+    fn role_restore_from_archive_requires_valid_non_empty_permissions() {
+        use crate::authz::policy::Permission::*;
+        // 正例：合法非空权限恢复 → 门禁过；同事务重建+回读得 active 非空权限。
+        assert!(validate_role_restore(true, false, Some(&[DeviceRead, DeviceReboot])).is_ok());
+        // 反例：无权限恢复 → InvalidArgument(400)，绝不产生 active 空权限角色。
+        assert!(matches!(
+            validate_role_restore(true, false, None),
+            Err(ControllerError::InvalidArgument)
+        ));
+        // 反例：空权限恢复 → validate_permission_list 非空门禁拒绝（同为 400 形状）。
+        assert!(validate_role_restore(true, false, Some(&[])).is_err());
+        // 非恢复分支不受限：归档、active 原地编辑、保持归档。
+        assert!(validate_role_restore(false, true, None).is_ok());
+        assert!(validate_role_restore(false, false, None).is_ok());
+        assert!(validate_role_restore(true, true, None).is_ok());
+    }
+
+    #[test]
+    fn validate_group_name_boundaries() {
+        let legal_128: String = "群".repeat(128); // 128 Unicode 字符 / 384 字节
+        assert_eq!(legal_128.chars().count(), 128);
+        let over_129: String = "群".repeat(129); // 129 字符
+        let cjk_300_bytes: String = "群".repeat(100); // 100 字符 / 300 字节：字符数规则合法、字节 255 规则会拒
+        let cases: [(&str, bool); 8] = [
+            ("ops-eu-1", true),
+            (legal_128.as_str(), true),
+            (cjk_300_bytes.as_str(), true),
+            ("", false),
+            ("   ", false),
+            (over_129.as_str(), false),
+            ("a\tb", false),
+            ("\u{1}", false), // 第 8 例：另一明确控制字符负例（U+0001）
+        ];
+        for (input, expect_ok) in cases {
+            assert_eq!(
+                validate_group_name(input).is_ok(),
+                expect_ok,
+                "input = {input:?}"
+            );
         }
     }
 }

@@ -5,8 +5,8 @@ use uuid::Uuid;
 use crate::auth::service::Session;
 use crate::authz::policy::{GrantRecord, Permission, RoleRecord, eval_memory_permissions};
 use crate::authz::sqlx_repo::{
-    AuthorizationSnapshot, acquire_authorization_read_connection, load_actor_authorization_in_tx,
-    load_device_snapshot_in_tx, load_snapshot_in_tx,
+    AuthorizationSnapshot, GroupRecord, acquire_authorization_read_connection,
+    load_actor_authorization_in_tx, load_device_snapshot_in_tx, load_snapshot_in_tx,
 };
 use crate::db::DbPool;
 use crate::error::ControllerError;
@@ -101,6 +101,24 @@ pub trait DeviceRepository: Send + Sync {
     ) -> RepoFuture<'a, (Vec<AuditEventRow>, Option<AuditCursor>)>;
 
     fn system_counts<'a>(&'a self, actor: &'a Session) -> RepoFuture<'a, SystemCounts>;
+
+    // ---- 管理写方法（Task 4）：统一事务骨架 guard → 行锁顺序 → CAS →
+    // 审计同事务插入 → commit；任一错误 drop 局部 tx 自动回滚。----
+    fn patch_device_display_name<'a>(
+        &'a self,
+        actor: &'a Session,
+        device_id: [u8; 32],
+        expected_revision: u64,
+        display_name: &'a str,
+    ) -> RepoFuture<'a, DeviceAdminView>;
+
+    fn replace_group_members<'a>(
+        &'a self,
+        actor: &'a Session,
+        group_id: Uuid,
+        expected_revision: u64,
+        device_ids: &'a [[u8; 32]],
+    ) -> RepoFuture<'a, GroupRecord>;
 }
 
 pub struct SqlxDeviceRepository {
@@ -508,6 +526,227 @@ impl DeviceRepository for SqlxDeviceRepository {
             })
         })
     }
+
+    // ---- Task 4 管理写方法：统一事务骨架 guard → 行锁顺序 → CAS →
+    // 审计同事务插入 → commit；任一错误 drop 局部 tx 自动回滚。----
+    fn patch_device_display_name<'a>(
+        &'a self,
+        actor: &'a Session,
+        device_id: [u8; 32],
+        expected_revision: u64,
+        display_name: &'a str,
+    ) -> RepoFuture<'a, DeviceAdminView> {
+        Box::pin(async move {
+            use sqlx::Row;
+            let mut tx = self.db.0.begin().await?;
+            crate::integrity::lock_integrity_guard(&mut tx).await?;
+            crate::integrity::require_active_admin(&mut tx, actor.user.id).await?;
+            // 1. 锁 devices 行（锁序止于 devices 行，guard → actor 行 → devices 行 FOR UPDATE）。
+            let row = sqlx::query(
+                "SELECT public_key, display_name, descriptor_json, admission_state, review_decision, revision, CAST(archived AS SIGNED) AS archived FROM devices WHERE public_key = ? FOR UPDATE",
+            )
+            .bind(device_id.as_slice())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(ControllerError::NotFound)?;
+            // 2. 严格 decode：复用同 crate 既有去敏解码，不复制第二份解码器。
+            let locked = crate::authz::sqlx_repo::decode_device_admin_view(
+                row.try_get("public_key")?,
+                row.try_get("display_name")?,
+                row.try_get("descriptor_json")?,
+                row.try_get("admission_state")?,
+                row.try_get("review_decision")?,
+                row.try_get::<u64, _>("revision")?,
+                row.try_get::<i64, _>("archived")?,
+            )?;
+
+            // 3. expected_revision CAS（与 UPDATE 的 WHERE revision=? + rows_affected==1 双保险）。
+            if locked.revision != expected_revision {
+                return Err(ControllerError::RevisionConflict);
+            }
+            crate::authz::sqlx_repo::validate_display_name(display_name)?;
+            let next_revision = locked
+                .revision
+                .checked_add(1)
+                .ok_or(ControllerError::RevisionConflict)?;
+            // 仅改中控档案 display_name/revision，不得改 admission_state/review_decision。
+            let changed = sqlx::query(
+                "UPDATE devices SET display_name = ?, revision = ? WHERE public_key = ? AND revision = ?",
+            )
+            .bind(display_name)
+            .bind(next_revision)
+            .bind(device_id.as_slice())
+            .bind(expected_revision)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if changed != 1 {
+                return Err(ControllerError::RevisionConflict);
+            }
+
+            // 4. bump authz_epoch 与 ADMIN 脱敏审计（target_id 为 public_key 的 hex）。
+            crate::authz::sqlx_repo::bump_authz_epoch(&mut tx).await?;
+            crate::audit::insert_audit(
+                &mut tx,
+                &crate::audit::AuditInsert {
+                    actor_kind: "user",
+                    actor_user_id: Some(actor.user.id),
+                    event_type: "identity.device.patch",
+                    target_kind: "device",
+                    target_id: Some(hex::encode(device_id)),
+                    params_redacted: "{}",
+                    outcome: "success",
+                },
+            )
+            .await?;
+
+            // 5. commit 前基于锁定行值构造全部 7 字段 DeviceAdminView：display_name 为新值、
+            //    revision 为 checked+1；其余保持锁定行值，绝无二次读取。
+            tx.commit().await?;
+
+            Ok(DeviceAdminView {
+                public_key: locked.public_key,
+                display_name: display_name.to_string(),
+                admission_state: locked.admission_state,
+                review_decision: locked.review_decision,
+                revision: next_revision,
+                descriptor: locked.descriptor,
+                archived: locked.archived,
+            })
+        })
+    }
+
+    fn replace_group_members<'a>(
+        &'a self,
+        actor: &'a Session,
+        group_id: Uuid,
+        expected_revision: u64,
+        device_ids: &'a [[u8; 32]],
+    ) -> RepoFuture<'a, GroupRecord> {
+        Box::pin(async move {
+            use sqlx::Row;
+            let sorted_ids = normalize_device_member_ids(device_ids)?;
+            let mut tx = self.db.0.begin().await?;
+            crate::integrity::lock_integrity_guard(&mut tx).await?;
+            crate::integrity::require_active_admin(&mut tx, actor.user.id).await?;
+
+            // 1. 锁 device_groups 行，重验未归档且 CAS revision 匹配。
+            let group_row = sqlx::query(
+                "SELECT name, CAST(archived AS SIGNED) AS archived, revision FROM device_groups WHERE id = ? FOR UPDATE",
+            )
+            .bind(group_id.as_bytes().as_slice())
+            .fetch_optional(&mut *tx)
+            .await?;
+            let (locked_name, group_archived, current_revision) = group_row
+                .map(|r| {
+                    Ok::<_, ControllerError>((
+                        r.try_get::<String, _>("name")?,
+                        crate::integrity::raw_bool(
+                            r.try_get("archived")?,
+                            "device_groups.archived",
+                        )?,
+                        r.try_get::<u64, _>("revision")?,
+                    ))
+                })
+                .transpose()?
+                .ok_or(ControllerError::NotFound)?;
+            if group_archived {
+                return Err(ControllerError::NotFound);
+            }
+            if current_revision != expected_revision {
+                return Err(ControllerError::RevisionConflict);
+            }
+
+            // 2. 按公钥字节序逐个锁 devices 行，重验全部设备存在且未归档。
+            for device_id in &sorted_ids {
+                let dev_row = sqlx::query(
+                    "SELECT CAST(archived AS SIGNED) AS archived FROM devices WHERE public_key = ? FOR UPDATE",
+                )
+                .bind(device_id.as_slice())
+                .fetch_optional(&mut *tx)
+                .await?;
+                let is_archived = dev_row
+                    .map(|r| crate::integrity::raw_bool(r.try_get("archived")?, "devices.archived"))
+                    .transpose()?
+                    .ok_or(ControllerError::NotFound)?;
+                if is_archived {
+                    return Err(ControllerError::NotFound);
+                }
+            }
+
+            // 3. DELETE 旧成员，并按公钥序 INSERT 固定去重集。
+            sqlx::query("DELETE FROM group_members WHERE group_id = ?")
+                .bind(group_id.as_bytes().as_slice())
+                .execute(&mut *tx)
+                .await?;
+            for device_id in &sorted_ids {
+                sqlx::query("INSERT INTO group_members (group_id, device_id) VALUES (?, ?)")
+                    .bind(group_id.as_bytes().as_slice())
+                    .bind(device_id.as_slice())
+                    .execute(&mut *tx)
+                    .await?;
+            }
+
+            // 4. group revision checked+1 CAS 更新。
+            let next_revision = current_revision
+                .checked_add(1)
+                .ok_or(ControllerError::RevisionConflict)?;
+            let changed =
+                sqlx::query("UPDATE device_groups SET revision = ? WHERE id = ? AND revision = ?")
+                    .bind(next_revision)
+                    .bind(group_id.as_bytes().as_slice())
+                    .bind(expected_revision)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected();
+            if changed != 1 {
+                return Err(ControllerError::RevisionConflict);
+            }
+
+            // 5. bump authz_epoch 与 ADMIN 脱敏审计。
+            crate::authz::sqlx_repo::bump_authz_epoch(&mut tx).await?;
+            crate::audit::insert_audit(
+                &mut tx,
+                &crate::audit::AuditInsert {
+                    actor_kind: "user",
+                    actor_user_id: Some(actor.user.id),
+                    event_type: "identity.group.members",
+                    target_kind: "group",
+                    target_id: Some(hex::encode(group_id.as_bytes())),
+                    params_redacted: "{}",
+                    outcome: "success",
+                },
+            )
+            .await?;
+
+            // 6. 提交事务；成功后直接基于已锁字段构造返回，绝无二次读取；
+            //    commit 未知错误直接透传不谎称回滚。
+            tx.commit().await?;
+
+            let member_count =
+                u64::try_from(sorted_ids.len()).map_err(|_| ControllerError::InvalidArgument)?;
+            Ok(GroupRecord {
+                id: group_id,
+                name: locked_name,
+                archived: false,
+                revision: next_revision,
+                member_count,
+            })
+        })
+    }
+}
+
+/// 成员替换纯规整 helper：显式去重、字节序排定、上限 1024 校验（0 为合法清空）。
+pub(crate) fn normalize_device_member_ids(
+    device_ids: &[[u8; 32]],
+) -> Result<Vec<[u8; 32]>, ControllerError> {
+    let mut sorted: Vec<[u8; 32]> = device_ids.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if sorted.len() > 1024 {
+        return Err(ControllerError::InvalidArgument);
+    }
+    Ok(sorted)
 }
 
 #[cfg(test)]
@@ -872,4 +1111,36 @@ mod tests {
     }
 
     fn empty_insert_nothing(_set: &mut HashSet<uuid::Uuid>) {}
+
+    #[test]
+    fn normalize_device_member_ids_pure_logic() {
+        use crate::devices::repository::normalize_device_member_ids;
+        assert_eq!(
+            normalize_device_member_ids(&[]).unwrap(),
+            Vec::<[u8; 32]>::new()
+        );
+        let (d1, d2, d3) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        assert_eq!(
+            normalize_device_member_ids(&[d3, d1, d2, d1, d3]).unwrap(),
+            vec![d1, d2, d3]
+        );
+        let mut batch_1024 = Vec::with_capacity(1024);
+        for i in 0..1024u16 {
+            let mut key = [0u8; 32];
+            key[..2].copy_from_slice(&i.to_be_bytes());
+            batch_1024.push(key);
+        }
+        assert_eq!(
+            normalize_device_member_ids(&batch_1024).unwrap().len(),
+            1024
+        );
+        let mut batch_1025 = batch_1024.clone();
+        let mut extra = [0u8; 32];
+        extra[..2].copy_from_slice(&1024u16.to_be_bytes());
+        batch_1025.push(extra);
+        assert!(matches!(
+            normalize_device_member_ids(&batch_1025),
+            Err(ControllerError::InvalidArgument)
+        ));
+    }
 }

@@ -37,6 +37,20 @@ impl Permission {
     }
 }
 
+/// 角色权限列表门禁：非空且无重复。
+pub fn validate_permission_list(permissions: &[Permission]) -> Result<(), ControllerError> {
+    if permissions.is_empty() {
+        return Err(ControllerError::InvalidArgument);
+    }
+    let mut seen: HashSet<&'static str> = HashSet::with_capacity(permissions.len());
+    for permission in permissions {
+        if !seen.insert(permission.as_str()) {
+            return Err(ControllerError::InvalidArgument);
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GrantSource {
     Role(Uuid),
