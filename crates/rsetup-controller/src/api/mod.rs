@@ -17,7 +17,7 @@ pub mod roles;
 pub mod system;
 pub mod users;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::http::StatusCode;
 use axum::response::Response;
@@ -556,6 +556,218 @@ pub(crate) fn decode_signed_cursor(
     }
 }
 
+// ---------------------------------------------------------------------------
+// cursor 密钥生产链
+// ---------------------------------------------------------------------------
+//
+// 32B 密钥的唯一来源是环境变量 `CONTROLLER_MANAGEMENT_CURSOR_SECRET_HEX`：只接受恰 64 个
+// 小写 hex 字符并解码成 32B，缺失/非法/长度不符一律固定去敏 `ControllerError::Config`，
+// 错误串不回显输入片段，任何路径都不得打印或记录取值。读取与安装只发生在集成 Task 0
+// 注册管理 router **之前**（load → install → build_management_router），任一步 `Err` 即
+// 管理 router 不注册、进程失败关闭，绝不以「无 cursor 密钥」降级启动。
+
+/// 管理 cursor 密钥的唯一进程内安装位：只允许一次性写入，不提供 clear/reset，
+/// 也不给 `ManagementState` 或各资源 `ApiState` 扩密钥字段。
+pub(crate) static MANAGEMENT_CURSOR_SECRET: OnceLock<[u8; 32]> = OnceLock::new();
+
+/// 解析环境变量取值：仅接受恰 64 个小写 hex 字符，其余固定去敏 `Config`。
+pub fn parse_management_cursor_secret(raw: &str) -> Result<[u8; 32], ControllerError> {
+    if raw.len() != 64
+        || !raw
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(ControllerError::Config(
+            "management cursor secret format".into(),
+        ));
+    }
+    let mut secret = [0u8; 32];
+    hex::decode_to_slice(raw, &mut secret)
+        .map_err(|_| ControllerError::Config("management cursor secret format".into()))?;
+    Ok(secret)
+}
+
+/// 从环境变量读取并解析密钥；变量缺失同样是固定去敏 `Config`，不回显变量名之外的信息。
+pub fn load_management_cursor_secret_from_env() -> Result<[u8; 32], ControllerError> {
+    let raw = std::env::var("CONTROLLER_MANAGEMENT_CURSOR_SECRET_HEX")
+        .map_err(|_| ControllerError::Config("management cursor secret missing".into()))?;
+    parse_management_cursor_secret(&raw)
+}
+
+/// 一次性安装语义：未安装→写入成功；重复安装同一 key→幂等 `Ok`；重复安装不同 key→
+/// `Config` 失败并保留既有 key。
+///
+/// `OnceLock::set` 的 `Err` 返回的是被拒绝的**本次入参**而非已安装值，拿返回值比较恒为真、
+/// 会误接受不同 key；因此失败后经 `slot.get()` 比较（`set` 失败即已填充，`get` 保证可读）。
+fn install_cursor_secret_into(
+    slot: &OnceLock<[u8; 32]>,
+    secret: &[u8; 32],
+) -> Result<(), ControllerError> {
+    if slot.set(*secret).is_ok() {
+        return Ok(());
+    }
+    match slot.get() {
+        Some(installed) if installed == secret => Ok(()),
+        _ => Err(ControllerError::Config(
+            "management cursor secret already installed".into(),
+        )),
+    }
+}
+
+/// 生产安装入口（集成 Task 0 在注册管理 router 前调用一次）。
+pub fn install_management_cursor_secret(secret: &[u8; 32]) -> Result<(), ControllerError> {
+    install_cursor_secret_into(&MANAGEMENT_CURSOR_SECRET, secret)
+}
+
+fn cursor_secret_of(slot: &OnceLock<[u8; 32]>) -> Result<&[u8; 32], ControllerError> {
+    slot.get()
+        .ok_or_else(|| ControllerError::Config("management cursor secret not installed".into()))
+}
+
+/// handler 侧唯一取密钥入口；未安装 → `Config` → 既有 `map_error` 精确 503
+/// `STORAGE_UNAVAILABLE`，绝不回退未签名 cursor。
+#[allow(dead_code)]
+pub(crate) fn management_cursor_secret() -> Result<&'static [u8; 32], ControllerError> {
+    cursor_secret_of(&MANAGEMENT_CURSOR_SECRET)
+}
+
+// ---------------------------------------------------------------------------
+// HTTP 边界 cursor helper
+// ---------------------------------------------------------------------------
+//
+// handler 不得直接调用 `encode_signed_cursor`/`decode_signed_cursor` 裸函数对，只经本节
+// 两个 helper；参数一律显式传入 `(secret, endpoint, user_id, filter)`，不引入 state 参数。
+// 失败分层：客户端侧（非法/篡改/跨端点/跨用户/换筛选 token、profile 不符）→ `InvalidArgument`
+// 400；后端侧（page 形状、raw key 长度/大小写/v4 shape、端点不在白名单）→ 固定去敏
+// `Config` 503，两条路径都不得返回未校验的内部 `CursorKey`。
+
+/// 管理分页端点的 cursor 键形态。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum ManagementCursorProfile {
+    Uuid,
+    Device,
+}
+
+/// endpoint → profile 的封闭白名单（唯一真源，失败关闭）：只有 6 个管理分页读端点有
+/// profile，其余端点（含 `AuditRead` 独立 MAC profile 与 `EffectivePermissionsRead`
+/// 独立分页 contract）一律固定去敏 `Config`，不写默认兜底掩盖装配错误。
+#[allow(dead_code)]
+pub(crate) fn management_cursor_profile(
+    endpoint: EndpointId,
+) -> Result<ManagementCursorProfile, ControllerError> {
+    match endpoint {
+        EndpointId::UsersRead
+        | EndpointId::RolesRead
+        | EndpointId::GrantsRead
+        | EndpointId::GroupsRead => Ok(ManagementCursorProfile::Uuid),
+        EndpointId::DevicesRead | EndpointId::ApprovalsRead => Ok(ManagementCursorProfile::Device),
+        _ => Err(ControllerError::Config(
+            "management cursor endpoint profile".to_string(),
+        )),
+    }
+}
+
+/// 入口 helper：HTTP `cursor` → 网关 typed key。`None` 直接 `Ok(None)`（不触碰 MAC）；
+/// `Some` 必须经真实 `decode_signed_cursor`，再校验解码结果落在本 endpoint 预期 profile，
+/// profile 不符或 token 非法一律 `InvalidArgument` → 400，无回退、不降级全量。
+#[allow(dead_code)]
+pub(crate) fn decode_management_list_cursor(
+    secret: &[u8; 32],
+    endpoint: EndpointId,
+    user_id: [u8; 16],
+    filter: &CursorFilterCtx,
+    token: Option<&str>,
+) -> Result<Option<CursorKey>, ControllerError> {
+    let profile = management_cursor_profile(endpoint)?;
+    let raw = match token {
+        None => return Ok(None),
+        Some(raw) => raw,
+    };
+    let key = decode_signed_cursor(secret, endpoint, user_id, filter, raw)?;
+    let bound = matches!(
+        (profile, &key),
+        (ManagementCursorProfile::Uuid, CursorKey::Uuid(_))
+            | (ManagementCursorProfile::Device, CursorKey::DeviceKey(_))
+    );
+    if !bound {
+        return Err(ControllerError::InvalidArgument);
+    }
+    Ok(Some(key))
+}
+
+fn management_page_shape_error() -> ControllerError {
+    ControllerError::Config("management cursor page shape".to_string())
+}
+
+/// 内部 raw key 的严格字节账：长度恰 `N * 2` 且全小写 hex，否则 `None`（不截断、不回显）。
+fn management_page_raw_bytes<const N: usize>(raw: &str) -> Option<[u8; N]> {
+    if raw.len() != N * 2 || !raw.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    let bytes = hex::decode(raw).ok()?;
+    bytes.as_slice().try_into().ok()
+}
+
+/// 后端内部 raw string → `CursorKey`，长度与 endpoint profile 互锁，
+/// UUID 另校验 canonical v4 shape；任何不符都是同一个去敏 `Config`。
+fn management_page_internal_key(
+    endpoint: EndpointId,
+    raw: &str,
+) -> Result<CursorKey, ControllerError> {
+    match management_cursor_profile(endpoint)? {
+        ManagementCursorProfile::Uuid => {
+            let uuid =
+                management_page_raw_bytes::<16>(raw).ok_or_else(management_page_shape_error)?;
+            if uuid[6] >> 4 != 4 || uuid[8] & 0xC0 != 0x80 {
+                return Err(management_page_shape_error());
+            }
+            Ok(CursorKey::Uuid(uuid))
+        }
+        ManagementCursorProfile::Device => {
+            let key =
+                management_page_raw_bytes::<32>(raw).ok_or_else(management_page_shape_error)?;
+            Ok(CursorKey::DeviceKey(key))
+        }
+    }
+}
+
+/// 出口 helper：网关内部 raw key → 外部签名 token。只接受 `Value::Object`，`items` 必须是
+/// array，`next_cursor` 必须存在且为 `null` 或 `String`；第一行先过与入口成对的封闭白名单，
+/// 因此 `next_cursor` 为 `null` 的非白名单端点同样被拦截。投影守恒：只替换 `next_cursor`
+/// 一个字段，`items` 与其余字段原样保留，不把裸内部 key 写进响应。
+#[allow(dead_code)]
+pub(crate) fn sign_management_list_page(
+    secret: &[u8; 32],
+    endpoint: EndpointId,
+    user_id: [u8; 16],
+    filter: &CursorFilterCtx,
+    page: serde_json::Value,
+) -> Result<serde_json::Value, ControllerError> {
+    management_cursor_profile(endpoint)?;
+    let mut map = match page {
+        serde_json::Value::Object(map) => map,
+        _ => return Err(management_page_shape_error()),
+    };
+    if !matches!(map.get("items"), Some(serde_json::Value::Array(_))) {
+        return Err(management_page_shape_error());
+    }
+    let raw_next = match map.get("next_cursor") {
+        Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(raw)) => Some(raw.clone()),
+        _ => return Err(management_page_shape_error()),
+    };
+    let next_cursor = match raw_next {
+        None => serde_json::Value::Null,
+        Some(raw) => {
+            let key = management_page_internal_key(endpoint, &raw)?;
+            serde_json::Value::String(encode_signed_cursor(secret, endpoint, user_id, filter, key))
+        }
+    };
+    map.insert("next_cursor".to_string(), next_cursor);
+    Ok(serde_json::Value::Object(map))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1036,5 +1248,397 @@ mod signed_cursor_tests {
         let err = decode_signed_cursor(&SECRET, endpoint, ACTOR, &other, &token)
             .expect_err("changed filter context rejected");
         assert!(matches!(err, ControllerError::InvalidArgument));
+    }
+}
+
+/// cursor 密钥生产链：安装/读取语义经**局部 `OnceLock` 注入的私有 helper** 验证，
+/// 生产 wrapper 调用同一 helper，避免全局静态互相污染；不在测试里 `set_var`，
+/// `SYNTHETIC_HEX` 是仅测试内使用的固定 synthetic key，不引用任何 secret 文件。
+#[cfg(test)]
+mod cursor_secret_tests {
+    use super::*;
+    const SYNTHETIC_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000001";
+    #[test]
+    fn parse_management_cursor_secret_rejects_invalid_input() {
+        assert_eq!(
+            parse_management_cursor_secret(SYNTHETIC_HEX).expect("64 位小写 hex 必须通过"),
+            {
+                let mut k = [0u8; 32];
+                k[31] = 1;
+                k
+            }
+        );
+        // SYNTHETIC_HEX 仅含数字 0/1，to_uppercase 仍返回同一合法值，不能充当大写拒绝样本；
+        // 改用确实 64 字符且含大写 A-F 的 synthetic hex，并断言其形状以免未来退化。
+        let uppercase_hex = "A".repeat(64);
+        assert_eq!(uppercase_hex.len(), 64, "大写样本必须恰好 64 字符");
+        assert!(
+            uppercase_hex.chars().any(|c| matches!(c, 'A'..='F')),
+            "大写样本必须至少含一个大写 hex 字符"
+        );
+        let bad = [
+            SYNTHETIC_HEX[..63].to_owned(),
+            uppercase_hex,
+            format!("{SYNTHETIC_HEX}0"),
+            format!("{}g", &SYNTHETIC_HEX[..63]),
+            "z".repeat(64),
+            String::new(),
+        ];
+        for case in &bad {
+            let err = parse_management_cursor_secret(case).expect_err("非法输入必须拒绝");
+            assert!(
+                matches!(&err, ControllerError::Config(m) if m == "management cursor secret format")
+                    && (case.len() < 8 || !format!("{err}").contains(&case[..8])),
+                "非法输入须固定去敏拒绝且不回显密钥片段"
+            );
+        }
+    }
+    #[test]
+    fn cursor_secret_accessor_requires_installed_slot() {
+        let err = cursor_secret_of(&OnceLock::<[u8; 32]>::new()).expect_err("未安装必须失败");
+        assert!(matches!(
+            &err,
+            ControllerError::Config(m) if m == "management cursor secret not installed"
+        ));
+        assert_eq!(
+            map_error(err).status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+    #[test]
+    fn install_cursor_secret_is_idempotent_only_for_same_key() {
+        let (slot, key) = (
+            OnceLock::<[u8; 32]>::new(),
+            parse_management_cursor_secret(SYNTHETIC_HEX).expect("合法 key"),
+        );
+        assert!(install_cursor_secret_into(&slot, &key).is_ok());
+        assert!(
+            install_cursor_secret_into(&slot, &key).is_ok(),
+            "同 key 重复安装应幂等成功"
+        );
+        let err = install_cursor_secret_into(&slot, &[7u8; 32]).expect_err("不同 key 必须失败");
+        assert!(matches!(
+            &err,
+            ControllerError::Config(m) if m == "management cursor secret already installed"
+        ));
+        assert_eq!(
+            cursor_secret_of(&slot).expect("已安装"),
+            &key,
+            "不同 key 不得覆盖既有 key"
+        );
+    }
+}
+
+/// HTTP 边界 cursor helper：6 个分页端点的 profile 封闭互锁、入口/出口转换与后端脏页防御。
+#[cfg(test)]
+mod management_cursor_helper_tests {
+    use super::*;
+    const SECRET: [u8; 32] = [3u8; 32];
+    const ACTOR: [u8; 16] = [1u8; 16];
+    /// canonical v4 的 16B 内部 raw key（32 小写 hex）。
+    const UUID_RAW_HEX: &str = "067e6162ea944431836c7d8fa2010b3c";
+    /// 32B 设备公钥内部 raw key（64 小写 hex）。
+    const DEVICE_RAW_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn fixture_uuid() -> [u8; 16] {
+        <[u8; 16]>::try_from(hex::decode(UUID_RAW_HEX).expect("fixture hex")).expect("16B")
+    }
+    fn fixture_device_key() -> [u8; 32] {
+        <[u8; 32]>::try_from(hex::decode(DEVICE_RAW_HEX).expect("fixture hex")).expect("32B")
+    }
+    /// 后端侧失败必须是固定去敏 `Config`，经 `map_error` 精确 503，不回显片段、不返回 400。
+    fn assert_backend_fail_closed(error: ControllerError) {
+        assert!(
+            matches!(error, ControllerError::Config(_)),
+            "后端侧失败须为 Config"
+        );
+        assert_eq!(
+            map_error(error).status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "后端侧失败须精确 503"
+        );
+    }
+    fn page(next_cursor: Option<&str>) -> serde_json::Value {
+        json!({
+            "items": [{"id": UUID_RAW_HEX}],
+            "next_cursor": next_cursor,
+            "total": 2,
+        })
+    }
+
+    #[test]
+    fn management_cursor_profile_is_closed_whitelist_of_six_read_endpoints() {
+        for endpoint in [
+            EndpointId::UsersRead,
+            EndpointId::RolesRead,
+            EndpointId::GrantsRead,
+            EndpointId::GroupsRead,
+        ] {
+            assert_eq!(
+                management_cursor_profile(endpoint).expect("uuid profile"),
+                ManagementCursorProfile::Uuid
+            );
+        }
+        for endpoint in [EndpointId::DevicesRead, EndpointId::ApprovalsRead] {
+            assert_eq!(
+                management_cursor_profile(endpoint).expect("device profile"),
+                ManagementCursorProfile::Device
+            );
+        }
+        // 其余 10 个端点全部落 `_ =>` 固定去敏 Config：无默认兜底。
+        for endpoint in [
+            EndpointId::Me,
+            EndpointId::Sessions,
+            EndpointId::EffectivePermissionsRead,
+            EndpointId::DeviceDetailRead,
+            EndpointId::AuditRead,
+            EndpointId::SystemStatusRead,
+            EndpointId::TaskList,
+            EndpointId::TaskDetail,
+            EndpointId::TaskChildren,
+            EndpointId::DeviceStatusRead,
+        ] {
+            let err = management_cursor_profile(endpoint).expect_err("非白名单端点必须失败关闭");
+            assert!(matches!(
+                &err,
+                ControllerError::Config(m) if m == "management cursor endpoint profile"
+            ));
+            assert_backend_fail_closed(err);
+        }
+    }
+
+    #[test]
+    fn decode_management_list_cursor_binds_endpoint_profile() {
+        let filter = CursorFilterCtx::empty();
+        // `None` 直接 Ok(None)，不触碰 MAC。
+        assert_eq!(
+            decode_management_list_cursor(&SECRET, EndpointId::UsersRead, ACTOR, &filter, None)
+                .expect("无 cursor 直接放行"),
+            None
+        );
+        let uuid = fixture_uuid();
+        let uuid_token = encode_signed_cursor(
+            &SECRET,
+            EndpointId::UsersRead,
+            ACTOR,
+            &filter,
+            CursorKey::Uuid(uuid),
+        );
+        assert_eq!(uuid_token.len(), CURSOR_UUID_HEX);
+        assert_eq!(
+            decode_management_list_cursor(
+                &SECRET,
+                EndpointId::UsersRead,
+                ACTOR,
+                &filter,
+                Some(&uuid_token)
+            )
+            .expect("uuid profile roundtrip"),
+            Some(CursorKey::Uuid(uuid))
+        );
+        let public_key = fixture_device_key();
+        let device_token = encode_signed_cursor(
+            &SECRET,
+            EndpointId::DevicesRead,
+            ACTOR,
+            &filter,
+            CursorKey::DeviceKey(public_key),
+        );
+        assert_eq!(device_token.len(), CURSOR_DEVICE_HEX);
+        assert_eq!(
+            decode_management_list_cursor(
+                &SECRET,
+                EndpointId::DevicesRead,
+                ACTOR,
+                &filter,
+                Some(&device_token)
+            )
+            .expect("device profile roundtrip"),
+            Some(CursorKey::DeviceKey(public_key))
+        );
+        // 客户端侧负向：跨端点、跨用户、非法形状一律 400，无回退、不降级全量。
+        for (endpoint, token) in [
+            (EndpointId::RolesRead, uuid_token.as_str()),
+            (EndpointId::UsersRead, device_token.as_str()),
+            (EndpointId::DevicesRead, uuid_token.as_str()),
+            (EndpointId::UsersRead, &uuid_token[..CURSOR_UUID_HEX - 1]),
+        ] {
+            let err = decode_management_list_cursor(&SECRET, endpoint, ACTOR, &filter, Some(token))
+                .expect_err("客户端侧非法 cursor 必须拒绝");
+            assert!(matches!(err, ControllerError::InvalidArgument));
+            assert_eq!(map_error(err).status(), StatusCode::BAD_REQUEST);
+        }
+        let err = decode_management_list_cursor(
+            &SECRET,
+            EndpointId::UsersRead,
+            [9u8; 16],
+            &filter,
+            Some(&uuid_token),
+        )
+        .expect_err("跨用户 cursor 必须拒绝");
+        assert!(matches!(err, ControllerError::InvalidArgument));
+    }
+
+    #[test]
+    fn decode_management_list_cursor_rejects_key_kind_outside_profile() {
+        // 用真实 MAC 造「UsersRead 端点码 + 设备 kind」的合法签名 token：codec 层能解出
+        // DeviceKey，入口 helper 必须按 profile 互锁拒绝，不得放行跨 profile 的内部 key。
+        let filter = CursorFilterCtx::empty();
+        let endpoint = EndpointId::UsersRead;
+        let endpoint_code = endpoint_cursor_code(endpoint);
+        let mut payload: Vec<u8> = Vec::new();
+        payload.extend_from_slice(&endpoint_code.to_be_bytes());
+        payload.push(CURSOR_KIND_DEVICE);
+        payload.push(0u8);
+        payload.extend_from_slice(&fixture_device_key());
+        payload.extend_from_slice(&[0u8; 4]);
+        let mac = management_cursor_mac(
+            &SECRET,
+            endpoint_code,
+            &ACTOR,
+            &filter.canonical(),
+            &payload,
+        );
+        let mut raw = payload;
+        raw.extend_from_slice(&mac[..CURSOR_TAG_LEN]);
+        let crossed = hex::encode(&raw);
+        assert!(matches!(
+            decode_signed_cursor(&SECRET, endpoint, ACTOR, &filter, &crossed)
+                .expect("codec 层可解出 DeviceKey"),
+            CursorKey::DeviceKey(_)
+        ));
+        let err = decode_management_list_cursor(&SECRET, endpoint, ACTOR, &filter, Some(&crossed))
+            .expect_err("profile 不符必须拒绝");
+        assert!(matches!(err, ControllerError::InvalidArgument));
+        assert_eq!(map_error(err).status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn sign_management_list_page_signs_both_profiles_and_preserves_projection() {
+        let filter = CursorFilterCtx::from_ordered_fields(&[(1u8, Some(&b"asc"[..]))])
+            .expect("fixture filter");
+        // UUID profile：内部 32 小写 hex（16B）→ 外部 64 小写 hex（24B payload + 8B tag）。
+        let signed = sign_management_list_page(
+            &SECRET,
+            EndpointId::UsersRead,
+            ACTOR,
+            &filter,
+            page(Some(UUID_RAW_HEX)),
+        )
+        .expect("uuid 页签名");
+        let token = signed["next_cursor"]
+            .as_str()
+            .expect("签名 token")
+            .to_owned();
+        assert_eq!(token.len(), CURSOR_UUID_HEX);
+        assert_eq!(
+            decode_management_list_cursor(
+                &SECRET,
+                EndpointId::UsersRead,
+                ACTOR,
+                &filter,
+                Some(&token)
+            )
+            .expect("出口 token 可用同一 filter 解回"),
+            Some(CursorKey::Uuid(fixture_uuid()))
+        );
+        // 投影守恒：只替换 next_cursor，items 与其余字段原样保留。
+        assert_eq!(signed["items"], page(Some(UUID_RAW_HEX))["items"]);
+        assert_eq!(signed["total"], 2);
+        assert_eq!(signed.as_object().expect("object").len(), 3);
+        // 设备 profile：内部 64 小写 hex（32B）→ 外部 96 小写 hex（40B payload + 8B tag）。
+        let signed = sign_management_list_page(
+            &SECRET,
+            EndpointId::DevicesRead,
+            ACTOR,
+            &filter,
+            page(Some(DEVICE_RAW_HEX)),
+        )
+        .expect("device 页签名");
+        let token = signed["next_cursor"]
+            .as_str()
+            .expect("签名 token")
+            .to_owned();
+        assert_eq!(token.len(), CURSOR_DEVICE_HEX);
+        assert_eq!(
+            decode_management_list_cursor(
+                &SECRET,
+                EndpointId::DevicesRead,
+                ACTOR,
+                &filter,
+                Some(&token)
+            )
+            .expect("设备出口 token 解回"),
+            Some(CursorKey::DeviceKey(fixture_device_key()))
+        );
+        // null 保持 null，且仍不触碰 MAC。
+        let signed =
+            sign_management_list_page(&SECRET, EndpointId::RolesRead, ACTOR, &filter, page(None))
+                .expect("null 页");
+        assert!(signed["next_cursor"].is_null());
+        assert_eq!(signed["items"], page(None)["items"]);
+    }
+
+    #[test]
+    fn sign_management_list_page_fails_closed_on_dirty_backend_pages() {
+        let filter = CursorFilterCtx::empty();
+        let cases = vec![
+            json!("not-an-object"),
+            json!({"next_cursor": null}),
+            json!({"items": {}, "next_cursor": null}),
+            json!({"items": []}),
+            json!({"items": [], "next_cursor": 7}),
+            json!({"items": [], "next_cursor": UUID_RAW_HEX.to_uppercase()}),
+            json!({"items": [], "next_cursor": &UUID_RAW_HEX[..31]}),
+            json!({"items": [], "next_cursor": format!("{UUID_RAW_HEX}0")}),
+            json!({"items": [], "next_cursor": DEVICE_RAW_HEX}),
+            json!({"items": [], "next_cursor": "000000000000000000000000000000ff"}),
+            json!({"items": [], "next_cursor": "0000000000000000f0000000000000ff"}),
+        ];
+        for case in cases {
+            let err =
+                sign_management_list_page(&SECRET, EndpointId::UsersRead, ACTOR, &filter, case)
+                    .expect_err("后端脏页必须失败关闭");
+            assert!(matches!(
+                &err,
+                ControllerError::Config(m) if m == "management cursor page shape"
+            ));
+            assert_backend_fail_closed(err);
+        }
+        // 长度与 profile 互锁：UUID 的 32 hex 用在设备端点同样 503，而非跨 profile 误签。
+        let err = sign_management_list_page(
+            &SECRET,
+            EndpointId::DevicesRead,
+            ACTOR,
+            &filter,
+            page(Some(UUID_RAW_HEX)),
+        )
+        .expect_err("跨 profile 长度必须拒绝");
+        assert_backend_fail_closed(err);
+    }
+
+    #[test]
+    fn management_cursor_helpers_fail_closed_on_non_whitelisted_endpoints() {
+        let filter = CursorFilterCtx::empty();
+        // 入口：cursor 为 None 也必须先过端点白名单，不得短路放行。
+        let err =
+            decode_management_list_cursor(&SECRET, EndpointId::AuditRead, ACTOR, &filter, None)
+                .expect_err("非白名单端点不得放行");
+        assert_backend_fail_closed(err);
+        // 出口：next_cursor 为 null 同样被第一行白名单拦截，不得回吐未校验的原始 page。
+        let err =
+            sign_management_list_page(&SECRET, EndpointId::AuditRead, ACTOR, &filter, page(None))
+                .expect_err("非白名单端点不得签名放行");
+        assert_backend_fail_closed(err);
+        // EffectivePermissionsRead 走独立分页 contract，同样不得进入本链路。
+        let err = sign_management_list_page(
+            &SECRET,
+            EndpointId::EffectivePermissionsRead,
+            ACTOR,
+            &filter,
+            page(Some(UUID_RAW_HEX)),
+        )
+        .expect_err("独立 contract 端点不得签名放行");
+        assert_backend_fail_closed(err);
     }
 }
