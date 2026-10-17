@@ -90,6 +90,9 @@ const isStale = (gen: number, id: string) => gen !== detailGeneration.value || i
 const childrenGeneration = ref(0)
 const isChildrenStale = (gen: number, cGen: number, id: string) =>
   gen !== detailGeneration.value || cGen !== childrenGeneration.value || id !== props.taskId
+// 子任务读取在途标记：任意 loadChildren（首屏或分页）在途时禁用"加载更多"，
+// 防重复点击推进代际；旧代际的 finally 不得清除新代际的加载态
+const childrenLoading = ref(false)
 
 async function loadChildren(cursor: string | null = null) {
   if (!props.onLoadChildren) return
@@ -97,6 +100,12 @@ async function loadChildren(cursor: string | null = null) {
   const id = props.taskId
   childrenGeneration.value += 1
   const cGen = childrenGeneration.value
+  // 首屏重刷（cursor === null，含写成功后 GET(null) 权威重取）在 await 前立即清空旧游标：
+  // 在途期间"加载更多"随旧游标一起消失，无法发起旧游标分页推进 childrenGeneration，
+  // 把随后返回的写后最新快照误判为 stale 反向淘汰、旧子任务状态残留；
+  // 即便点击先于重渲染发生，模板读取的 nextCursor 也已是 null，最坏退化为又一次安全重置
+  if (cursor === null) nextCursor.value = null
+  childrenLoading.value = true
   try {
     const page = await props.onLoadChildren(id, cursor)
     if (isChildrenStale(gen, cGen, id)) return
@@ -107,6 +116,8 @@ async function loadChildren(cursor: string | null = null) {
   } catch {
     if (isChildrenStale(gen, cGen, id)) return
     childrenError.value = t('state.error') // 保留旧数据，不伪装成功、不伪装空
+  } finally {
+    if (!isChildrenStale(gen, cGen, id)) childrenLoading.value = false
   }
 }
 
@@ -206,6 +217,7 @@ watch(
     task.value = null
     children.value = []
     nextCursor.value = null
+    childrenLoading.value = false
     evidence.value = null
     taskError.value = null
     childrenError.value = null
@@ -287,7 +299,7 @@ watch(
         :show-release-action="isAdmin"
         @release-lock="(sub: SubTaskItem) => { releaseTarget = sub }"
       />
-      <BaseButton v-if="nextCursor" variant="secondary" @click="loadChildren(nextCursor)">
+      <BaseButton v-if="nextCursor" variant="secondary" :disabled="childrenLoading" @click="loadChildren(nextCursor)">
         {{ t('task.list.loadMore') }}
       </BaseButton>
 

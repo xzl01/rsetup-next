@@ -134,11 +134,18 @@ describe('TaskDetailView authorization projection and cancellation', () => {
     expect(onCancel).not.toHaveBeenCalled()
   })
 
-  it('paginates children with the opaque cursor', async () => {
-    const onLoadChildren = vi.fn(async () => ({ items: [child({ id: SUB_B })], next_cursor: null }))
+  it('paginates children with the opaque cursor and disables load more while a page is in flight', async () => {
+    let resolvePage!: (v: { items: SubTaskItem[]; next_cursor: string | null }) => void
+    const onLoadChildren = vi.fn(() => new Promise<{ items: SubTaskItem[]; next_cursor: string | null }>((r) => { resolvePage = r }))
     mount({ taskId: TASK_ID, initialTask: heldTask, initialChildren: [child()], initialNextCursor: 'cursor-1', onLoadChildren })
     await fireEvent.click(screen.getByRole('button', { name: name('task.list.loadMore') }))
     expect(onLoadChildren).toHaveBeenCalledWith(TASK_ID, 'cursor-1')
+    // 分页在途：加载更多进入禁用态，重复点击不得再次发起请求或推进读取代际
+    const loadMore = screen.getByRole('button', { name: name('task.list.loadMore') }) as HTMLButtonElement
+    expect(loadMore.disabled).toBe(true)
+    await fireEvent.click(loadMore)
+    expect(onLoadChildren).toHaveBeenCalledTimes(1)
+    resolvePage({ items: [child({ id: SUB_B })], next_cursor: null })
     await waitFor(() => expect(screen.getByTestId(`subtask-row-${SUB_B}`)).toBeTruthy())
   })
 
@@ -161,6 +168,9 @@ describe('TaskDetailView authorization projection and cancellation', () => {
       reason: '现场确认已重启',
     }))
     await waitFor(() => expect(reloaded).toHaveBeenCalledWith(TASK_ID, null))
+    // 主任务状态直接定位 task-state 元素：主任务 held 文案与子任务 held 文案同词（"等待核验"），
+    // 通用文本查询会与子任务行混淆
+    expect(screen.getByTestId('task-state').textContent).toContain(i18n.t('task.mainState.held'))
   })
 })
 
@@ -416,6 +426,48 @@ describe('TaskDetailView generation defense', () => {
     expect(onLoadChildren).toHaveBeenCalledTimes(2)
     expect(screen.getByTestId(`subtask-row-${SUB_A}`).textContent).toContain(i18n.t('task.state.queued'))
     // 过期 next_cursor 不得复活加载更多按钮
+    expect(screen.queryByRole('button', { name: name('task.list.loadMore') })).toBeNull()
+  })
+
+  it('never lets a stale-cursor page reverse-eliminate the in-flight post-write first page', async () => {
+    // 审查 Important 回归：释放锁成功启动 loadChildren(null) 后，若旧 nextCursor 仍可点，
+    // 旧游标分页会推进 childrenGeneration，把权威 GET(null) 写后快照判为 stale 丢弃，
+    // 旧列表追加旧页并保留已释放锁前的旧状态与释放入口。修复后首屏重刷立即清空旧游标，
+    // 且任意 children 读取在途时加载更多禁用，反向淘汰路径不复存在
+    const flush = () => new Promise<void>((r) => setTimeout(r, 0))
+    let resolveRefetch!: (v: { items: SubTaskItem[]; next_cursor: string | null }) => void
+    const onLoadChildren = vi.fn((_id: string, cursor: string | null) => {
+      if (cursor === null) {
+        // 写后 GET(null) 权威重取：挂起在途（网络迟缓）
+        return new Promise<{ items: SubTaskItem[]; next_cursor: string | null }>((r) => { resolveRefetch = r })
+      }
+      // 旧游标分页若被发起即视为竞态复活：返回释放锁前的旧快照页（未释放、带释放入口）
+      return Promise.resolve({ items: [child({ id: SUB_B, state: 'unknown', lock_released: false })], next_cursor: null })
+    })
+    const onReleaseLock = vi.fn(async () => undefined)
+    mount({
+      taskId: TASK_ID,
+      initialTask: heldTask,
+      initialChildren: [child({ state: 'unknown', lock_released: false })],
+      initialNextCursor: 'cursor-old',
+      isAdmin: true, onReleaseLock, onLoadChildren,
+    })
+    // 挂载时已有旧页与旧游标：加载更多可点
+    expect(screen.getByRole('button', { name: name('task.list.loadMore') })).toBeTruthy()
+    await fireEvent.click(screen.getByTestId(`release-lock-${SUB_A}`))
+    await fireEvent.update(screen.getByLabelText(name('task.field.releaseReason')), '现场确认已重启')
+    await fireEvent.click(screen.getByRole('checkbox', { name: name('task.risk.acknowledgeUnknown') }))
+    await fireEvent.click(screen.getByTestId('confirm-release'))
+    await waitFor(() => expect(onLoadChildren).toHaveBeenCalledWith(TASK_ID, null))
+    await flush()
+    // 首屏重刷在途：旧游标已清空，加载更多不可点，无法用旧游标推进读取代际
+    expect(screen.queryByRole('button', { name: name('task.list.loadMore') })).toBeNull()
+    expect(onLoadChildren).toHaveBeenCalledTimes(1)
+    // 权威写后快照返回：只呈现释放后的新状态，无释放前旧状态、旧页或多余游标残留
+    resolveRefetch({ items: [child({ state: 'unknown', lock_released: true })], next_cursor: null })
+    await waitFor(() => expect(screen.queryByTestId(`release-lock-${SUB_A}`)).toBeNull())
+    expect(onLoadChildren).toHaveBeenCalledTimes(1)
+    expect(screen.queryByTestId(`subtask-row-${SUB_B}`)).toBeNull()
     expect(screen.queryByRole('button', { name: name('task.list.loadMore') })).toBeNull()
   })
 })
