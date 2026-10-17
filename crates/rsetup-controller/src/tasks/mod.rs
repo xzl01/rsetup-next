@@ -1,5 +1,6 @@
-//! 任务域：模型、预览纯逻辑、调度准入与只读恢复纯逻辑、仓储边界与编排服务。
+//! 任务域：模型、预览纯逻辑、调度准入与只读恢复纯逻辑、仓储边界、编排服务与 HTTP 端点。
 
+pub mod http;
 pub mod model;
 pub mod preview;
 pub mod recovery;
@@ -27,3 +28,5 @@ macro_rules! params {
 
 pub mod repository;
 pub mod service;
+
+pub use http::build_tasks_router;
