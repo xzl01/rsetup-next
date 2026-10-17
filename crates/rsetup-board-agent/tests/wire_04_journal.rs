@@ -747,3 +747,173 @@ fn insert_accepted_rejects_non_canonical_uuid_v4_before_touching_disk() {
     assert_eq!(reread.state, TaskState::Accepted);
     assert_eq!(reread.pre_boot_id, BOOT_OLD);
 }
+
+/// TR-R11-1（Critical）：`pre_boot_id` 是 `accepted` 时刻即固化的**意图基线**，
+/// 任何入站记录都不得改写。否则入站 `Attempted(v3, pre_boot_id=B)` 覆盖原 `pre_boot_id=A` 后，
+/// `apply_boot_transition_evidence(A)` 会因 `B != A` 误判发生重启并伪造 `Succeeded`。
+#[test]
+fn merge_rejects_higher_version_with_different_pre_boot_id() {
+    let dir = TempDir::new("merge_pre_boot");
+    let key = [9u8; 32];
+    let store = open_store(&dir);
+    store
+        .insert_accepted(&key, SUB_TASK, &[0u8; 32], BOOT_OLD)
+        .expect("accepted");
+    let attempted = store.mark_attempted(&key, SUB_TASK).expect("attempted");
+    let logs_path = dir.path().join(JournalStore::<RealFs>::LOG_FILE);
+    let logs_before = std::fs::read(&logs_path).expect("read logs");
+
+    // 入站：同任务、同 epoch、同状态、形状合法，仅 pre_boot_id 换成另一 boot 代际且版本更高
+    let mut forged = attempted.clone();
+    forged.pre_boot_id = BOOT_NEW.to_string();
+    forged.record_version = attempted.record_version + 1;
+    assert_eq!(
+        store.merge_evidence(&key, &forged),
+        Ok(EvidenceMerge::Conflict(attempted.clone())),
+        "不同 pre_boot_id 的高版本记录绝不允许替换"
+    );
+    assert_eq!(
+        store.get(&key, SUB_TASK).expect("get").unwrap(),
+        attempted,
+        "内存原记录不得被改写"
+    );
+    assert_eq!(
+        std::fs::read(&logs_path).expect("re-read logs"),
+        logs_before,
+        "被拒绝的合并必须零写盘"
+    );
+
+    // 攻击链闭合：意图基线仍是 BOOT_OLD，同 boot 恢复不构成重启证据，绝不伪造 Succeeded
+    assert!(
+        store
+            .apply_boot_transition_evidence(BOOT_OLD)
+            .expect("apply")
+            .is_empty(),
+        "同 boot 不得写入成功证据"
+    );
+    let after = store.get(&key, SUB_TASK).expect("get").unwrap();
+    assert_eq!(after.state, TaskState::Attempted);
+    assert_eq!(after.pre_boot_id, BOOT_OLD);
+    assert_eq!(after.observed_boot_id, None);
+    assert_eq!(after.evidence_kind, None);
+    assert_eq!(after.record_version, attempted.record_version);
+    assert_eq!(
+        std::fs::read(&logs_path).expect("re-read logs"),
+        logs_before,
+        "整条攻击链零写盘"
+    );
+}
+
+/// TR-R11-1：已固化 `Succeeded` 的 `observed_boot_id` 与 `evidence_kind` 同样不得被冲突数据替换。
+/// 状态本身相同（`Succeeded`→`Succeeded`）时终态全封闭守卫不触发，必须由证据字段守卫兜住。
+#[test]
+fn merge_never_replaces_frozen_boot_evidence_of_succeeded_record() {
+    const BOOT_THIRD: &str = "6f8b1c2d-0000-4000-8000-000000000003";
+    let dir = TempDir::new("merge_frozen_evidence");
+    let key = [9u8; 32];
+    let store = open_store(&dir);
+    store
+        .insert_accepted(&key, SUB_TASK, &[0u8; 32], BOOT_OLD)
+        .expect("accepted");
+    store.mark_attempted(&key, SUB_TASK).expect("attempted");
+    let succeeded = store
+        .finish_succeeded_with_boot(&key, SUB_TASK, BOOT_NEW)
+        .expect("succeeded");
+    let logs_path = dir.path().join(JournalStore::<RealFs>::LOG_FILE);
+    let logs_before = std::fs::read(&logs_path).expect("read logs");
+
+    // 同状态、更高版本、证据本身合法，但观察代际不同：不得替换已落盘的 observed_boot_id
+    let mut rival = succeeded.clone();
+    rival.observed_boot_id = Some(BOOT_THIRD.to_string());
+    rival.record_version = succeeded.record_version + 1;
+    assert_eq!(
+        store.merge_evidence(&key, &rival),
+        Ok(EvidenceMerge::Conflict(succeeded.clone())),
+        "已固化的 observed_boot_id 不得被替换"
+    );
+    // 同状态、更高版本、抹掉 evidence_kind：同样不得替换已固化的证据种类
+    let mut stripped = succeeded.clone();
+    stripped.evidence_kind = None;
+    stripped.record_version = succeeded.record_version + 1;
+    assert_eq!(
+        store.merge_evidence(&key, &stripped),
+        Ok(EvidenceMerge::Conflict(succeeded.clone())),
+        "已固化的 evidence_kind 不得被抹除"
+    );
+
+    let after = store.get(&key, SUB_TASK).expect("get").unwrap();
+    assert_eq!(after, succeeded, "终态记录整体原样不动");
+    assert_eq!(after.observed_boot_id.as_deref(), Some(BOOT_NEW));
+    assert_eq!(
+        after.evidence_kind.as_deref(),
+        Some("boot_transition_observed")
+    );
+    assert_eq!(
+        std::fs::read(&logs_path).expect("re-read logs"),
+        logs_before,
+        "被拒绝的合并必须零写盘"
+    );
+}
+
+/// 毒锁测试缝（`test-seam`）：`records` 互斥锁被毒化后，全部读写入口必须 fail-closed
+/// 返回 `JournalError::Io`，绝不 panic、不吞毒继续返回旧内存快照；毒化仅限本实例，
+/// 磁盘完好，重开（新实例、新锁）后记录仍可正常读取。
+#[test]
+#[cfg(feature = "test-seam")]
+fn poisoned_records_mutex_fails_closed_with_io() {
+    let dir = TempDir::new("poison-records");
+    let key = [9u8; 32];
+    let store = open_store(&dir);
+    store
+        .insert_accepted(&key, SUB_TASK, &[0u8; 32], BOOT_OLD)
+        .expect("accepted");
+    let stored = store.get(&key, SUB_TASK).expect("get").expect("record");
+    let logs_path = dir.path().join(JournalStore::<RealFs>::LOG_FILE);
+    let logs_before = std::fs::read(&logs_path).expect("read logs");
+
+    store.poison_records_for_test();
+
+    let err = store
+        .get(&key, SUB_TASK)
+        .expect_err("poisoned records mutex must fail closed");
+    assert!(
+        matches!(err, JournalError::Io(ref msg) if msg == "journal.records poisoned"),
+        "毒锁必须返回固定去敏 Io，实际 {err:?}"
+    );
+    // 其余入口同样在加锁处 fail-closed：不 panic、不落盘
+    let unused_sub_task = "11111111-2222-4333-8444-555555555555";
+    assert!(matches!(
+        store.insert_accepted(&key, unused_sub_task, &[0u8; 32], BOOT_OLD),
+        Err(JournalError::Io(_))
+    ));
+    assert!(matches!(
+        store.mark_attempted(&key, SUB_TASK),
+        Err(JournalError::Io(_))
+    ));
+    assert!(matches!(
+        store.finish(&key, SUB_TASK, TaskState::Failed, Some("OS_ERROR")),
+        Err(JournalError::Io(_))
+    ));
+    assert!(matches!(
+        store.merge_evidence(&key, &stored),
+        Err(JournalError::Io(_))
+    ));
+    assert!(matches!(
+        store.apply_boot_transition_evidence(BOOT_NEW),
+        Err(JournalError::Io(_))
+    ));
+    assert_eq!(
+        std::fs::read(&logs_path).expect("re-read logs"),
+        logs_before,
+        "毒锁路径必须零写盘"
+    );
+
+    // 毒化只影响本实例的锁：磁盘完好，重开后记录仍可读取
+    drop(store);
+    let reopened = open_store(&dir);
+    let reread = reopened
+        .get(&key, SUB_TASK)
+        .expect("get")
+        .expect("record survives poison of a different instance");
+    assert_eq!(reread, stored);
+}

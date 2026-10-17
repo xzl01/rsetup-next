@@ -707,6 +707,18 @@ impl<F: Fs> JournalStore<F> {
             .map_err(|_| JournalError::Io("journal.records poisoned".to_string()))
     }
 
+    /// 仅测试用途（`test-seam`）：故意在持锁期间 panic，把 `records` 互斥锁毒化，
+    /// 用于验证 `lock_records` 的 fail-closed 分支（`get`/`insert_accepted`/`mark_attempted`/
+    /// `merge_evidence` 等入口返回 `JournalError::Io`，绝不 panic、不吞毒继续读）。
+    /// `catch_unwind` 吞掉 panic 本身，测试进程继续运行；毒化只影响本实例的锁。
+    #[cfg(any(test, feature = "test-seam"))]
+    pub fn poison_records_for_test(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self.records.lock().unwrap();
+            panic!("poisoning journal records mutex for test");
+        }));
+    }
+
     /// 以当前 epoch 把整份记录集两阶段落盘（唯一整文件提交入口，统一经 `commit_durable`，
     /// 因此 `CommitUnknown` 必然先置 uncertain 隔离态再返回）。
     fn write_logs(&self, records: &[StoredRecord]) -> Result<(), JournalError> {
@@ -942,12 +954,17 @@ impl<F: Fs> JournalStore<F> {
     /// 证据合并：先做合法性守卫（任一不满足 → `Conflict(stored)`，零写盘、绝不改原记录），
     /// 全部守卫通过后才比较版本。守卫顺序：
     /// 1. 同一 `journal_epoch`（`record_version` 只在当前 epoch 内可比，跨 epoch 高版本也不得采用）、
-    ///    同一 `sub_task_id`、同一 `schema_version`，且入站记录形状本身可安全持久化；
+    ///    同一 `sub_task_id`、同一 `schema_version`、同一 `pre_boot_id`，且入站记录形状本身可安全持久化；
+    ///    TR-R11-1 `pre_boot_id` 是 `accepted` 时刻即固化的**意图基线**，任何入站记录都不得改写：
+    ///    否则 `Attempted(v3, pre_boot_id=B)` 会覆盖原 `pre_boot_id=A`，随后
+    ///    `apply_boot_transition_evidence(A)` 因 `B != A` 误判发生重启并伪造 `Succeeded`；
     /// 2. TR-R10-1 已存终态全封闭（04 规格 L69–70、L119–124）：`stored` 处于 `Failed`/`Succeeded`
     ///    时，任何不同状态的后续跃迁——无论版本多高、无论是中间态回退、矛盾的另一终态还是
     ///    `Unknown` 中继——一律 `Conflict`，封死 `Failed(v3)→Unknown(v4)→Succeeded(v5)` 两步绕过；
-    /// 3. TR-R9-1 `Succeeded` 必须携带完整 boot transition 证据；
-    /// 4. 已存中间态只允许向终态收敛（同状态的高版本更新除外），不得借合并回退。
+    /// 3. TR-R11-1 已存终态的 boot 证据字段（`observed_boot_id`、`evidence_kind`）同样固化：
+    ///    同状态（如 `Succeeded`→`Succeeded`）的高版本记录也不得替换已落盘的观察代际与证据种类；
+    /// 4. TR-R9-1 `Succeeded` 必须携带完整 boot transition 证据；
+    /// 5. 已存中间态只允许向终态收敛（同状态的高版本更新除外），不得借合并回退。
     pub fn merge_evidence(
         &self,
         controller_key: &[u8; 32],
@@ -962,11 +979,21 @@ impl<F: Fs> JournalStore<F> {
         if incoming.journal_epoch != stored.journal_epoch
             || incoming.sub_task_id != stored.sub_task_id
             || incoming.schema_version != stored.schema_version
+            || incoming.pre_boot_id != stored.pre_boot_id
             || !persisted_shape_is_valid(incoming)
         {
             return Ok(EvidenceMerge::Conflict(stored));
         }
         if stored.state.is_terminal() && incoming.state != stored.state {
+            return Ok(EvidenceMerge::Conflict(stored));
+        }
+        // TR-R11-1：终态记录已固化的 boot 证据字段不得被替换。上方守卫只锁状态本身，
+        // 同状态高版本（Succeeded→Succeeded）会走到整条复制分支，用入站的
+        // observed_boot_id/evidence_kind 改写已落盘的观察代际，等价于伪造成功证据。
+        if stored.state.is_terminal()
+            && (incoming.observed_boot_id != stored.observed_boot_id
+                || incoming.evidence_kind != stored.evidence_kind)
+        {
             return Ok(EvidenceMerge::Conflict(stored));
         }
         if incoming.state == TaskState::Succeeded && !has_valid_boot_transition_evidence(incoming) {
