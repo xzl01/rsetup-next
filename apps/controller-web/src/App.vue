@@ -243,7 +243,14 @@ const tasksGeneration = ref(0)
 function handleAuthorizationChanged() {
   // ① 任务视图整体重建：旧实例与其在途请求（onBeforeUnmount 的 abort）一起作废
   tasksGeneration.value += 1
-  // ② 设备权限投影同样失效：先清空旧投影（fail-closed，绝不继续用旧授权放行危险操作），再按当前授权重载
+  // ② 清除 URL 上的待处理设备 query：深链 `#/tasks?device=<id>` 携带的预选意图属于上一授权代际，
+  // 若保留，设备重载后 tasksPendingDevice 会重新命中，重建的 TasksView 会把用户已取消勾选的
+  // 设备重新勾回，使已取消的意图跨授权代际复活。导航到无 query 的 #/tasks 一并销毁该意图。
+  const current = router.currentRoute.value
+  if (current.name === 'tasks' && current.query?.device) {
+    router.navigate({ name: 'tasks' })
+  }
+  // ③ 设备权限投影同样失效：先清空旧投影（fail-closed，绝不继续用旧授权放行危险操作），再按当前授权重载
   devicesGeneration++
   devicesList.value = []
   devicesNextCursor.value = null

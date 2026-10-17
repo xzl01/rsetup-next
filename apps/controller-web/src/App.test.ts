@@ -1584,6 +1584,53 @@ describe('signed_in session management UI (Task 5)', () => {
     expect(window.location.hash).toBe('#/tasks')
   })
 
+  // Task 10 Fix 2：深链 query 携带的待处理设备意图属于上一授权代际。
+  // 用户取消勾选后触发 permissions.changed，重建的 TasksView 绝不得把已取消的设备重新勾回，
+  // URL 上的旧 device query 亦须被清除，防止设备重载后 tasksPendingDevice 重新命中并复活旧意图。
+  test('深链 #/tasks?device 进入并取消勾选后 permissions.changed：清除待处理设备 query 且设备不复活', async () => {
+    const devA = 'a'.repeat(64)
+    const devB = 'b'.repeat(64)
+    let tasksCalls = 0
+    let devicesCalls = 0
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input)
+      if (url.includes('/api/v1/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
+      if (url.includes('/api/v1/devices')) {
+        devicesCalls += 1
+        return jsonResponse({ data: { items: [
+          { device_id: devA, display_name: 'Alpha', effective_permissions: ['device.read', 'device.task.read', 'device.reboot'] },
+          { device_id: devB, display_name: 'Beta', effective_permissions: ['device.read', 'device.task.read', 'device.reboot'] },
+        ], next_cursor: null }, request_id: RID_DEV })
+      }
+      if (url.includes('/api/v1/tasks')) {
+        tasksCalls += 1
+        return jsonResponse({ data: { items: [], next_cursor: null }, request_id: RID_TASKS })
+      }
+      return jsonResponse({ error: { code: 'NOT_FOUND', message_key: 'errors.notFound' }, request_id: RID_NF }, 404)
+    }))
+
+    // 深链冷启动：URL 携带待处理设备，设备列表到位后 Alpha 被自动预选
+    window.location.hash = `#/tasks?device=${devA}`
+    render(App)
+    await vi.waitFor(() => expect((screen.getByTestId(`task-device-${devA}`) as HTMLInputElement).checked).toBe(true))
+    expect(window.location.hash).toBe(`#/tasks?device=${devA}`)
+
+    // 用户手动取消勾选 = 已取消的意图，必须跨授权代际保持取消
+    await fireEvent.click(screen.getByTestId(`task-device-${devA}`))
+    expect((screen.getByTestId(`task-device-${devA}`) as HTMLInputElement).checked).toBe(false)
+
+    window.dispatchEvent(new Event('permissions.changed'))
+
+    // 视图随授权代际重建并重新拉取任务与设备
+    await vi.waitFor(() => expect(tasksCalls).toBe(2))
+    await vi.waitFor(() => expect(devicesCalls).toBe(2))
+    // 旧的待处理设备 query 被清除，绝不残留在 URL 上供重建视图重新预选
+    expect(window.location.hash).toBe('#/tasks')
+    // 重建后的新视图不得把用户已取消的设备重新勾回（旧意图不跨授权代际复活）
+    await vi.waitFor(() => expect((screen.getByTestId(`task-device-${devA}`) as HTMLInputElement).checked).toBe(false))
+    expect((screen.getByTestId(`task-device-${devB}`) as HTMLInputElement).checked).toBe(false)
+  })
+
   test('permissions.changed 重建任务详情视图：重新拉取主任务与子任务，不残留旧授权代际数据', async () => {
     const counters = { detail: 0, children: 0, devices: 0 }
     stubTaskDetailFetch(counters)
