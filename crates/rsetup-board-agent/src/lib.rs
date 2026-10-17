@@ -8,6 +8,7 @@ pub mod read_only;
 #[cfg(any(test, feature = "test-seam"))]
 pub mod test_seam;
 pub mod tickets;
+pub mod tunnel_binding;
 
 pub use actions::{
     ACTION_ALLOWLIST, ActionKind, ActionSpec, allowed_action_names, is_reserved, lookup_action,
@@ -25,3 +26,4 @@ pub use tickets::{
     TICKET_TOKEN_BYTES, TICKET_TTL_MS, TICKET_TTL_SECS, TicketBinding, TicketManager, TicketOrigin,
     TicketToken,
 };
+pub use tunnel_binding::{ApprovalGate, DualStreamBinding, StreamError, StreamState, StreamType};
