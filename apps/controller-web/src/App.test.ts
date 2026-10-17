@@ -29,6 +29,9 @@ const RID_ERR = '678d9abc-2d5f-47a9-99ab-97bb69629555';
 const RID_NULL = '789eabcd-3e6a-48ba-babc-a8cc7a73a666';
 const RID_DEV_DETAIL = 'abcdef01-2345-4678-9abc-def012345678';
 const RID_DEV_STATUS = '456789ab-cdef-4123-8456-789abcdef012';
+const RID_DEV = '11111111-2222-4333-8444-555555555555';
+const RID_TASKS = '22222222-3333-4444-8555-666666666666';
+const RID_NF = '33333333-4444-4555-8666-777777777777';
 
 const ME_DATA = {
   user: CONTRACT_USER,
@@ -1349,4 +1352,106 @@ describe('signed_in session management UI (Task 5)', () => {
     expect(dispatchedUrls.some((u) => u.endsWith(`/devices/${DEV_DUP}/status`))).toBe(false);
     expect(dispatchedUrls.some((u) => u.endsWith(`/devices/${DEV_DUP}`))).toBe(true);
   });
+
+  test('device reboot entry navigates to the tasks route carrying the device id and issues no write request', async () => {
+    fetchForMe(jsonResponse({ data: ME_DATA, request_id: RID_ME }))
+    const fetcher = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/v1/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
+      if (url.includes('/api/v1/devices')) {
+        return jsonResponse({ data: { items: [{
+          device_id: 'a'.repeat(64), display_name: 'Alpha',
+          effective_permissions: ['device.read', 'device.task.read', 'device.reboot'],
+        }], next_cursor: null }, request_id: RID_DEV })
+      }
+      if (url.includes('/api/v1/tasks')) return jsonResponse({ data: { items: [], next_cursor: null }, request_id: RID_TASKS })
+      return jsonResponse({ error: { code: 'NOT_FOUND', message_key: 'errors.notFound' }, request_id: RID_NF }, 404)
+    })
+    vi.stubGlobal('fetch', fetcher)
+
+    // 隔离旧路由初态：App.test.ts 前序旧 test 结束后可能遗留 #/devices/<id>，此处显式回到设备列表初态
+    window.location.hash = '#/devices'
+    render(App)
+    await vi.waitFor(() => expect(screen.getByText('Alpha')).toBeTruthy())
+    await fireEvent.click(screen.getByTestId(`reboot-action-${'a'.repeat(64)}`))
+
+    await vi.waitFor(() => expect(window.location.hash).toBe(`#/tasks?device=${'a'.repeat(64)}`))
+    const writes = fetcher.mock.calls.filter(([, init]) => (init as RequestInit | undefined)?.method === 'POST')
+    expect(writes).toHaveLength(0)
+  })
+
+  test('renders the tasks view for the tasks route without admin-only release controls', async () => {
+    fetchForMe(jsonResponse({ data: ME_DATA, request_id: RID_ME }))
+    const fetcher = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/v1/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
+      if (url.includes('/api/v1/devices')) return jsonResponse({ data: { items: [], next_cursor: null }, request_id: RID_DEV })
+      if (url.includes('/api/v1/tasks')) return jsonResponse({ data: { items: [{
+        id: 'f47ac10b-58cc-4372-a567-0e02b2c3d479', operation: 'reboot', state: 'running', outcome: null,
+        revision: '7',
+        created_time: {
+          system_wall_utc: '2026-10-16T00:00:00Z', reference_utc: '2026-10-16T00:00:00Z',
+          quality: 'system_fallback', clock_epoch: '0f8fad5b-d9cb-469f-a165-70867728950e',
+          source: null, sample_age_ms: null, offset_ms: null, uncertainty_ms: null,
+        },
+        counts: { queued: '0', held: '0', dispatching: '0', accepted: '0', verifying: '0', succeeded: '0', failed: '0', unknown: '0', cancelled: '0', expired: '0' },
+        view_scope: 'authorized_subset',
+      }], next_cursor: null }, request_id: RID_TASKS })
+      return jsonResponse({ error: { code: 'NOT_FOUND', message_key: 'errors.notFound' }, request_id: RID_NF }, 404)
+    })
+    vi.stubGlobal('fetch', fetcher)
+    window.location.hash = '#/tasks'
+    render(App)
+    await vi.waitFor(() => expect(screen.getByRole('heading', { name: '任务列表' })).toBeTruthy())
+    expect(screen.queryByRole('button', { name: /释放设备占用/ })).toBeNull()
+    expect(window.location.hash).toBe('#/tasks')
+  })
+
+  test('cold start on #/tasks?device=<id> loads the minimal device list and preselects the pending device', async () => {
+    const deviceId = 'a'.repeat(64)
+    const fetcher = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/v1/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
+      if (url.includes('/api/v1/devices')) {
+        return jsonResponse({ data: { items: [
+          { device_id: deviceId, display_name: 'Alpha', effective_permissions: ['device.read', 'device.task.read', 'device.reboot'] },
+          { device_id: 'b'.repeat(64), display_name: 'Beta', effective_permissions: ['device.read', 'device.task.read'] },
+        ], next_cursor: null }, request_id: RID_DEV })
+      }
+      if (url.includes('/api/v1/tasks')) return jsonResponse({ data: { items: [], next_cursor: null }, request_id: RID_TASKS })
+      return jsonResponse({ error: { code: 'NOT_FOUND', message_key: 'errors.notFound' }, request_id: RID_NF }, 404)
+    })
+    vi.stubGlobal('fetch', fetcher)
+
+    // 冷启动：render 前 hash 已是目标 URL，devicesList 初始恒空，由 App.vue watch 的 tasks 分支触发 loadDevices
+    window.location.hash = `#/tasks?device=${deviceId}`
+    render(App)
+    await vi.waitFor(() => expect(screen.getByRole('checkbox', { name: 'Alpha' })).toBeTruthy())
+    expect(fetcher.mock.calls.some((call) => String(call[0]).includes('/api/v1/devices'))).toBe(true)
+    expect((screen.getByRole('checkbox', { name: 'Alpha' }) as HTMLInputElement).checked).toBe(true)
+    expect((screen.getByRole('checkbox', { name: 'Beta' }) as HTMLInputElement).checked).toBe(false)
+  })
+
+  test('direct navigation (refresh) to #/tasks triggers the minimal device list load', async () => {
+    const fetcher = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/v1/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
+      if (url.includes('/api/v1/devices')) {
+        return jsonResponse({ data: { items: [
+          { device_id: 'a'.repeat(64), display_name: 'Alpha', effective_permissions: ['device.read', 'device.reboot'] },
+        ], next_cursor: null }, request_id: RID_DEV })
+      }
+      if (url.includes('/api/v1/tasks')) return jsonResponse({ data: { items: [], next_cursor: null }, request_id: RID_TASKS })
+      return jsonResponse({ error: { code: 'NOT_FOUND', message_key: 'errors.notFound' }, request_id: RID_NF }, 404)
+    })
+    vi.stubGlobal('fetch', fetcher)
+
+    // 刷新/直接导航：先隔离前序 test 遗留路由初态，render 前 hash 直接置为 #/tasks
+    window.location.hash = '#/devices'
+    window.location.hash = '#/tasks'
+    render(App)
+    await vi.waitFor(() => expect(screen.getByRole('checkbox', { name: 'Alpha' })).toBeTruthy())
+    expect(fetcher.mock.calls.some((call) => String(call[0]).includes('/api/v1/devices'))).toBe(true)
+    expect(window.location.hash).toBe('#/tasks')
+  })
 });

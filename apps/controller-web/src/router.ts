@@ -7,7 +7,7 @@ export type AppRoute =
   | { name: 'sessions' }
   | { name: 'devices' }
   | { name: 'device-detail'; params: { id: string } }
-  | { name: 'tasks' }
+  | { name: 'tasks'; query?: { device: string } }
   | { name: 'task-detail'; params: { id: string } }
   | { name: 'admin-approvals' }
   | { name: 'admin-groups' }
@@ -28,6 +28,15 @@ export interface AppRouter {
 export const DEVICE_ID_HEX64 = /^[0-9a-f]{64}$/
 export const TASK_ID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 
+function parseTasksQuery(search: string): { query?: { device: string } } {
+  if (!search) return {}
+  const params = new URLSearchParams(search)
+  if (params.size !== 1) return {}
+  const device = params.get('device')
+  if (device === null || !DEVICE_ID_HEX64.test(device)) return {}
+  return { query: { device } }
+}
+
 function parseHash(hash: string): AppRoute {
   const path = hash.replace(/^#\/?/, '')
   if (!path || path === 'login') return { name: 'login' }
@@ -43,7 +52,11 @@ function parseHash(hash: string): AppRoute {
     // Fail closed: malformed id falls back to devices
     return { name: 'devices' }
   }
-  if (path === 'tasks') return { name: 'tasks' }
+  if (path === 'tasks' || path.startsWith('tasks?')) {
+    const question = path.indexOf('?')
+    const search = question < 0 ? '' : path.slice(question + 1)
+    return { name: 'tasks', ...parseTasksQuery(search) }
+  }
   const taskMatch = path.match(/^tasks\/([a-zA-Z0-9_-]+)$/)
   if (taskMatch) {
     const id = taskMatch[1] ?? ''
@@ -70,7 +83,7 @@ function formatRouteToHash(route: AppRoute): string {
     case 'sessions': return '#/sessions'
     case 'devices': return '#/devices'
     case 'device-detail': return `#/devices/${route.params.id}`
-    case 'tasks': return '#/tasks'
+    case 'tasks': return route.query?.device ? `#/tasks?device=${route.query.device}` : '#/tasks'
     case 'task-detail': return `#/tasks/${route.params.id}`
     case 'admin-approvals': return '#/admin/approvals'
     case 'admin-groups': return '#/admin/groups'

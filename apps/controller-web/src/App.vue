@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, provide, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, provide, ref, watch } from 'vue'
 import AppNotice from './components/AppNotice.vue'
 import BaseButton from './components/BaseButton.vue'
 import LoginView from './views/LoginView.vue'
@@ -7,11 +7,25 @@ import PasswordView from './views/PasswordView.vue'
 import SessionsView from './views/SessionsView.vue'
 import DevicesView from './views/DevicesView.vue'
 import DeviceDetailView from './views/DeviceDetailView.vue'
+import TasksView from './views/TasksView.vue'
+import TaskDetailView from './views/TaskDetailView.vue'
 import { createI18n, type Locale } from './i18n'
 import { createAuth } from './auth'
 import { createRouter, type AppRoute } from './router'
 import { get } from './api'
 import { assertDeviceListPageShape, type DeviceItem, type DeviceListPage } from './types'
+import {
+  createTaskPreview,
+  submitTask,
+  cancelTask,
+  listTasks,
+  getTask,
+  getTaskChildren,
+  reviewHeldTime,
+  releaseUnknownLock,
+  type TimeReviewEvidenceKind,
+} from './task-requests'
+import type { SubTaskItem, TaskItem, TaskPage, TaskPreview } from './task-ops'
 
 const i18nInstance = createI18n()
 const { locale, t, setLocale } = i18nInstance
@@ -19,6 +33,107 @@ provide('i18n', i18nInstance)
 
 const auth = createAuth()
 const router = createRouter(auth)
+
+const DEVICE_ID_HEX64 = /^[0-9a-f]{64}$/i
+
+const route = computed(() => router.currentRoute.value)
+
+const tasksPendingDevice = computed<string | null>(() => {
+  const current = route.value
+  const device = current.name === 'tasks' ? current.query?.device ?? null : null
+  return device !== null && devicesList.value.some((d) => d.device_id === device) ? device : null
+})
+
+const taskPermissionByDevice = computed<Record<string, string[]>>(() => {
+  const permissions: Record<string, string[]> = {}
+  for (const device of devicesList.value) {
+    permissions[device.device_id] = device.effective_permissions ?? []
+  }
+  return permissions
+})
+
+function handleRebootDevice(deviceId: string) {
+  if (!DEVICE_ID_HEX64.test(deviceId)) return
+  navigateTo({ name: 'tasks', query: { device: deviceId } })
+}
+
+async function adaptPreview(
+  operation: 'reboot',
+  deviceIds: string[],
+  signal?: AbortSignal,
+): Promise<TaskPreview> {
+  const res = await createTaskPreview(operation, deviceIds, {
+    csrfToken: auth.csrfToken.value ?? '',
+    signal,
+  })
+  return res.data
+}
+
+async function adaptSubmit(
+  payload: { preview_token: string; confirm: true },
+  options: { idempotencyKey: string; signal?: AbortSignal },
+): Promise<{ task_id: string; accepted: boolean }> {
+  const res = await submitTask({
+    previewToken: payload.preview_token,
+    idempotencyKey: options.idempotencyKey,
+    confirm: true,
+    context: { csrfToken: auth.csrfToken.value ?? '', signal: options.signal },
+  })
+  return res.data
+}
+
+async function adaptLoadTasks(
+  cursor: string | null,
+  signal?: AbortSignal,
+): Promise<TaskPage<TaskItem>> {
+  const res = await listTasks(cursor, { csrfToken: auth.csrfToken.value ?? '', signal })
+  return res.data
+}
+
+async function adaptLoadTask(
+  taskId: string,
+  signal?: AbortSignal,
+): Promise<TaskItem> {
+  const res = await getTask(taskId, { csrfToken: auth.csrfToken.value ?? '', signal })
+  return res.data
+}
+
+async function adaptLoadChildren(
+  taskId: string,
+  cursor: string | null,
+  signal?: AbortSignal,
+): Promise<TaskPage<SubTaskItem>> {
+  const res = await getTaskChildren(taskId, cursor, { csrfToken: auth.csrfToken.value ?? '', signal })
+  return res.data
+}
+
+async function adaptCancel(
+  payload: { taskId: string; expectedRevision: string; confirm: true },
+  signal?: AbortSignal,
+): Promise<void> {
+  await cancelTask({ ...payload, context: { csrfToken: auth.csrfToken.value ?? '', signal } })
+}
+
+async function adaptTimeReview(
+  payload: { taskId: string; expectedRevision: string; decision: 'resume_original_deadline' | 'expire'; evidence: TimeReviewEvidenceKind },
+  signal?: AbortSignal,
+): Promise<TaskItem> {
+  const res = await reviewHeldTime({ ...payload, context: { csrfToken: auth.csrfToken.value ?? '', signal } })
+  return res.data
+}
+
+async function adaptReleaseLock(
+  payload: { subtaskId: string; expected_revision: string; acknowledge_unknown: true; reason: string },
+  signal?: AbortSignal,
+): Promise<void> {
+  await releaseUnknownLock({
+    subTaskId: payload.subtaskId,
+    expectedRevision: payload.expected_revision,
+    acknowledgeUnknown: payload.acknowledge_unknown,
+    reason: payload.reason,
+    context: { csrfToken: auth.csrfToken.value ?? '', signal },
+  })
+}
 
 const busy = ref(false)
 const sessionChecked = ref(false)
@@ -94,6 +209,8 @@ watch(
       if (routeName === 'sessions') {
         void auth.listSessions()
       } else if (routeName === 'devices') {
+        void loadDevices()
+      } else if (routeName === 'tasks' && devicesList.value.length === 0 && !devicesLoading.value) {
         void loadDevices()
       } else if (routeName === 'device-detail') {
         const targetId = (router.currentRoute.value as { params?: { id?: string } }).params?.id
@@ -212,6 +329,13 @@ onUnmounted(() => {
         <BaseButton
           variant="secondary"
           :disabled="busy"
+          @click="() => navigateTo({ name: 'tasks' })"
+        >
+          {{ t('nav.tasks') }}
+        </BaseButton>
+        <BaseButton
+          variant="secondary"
+          :disabled="busy"
           @click="() => navigateTo({ name: 'sessions' })"
         >
           {{ t('auth.sessions.title') }}
@@ -232,6 +356,7 @@ onUnmounted(() => {
           @retry="loadDevices"
           @page-loaded="handlePageLoaded"
           @select-device="(id) => navigateTo({ name: 'device-detail', params: { id } })"
+          @reboot-device="handleRebootDevice"
         />
       </template>
       <template v-else-if="router.currentRoute.value.name === 'device-detail'">
@@ -239,6 +364,30 @@ onUnmounted(() => {
           v-if="getDevicePermissions(router.currentRoute.value.params.id)"
           :device-id="router.currentRoute.value.params.id"
           :permissions="getDevicePermissions(router.currentRoute.value.params.id)"
+        />
+      </template>
+      <template v-else-if="route.name === 'tasks'">
+        <TasksView
+          :devices="devicesList"
+          :pending-device-id="tasksPendingDevice"
+          :csrf-token="auth.csrfToken.value ?? ''"
+          @open-task="(id) => navigateTo({ name: 'task-detail', params: { id } })"
+          :on-preview="adaptPreview"
+          :on-submit="adaptSubmit"
+          :on-cancel="adaptCancel"
+          :on-load-tasks="adaptLoadTasks"
+        />
+      </template>
+      <template v-else-if="route.name === 'task-detail'">
+        <TaskDetailView
+          :task-id="route.params.id"
+          :is-admin="auth.user.value?.is_admin === true"
+          :device-permissions="taskPermissionByDevice"
+          :on-load-task="adaptLoadTask"
+          :on-load-children="adaptLoadChildren"
+          :on-cancel="adaptCancel"
+          :on-time-review="adaptTimeReview"
+          :on-release-lock="adaptReleaseLock"
         />
       </template>
       <template v-else>

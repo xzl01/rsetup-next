@@ -454,4 +454,50 @@ describe('client router hash synchronization & guards', () => {
       router.cleanup()
     })
   })
+
+  describe('tasks query routing for the device reboot entry', () => {
+    it('parses a hex64 device query into the tasks route', async () => {
+      const auth = fakeAuthStore(
+        { id: 'u-1', username: 'u', is_admin: false, must_change_password: false, revision: '1' },
+        'signed_in'
+      )
+      const router = createRouter(auth)
+      const device = 'a'.repeat(64)
+      window.location.hash = `#/tasks?device=${device}`
+      window.dispatchEvent(new HashChangeEvent('hashchange'))
+      await vi.waitFor(() => expect(router.currentRoute.value).toEqual({ name: 'tasks', query: { device } }))
+      window.location.hash = '#/tasks'
+      window.dispatchEvent(new HashChangeEvent('hashchange'))
+      await vi.waitFor(() => expect(router.currentRoute.value).toEqual({ name: 'tasks' }))
+      router.cleanup()
+    })
+
+    it('drops a malformed or unknown query instead of redirecting elsewhere', async () => {
+      const auth = fakeAuthStore(
+        { id: 'u-1', username: 'u', is_admin: false, must_change_password: false, revision: '1' },
+        'signed_in'
+      )
+      const router = createRouter(auth)
+      window.location.hash = '#/tasks?device=NOT-A-DEVICE'
+      window.dispatchEvent(new HashChangeEvent('hashchange'))
+      await vi.waitFor(() => expect(router.currentRoute.value).toEqual({ name: 'tasks' }))
+      window.location.hash = '#/tasks?device=' + 'a'.repeat(64) + '&extra=1'
+      window.dispatchEvent(new HashChangeEvent('hashchange'))
+      await vi.waitFor(() => expect(router.currentRoute.value).toEqual({ name: 'tasks' }))
+      router.cleanup()
+    })
+
+    it('keeps the devices fallback for non-tasks routes carrying a query', async () => {
+      const auth = fakeAuthStore(
+        { id: 'u-1', username: 'u', is_admin: false, must_change_password: false, revision: '1' },
+        'signed_in'
+      )
+      const router = createRouter(auth)
+      window.location.hash = '#/sessions?x=1'
+      window.dispatchEvent(new HashChangeEvent('hashchange'))
+      await vi.waitFor(() => expect(router.currentRoute.value).toEqual({ name: 'devices' }))
+      router.cleanup()
+    })
+  })
 })
+
