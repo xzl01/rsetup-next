@@ -193,6 +193,87 @@ pub fn eval_memory_permissions(
     evaluate_grants(actor.id, device_id, grants, roles, device_groups)
 }
 
+/// 权限点来源类别：admin shortcut、角色 grant 或直接 grant。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PermissionSourceKind {
+    Admin,
+    Role(Uuid),
+    Direct(Uuid),
+}
+
+/// 单个权限点及其确定性归因来源。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PermissionSourceEntry {
+    pub permission: Permission,
+    pub source: PermissionSourceKind,
+}
+
+/// 权限点来源归因（确定性）：admin shortcut → `Admin`；角色 grant → `Role(role_id)`；
+/// 直接 grant → `Direct(grant_id)`。scope 匹配语义与 `evaluate_grants` 完全一致，
+/// 输出按 permission 字典序 → kind 变体序 → id 字节序排序并去重。
+pub fn permission_sources(
+    user_id: [u8; 16],
+    device_id: [u8; 32],
+    grants: &[GrantRecord],
+    roles: &HashMap<Uuid, RoleRecord>,
+    device_groups: &HashSet<Uuid>,
+    is_admin: bool,
+) -> Vec<PermissionSourceEntry> {
+    if is_admin {
+        return ALL_DEVICE_PERMISSIONS
+            .iter()
+            .map(|permission| PermissionSourceEntry {
+                permission: *permission,
+                source: PermissionSourceKind::Admin,
+            })
+            .collect();
+    }
+    let mut entries = Vec::new();
+    for grant in grants {
+        if grant.user_id != user_id {
+            continue;
+        }
+        let scope_matches = match &grant.scope {
+            GrantScope::All => true,
+            GrantScope::Group(gid) => device_groups.contains(gid),
+            GrantScope::Device(did) => *did == device_id,
+        };
+        if !scope_matches {
+            continue;
+        }
+        match &grant.source {
+            GrantSource::Role(rid) => {
+                if let Some(role) = roles.get(rid) {
+                    if !role.archived {
+                        for permission in &role.permissions {
+                            entries.push(PermissionSourceEntry {
+                                permission: *permission,
+                                source: PermissionSourceKind::Role(*rid),
+                            });
+                        }
+                    }
+                }
+            }
+            GrantSource::Direct(perms) => {
+                for permission in perms {
+                    entries.push(PermissionSourceEntry {
+                        permission: *permission,
+                        source: PermissionSourceKind::Direct(grant.id),
+                    });
+                }
+            }
+        }
+    }
+    entries.sort_unstable_by(|a, b| {
+        a.permission
+            .as_str()
+            .cmp(b.permission.as_str())
+            .then_with(|| a.source.cmp(&b.source))
+    });
+    entries.dedup();
+    entries
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,5 +636,40 @@ mod tests {
         let roles = HashMap::new();
         let groups = HashSet::new();
         assert!(eval_memory_permissions(&actor, [0xc1; 32], &[], &roles, &groups).is_empty());
+    }
+
+    #[test]
+    fn permission_sources_attributes_admin_role_and_direct_deterministically() {
+        let user = [1u8; 16];
+        let dev = [2u8; 32];
+        // 管理员：每个权限的来源都是 Admin。
+        let entries = permission_sources(user, dev, &[], &HashMap::new(), &HashSet::new(), true);
+        assert_eq!(entries.len(), 4);
+        assert!(
+            entries
+                .iter()
+                .all(|e| matches!(e.source, PermissionSourceKind::Admin))
+        );
+
+        // 普通用户：归因到具体的 grant.id（direct）或 role_id（role）。
+        let grant_id = uuid::Uuid::from_bytes([5u8; 16]);
+        let direct = GrantRecord {
+            id: grant_id,
+            user_id: user,
+            source: GrantSource::Direct(vec![Permission::DeviceRead]),
+            scope: GrantScope::All,
+            revision: 1,
+        };
+        let entries = permission_sources(
+            user,
+            dev,
+            &[direct],
+            &HashMap::new(),
+            &HashSet::new(),
+            false,
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].permission, Permission::DeviceRead);
+        assert_eq!(entries[0].source, PermissionSourceKind::Direct(grant_id));
     }
 }
