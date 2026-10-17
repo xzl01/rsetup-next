@@ -1,7 +1,9 @@
-//! 任务域：模型、预览纯逻辑、仓储边界与编排服务。
+//! 任务域：模型、预览纯逻辑、调度准入与只读恢复纯逻辑、仓储边界与编排服务。
 
 pub mod model;
 pub mod preview;
+pub mod recovery;
+pub mod scheduler;
 
 /// 位置绑定宏：宏实参顺序 = SQL `?` 顺序，逐位调用 `sqlx::Arguments::add`。
 ///
