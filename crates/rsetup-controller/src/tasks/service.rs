@@ -8,6 +8,12 @@
 //! 决不接受请求侧自报时钟或自报证据种类参与分派；任何路径都不会把
 //! `created_at` / `observe_deadline` 改成更晚的值。
 //!
+//! 两条期限列各记各的含义，绝不互相顶替（`sub_tasks` DDL 为真相源）：
+//! `queue_deadline` 是**排队截止**（04 §5.1 排队有效期），由创建时可信时基
+//! （[`queue_deadline_of`]）算出，是时限复核判定 `held` 是否过期的唯一比对依据；
+//! `observe_deadline` 是**观察窗截止**（04 §5.2/§5.3，自 `dispatching` 起算），
+//! 由派发路径持有，复核路径只读不写、更不拿它替代排队截止。
+//!
 //! 行读取口径：本 crate 的 `sqlx` 未启用 `derive` 特性，原始行统一经
 //! [`tx_rows`] / [`tx_row`] + [`column`] 显式解码，checked 转换失败一律 503。
 
@@ -62,6 +68,115 @@ pub fn time_review_allows_extend(
     kind: TimeReviewEvidenceKind,
 ) -> bool {
     matches!(kind, TimeReviewEvidenceKind::ReferenceDeadlineProven) && requested_extension_ms == 0
+}
+
+/// 排队有效期（04 §5.1 建议 60min）：`sub_tasks.queue_deadline` 的唯一 TTL 来源。
+pub const QUEUE_TTL_MS: i64 = 3_600_000;
+
+/// 排队截止：与时限复核的比对处于**同一可信时基**，绝不由 DB 宿主墙钟
+/// （`DATE_ADD(NOW(6), …)`）生成——数据库漂移会变成排队寿命错配。
+///
+/// - `NtpValid`：`reference_utc` 是静态采样时刻，须累加样本年龄 `sample_age_ms`，
+///   否则样本越旧、排队寿命被隐性拉长（缺失按 0 处理）；
+/// - `SystemFallback` / `Stale`：`reference_utc` 已由时钟源刷新为当前墙钟，
+///   直接加 TTL，不重复累加历史 age，否则排队截止被双重放大。
+///
+/// 溢出（TTL 或 age 大到不可表示）返回 `None`，由调用方 fail-closed 拒绝创建。
+pub fn queue_deadline_of(created: &TimeEvidence) -> Option<DateTime<Utc>> {
+    let age_ms = match created.quality {
+        // 样本年龄缺失按 0 处理：缺列不等于「无限陈旧」，更不得让创建失败。
+        TimeQuality::NtpValid => created.sample_age_ms.unwrap_or(0),
+        TimeQuality::SystemFallback | TimeQuality::Stale => 0,
+    };
+    let age = chrono::Duration::try_milliseconds(i64::try_from(age_ms).ok()?)?;
+    let ttl = chrono::Duration::try_milliseconds(QUEUE_TTL_MS)?;
+    created
+        .reference_utc
+        .checked_add_signed(age)?
+        .checked_add_signed(ttl)
+}
+
+/// 推进后的当前参考时刻：`reference_utc` 是静态 NTP 采样时刻（driver 周期性复验
+/// 才刷新），直接当当前时刻比对，会把「采样时刻 < 期限 < 真实当前时刻」的已过期
+/// 任务误判为未过期，因此必须先累加样本年龄再比对。
+///
+/// 溢出（age 大到不可表示）取 `DateTime::MAX_UTC`：视为早已越过任何合理期限，
+/// 绝不回退到采样时刻。
+pub fn advanced_reference_utc(clock: &TimeEvidence) -> DateTime<Utc> {
+    let age = match clock.sample_age_ms {
+        None => chrono::Duration::zero(),
+        Some(ms) => chrono::Duration::try_milliseconds(i64::try_from(ms).unwrap_or(i64::MAX))
+            .unwrap_or_else(|| chrono::Duration::seconds(i64::MAX / 4)),
+    };
+    clock
+        .reference_utc
+        .checked_add_signed(age)
+        .unwrap_or(DateTime::<Utc>::MAX_UTC)
+}
+
+/// 时间安全核验的纯策略结论：时限复核分派的唯一依据（`evidence_kind` 只记审计）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeReviewVerdict {
+    /// 原排队期限的有效性**无法证明**：当前或创建时时钟不可信、时钟纪元不连续、
+    /// 创建证据缺失/不可解析，或恢复决策下已存在过期子任务。
+    /// 一律保持 `held`、零状态变更（回滚），绝不盲目恢复。
+    Unverifiable,
+    /// 全部未过期且请求恢复原期限：整批 `held → queued`，不写任何更晚期限。
+    Resume,
+    /// 全部已过期且请求判过期：整批 `expired` + `QUEUE_EXPIRED` 并释放本代际设备锁。
+    Expire,
+    /// 请求与服务端真实比对矛盾（仍有未过期子任务却请求整批判过期）：拒绝。
+    Contradiction,
+}
+
+/// 纯策略 seam：由创建时证据、当前时钟快照与全部 `held` 子任务的**排队截止**
+/// 推出唯一允许的处置，零 IO、零副作用。
+///
+/// `queue_deadlines` 是被锁定的全部 `held` 子任务的 `queue_deadline`；`None`
+/// 表示列值缺失，无法证明未过期，按已过期处置。空集合由调用方先行拒绝。
+pub fn time_review_verdict(
+    created: Option<&TimeEvidence>,
+    clock: &TimeEvidence,
+    decision: TimeReviewDecision,
+    queue_deadlines: &[Option<DateTime<Utc>>],
+) -> TimeReviewVerdict {
+    // 当前时钟不可信（Stale/SystemFallback）：无法证明任何期限的有效性。
+    if clock.quality != TimeQuality::NtpValid {
+        return TimeReviewVerdict::Unverifiable;
+    }
+    // 创建证据缺失或不可解析：`queue_deadline` 的来源时基无法证明可信。
+    let Some(created) = created else {
+        return TimeReviewVerdict::Unverifiable;
+    };
+    // 创建当时时钟不可信（纪元虽连续也一样），或跳钟/进程换代导致纪元不连续：
+    // 原排队期限的参考系连续性无法证明，绝不盲目恢复。
+    if created.quality != TimeQuality::NtpValid || created.clock_epoch != clock.clock_epoch {
+        return TimeReviewVerdict::Unverifiable;
+    }
+    let now = advanced_reference_utc(clock);
+    let expired = |deadline: &Option<DateTime<Utc>>| deadline.is_none_or(|deadline| now > deadline);
+    let expired_count = queue_deadlines
+        .iter()
+        .filter(|deadline| expired(deadline))
+        .count();
+    match decision {
+        // 要求**全部**未过期才允许整批恢复；存在任一过期即绝不整批恢复。
+        TimeReviewDecision::ResumeOriginalDeadline if expired_count == 0 => {
+            TimeReviewVerdict::Resume
+        }
+        TimeReviewDecision::ResumeOriginalDeadline => TimeReviewVerdict::Unverifiable,
+        // 要求**全部**已过期才允许整批判过期；仍有未过期者即误伤，拒绝矛盾请求。
+        TimeReviewDecision::Expire if expired_count == queue_deadlines.len() => {
+            TimeReviewVerdict::Expire
+        }
+        TimeReviewDecision::Expire => TimeReviewVerdict::Contradiction,
+    }
+}
+
+/// 解析主任务 `created_time_json` 为创建时时钟证据；缺失或不可解析一律 `None`
+/// （无法证明原期限有效，fail-closed 保持 `held`），绝不猜测近似值。
+fn parse_created_time_evidence(raw: &str) -> Option<TimeEvidence> {
+    serde_json::from_str(raw).ok()
 }
 
 /// 取消前置条件：只有 `queued` / `held` 可取消，且要求管理员或持有该设备的
@@ -128,30 +243,49 @@ pub fn submit_counts_json(locked: u64, device_busy: u64) -> String {
 }
 
 /// 主任务收敛（本地实现；Task 5 唯一聚合器 `calculate_main_task_outcome` 落地后由其
-/// 替换，两者口径必须一致）：存在未决子任务即非 `completed`；全终态才汇总 outcome。
+/// 替换，两者口径必须一致）：严格按 04 §4 的优先级汇总，**顺序不可调换**。
+///
+/// 1. `running`：存在 `dispatching`/`accepted`/`verifying`，或批次已开始（至少一个
+///    子任务已离开 `queued`）且仍有可运行 `queued`；
+/// 2. `queued`：尚未开始（全部仍为 `queued`）；
+/// 3. `held`：无执行中、无可运行 `queued`，且至少一个 `held`（**不是** `running`）；
+/// 4. `completed`：全部属于批次终态，outcome 优先级为
+///    含 `unknown` → `unknown` ＞ 全 `succeeded` → `success` ＞ 全 `cancelled` →
+///    `cancelled` ＞ 有 `succeeded` 且有非成功 → `partial` ＞ 其余（含仅 `expired`、
+///    `failed`+`cancelled` 组合）→ `failed`。
 pub fn main_task_convergence(states: &[SubTaskState]) -> (MainTaskState, Option<MainTaskOutcome>) {
     if states.is_empty() {
         return (MainTaskState::Queued, None);
     }
-    let open: Vec<&SubTaskState> = states.iter().filter(|s| !is_terminal_state(**s)).collect();
-    if !open.is_empty() {
-        // 全部仍在排队 → queued；一旦混入执行中或已终态子任务 → running（04 规格 L79–83）
-        if open.len() == states.len() && open.iter().all(|s| **s == SubTaskState::Queued) {
-            return (MainTaskState::Queued, None);
-        }
+    let any = |target: SubTaskState| states.contains(&target);
+    let all = |target: SubTaskState| states.iter().all(|state| *state == target);
+    let executing = states.iter().any(|state| {
+        matches!(
+            state,
+            SubTaskState::Dispatching | SubTaskState::Accepted | SubTaskState::Verifying
+        )
+    });
+    // 「批次已开始」= 至少一个子任务已离开 queued；与「仍有可运行 queued」同时成立即 running
+    if executing || (any(SubTaskState::Queued) && !all(SubTaskState::Queued)) {
         return (MainTaskState::Running, None);
     }
-    let all = |target: SubTaskState| states.iter().all(|state| *state == target);
-    let outcome = if all(SubTaskState::Succeeded) {
+    if all(SubTaskState::Queued) {
+        return (MainTaskState::Queued, None);
+    }
+    if any(SubTaskState::Held) {
+        return (MainTaskState::Held, None);
+    }
+    // 走到这里全部子任务都是批次终态（succeeded/failed/unknown/cancelled/expired）
+    let outcome = if any(SubTaskState::Unknown) {
+        MainTaskOutcome::Unknown
+    } else if all(SubTaskState::Succeeded) {
         MainTaskOutcome::Success
-    } else if all(SubTaskState::Failed) {
-        MainTaskOutcome::Failed
     } else if all(SubTaskState::Cancelled) {
         MainTaskOutcome::Cancelled
-    } else if all(SubTaskState::Unknown) {
-        MainTaskOutcome::Unknown
-    } else {
+    } else if any(SubTaskState::Succeeded) {
         MainTaskOutcome::Partial
+    } else {
+        MainTaskOutcome::Failed
     };
     (MainTaskState::Completed, Some(outcome))
 }
@@ -365,7 +499,9 @@ pub enum TimeReviewOutcome {
     Completed {
         affected: usize,
     },
-    /// 服务端时钟不可信（非 `NtpValid`）：全部保持 `held`、零状态变更。
+    /// 原排队期限的有效性无法证明（当前或创建时时钟非 `NtpValid`、时钟纪元不连续、
+    /// 创建证据缺失/不可解析，或恢复决策下已存在过期子任务）：
+    /// 全部保持 `held`、零状态变更（事务回滚）。
     Inconclusive,
 }
 
@@ -456,7 +592,22 @@ impl From<ReleaseLockError> for ControllerError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ActorRow {
     active: bool,
+    is_admin: bool,
     must_change_password: bool,
+}
+
+impl ActorRow {
+    /// `integrity::require_active_admin` 同语义：`active && is_admin &&
+    /// !must_change_password` 三条件缺一即拒绝管理写操作（并发降权/停用/未改
+    /// 初始口令都必须在事务内失败关闭，绝不信 HTTP 层快照的 `is_admin` 布尔）。
+    fn active_admin(&self) -> bool {
+        self.active && self.is_admin && !self.must_change_password
+    }
+
+    /// 提交/取消等业务写操作的最低要求：账号有效且未待改初始口令（不要求 admin）。
+    fn writable(&self) -> bool {
+        self.active && !self.must_change_password
+    }
 }
 
 /// 预览快照在锁内读出并校验后的固定值。
@@ -468,6 +619,10 @@ struct PreviewSnapshotFixed {
 }
 
 /// 待写入的子任务行（避免 7 参数以上的 helper 签名）。
+///
+/// 两条期限列语义独立、绝不互替：`queue_deadline` 是排队截止（服务端可信时基 +
+/// 排队 TTL，时限复核的唯一比对依据）；`observe_deadline` 是观察窗截止（04 §5.2
+/// 派发期语义，复核路径只读不写）。
 #[derive(Clone, Copy, Debug)]
 struct NewSubTask {
     subtask_id: Uuid,
@@ -476,6 +631,7 @@ struct NewSubTask {
     state: SubTaskState,
     reason_code: Option<ReasonCode>,
     queue_deadline: DateTime<Utc>,
+    observe_deadline: DateTime<Utc>,
 }
 
 /// 11 字段脱敏审计的入参集合。
@@ -570,9 +726,9 @@ impl<R: TaskRepository> TaskService<R> {
         // ② 写事务 guard：期望版本来自编译期配置，绝不从数据库行推断
         crate::integrity::lock_integrity_guard(tx).await?;
 
-        // ③ actor 事务内重验（`users` 环节的唯一取锁点）
+        // ③ actor 事务内重验（`users` 环节的唯一取锁点）：账号失效或待改初始口令即拒绝
         let actor = read_actor_in_tx(tx, ctx.user_id).await?;
-        if !actor.active || actor.must_change_password {
+        if !actor.writable() {
             return Err(SubmitError::ActorInactive);
         }
 
@@ -633,6 +789,10 @@ impl<R: TaskRepository> TaskService<R> {
 
         // ⑧ 逐目标重验当前授权并按锁序申请设备锁（同一快照、同一事务、零网络）
         let authz = load_snapshot_in_tx(tx, ctx.user_id.into_bytes(), &targets).await?;
+        // 排队截止由服务端创建时证据在同一可信时基上算出（与 time_review 的比对同源）；
+        // 观察窗截止属派发期语义，随请求携带的服务端值原样落 observe_deadline，两列不互替。
+        let queue_deadline =
+            queue_deadline_of(&req.time_evidence).ok_or_else(time_evidence_error)?;
         let mut created = Vec::with_capacity(targets.len());
         for device_id in &targets {
             let (state, reason_code) = match check_target_authz(&authz, *device_id) {
@@ -652,49 +812,27 @@ impl<R: TaskRepository> TaskService<R> {
                     device_id: *device_id,
                     state,
                     reason_code,
-                    queue_deadline: req.observe_deadline,
+                    queue_deadline,
+                    observe_deadline: req.observe_deadline,
                 },
             )
             .await?;
-            if state != SubTaskState::Queued {
-                continue;
-            }
-            // 设备唯一操作锁 CAS：未插入即设备忙，不排队、不等待
-            let acquired = tx_execute(
-                tx,
-                "INSERT INTO device_operation_locks \
-                 (device_id, main_task_id, owner_sub_task_id, generation, acquired_at) \
-                 SELECT ?, ?, ?, 1, NOW(6) FROM DUAL \
-                 WHERE NOT EXISTS (SELECT 1 FROM device_operation_locks WHERE device_id = ?)",
-                params![
-                    &device_id[..],
-                    main_task_id.as_bytes().as_slice(),
-                    subtask_id.as_bytes().as_slice(),
-                    &device_id[..],
-                ],
-            )
-            .await?;
-            if acquired == 1 {
-                tx_execute(
-                    tx,
-                    "UPDATE sub_tasks SET lock_generation = 1 WHERE id = ?",
-                    params![subtask_id.as_bytes().as_slice()],
-                )
-                .await?;
-                created.push(SubTaskState::Queued);
-            } else {
-                tx_execute(
-                    tx,
-                    "UPDATE sub_tasks SET state = ?, reason_code = ? WHERE id = ?",
-                    params![
-                        &enum_wire(&SubTaskState::Failed)?,
-                        &enum_wire(&ReasonCode::DeviceBusy)?,
-                        subtask_id.as_bytes().as_slice(),
-                    ],
-                )
-                .await?;
-                created.push(SubTaskState::Failed);
-            }
+            // 三种落库结局（queued / failed:PERMISSION_DENIED / failed:DEVICE_BUSY）
+            // **一律**计入 created：counts_json 与主任务收敛必须与子任务行一一对应，
+            // 漏计任一失败目标都会让主任务永远停在非终态。
+            let final_state = match state {
+                SubTaskState::Queued => {
+                    if acquire_device_lock(tx, *device_id, main_task_id, subtask_id).await? {
+                        SubTaskState::Queued
+                    } else {
+                        // 设备唯一操作锁 CAS 未插入即设备忙：不排队、不等待，就地落 failed
+                        mark_sub_task_failed(tx, subtask_id, ReasonCode::DeviceBusy).await?;
+                        SubTaskState::Failed
+                    }
+                }
+                other => other,
+            };
+            created.push(final_state);
         }
 
         // ⑩ counts 真实回写 + 主任务收敛（与实际子状态分布同源，不写假持久化）
@@ -762,6 +900,8 @@ impl<R: TaskRepository> TaskService<R> {
     /// 时限复核：只以服务端时钟快照真实比对，绝不延长任何期限。
     ///
     /// `clock` 必须由服务端时钟源（TimeGate）产出，绝不来自请求体。
+    /// `Inconclusive`（原期限有效性无法证明）走**显式回滚**：释放 `FOR UPDATE`
+    /// 行锁、零状态变更，`held` 子任务与主任务 revision 一律保持原样。
     pub async fn time_review(
         &self,
         req: &TimeReviewRequest,
@@ -770,6 +910,10 @@ impl<R: TaskRepository> TaskService<R> {
     ) -> Result<TimeReviewOutcome, TimeReviewError> {
         let mut tx = self.repo.begin().await?;
         match time_review_in_tx(&mut tx, req, clock, ctx).await {
+            Ok(TimeReviewOutcome::Inconclusive) => {
+                let _ = tx.rollback().await;
+                Ok(TimeReviewOutcome::Inconclusive)
+            }
             Ok(outcome) => {
                 tx.commit().await?;
                 Ok(outcome)
@@ -825,13 +969,15 @@ fn tally(states: &[SubTaskState]) -> Vec<(SubTaskState, u64)> {
 }
 
 /// actor 行事务内重验：`CAST(... AS SIGNED)` 严格解码，污染值即 DB 损坏（503）。
+/// 三列一次读全（`active`/`is_admin`/`must_change_password`），写操作路径不得只读其中
+/// 一部分而漏掉「未改初始口令」这一 fail-closed 条件。
 async fn read_actor_in_tx(
     tx: &mut Transaction<'_, MySql>,
     user_id: Uuid,
 ) -> Result<ActorRow, ControllerError> {
     let row = tx_row(
         tx,
-        "SELECT CAST(active AS SIGNED) AS active, \
+        "SELECT CAST(active AS SIGNED) AS active, CAST(is_admin AS SIGNED) AS is_admin, \
          CAST(must_change_password AS SIGNED) AS must_change_password \
          FROM users WHERE id = ? FOR UPDATE",
         params![user_id.as_bytes().as_slice()],
@@ -840,6 +986,7 @@ async fn read_actor_in_tx(
     .ok_or(ControllerError::PermissionDenied)?;
     Ok(ActorRow {
         active: strict_bool(column::<i64>(&row, "active")?)?,
+        is_admin: strict_bool(column::<i64>(&row, "is_admin")?)?,
         must_change_password: strict_bool(column::<i64>(&row, "must_change_password")?)?,
     })
 }
@@ -987,6 +1134,9 @@ async fn lock_table_in_byte_order(
 
 /// 落一条子任务。`sub_tasks` 无 `outcome` 列（0004 DDL 真相源），
 /// 子任务结局由 `state` + `reason_code` 表达。
+///
+/// `queue_deadline` 与 `observe_deadline` **分别**绑定各自的值：把排队截止写进观察
+/// 窗列（或反之）会让复核拿观察窗判排队寿命，属跨生命周期混用。
 async fn insert_sub_task(
     tx: &mut Transaction<'_, MySql>,
     row: &NewSubTask,
@@ -994,7 +1144,8 @@ async fn insert_sub_task(
     tx_execute(
         tx,
         "INSERT INTO sub_tasks (id, main_task_id, device_id, state, reason_code, revision, \
-         queue_deadline, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, ?, NOW(6), NOW(6))",
+         queue_deadline, observe_deadline, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, 1, ?, ?, NOW(6), NOW(6))",
         params![
             row.subtask_id.as_bytes().as_slice(),
             row.main_task_id.as_bytes().as_slice(),
@@ -1005,6 +1156,60 @@ async fn insert_sub_task(
                 Some(code) => Some(enum_wire(&code)?),
             },
             row.queue_deadline,
+            row.observe_deadline,
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+/// 设备唯一操作锁 CAS：条件插入成功（恰 1 行）即抢到，并把本代际 `generation = 1`
+/// 回写子任务；未插入即设备忙，由调用方就地落 `failed`，不排队、不等待。
+async fn acquire_device_lock(
+    tx: &mut Transaction<'_, MySql>,
+    device_id: [u8; 32],
+    main_task_id: Uuid,
+    subtask_id: Uuid,
+) -> Result<bool, SubmitError> {
+    let acquired = tx_execute(
+        tx,
+        "INSERT INTO device_operation_locks \
+         (device_id, main_task_id, owner_sub_task_id, generation, acquired_at) \
+         SELECT ?, ?, ?, 1, NOW(6) FROM DUAL \
+         WHERE NOT EXISTS (SELECT 1 FROM device_operation_locks WHERE device_id = ?)",
+        params![
+            &device_id[..],
+            main_task_id.as_bytes().as_slice(),
+            subtask_id.as_bytes().as_slice(),
+            &device_id[..],
+        ],
+    )
+    .await?;
+    if acquired != 1 {
+        return Ok(false);
+    }
+    tx_execute(
+        tx,
+        "UPDATE sub_tasks SET lock_generation = 1 WHERE id = ?",
+        params![subtask_id.as_bytes().as_slice()],
+    )
+    .await?;
+    Ok(true)
+}
+
+/// 把子任务就地改写为 `failed` + 指定原因码（提交期设备忙的唯一实现）。
+async fn mark_sub_task_failed(
+    tx: &mut Transaction<'_, MySql>,
+    subtask_id: Uuid,
+    reason_code: ReasonCode,
+) -> Result<(), SubmitError> {
+    tx_execute(
+        tx,
+        "UPDATE sub_tasks SET state = ?, reason_code = ? WHERE id = ?",
+        params![
+            &enum_wire(&SubTaskState::Failed)?,
+            &enum_wire(&reason_code)?,
+            subtask_id.as_bytes().as_slice(),
         ],
     )
     .await?;
@@ -1017,22 +1222,18 @@ async fn cancel_in_tx(
     ctx: &AuthCtx,
 ) -> Result<CancelOutcome, CancelError> {
     crate::integrity::lock_integrity_guard(tx).await?;
-    let caller = tx_row(
-        tx,
-        "SELECT CAST(active AS SIGNED) AS active, CAST(is_admin AS SIGNED) AS is_admin \
-         FROM users WHERE id = ? FOR UPDATE",
-        params![ctx.user_id.as_bytes().as_slice()],
-    )
-    .await?;
-    let caller = caller.ok_or(CancelError::PermissionDenied)?;
-    if !strict_bool(column::<i64>(&caller, "active")?)? {
+    // 事务内完整重验 actor（active && !must_change_password）：HTTP 层快照不可信，
+    // 并发停用/待改初始口令必须失败关闭；is_admin 只作 admin 直通判定输入。
+    let caller = read_actor_in_tx(tx, ctx.user_id).await?;
+    if !caller.writable() {
         return Err(CancelError::PermissionDenied);
     }
-    let caller_admin = strict_bool(column::<i64>(&caller, "is_admin")?)?;
+    let caller_admin = caller.is_admin;
 
     let row = tx_row(
         tx,
-        "SELECT st.revision, st.state, st.device_id, mt.actor_user_id FROM sub_tasks st \
+        "SELECT st.revision, st.state, st.device_id, st.main_task_id, mt.actor_user_id, \
+         mt.revision AS main_revision FROM sub_tasks st \
          JOIN main_tasks mt ON mt.id = st.main_task_id WHERE st.id = ? FOR UPDATE",
         params![req.subtask_id.as_bytes().as_slice()],
     )
@@ -1088,6 +1289,12 @@ async fn cancel_in_tx(
         params![&device_id[..], req.subtask_id.as_bytes().as_slice()],
     )
     .await?;
+    // 取消改写子任务状态后，主任务持久汇总必须**同事务**重算回写（state/outcome/
+    // counts_json 与 revision + 1 同条 UPDATE）；只递增子任务 revision 会让主行永远
+    // 停留在 running，且 counts 漏掉 cancelled。主任务行已被上面的 FOR UPDATE 锁住。
+    let main_task_id = mysql_uuid(&column::<Vec<u8>>(&row, "main_task_id")?)?;
+    let main_revision = column::<u64>(&row, "main_revision")?;
+    sync_main_task_summary(tx, main_task_id, main_revision).await?;
     insert_task_audit(
         tx,
         &TaskAudit {
@@ -1111,22 +1318,15 @@ async fn time_review_in_tx(
     ctx: &AuthCtx,
 ) -> Result<TimeReviewOutcome, TimeReviewError> {
     crate::integrity::lock_integrity_guard(tx).await?;
-    let caller = tx_row(
-        tx,
-        "SELECT CAST(active AS SIGNED) AS active, CAST(is_admin AS SIGNED) AS is_admin \
-         FROM users WHERE id = ? FOR UPDATE",
-        params![ctx.user_id.as_bytes().as_slice()],
-    )
-    .await?;
-    let caller = caller.ok_or(TimeReviewError::PermissionDenied)?;
-    if !strict_bool(column::<i64>(&caller, "active")?)?
-        || !strict_bool(column::<i64>(&caller, "is_admin")?)?
-    {
+    // 管理写操作在事务内完整重验 actor：active && is_admin && !must_change_password
+    let caller = read_actor_in_tx(tx, ctx.user_id).await?;
+    if !caller.active_admin() {
         return Err(TimeReviewError::PermissionDenied);
     }
     let task = tx_row(
         tx,
-        "SELECT revision FROM main_tasks WHERE id = ? FOR UPDATE",
+        "SELECT revision, CAST(created_time_json AS CHAR) AS created_time_json \
+         FROM main_tasks WHERE id = ? FOR UPDATE",
         params![req.main_task_id.as_bytes().as_slice()],
     )
     .await?
@@ -1134,10 +1334,12 @@ async fn time_review_in_tx(
     if column::<u64>(&task, "revision")? != req.expected_revision {
         return Err(TimeReviewError::RevisionConflict);
     }
-    // 锁定该主任务的全部 held 子任务（按 id 字节序，单一取锁段）
+    // 锁定该主任务的全部 held 子任务（按 id 字节序，单一取锁段）。
+    // 比对依据是 **queue_deadline**（排队截止）：held 子任务尚未派发，其寿命由排队
+    // TTL 决定，绝不得混用派发后才生效的 observe_deadline 观察窗。
     let rows = tx_rows(
         tx,
-        "SELECT id, device_id, lock_generation, observe_deadline FROM sub_tasks \
+        "SELECT id, device_id, lock_generation, queue_deadline FROM sub_tasks \
          WHERE main_task_id = ? AND state = ? ORDER BY id FOR UPDATE",
         params![
             req.main_task_id.as_bytes().as_slice(),
@@ -1148,34 +1350,26 @@ async fn time_review_in_tx(
     if rows.is_empty() {
         return Err(TimeReviewError::InvalidArgument);
     }
-    // 服务端时钟不可信：无法证明原期限有效性，保持 held、零状态变更
-    if clock.quality != TimeQuality::NtpValid {
-        return Ok(TimeReviewOutcome::Inconclusive);
-    }
-    // 真实比对：缺失 observe_deadline 无法证明未过期，按已过期处置
     let mut held = Vec::with_capacity(rows.len());
-    let mut all_expired = true;
+    let mut queue_deadlines = Vec::with_capacity(rows.len());
     for row in &rows {
-        let expired = match column::<Option<DateTime<Utc>>>(row, "observe_deadline")? {
-            None => true,
-            Some(deadline) => clock.reference_utc >= deadline,
-        };
-        all_expired &= expired;
+        queue_deadlines.push(column::<Option<DateTime<Utc>>>(row, "queue_deadline")?);
         held.push((
             mysql_uuid(&column::<Vec<u8>>(row, "id")?)?,
             fixed_mysql_bytes::<32>(&column::<Vec<u8>>(row, "device_id")?)?,
             column::<u64>(row, "lock_generation")?,
         ));
     }
-    // 管理员结论必须与比对结果一致，否则拒绝矛盾请求
-    let contradicts = match req.decision {
-        TimeReviewDecision::ResumeOriginalDeadline => all_expired,
-        TimeReviewDecision::Expire => !all_expired,
-    };
-    if contradicts {
-        return Err(TimeReviewError::InvalidArgument);
+    // 时间安全核验（纯策略，零 IO）：创建时证据缺失/不可解析、创建时或当前时钟
+    // 不可信、时钟纪元不连续、恢复决策下存在过期子任务，一律无法证明原期限有效。
+    let created = parse_created_time_evidence(&column::<String>(&task, "created_time_json")?);
+    let verdict = time_review_verdict(created.as_ref(), clock, req.decision, &queue_deadlines);
+    match verdict {
+        TimeReviewVerdict::Unverifiable => return Ok(TimeReviewOutcome::Inconclusive),
+        TimeReviewVerdict::Contradiction => return Err(TimeReviewError::InvalidArgument),
+        TimeReviewVerdict::Resume | TimeReviewVerdict::Expire => {}
     }
-    let resume = matches!(req.decision, TimeReviewDecision::ResumeOriginalDeadline);
+    let resume = verdict == TimeReviewVerdict::Resume;
     let target_state = if resume {
         SubTaskState::Queued
     } else {
@@ -1217,24 +1411,9 @@ async fn time_review_in_tx(
             .await?;
         }
     }
-    let states = read_sub_task_states(tx, req.main_task_id).await?;
-    let (state, outcome) = main_task_convergence(&states);
-    tx_execute(
-        tx,
-        "UPDATE main_tasks SET state = ?, outcome = ?, counts_json = ?, revision = revision + 1, \
-         updated_at = NOW(6) WHERE id = ? AND revision = ?",
-        params![
-            &enum_wire(&state)?,
-            &match outcome {
-                None => None,
-                Some(outcome) => Some(enum_wire(&outcome)?),
-            },
-            &counts_json_of(&tally(&states)),
-            req.main_task_id.as_bytes().as_slice(),
-            req.expected_revision,
-        ],
-    )
-    .await?;
+    // 主任务持久汇总与子任务变更同事务原子回写（RT-R8-3）：只递增 revision 会让主行
+    // state/outcome/counts_json 严重陈旧。
+    sync_main_task_summary(tx, req.main_task_id, req.expected_revision).await?;
     let audit_params = serde_json::json!({
         "decision": if resume { "resume_original_deadline" } else { "expire" },
         "evidence_kind": format!("{:?}", req.evidence_kind),
@@ -1265,14 +1444,9 @@ async fn release_lock_in_tx(
     ctx: &AuthCtx,
 ) -> Result<ReleaseLockOutcome, ReleaseLockError> {
     crate::integrity::lock_integrity_guard(tx).await?;
-    let caller = tx_row(
-        tx,
-        "SELECT CAST(is_admin AS SIGNED) AS is_admin FROM users WHERE id = ? FOR UPDATE",
-        params![ctx.user_id.as_bytes().as_slice()],
-    )
-    .await?
-    .ok_or(ReleaseLockError::PermissionDenied)?;
-    if !strict_bool(column::<i64>(&caller, "is_admin")?)? {
+    // 管理写操作在事务内完整重验 actor：active && is_admin && !must_change_password
+    let caller = read_actor_in_tx(tx, ctx.user_id).await?;
+    if !caller.active_admin() {
         return Err(ReleaseLockError::PermissionDenied);
     }
     let row = tx_row(
@@ -1354,6 +1528,41 @@ async fn read_sub_task_states(
         states.push(sub_task_state_from_str(&column::<String>(row, "state")?)?);
     }
     Ok(states)
+}
+
+/// 同事务回写主任务持久汇总：重查全部子任务最新状态 → 重算 `state`/`outcome` 与
+/// 十态 `counts_json` → 连同 `revision + 1` 一条 UPDATE 落库（子任务变更与主行
+/// 汇总同提交、同回滚，不存在「只动子任务、主行陈旧」的中间态）。
+///
+/// 调用方必须已在本事务内锁住主任务行（`FOR UPDATE`）；`expected_revision` 作 CAS
+/// 兜底，0 行即并发冲突（503/409 语义由调用方错误类型承载）。
+async fn sync_main_task_summary(
+    tx: &mut Transaction<'_, MySql>,
+    main_task_id: Uuid,
+    expected_revision: u64,
+) -> Result<(), ControllerError> {
+    let states = read_sub_task_states(tx, main_task_id).await?;
+    let (state, outcome) = main_task_convergence(&states);
+    let updated = tx_execute(
+        tx,
+        "UPDATE main_tasks SET state = ?, outcome = ?, counts_json = ?, revision = revision + 1, \
+         updated_at = NOW(6) WHERE id = ? AND revision = ?",
+        params![
+            &enum_wire(&state)?,
+            &match outcome {
+                None => None,
+                Some(outcome) => Some(enum_wire(&outcome)?),
+            },
+            &counts_json_of(&tally(&states)),
+            main_task_id.as_bytes().as_slice(),
+            expected_revision,
+        ],
+    )
+    .await?;
+    if updated != 1 {
+        return Err(ControllerError::RevisionConflict);
+    }
+    Ok(())
 }
 
 /// 以既有 serde 定义（snake_case，Task 2 唯一真相源）解析 `sub_tasks.state`。
@@ -1723,6 +1932,350 @@ mod tests {
             main_task_convergence(&[Succeeded, Failed]),
             (MainTaskState::Completed, Some(MainTaskOutcome::Partial))
         );
+    }
+
+    /// 固定可复现时刻（不依赖测试运行时刻）。
+    fn fixed_instant() -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp(1_800_000_000, 0).expect("fixed instant in range")
+    }
+
+    fn evidence_at(
+        quality: TimeQuality,
+        reference: DateTime<Utc>,
+        age_ms: Option<u64>,
+    ) -> TimeEvidence {
+        TimeEvidence {
+            system_wall_utc: reference,
+            reference_utc: reference,
+            quality,
+            clock_epoch: Uuid::new_v4(),
+            source: None,
+            sample_age_ms: age_ms,
+            offset_ms: None,
+            uncertainty_ms: None,
+        }
+    }
+
+    /// 同一纪元下的「创建时证据 + 当前时钟」对（时间安全核验用例的共用夹具）。
+    fn same_epoch_pair(age_ms: Option<u64>) -> (TimeEvidence, TimeEvidence) {
+        let epoch = Uuid::new_v4();
+        let mut created = evidence_at(TimeQuality::NtpValid, fixed_instant(), None);
+        let mut clock = evidence_at(TimeQuality::NtpValid, fixed_instant(), age_ms);
+        created.clock_epoch = epoch;
+        clock.clock_epoch = epoch;
+        (created, clock)
+    }
+
+    #[test]
+    fn main_task_convergence_priority_follows_spec_04() {
+        use SubTaskState::*;
+        let completed = |outcome: MainTaskOutcome| (MainTaskState::Completed, Some(outcome));
+        // 全体 held → held（不是 running）
+        assert_eq!(
+            main_task_convergence(&[Held, Held]),
+            (MainTaskState::Held, None)
+        );
+        // 无执行中、无可运行 queued，至少一个 held → held
+        assert_eq!(
+            main_task_convergence(&[Held, Succeeded]),
+            (MainTaskState::Held, None)
+        );
+        assert_eq!(
+            main_task_convergence(&[Held, Expired, Cancelled]),
+            (MainTaskState::Held, None)
+        );
+        // 批次已开始且仍有可运行 queued → running
+        assert_eq!(
+            main_task_convergence(&[Queued, Held]),
+            (MainTaskState::Running, None)
+        );
+        assert_eq!(
+            main_task_convergence(&[Queued, Expired]),
+            (MainTaskState::Running, None)
+        );
+        // 执行中优先一切
+        assert_eq!(
+            main_task_convergence(&[Verifying, Held, Succeeded]),
+            (MainTaskState::Running, None)
+        );
+        // 含 unknown 优先 unknown（不是 partial/failed）
+        assert_eq!(
+            main_task_convergence(&[Unknown, Failed]),
+            completed(MainTaskOutcome::Unknown)
+        );
+        assert_eq!(
+            main_task_convergence(&[Succeeded, Unknown]),
+            completed(MainTaskOutcome::Unknown)
+        );
+        assert_eq!(
+            main_task_convergence(&[Cancelled, Unknown]),
+            completed(MainTaskOutcome::Unknown)
+        );
+        // 仅 expired、failed + cancelled → failed（不是 partial）
+        assert_eq!(
+            main_task_convergence(&[Expired]),
+            completed(MainTaskOutcome::Failed)
+        );
+        assert_eq!(
+            main_task_convergence(&[Expired, Expired]),
+            completed(MainTaskOutcome::Failed)
+        );
+        assert_eq!(
+            main_task_convergence(&[Failed, Cancelled]),
+            completed(MainTaskOutcome::Failed)
+        );
+        // 有成功且有非成功 → partial
+        assert_eq!(
+            main_task_convergence(&[Succeeded, Expired]),
+            completed(MainTaskOutcome::Partial)
+        );
+        assert_eq!(
+            main_task_convergence(&[Succeeded, Cancelled]),
+            completed(MainTaskOutcome::Partial)
+        );
+    }
+
+    #[test]
+    fn every_created_sub_task_is_counted_including_visible_forbidden() {
+        // 提交期三种落库结局（queued / failed:PERMISSION_DENIED / failed:DEVICE_BUSY）
+        // 一律计入 created：漏计失败目标会让十键频数少算、主任务永不收敛。
+        let created = [
+            SubTaskState::Queued,
+            SubTaskState::Failed,
+            SubTaskState::Failed,
+        ];
+        let counts: serde_json::Value =
+            serde_json::from_str(&counts_json_of(&tally(&created))).expect("json");
+        let total: u64 = counts
+            .as_object()
+            .expect("object")
+            .values()
+            .map(|value| {
+                value
+                    .as_str()
+                    .expect("decimal string")
+                    .parse::<u64>()
+                    .expect("decimal")
+            })
+            .sum();
+        assert_eq!(
+            total,
+            created.len() as u64,
+            "十键频数之和必须等于子任务行数"
+        );
+        assert_eq!(counts["queued"].as_str(), Some("1"));
+        assert_eq!(counts["failed"].as_str(), Some("2"));
+        // 全部目标都因 VisibleForbidden 落 failed：主任务必须直接收敛 completed/failed；
+        // 漏计时 created 为空，只会得到 (queued, None) 并永远停在非终态。
+        assert_eq!(
+            main_task_convergence(&[SubTaskState::Failed, SubTaskState::Failed]),
+            (MainTaskState::Completed, Some(MainTaskOutcome::Failed))
+        );
+    }
+
+    #[test]
+    fn queue_deadline_uses_trusted_time_base_and_sample_age() {
+        let reference = fixed_instant();
+        let ttl = chrono::Duration::milliseconds(QUEUE_TTL_MS);
+        // NtpValid：reference + 样本年龄 + TTL（样本越旧，排队寿命不得被隐性拉长）
+        let ntp = queue_deadline_of(&evidence_at(TimeQuality::NtpValid, reference, Some(150)))
+            .expect("deadline");
+        assert_eq!(ntp, reference + ttl + chrono::Duration::milliseconds(150));
+        // NtpValid 且样本年龄缺失：按 0 处理，绝不让创建失败
+        let no_age = queue_deadline_of(&evidence_at(TimeQuality::NtpValid, reference, None))
+            .expect("deadline");
+        assert_eq!(no_age, reference + ttl);
+        // SystemFallback/Stale：reference_utc 已是当前墙钟，不重复累加历史 age
+        for quality in [TimeQuality::SystemFallback, TimeQuality::Stale] {
+            let fallback =
+                queue_deadline_of(&evidence_at(quality, reference, Some(9_999))).expect("deadline");
+            assert_eq!(
+                fallback,
+                reference + ttl,
+                "{quality:?} 不得重复累加样本年龄"
+            );
+        }
+        assert!(ntp > reference, "排队截止必须晚于创建参考时刻");
+    }
+
+    #[test]
+    fn time_review_resumes_only_when_every_queue_deadline_is_live() {
+        use TimeReviewDecision::ResumeOriginalDeadline;
+        use TimeReviewVerdict::*;
+        let (created, clock) = same_epoch_pair(None);
+        let live = fixed_instant() + chrono::Duration::seconds(60);
+        let past = fixed_instant() - chrono::Duration::seconds(1);
+        // 全部未过期 + Resume → 整批恢复
+        assert_eq!(
+            time_review_verdict(
+                Some(&created),
+                &clock,
+                ResumeOriginalDeadline,
+                &[Some(live), Some(live)]
+            ),
+            Resume
+        );
+        // 部分过期 + Resume → 绝不允许整批恢复（保持 held，不是错误恢复）
+        assert_eq!(
+            time_review_verdict(
+                Some(&created),
+                &clock,
+                ResumeOriginalDeadline,
+                &[Some(live), Some(past)]
+            ),
+            Unverifiable
+        );
+        // 全部过期 + Resume → 同样不得恢复
+        assert_eq!(
+            time_review_verdict(
+                Some(&created),
+                &clock,
+                ResumeOriginalDeadline,
+                &[Some(past)]
+            ),
+            Unverifiable
+        );
+        // 缺失 queue_deadline 无法证明未过期，按已过期处置
+        assert_eq!(
+            time_review_verdict(
+                Some(&created),
+                &clock,
+                ResumeOriginalDeadline,
+                &[Some(live), None]
+            ),
+            Unverifiable
+        );
+        // 全部已过期 + Expire → 整批 expired
+        assert_eq!(
+            time_review_verdict(
+                Some(&created),
+                &clock,
+                TimeReviewDecision::Expire,
+                &[Some(past), None]
+            ),
+            Expire
+        );
+        // 部分过期 + Expire → 矛盾请求（整批判过期会误伤未过期者）
+        assert_eq!(
+            time_review_verdict(
+                Some(&created),
+                &clock,
+                TimeReviewDecision::Expire,
+                &[Some(past), Some(live)]
+            ),
+            Contradiction
+        );
+    }
+
+    #[test]
+    fn time_review_fails_closed_on_untrusted_or_discontinuous_clock() {
+        use TimeReviewDecision::ResumeOriginalDeadline;
+        use TimeReviewVerdict::{Resume, Unverifiable};
+        let live = fixed_instant() + chrono::Duration::seconds(60);
+        let deadlines = [Some(live)];
+        let (created, clock) = same_epoch_pair(None);
+        // 基线：同纪元、双方 NtpValid、未过期 → 允许恢复
+        assert_eq!(
+            time_review_verdict(Some(&created), &clock, ResumeOriginalDeadline, &deadlines),
+            Resume
+        );
+        // ① 当前时钟不可信
+        for quality in [TimeQuality::SystemFallback, TimeQuality::Stale] {
+            let mut untrusted = clock.clone();
+            untrusted.quality = quality;
+            assert_eq!(
+                time_review_verdict(
+                    Some(&created),
+                    &untrusted,
+                    ResumeOriginalDeadline,
+                    &deadlines
+                ),
+                Unverifiable,
+                "{quality:?} 的当前时钟不得参与恢复判定"
+            );
+        }
+        // ② 创建当时时钟不可信（纪元虽连续也一样）
+        for quality in [TimeQuality::SystemFallback, TimeQuality::Stale] {
+            let mut created_at = created.clone();
+            created_at.quality = quality;
+            assert_eq!(
+                time_review_verdict(
+                    Some(&created_at),
+                    &clock,
+                    ResumeOriginalDeadline,
+                    &deadlines
+                ),
+                Unverifiable,
+                "创建时 {quality:?} 的原排队期限无法证明有效"
+            );
+        }
+        // ③ 时钟纪元不连续（跳钟/进程换代）：参考系连续性无法证明
+        let mut shifted = clock.clone();
+        shifted.clock_epoch = Uuid::new_v4();
+        assert_eq!(
+            time_review_verdict(Some(&created), &shifted, ResumeOriginalDeadline, &deadlines),
+            Unverifiable
+        );
+        // ④ 创建证据缺失（created_time_json 缺失或不可解析）
+        assert_eq!(
+            time_review_verdict(None, &clock, ResumeOriginalDeadline, &deadlines),
+            Unverifiable
+        );
+    }
+
+    #[test]
+    fn stale_sample_clock_cannot_keep_an_expired_task_alive() {
+        use TimeReviewDecision::ResumeOriginalDeadline;
+        use TimeReviewVerdict::*;
+        // 采样时刻 < queue_deadline < 采样时刻 + 样本年龄：必须判过期，
+        // 否则陈旧时钟会把已越期的任务错误恢复为 queued。
+        let (created, mut clock) = same_epoch_pair(Some(50));
+        let deadline = fixed_instant() + chrono::Duration::milliseconds(10);
+        assert!(advanced_reference_utc(&clock) > deadline);
+        assert_eq!(
+            time_review_verdict(
+                Some(&created),
+                &clock,
+                ResumeOriginalDeadline,
+                &[Some(deadline)]
+            ),
+            Unverifiable
+        );
+        assert_eq!(
+            time_review_verdict(
+                Some(&created),
+                &clock,
+                TimeReviewDecision::Expire,
+                &[Some(deadline)]
+            ),
+            Expire
+        );
+        // 样本年龄缺失按 0 推进：同一期限此刻仍未过期，允许恢复
+        clock.sample_age_ms = None;
+        assert_eq!(
+            time_review_verdict(
+                Some(&created),
+                &clock,
+                ResumeOriginalDeadline,
+                &[Some(deadline)]
+            ),
+            Resume
+        );
+    }
+
+    #[test]
+    fn created_time_evidence_parser_is_fail_closed() {
+        let evidence = evidence_at(TimeQuality::NtpValid, fixed_instant(), Some(7));
+        let raw = serde_json::to_string(&evidence).expect("serialize");
+        assert_eq!(parse_created_time_evidence(&raw), Some(evidence));
+        // 空串、非对象、缺字段一律 None（无法证明原期限有效，fail-closed）
+        for raw in ["", "null", "\"x\"", "{}", "{\"clock_epoch\":\"nope\"}"] {
+            assert_eq!(
+                parse_created_time_evidence(raw),
+                None,
+                "{raw:?} 必须解析失败"
+            );
+        }
     }
 
     #[test]

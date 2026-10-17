@@ -111,7 +111,9 @@ pub struct MainTaskRow {
     pub counts_json: String,
 }
 
-/// 子任务领域行（列表投影；`queue_deadline` 不进列表行）。
+/// 子任务领域行（列表投影；两条期限列都不进列表行：`queue_deadline` 是排队截止、
+/// 只由时限复核/调度路径读取，`observe_deadline` 是派发后的观察窗截止，
+/// 两者语义独立，都不属于列表展示字段）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubTaskRow {
     pub id: Uuid,
@@ -310,6 +312,9 @@ pub trait TaskRepository: Send + Sync {
     ) -> impl std::future::Future<Output = Result<CancelOutcome, ControllerError>> + Send;
 
     /// `clock` 必须是服务端时钟源（TimeGate）产出的快照，绝不来自请求体。
+    /// 分派依据只有服务端真实比对：`sub_tasks.queue_deadline`（排队截止，不是
+    /// `observe_deadline` 观察窗）对「采样时刻 + 样本年龄」，并要求主任务
+    /// `created_time_json` 的时钟纪元与当前纪元连续，否则一律 `Inconclusive`。
     fn time_review(
         &self,
         req: &TimeReviewRequest,
