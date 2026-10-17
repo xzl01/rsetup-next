@@ -7,6 +7,10 @@
 //! roles, grants, groups } }`：`schema_version` 与五个 `COUNT(*)` 来自网关真实聚合
 //! （`schema_meta` 单例 + 计数，十进制字符串），`version` 来自 `CARGO_PKG_VERSION`，
 //! `ready`/`recovery_mode` 来自 `RecoveryModeProbe` 的 Runtime 当前快照。
+//! 网关**内部投影**是扁平形状 `{schema_version, version, users, devices, roles,
+//! grants, groups}`（对齐 Task 13 `SqlxManagementGateway::status` 与 05 适配器矩阵）：
+//! handler 在顶层逐个校验五个十进制计数后组装进嵌套 `counts`，多余键忽略，因此内部
+//! 扁平形状与线上嵌套契约互不耦合。
 //! 探针可失败：Runtime 不可读时上抛固定去敏错误，handler 映射 503 `NOT_READY`，
 //! 不用常量 `normal` 兜底、不把恢复模式等同调度放行。
 
@@ -47,24 +51,34 @@ pub struct SystemApiState {
 }
 
 /// 即使只是统计也必须把 actor 送到仓储的当前管理员检查。
-/// 网关返回形状固定为 `{ schema_version: <number>, counts: { users, devices,
-/// roles, grants, groups } }`，计数为十进制字符串；任何偏离都是去敏 `Config` → 503。
+/// 网关内部投影是**扁平**形状（对齐 Task 13 `SqlxManagementGateway::status`）：
+/// `{ schema_version: <number>, users, devices, roles, grants, groups }`，五个计数为
+/// 顶层十进制字符串；缺任一键、非字符串或非十进制都是去敏 `Config` → 503。网关对象
+/// 的多余键（如自带的 `version`）由 handler 忽略，HTTP 响应契约不受其影响。
 pub trait SystemGateway: Send + Sync {
     fn status<'a>(&'a self, actor: &'a Session) -> ManagementFuture<'a, serde_json::Value>;
 }
 
-/// 网关聚合页的形状契约字段：五个计数键齐全且为十进制字符串。
+/// 网关扁平投影的顶层计数键：五个必须齐全且各为十进制字符串。
 const SYSTEM_COUNT_KEYS: [&str; 5] = ["users", "devices", "roles", "grants", "groups"];
 
 fn system_status_shape_error() -> ControllerError {
     ControllerError::Config("system status page shape".into())
 }
 
+/// 顶层十进制计数：非字符串、空串、带符号、负数、非 ASCII 数字一律 `None`。
+fn decimal_count(map: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    map.get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|raw| !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()))
+        .map(str::to_string)
+}
+
 /// `GET /api/v1/system/status` handler：调用顺序固定为
 /// `authenticate_read(SystemStatusRead)` → `require_admin_session` →
 /// `recovery_probe.current_mode()`（探针先行，Err → 固定 503 `NOT_READY`，
 /// 不回显错误片段）→ `gateway.status(&actor)`（错误经 `map_error`）→
-/// 聚合页形状 fail-closed 校验 → 组装固定契约。
+/// 扁平聚合页形状 fail-closed 校验 → 组装固定嵌套契约。
 async fn get_system_status(State(state): State<SystemApiState>, headers: HeaderMap) -> Response {
     let actor = match authenticate_read(&state.auth, &headers, EndpointId::SystemStatusRead).await {
         Ok(session) => session,
@@ -96,17 +110,15 @@ async fn get_system_status(State(state): State<SystemApiState>, headers: HeaderM
         }
         _ => return map_error(system_status_shape_error()),
     };
-    let counts = match map.get("counts").and_then(serde_json::Value::as_object) {
-        Some(counts) if counts.len() == SYSTEM_COUNT_KEYS.len() => counts,
-        _ => return map_error(system_status_shape_error()),
-    };
+    // 扁平投影 → 嵌套响应：五个计数在网关对象顶层逐个校验后组装进 `counts`；
+    // 多余键忽略，`version` 只取 `CARGO_PKG_VERSION`，`ready`/`recovery_mode` 只来自探针。
+    let mut counts = serde_json::Map::new();
     for key in SYSTEM_COUNT_KEYS {
-        let decimal = counts
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|raw| !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()));
-        if !decimal {
-            return map_error(system_status_shape_error());
+        match decimal_count(map, key) {
+            Some(value) => {
+                counts.insert((*key).to_string(), serde_json::Value::String(value));
+            }
+            None => return map_error(system_status_shape_error()),
         }
     }
     ok_response(serde_json::json!({
@@ -131,10 +143,13 @@ pub fn system_router(state: SystemApiState) -> Router<()> {
 mod tests {
     use super::*;
     use crate::api::users::test_fixture::*;
-    use axum::http::StatusCode;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
     use tower::ServiceExt;
 
-    /// 私有 system 网关桩：固定计数（十进制字符串）+ `schema_version`。
+    /// 私有 system 网关桩：**扁平**投影（对齐 Task 13 `SqlxManagementGateway::status`
+    /// 的 `{schema_version, version, users, devices, roles, grants, groups}`），计数为
+    /// 十进制字符串；`version` 是 handler 不消费的多余键，必须被忽略。
     struct FixtureSystemGateway;
 
     impl SystemGateway for FixtureSystemGateway {
@@ -142,13 +157,12 @@ mod tests {
             Box::pin(async {
                 Ok(serde_json::json!({
                     "schema_version": 4,
-                    "counts": {
-                        "users": "1",
-                        "devices": "2",
-                        "roles": "3",
-                        "grants": "4",
-                        "groups": "5"
-                    },
+                    "version": "gateway-version-must-be-ignored",
+                    "users": "1",
+                    "devices": "2",
+                    "roles": "3",
+                    "grants": "4",
+                    "groups": "5",
                 }))
             })
         }
@@ -223,6 +237,11 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let val: serde_json::Value = body_json(res).await;
         assert_eq!(val["data"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_ne!(
+            val["data"]["version"].as_str(),
+            Some("gateway-version-must-be-ignored"),
+            "version 只取 CARGO_PKG_VERSION，不得透传网关版本字段"
+        );
         assert_eq!(val["data"]["recovery_mode"], "normal");
         assert_eq!(val["data"]["counts"]["users"], "1");
         assert_eq!(val["data"]["ready"], true);
@@ -231,6 +250,52 @@ mod tests {
         assert_eq!(val["data"]["counts"]["roles"], "3");
         assert_eq!(val["data"]["counts"]["grants"], "4");
         assert_eq!(val["data"]["counts"]["groups"], "5");
+        // 响应契约保持嵌套：五个计数在 `data.counts` 下，网关顶层计数不外泄。
+        assert_eq!(
+            val["data"]
+                .as_object()
+                .expect("data 对象")
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>()
+                .iter()
+                .copied()
+                .cloned()
+                .collect::<Vec<String>>(),
+            vec![
+                "counts".to_string(),
+                "ready".to_string(),
+                "recovery_mode".to_string(),
+                "schema_version".to_string(),
+                "version".to_string(),
+            ],
+            "data 恰为五字段"
+        );
+        assert!(
+            val["data"].get("users").is_none(),
+            "网关扁平计数键不得出现在响应顶层"
+        );
+    }
+
+    #[tokio::test]
+    async fn system_status_unauthenticated_is_rejected_with_401() {
+        let router = system_router(fixture_system_state());
+        let res = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/system/status")
+                    .header(header::HOST, FIXTURE_HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let value = body_json(res).await;
+        assert_eq!(value["error"]["code"].as_str(), Some("AUTH_REQUIRED"));
+        assert!(
+            !value.to_string().contains("counts"),
+            "401 响应不得携带聚合投影"
+        );
     }
 
     #[tokio::test]
@@ -272,26 +337,100 @@ mod tests {
         assert_eq!(code, "PERMISSION_DENIED");
     }
 
+    /// 合法扁平网关投影：`schema_version` + 顶层五个十进制计数 + handler 不消费的
+    /// 多余 `version` 键。
+    fn flat_status() -> serde_json::Map<String, serde_json::Value> {
+        let mut map = serde_json::Map::new();
+        map.insert("schema_version".into(), serde_json::json!(4));
+        map.insert("version".into(), serde_json::json!("1.0.0"));
+        for (key, value) in [
+            ("users", "1"),
+            ("devices", "2"),
+            ("roles", "3"),
+            ("grants", "4"),
+            ("groups", "5"),
+        ] {
+            map.insert(key.into(), serde_json::Value::String(value.into()));
+        }
+        map
+    }
+
+    /// 在合法扁平页上覆盖一个键；`None` 表示删除该键。
+    fn flat_status_with(key: &str, value: Option<serde_json::Value>) -> serde_json::Value {
+        let mut map = flat_status();
+        match value {
+            None => {
+                map.remove(key);
+            }
+            Some(value) => {
+                map.insert(key.into(), value);
+            }
+        }
+        serde_json::Value::Object(map)
+    }
+
+    /// 网关多余键（`version` 及任意未知键）不再是拒绝条件，也不得进入响应。
+    #[tokio::test]
+    async fn system_status_ignores_extra_gateway_keys() {
+        let mut map = flat_status();
+        map.insert("extra".into(), serde_json::json!("6"));
+        map.insert(
+            "time_evidence".into(),
+            serde_json::json!({ "source": "fixture" }),
+        );
+        let router = system_router(system_state(
+            Arc::new(DirtyStatusGateway(serde_json::Value::Object(map))),
+            FixtureRecoveryProbe::Ok,
+        ));
+        let res = router
+            .oneshot(authenticated_get("/api/v1/system/status"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let value = body_json(res).await;
+        assert_eq!(value["data"]["counts"]["users"], "1");
+        assert_eq!(value["data"]["counts"]["groups"], "5");
+        assert!(value["data"].get("extra").is_none());
+        assert!(value["data"].get("time_evidence").is_none());
+    }
+
+    /// 扁平投影脏页逐项 fail-closed：缺任一计数键、非字符串、非 ASCII 十进制、
+    /// 带符号、负数、空串，以及 `schema_version` 缺失/非数字/i32 越界。
+    /// 旧的嵌套 `counts` 形状在扁平契约下同样必须拒绝（跨任务契约锚点）。
     #[tokio::test]
     async fn system_status_fails_closed_on_dirty_gateway_pages() {
-        let cases = vec![
+        let mut cases = vec![
             serde_json::json!("not-an-object"),
-            serde_json::json!({"counts": {"users": "1"}}),
-            serde_json::json!({"schema_version": "4", "counts": {}}),
+            serde_json::json!([]),
+            serde_json::json!({}),
             serde_json::json!({"schema_version": 4, "counts": {
-                "users": 1, "devices": "2", "roles": "3", "grants": "4", "groups": "5"
+                "users": "1", "devices": "2", "roles": "3", "grants": "4", "groups": "5"
             }}),
-            serde_json::json!({"schema_version": 4, "counts": {
-                "users": "1", "devices": "2", "roles": "3", "grants": "4"
-            }}),
-            serde_json::json!({"schema_version": 4, "counts": {
-                "users": "1", "devices": "2", "roles": "3", "grants": "4",
-                "groups": "5", "extra": "6"
-            }}),
-            serde_json::json!({"schema_version": 4, "counts": {
-                "users": "+1", "devices": "2", "roles": "3", "grants": "4", "groups": "5"
-            }}),
+            flat_status_with("schema_version", None),
+            flat_status_with("schema_version", Some(serde_json::json!("4"))),
+            flat_status_with("schema_version", Some(serde_json::json!(true))),
+            flat_status_with("schema_version", Some(serde_json::json!(4.0))),
+            flat_status_with(
+                "schema_version",
+                Some(serde_json::json!(i64::from(i32::MAX) + 1)),
+            ),
+            flat_status_with(
+                "schema_version",
+                Some(serde_json::json!(i64::from(i32::MIN) - 1)),
+            ),
         ];
+        for key in SYSTEM_COUNT_KEYS {
+            cases.push(flat_status_with(key, None));
+            cases.push(flat_status_with(key, Some(serde_json::json!(1))));
+            cases.push(flat_status_with(key, Some(serde_json::Value::Null)));
+            cases.push(flat_status_with(key, Some(serde_json::json!({ "v": "1" }))));
+            for bad in ["+1", "-1", "", " 1", "1.0", "0x1", "1e0", "abc", "١"] {
+                cases.push(flat_status_with(
+                    key,
+                    Some(serde_json::Value::String(bad.into())),
+                ));
+            }
+        }
         for page in cases {
             let router = system_router(system_state(
                 Arc::new(DirtyStatusGateway(page.clone())),

@@ -365,6 +365,23 @@ mod tests {
         "067e6162ea944431836c7d8fa2010b3c0000000000000007067e6162ea944431836c7d8fa2010b3d";
     /// 与 users/roles/grants/groups/devices/approvals 区同值的测试合成 key。
     const SYNTHETIC_SECRET: [u8; 32] = [7u8; 32];
+    /// fixture admin 的 actor id（与 `fixture_session` 一致）。
+    const FIXTURE_ACTOR: [u8; 16] = [7u8; 16];
+    /// 另一个 fixture actor id：跨用户用例只改这一个维度。
+    const OTHER_ACTOR: [u8; 16] = [8u8; 16];
+    /// UUID version nibble 位于 16 字节布局的 byte 6 高 4 位 → hex 下标 12。
+    const UUID_VERSION_NIBBLE_HEX: usize = 6 * 2;
+    /// raw 复合键布局（见 `parse_audit_raw_key`）：epoch 16B ‖ seq 8B ‖ id 16B，
+    /// 故 `id` 字段起点在 `(16 + 8)` 字节处，不硬编码新的键长。
+    const RAW_ID_OFFSET_HEX: usize = (16 + 8) * 2;
+
+    /// 替换 raw 复合键指定 hex 位上的 nibble（形状脏页用）。
+    fn raw_key_with_nibble(hex_index: usize, nibble: char) -> String {
+        assert_eq!(RAW_NEXT.len(), AUDIT_RAW_KEY_HEX, "raw 键布局账目");
+        let mut raw = RAW_NEXT.to_string();
+        raw.replace_range(hex_index..hex_index + 1, &nibble.to_string());
+        raw
+    }
 
     fn audit_page(next_cursor: serde_json::Value) -> serde_json::Value {
         serde_json::json!({
@@ -411,17 +428,52 @@ mod tests {
         }
     }
 
-    async fn error_code(res: axum::response::Response) -> (StatusCode, String) {
+    async fn error_code(res: axum::response::Response) -> (StatusCode, String, String) {
         let status = res.status();
         let value = body_json(res).await;
         (
             status,
             value["error"]["code"].as_str().unwrap_or("").to_string(),
+            value.to_string(),
         )
+    }
+
+    /// 不带会话 cookie 的请求：门禁顺序由 `http_gate` 保证，401 先于任何网关调用。
+    fn anonymous_get(uri: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header(
+                axum::http::header::HOST,
+                crate::api::users::test_fixture::FIXTURE_HOST,
+            )
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn audit_unauthenticated_is_rejected_with_401() {
+        let router = audit_router(fixture_audit_state());
+        let (status, code, text) = error_code(
+            router
+                .oneshot(anonymous_get("/api/v1/audit"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(code, "AUTH_REQUIRED");
+        assert!(
+            !text.contains("items"),
+            "401 响应不得携带审计页投影：{text}"
+        );
     }
 
     #[tokio::test]
     async fn audit_endpoint_returns_redacted_events_never_tokens() {
+        // 脱敏边界是 Task 13 生产 adapter 的固定投影（`params_redacted` 列 + 白名单
+        // 字段），handler 逐字透传 `items`，不得在 handler 侧新增或删减字段；因此本
+        // 用例只断言网关投影原样出口且不含凭据形态，不构造“handler 脱敏”的负向用例。
         let router = audit_router(fixture_audit_state());
         let res = router
             .oneshot(authenticated_get("/api/v1/audit"))
@@ -444,7 +496,7 @@ mod tests {
                 next_cursor: serde_json::Value::Null,
             }),
         });
-        let (status, code) = error_code(
+        let (status, code, _) = error_code(
             router
                 .oneshot(authenticated_get("/api/v1/audit"))
                 .await
@@ -469,7 +521,7 @@ mod tests {
         ];
         for uri in cases {
             let router = audit_router(fixture_audit_state());
-            let (status, code) =
+            let (status, code, _) =
                 error_code(router.oneshot(authenticated_get(uri)).await.unwrap()).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} 必须 400");
             assert_eq!(code, "INVALID_ARGUMENT", "{uri}");
@@ -486,7 +538,7 @@ mod tests {
                 next_cursor: serde_json::json!(RAW_NEXT),
             }),
         });
-        let (status, code) = error_code(
+        let (status, code, text) = error_code(
             router
                 .oneshot(authenticated_get("/api/v1/audit"))
                 .await
@@ -495,6 +547,49 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(code, "STORAGE_UNAVAILABLE");
+        assert!(
+            !text.contains(RAW_NEXT),
+            "密钥未安装时绝不回吐裸 raw 复合键：{text}"
+        );
+    }
+
+    /// 无 `limit` 时网关必须收到缺省 50（`limit` 不进 cursor schema，故用计数桩断言）。
+    #[tokio::test]
+    async fn audit_without_limit_sends_default_50_to_gateway() {
+        let gateway = Arc::new(PageAuditGateway::default());
+        let router = signed_audit_cursor_router(Some(SYNTHETIC_SECRET), gateway.clone());
+        let res = router
+            .oneshot(authenticated_get("/api/v1/audit"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let calls = gateway.recorded();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0],
+            (None, 50),
+            "缺省 limit 必须是 50 且 cursor 为 None"
+        );
+    }
+
+    /// 非签名 token 的 `cursor`（长度/字符集都不合法）必须是去敏 400，且不触网关。
+    #[tokio::test]
+    async fn audit_rejects_non_token_cursor_with_400() {
+        let gateway = Arc::new(PageAuditGateway::default());
+        let router = signed_audit_cursor_router(Some(SYNTHETIC_SECRET), gateway.clone());
+        let (status, code, _) = error_code(
+            router
+                .oneshot(authenticated_get("/api/v1/audit?cursor=not-a-token"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "INVALID_ARGUMENT");
+        assert!(
+            gateway.recorded().is_empty(),
+            "cursor 解码失败必须在调用网关前返回"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -557,10 +652,22 @@ mod tests {
     }
 
     /// fixture helper：只挂 wrapper 的 GET list 路由并 `.with_state(state)` 归约；
-    /// `Some` 经 `install_cursor_secret_into` 装入测试合成 key。
+    /// `Some` 经 `install_cursor_secret_into` 装入测试合成 key。gateway 参数取
+    /// `Arc<dyn AuditGateway>`（与 `AuditApiState.gateway` 同型），使脏页桩也能挂到
+    /// **已装测试密钥**的同一条真实链路上，不被“密钥未安装”短路。
     fn signed_audit_cursor_router(
         secret: Option<[u8; 32]>,
-        gateway: Arc<PageAuditGateway>,
+        gateway: Arc<dyn AuditGateway>,
+    ) -> Router<()> {
+        signed_audit_cursor_router_as(secret, gateway, fixture_session(true))
+    }
+
+    /// 同 `signed_audit_cursor_router`，但显式指定会话（跨用户用例只换 actor，
+    /// 其余 Host/Cookie/CSRF/密钥/筛选全部保持一致）。
+    fn signed_audit_cursor_router_as(
+        secret: Option<[u8; 32]>,
+        gateway: Arc<dyn AuditGateway>,
+        session: Session,
     ) -> Router<()> {
         let secret_slot = Arc::new(std::sync::OnceLock::new());
         if let Some(secret) = secret {
@@ -569,7 +676,7 @@ mod tests {
         }
         let state = SignedAuditCursorTestState {
             audit: AuditApiState {
-                auth: fixture_auth(fixture_session(true)),
+                auth: fixture_auth(session),
                 gateway,
             },
             secret_slot,
@@ -577,6 +684,24 @@ mod tests {
         Router::new()
             .route("/api/v1/audit", get(list_audit_with_test_secret))
             .with_state(state)
+    }
+
+    /// 只改 `user.id` 的 admin 会话：跨用户用例的 actor 维度。
+    fn session_with_actor(id: [u8; 16]) -> Session {
+        let mut session = fixture_session(true);
+        session.user.id = id;
+        session
+    }
+
+    /// 与 handler 处理**无筛选**请求时逐字相同的 filter 上下文（两个 schema 字段都
+    /// 缺省 → canonical `[0, 0]`）；`CursorFilterCtx::empty()` 的 canonical 是 `[]`，
+    /// 用它做跨用户断言会因 filter 不同而假失败。
+    fn unfiltered_audit_filter() -> CursorFilterCtx {
+        CursorFilterCtx::from_ordered_fields(&[
+            (AUDIT_FILTER_TAG_ACTOR, None),
+            (AUDIT_FILTER_TAG_DEVICE, None),
+        ])
+        .expect("固定两字段 schema 必须构造成功")
     }
 
     #[tokio::test]
@@ -641,7 +766,7 @@ mod tests {
             .to_string();
         // 换筛选（追加 actor_id）后旧 token 必须 400：filter 绑定进 MAC 输入。
         let router = signed_audit_cursor_router(Some(SYNTHETIC_SECRET), gateway.clone());
-        let (status, code) = error_code(
+        let (status, code, _) = error_code(
             router
                 .oneshot(authenticated_get(&format!(
                     "/api/v1/audit?cursor={token}&actor_id=067e6162-ea94-4431-836c-7d8fa2010b3c"
@@ -659,7 +784,7 @@ mod tests {
             if token.ends_with('0') { "1" } else { "0" },
         );
         let router = signed_audit_cursor_router(Some(SYNTHETIC_SECRET), gateway.clone());
-        let (status, code) = error_code(
+        let (status, code, _) = error_code(
             router
                 .oneshot(authenticated_get(&format!(
                     "/api/v1/audit?cursor={tampered}"
@@ -670,44 +795,108 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(code, "INVALID_ARGUMENT");
-        // 跨用户（不同 actor 的 MAC 输入）同样 400：以另一 fixture actor 上下文重算必失败。
-        let other_actor = [8u8; 16];
-        let filter = CursorFilterCtx::empty();
-        let err = decode_audit_cursor(&SYNTHETIC_SECRET, other_actor, &filter, &token)
+        // 跨用户：filter 上下文必须与签出时**逐字相同**（无筛选请求 → 两字段都缺省），
+        // 只替换 actor，才能把失败唯一归因于 actor 参与 MAC 输入。
+        let same_filter = unfiltered_audit_filter();
+        let expected = AuditCursor {
+            process_epoch: Uuid::parse_str(EPOCH_V4).expect("fixture epoch"),
+            event_seq: 7,
+            id: Uuid::parse_str(ID_V4).expect("fixture id"),
+        };
+        // 正向对照：同一 actor + 同一 filter 必须解回预期复合键，否则无法证明差异只在 actor。
+        let decoded = decode_audit_cursor(&SYNTHETIC_SECRET, FIXTURE_ACTOR, &same_filter, &token)
+            .expect("同 actor 同 filter 必须解码成功");
+        assert_eq!(decoded, expected);
+        let err = decode_audit_cursor(&SYNTHETIC_SECRET, OTHER_ACTOR, &same_filter, &token)
             .expect_err("跨用户 cursor 必须拒绝");
         assert!(matches!(err, ControllerError::InvalidArgument));
     }
 
+    /// HTTP 级跨用户：同一密钥、同一（无筛选）请求，只把会话换成另一个 admin actor，
+    /// 他人 token 必须 400；同 actor 重放同一 token 必须 200。
+    #[tokio::test]
+    async fn cursor_from_another_actor_is_rejected_over_http_with_400() {
+        let gateway = Arc::new(PageAuditGateway::default());
+        let router = signed_audit_cursor_router(Some(SYNTHETIC_SECRET), gateway.clone());
+        let res = router
+            .oneshot(authenticated_get("/api/v1/audit"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let token = body_json(res).await["data"]["next_cursor"]
+            .as_str()
+            .expect("signed token")
+            .to_string();
+        // 他人 actor 的会话携带该 token → 同一个去敏 400。
+        let other_router = signed_audit_cursor_router_as(
+            Some(SYNTHETIC_SECRET),
+            gateway.clone(),
+            session_with_actor(OTHER_ACTOR),
+        );
+        let (status, code, _) = error_code(
+            other_router
+                .oneshot(authenticated_get(&format!("/api/v1/audit?cursor={token}")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "INVALID_ARGUMENT");
+        // 正向对照：同 actor 同 filter 重放同一 token 必须 200。
+        let same_router = signed_audit_cursor_router(Some(SYNTHETIC_SECRET), gateway.clone());
+        let res = same_router
+            .oneshot(authenticated_get(&format!("/api/v1/audit?cursor={token}")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    /// 脏网关页必须在**已装测试密钥**的真实链路上逐项 fail-closed 503，且响应体不含
+    /// 裸 raw 复合键。这里必须走 `signed_audit_cursor_router(Some(SYNTHETIC_SECRET), …)`
+    /// 而不是生产 `audit_router`：后者进程内全局密钥未安装，会在取密钥处就 503，
+    /// `parse_audit_raw_key` 的形状校验根本不执行（假阳性）。
     #[tokio::test]
     async fn dirty_gateway_pages_fail_closed_with_503() {
         let cases = [
+            // 非 raw-key 形状：缺 items、items 非数组、缺 next_cursor、next_cursor 非 string。
             serde_json::json!({"next_cursor": null}),
             serde_json::json!({"items": {}, "next_cursor": null}),
             serde_json::json!({"items": []}),
             serde_json::json!({"items": [], "next_cursor": 7}),
-            // raw key 形状脏：大写 hex、长度不符、epoch 非 v4（version nibble 改 5）。
+            // raw key 形状脏：大写 hex、长度不足、长度超出、epoch 非 v4、id 非 v4。
             serde_json::json!({"items": [], "next_cursor": RAW_NEXT.to_uppercase()}),
-            serde_json::json!({"items": [], "next_cursor": &RAW_NEXT[..79]}),
+            serde_json::json!({
+                "items": [],
+                "next_cursor": &RAW_NEXT[..AUDIT_RAW_KEY_HEX - 1],
+            }),
             serde_json::json!({"items": [], "next_cursor": format!("{RAW_NEXT}0")}),
             serde_json::json!({
                 "items": [],
-                "next_cursor": format!("{}{}{}", &RAW_NEXT[..12], "5", &RAW_NEXT[13..]),
+                "next_cursor": raw_key_with_nibble(UUID_VERSION_NIBBLE_HEX, '5'),
+            }),
+            serde_json::json!({
+                "items": [],
+                "next_cursor": raw_key_with_nibble(RAW_ID_OFFSET_HEX + UUID_VERSION_NIBBLE_HEX, '5'),
             }),
         ];
         for page in cases {
-            let router = audit_router(AuditApiState {
-                auth: fixture_auth(fixture_session(true)),
-                gateway: Arc::new(DirtyPageGateway(page)),
-            });
-            let (status, code) = error_code(
+            let router = signed_audit_cursor_router(
+                Some(SYNTHETIC_SECRET),
+                Arc::new(DirtyPageGateway(page.clone())),
+            );
+            let (status, code, text) = error_code(
                 router
                     .oneshot(authenticated_get("/api/v1/audit"))
                     .await
                     .unwrap(),
             )
             .await;
-            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-            assert_eq!(code, "STORAGE_UNAVAILABLE");
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{page}");
+            assert_eq!(code, "STORAGE_UNAVAILABLE", "{page}");
+            assert!(
+                !text.contains(RAW_NEXT),
+                "脏页响应不得含裸 raw 复合键：{text}"
+            );
         }
     }
 
