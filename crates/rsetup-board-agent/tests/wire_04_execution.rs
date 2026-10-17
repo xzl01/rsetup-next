@@ -29,11 +29,17 @@ const BOOT_OLD: &str = "6f8b1c2d-0000-4000-8000-000000000001";
 const BOOT_NEW: &str = "6f8b1c2d-0000-4000-8000-000000000002";
 const SUB_TASK: &str = "9c858901-8a57-4791-81fe-4c455b099bc9";
 const SUB_TASK_B: &str = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
+const SUB_TASK_C: &str = "7d1e2c34-5678-4abc-9def-0123456789ab";
+const SUB_TASK_D: &str = "2b8f4a16-3c9d-4e5f-8a6b-1c2d3e4f5a6b";
+const SUB_TASK_E: &str = "a1b2c3d4-5e6f-4a1b-9c2d-3e4f5a6b7c8d";
+const SUB_TASK_F: &str = "0f1e2d3c-4b5a-4988-8776-655443322110";
 const JOURNAL_EPOCH: &str = "11111111-1111-4111-8111-111111111111";
 const AGENT_EPOCH: &str = "1b4e28ba-2fa1-4d4b-9c1a-2b6b9d0e0c11";
 const CLOCK_EPOCH: &str = "2c1f9d3a-5b6e-4f70-8a91-0d2e3f4a5b6c";
 const KEY: [u8; 32] = [1u8; 32];
 const OTHER_KEY: [u8; 32] = [2u8; 32];
+const KEY_C: [u8; 32] = [3u8; 32];
+const KEY_D: [u8; 32] = [4u8; 32];
 
 // ---------------------------------------------------------------------------
 // 公共构造
@@ -919,6 +925,237 @@ fn boot_transition_releases_stale_occupation_on_same_executor() {
         "boot transition 后占用必须自动解除, got {outcome_b:?}"
     );
     assert_eq!(executor.os().call_count(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// 2.5 设备占用原子代际交接 & 多条未决 Attempted 完整追踪（复审 fix-2）
+// ---------------------------------------------------------------------------
+
+/// 合法 UUIDv4 形态的播种 `sub_task_id`（版本位 4、variant 位 8）：批量制造同 boot 未决记录。
+fn seeded_sub_task(index: usize) -> String {
+    format!("550e8400-0000-4000-8000-{index:012x}")
+}
+
+/// 直接经持久日志制造若干条同 boot 未决 `Attempted`（不占用 executor 的 OS 边界）。
+fn seed_pending_attempted(journal: &JournalStore<RealFs>, ids: &[String]) {
+    for id in ids {
+        journal
+            .insert_accepted(&KEY, id, &[7u8; 32], BOOT_OLD)
+            .expect("seed accepted");
+        journal.mark_attempted(&KEY, id).expect("seed attempted");
+    }
+}
+
+fn finish_all(journal: &JournalStore<RealFs>, ids: &[String]) {
+    for id in ids {
+        journal
+            .finish(&KEY, id, TaskState::Failed, Some("OS_ERROR"))
+            .expect("finish seeded record");
+    }
+}
+
+/// 为指定 `sub_task_id` 现签票据并执行一次（占用阻断路径在票据消费之前，票据不被消耗）。
+fn prepare_and_execute<O: RebootOs>(
+    executor: &RebootExecutor<O, RealFs>,
+    sub_task_id: &str,
+    now: Instant,
+) -> ExecuteOutcome {
+    let mut prepare = prepare_request();
+    prepare.sub_task_id = sub_task_id.to_string();
+    let issued = executor
+        .prepare(&KEY, "conn-1", &prepare, now)
+        .expect("prepare");
+    let mut request = execute_request(issued.execution_token);
+    request.sub_task_id = sub_task_id.to_string();
+    let payload_hash = canonical_reboot_payload_hash(&request);
+    executor.execute(&KEY, "conn-1", &request, &payload_hash, now)
+}
+
+#[test]
+fn new_recovering_tracks_every_pending_attempted_record() {
+    // 复审 fix-2：同 boot 存在多条未决 Attempted 时，恢复占用必须追踪全部记录，
+    // 不得只记住第一条——否则其中一条进入终态就会误解除其余未决任务仍持有的占用。
+    let dir = TempDir::new("recover-multi-pending");
+    let journal = Arc::new(JournalStore::open(dir.path(), RealFs).expect("open journal"));
+    let pending = vec![SUB_TASK.to_string(), SUB_TASK_B.to_string()];
+    seed_pending_attempted(&journal, &pending);
+
+    let rebuilt = RebootExecutor::new_recovering(
+        Arc::clone(&journal),
+        FakeOs::ok(),
+        TicketManager::new(),
+        Box::new(|| BOOT_OLD.to_string()),
+        "agent-2",
+    );
+    assert!(
+        rebuilt.device_occupied(),
+        "同 boot 存在未决 Attempted 必须恢复占用"
+    );
+    let mut tracked = rebuilt.occupying_sub_tasks();
+    tracked.sort();
+    let mut expected = pending;
+    expected.sort();
+    assert_eq!(
+        tracked, expected,
+        "恢复占用必须追踪全部未决记录，而不是只追踪第一条"
+    );
+}
+
+#[test]
+fn single_terminal_pending_record_keeps_device_busy() {
+    // A、B 两条同 boot 未决任务：仅 A 写入终态时占用仍必须成立，新任务必须收到
+    // 1005 DeviceBusy 且 fake OS 计数恒 0；B 也进入终态后新任务才可原子交接占用。
+    let dir = TempDir::new("multi-pending-release");
+    let journal = Arc::new(JournalStore::open(dir.path(), RealFs).expect("open journal"));
+    seed_pending_attempted(&journal, &[SUB_TASK.to_string(), SUB_TASK_B.to_string()]);
+    let executor = RebootExecutor::new_recovering(
+        Arc::clone(&journal),
+        FakeOs::ok(),
+        TicketManager::new(),
+        Box::new(|| BOOT_OLD.to_string()),
+        "agent-2",
+    );
+    let now = Instant::now();
+
+    // 仅 A 进入终态：B 仍未决 → 占用不得解除，新任务必须被拒绝
+    journal
+        .finish(&KEY, SUB_TASK, TaskState::Failed, Some("OS_ERROR"))
+        .expect("finish a");
+    assert!(executor.device_occupied(), "仍有未决记录时不得解除设备占用");
+    assert!(
+        matches!(
+            prepare_and_execute(&executor, SUB_TASK_C, now),
+            ExecuteOutcome::Rejected(BusinessStatus::DeviceBusy)
+        ),
+        "仅一条未决记录进入终态时新任务必须被拒绝（DeviceBusy）"
+    );
+    assert_eq!(
+        executor.os().call_count(),
+        0,
+        "未决记录未全部终结前绝不允许触达 OS 边界"
+    );
+    assert!(
+        executor.occupying_sub_task().is_some(),
+        "被拒绝的新任务绝不得改写占用者"
+    );
+
+    // B 也进入终态：占用集合全部终结 → 新任务可原子交接占用并进入 OS 边界
+    journal
+        .finish(&KEY, SUB_TASK_B, TaskState::Failed, Some("OS_ERROR"))
+        .expect("finish b");
+    assert!(
+        matches!(
+            prepare_and_execute(&executor, SUB_TASK_C, now),
+            ExecuteOutcome::Attempted(_)
+        ),
+        "全部未决记录终结后新任务必须可占用"
+    );
+    assert_eq!(executor.os().call_count(), 1);
+    assert_eq!(
+        executor.occupying_sub_task().as_deref(),
+        Some(SUB_TASK_C),
+        "交接后占用者必须是新任务"
+    );
+}
+
+#[test]
+fn concurrent_stale_review_handover_keeps_exactly_one_occupation() {
+    // 复审 fix-2 竞态回归门禁：两个以上线程同时复核同一份已失效占用时，
+    // 只允许一个线程完成原子交接，其余必须 DeviceBusy；胜者的新占用绝不被
+    // 败者依据过期终态结论清除（旧实现先解锁复核、后无条件 release，可被清除）。
+    // 隔离纪律：OS 替身为进程内计数器，宿主物理 reboot 恒 0。
+    for round in 0..24u8 {
+        let dir = TempDir::new("handover-race");
+        let journal = Arc::new(JournalStore::open(dir.path(), RealFs).expect("open journal"));
+        // 播种两条同 boot 未决记录 → 恢复占用；随后全部进入终态 → 占用已可安全解除
+        let seeded = vec![seeded_sub_task(0), seeded_sub_task(1)];
+        seed_pending_attempted(&journal, &seeded);
+        let executor = Arc::new(RebootExecutor::new_recovering(
+            Arc::clone(&journal),
+            FakeOs::ok(),
+            TicketManager::new(),
+            Box::new(|| BOOT_OLD.to_string()),
+            "agent-1",
+        ));
+        finish_all(&journal, &seeded);
+
+        let now = Instant::now();
+        // 票据按 controller 单槽位存放：每个竞争者使用各自的已认证 controller
+        let competitors: [([u8; 32], &str); 4] = [
+            (KEY, SUB_TASK_C),
+            (OTHER_KEY, SUB_TASK_D),
+            (KEY_C, SUB_TASK_E),
+            (KEY_D, SUB_TASK_F),
+        ];
+        let mut issued = Vec::with_capacity(competitors.len());
+        for (controller_key, sub_task_id) in competitors {
+            let mut prepare = prepare_request();
+            prepare.sub_task_id = sub_task_id.to_string();
+            let ticket = executor
+                .prepare(&controller_key, "conn-1", &prepare, now)
+                .expect("prepare competitor");
+            issued.push((controller_key, sub_task_id, ticket.execution_token));
+        }
+
+        let barrier = Arc::new(std::sync::Barrier::new(competitors.len()));
+        let mut handles = Vec::with_capacity(issued.len());
+        for (controller_key, sub_task_id, token) in issued {
+            let executor = Arc::clone(&executor);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let mut request = execute_request(token);
+                request.sub_task_id = sub_task_id.to_string();
+                let payload_hash = canonical_reboot_payload_hash(&request);
+                barrier.wait();
+                let outcome =
+                    executor.execute(&controller_key, "conn-1", &request, &payload_hash, now);
+                (sub_task_id, outcome)
+            }));
+        }
+        let outcomes: Vec<(&str, ExecuteOutcome)> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("competitor thread"))
+            .collect();
+
+        let winners: Vec<&str> = outcomes
+            .iter()
+            .filter(|(_, outcome)| matches!(outcome, ExecuteOutcome::Attempted(_)))
+            .map(|(sub_task_id, _)| *sub_task_id)
+            .collect();
+        let losers = outcomes
+            .iter()
+            .filter(|(_, outcome)| {
+                matches!(
+                    outcome,
+                    ExecuteOutcome::Rejected(BusinessStatus::DeviceBusy)
+                )
+            })
+            .count();
+        assert_eq!(
+            winners.len(),
+            1,
+            "第 {round} 轮：同一份失效占用的并发复核只能有一个胜者完成交接, got {outcomes:?}"
+        );
+        assert_eq!(
+            losers,
+            outcomes.len() - 1,
+            "第 {round} 轮：其余竞争者必须收到 1005 DeviceBusy, got {outcomes:?}"
+        );
+        assert_eq!(
+            executor.os().call_count(),
+            1,
+            "第 {round} 轮：并发交接期间至多一次 OS 调用（fake 计数，宿主物理 reboot 恒 0）"
+        );
+        assert!(
+            executor.device_occupied(),
+            "第 {round} 轮：胜者的新占用绝不被败者的过期复核结论清除"
+        );
+        assert_eq!(
+            executor.occupying_sub_task().as_deref(),
+            Some(winners[0]),
+            "第 {round} 轮：占用者必须是完成交接的胜者"
+        );
+    }
 }
 
 // ---- 落盘故障注入替身：把失败精确投到 execute 的某个写 stage ----

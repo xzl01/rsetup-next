@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::actions::{ActionKind, lookup_action};
@@ -393,41 +393,92 @@ pub enum ExecuteOutcome {
 
 /// Reboot 执行调度器：票据、journal 与固定无参 OS 边界的唯一接线点。
 ///
-/// 设备级原子占用标记（TR-N5 / 正审 R-05）：同 agent 实例单设备串行互斥（1005 DeviceBusy）。
+/// 设备级占用状态机（TR-N5 / 正审 R-05 / 复审 fix-2）：同 agent 实例单设备串行互斥
+/// （1005 DeviceBusy）。「是否占用、当前占用者集合、占用代际」合并为**同一个互斥锁**
+/// （[`DeviceOccupationState`]）保护的状态机：占用标记与占用者身份之间不存在任何中间窗口，
+/// 释放与交接必须在锁内以代际 CAS 复核「仍是我复核过的那份占用」后才生效。
+///
 /// 占用覆盖未决重启全生命周期：fresh execute 开始时申请；当且仅当确定未执行的拒绝
 /// （DefinitelyNotCommitted / 票据无效 / boot 不匹配）或写入终态（Failed）才释放；
 /// OS Ok 返回未决 Attempted 中间态时保持占用。
 ///
-/// 恢复规则（TR-R6-3）：实例重启后经 [`RebootExecutor::new_recovering`] 重建时扫描持久 records，
-/// 若存在任何 `state == Attempted` 且 `pre_boot_id == 当前 boot`（重启已发起但 boot transition
-/// 未观察到）的记录，恢复占用为 true（扫描失败按占用 fail-closed）；全部为终态或已观察到
-/// boot transition 则为 false。
+/// 恢复规则（TR-R6-3 / 复审 fix-2）：实例重启后经 [`RebootExecutor::new_recovering`] 重建时
+/// 扫描持久 records，若存在任何 `state == Attempted` 且 `pre_boot_id == 当前 boot`（重启已发起
+/// 但 boot transition 未观察到）的记录，恢复占用并把**全部**未决记录记为占用者集合（不得只追踪
+/// 第一条）；全部为终态或已观察到 boot transition 则为空闲；扫描失败按占用 fail-closed（占用者
+/// 未知，见 [`OccupationState::Unknown`]）。
 ///
-/// 占用解除复核（正审 fix-1）：记录当前占用者 `occupying: Option<Occupation>`。当新任务被占用
-/// 阻断前，复核该占用任务在持久日志中是否已进入终态（`Failed` / `Succeeded`），或设备 boot 是否
-/// 已变化（发生 boot transition）；若是则自动安全释放占用，让新任务得以重新占用。
+/// 占用解除复核（正审 fix-1 / 复审 fix-2）：新任务被占用阻断前，复核占用集合中**每一条**任务
+/// 在持久日志中是否都已进入终态（`Failed` / `Succeeded`），或设备 boot 是否已变化（boot
+/// transition）；成立才以代际 CAS 把占用原子交接给新任务。复核结论跨锁失效（代际被并发改写）
+/// 时一律放弃，绝不依据过期的终态结论清除并发线程刚取得的新占用。
 pub struct RebootExecutor<O: RebootOs, F: Fs> {
     journal: Arc<JournalStore<F>>,
     os: O,
     tickets: TicketManager,
     boot_id: Box<dyn Fn() -> String + Send + Sync>,
     agent_instance_id: String,
-    device_occupied: AtomicBool,
-    /// 当前占用者身份（去重键 + 占用时的 boot），用于终态收敛 / boot transition 后安全解除占用。
-    occupying: Mutex<Option<Occupation>>,
+    /// 设备占用状态机：`generation` 每次变更递增，释放 / 交接必须携带复核时看到的代际做 CAS。
+    occupation: Mutex<DeviceOccupationState>,
 }
 
-/// 占用者身份见证：与 journal 去重键一致（`controller_key` + `sub_task_id`），
-/// 外加占用发生时的 `boot_id`，用于复核占用是否已失效。
+/// 设备占用状态机：占用标记、占用者身份与代际号必须一起变更，因此整体置于同一互斥锁内。
+#[derive(Clone, Debug)]
+struct DeviceOccupationState {
+    /// 占用代际：每次占用状态变更（占用 / 释放 / 交接）递增，作为 CAS 见证。
+    generation: u64,
+    state: OccupationState,
+}
+
+/// 占用状态：空闲 / 被具体任务集合占用 / 占用状态未知（恢复扫描失败 fail-closed）。
+#[derive(Clone, Debug)]
+enum OccupationState {
+    /// 设备空闲，可被新任务原子占用。
+    Free,
+    /// 被 [`Occupation`] 记录的全部任务占用。
+    Occupied(Occupation),
+    /// 占用状态未知（恢复扫描失败 fail-closed）：与 `Occupied` 同样排他，但无占用者身份可
+    /// 逐条复核，解除时回退到再次扫描持久日志。
+    Unknown,
+}
+
+/// 占用者身份见证：持有占用的**全部**任务（恢复场景可能同时存在多条同 boot 未决
+/// `Attempted`），外加占用发生时的 `boot_id`，用于复核占用是否已失效。
 #[derive(Clone, Debug)]
 struct Occupation {
+    boot_id: String,
+    tasks: Vec<OccupiedTask>,
+}
+
+/// 单个占用任务的身份：与 journal 去重键一致（`controller_key` + `sub_task_id`）。
+#[derive(Clone, Debug)]
+struct OccupiedTask {
     controller_key: [u8; 32],
     sub_task_id: String,
-    boot_id: String,
+}
+
+impl DeviceOccupationState {
+    fn new(state: OccupationState) -> Self {
+        Self {
+            generation: 0,
+            state,
+        }
+    }
+}
+
+/// fresh execute 占用身份：单个任务、当前 boot。
+fn fresh_occupation(controller_key: &[u8; 32], sub_task_id: &str, boot_id: &str) -> Occupation {
+    Occupation {
+        boot_id: boot_id.to_string(),
+        tasks: vec![OccupiedTask {
+            controller_key: *controller_key,
+            sub_task_id: sub_task_id.to_string(),
+        }],
+    }
 }
 
 impl<O: RebootOs, F: Fs> RebootExecutor<O, F> {
-    /// fresh journal 构造：`device_occupied` 初始化为 `false`（无未决任务场景）。
+    /// fresh journal 构造：占用状态机初始化为 `Free`（无未决任务场景）。
     pub fn new(
         journal: Arc<JournalStore<F>>,
         os: O,
@@ -441,17 +492,17 @@ impl<O: RebootOs, F: Fs> RebootExecutor<O, F> {
             tickets,
             boot_id,
             agent_instance_id,
-            false,
-            None,
+            OccupationState::Free,
         )
     }
 
-    /// TR-R6-3 恢复构造器：按恢复规则初始化 `device_occupied`（扫描失败按占用 fail-closed）。
+    /// TR-R6-3 恢复构造器：按恢复规则初始化占用状态机（扫描失败按占用 fail-closed）。
     ///
     /// 扫描持久 records：若存在 `state == Attempted` 且 `pre_boot_id == 当前 boot` 的未决任务，
-    /// 则恢复占用为 true，并把首个未决任务记为占用者（供后续终态 / boot transition 复核解除）；
-    /// 全部为终态或已观察到 boot transition 则为 false。扫描出错（含 uncertain 隔离态 / 毒锁 /
-    /// 解码失败）fail-closed 视为占用，占用者未知（后续复核回退到再次扫描）。
+    /// 则恢复占用，并把**全部**未决任务记为占用者集合（复审 fix-2：不得只追踪第一条，否则
+    /// 其中一条进入终态就会误解除仍被其他未决任务持有的占用）；全部为终态或已观察到 boot
+    /// transition 则为空闲。扫描出错（含 uncertain 隔离态 / 毒锁 / 解码失败）fail-closed 视为
+    /// 占用且占用者未知（`Unknown`，复核时回退到再次扫描）。
     pub fn new_recovering(
         journal: Arc<JournalStore<F>>,
         os: O,
@@ -460,40 +511,31 @@ impl<O: RebootOs, F: Fs> RebootExecutor<O, F> {
         agent_instance_id: impl Into<String>,
     ) -> Self {
         let current_boot = (boot_id)();
-        let (occupied, occupying) = match journal.scan_pending_attempted(&current_boot) {
-            Ok(pending) => {
-                let occupying = pending
-                    .first()
-                    .map(|(controller_key, sub_task_id)| Occupation {
+        let initial = match journal.scan_pending_attempted(&current_boot) {
+            Ok(pending) if pending.is_empty() => OccupationState::Free,
+            Ok(pending) => OccupationState::Occupied(Occupation {
+                boot_id: current_boot,
+                tasks: pending
+                    .iter()
+                    .map(|(controller_key, sub_task_id)| OccupiedTask {
                         controller_key: *controller_key,
                         sub_task_id: sub_task_id.clone(),
-                        boot_id: current_boot.clone(),
-                    });
-                (!pending.is_empty(), occupying)
-            }
+                    })
+                    .collect(),
+            }),
             // 扫描失败 fail-closed：视为占用，占用者未知（复核时回退到再次扫描）
-            Err(_) => (true, None),
+            Err(_) => OccupationState::Unknown,
         };
-        Self::build(
-            journal,
-            os,
-            tickets,
-            boot_id,
-            agent_instance_id,
-            occupied,
-            occupying,
-        )
+        Self::build(journal, os, tickets, boot_id, agent_instance_id, initial)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn build(
         journal: Arc<JournalStore<F>>,
         os: O,
         tickets: TicketManager,
         boot_id: Box<dyn Fn() -> String + Send + Sync>,
         agent_instance_id: impl Into<String>,
-        device_occupied: bool,
-        occupying: Option<Occupation>,
+        initial: OccupationState,
     ) -> Self {
         Self {
             journal,
@@ -501,8 +543,7 @@ impl<O: RebootOs, F: Fs> RebootExecutor<O, F> {
             tickets,
             boot_id,
             agent_instance_id: agent_instance_id.into(),
-            device_occupied: AtomicBool::new(device_occupied),
-            occupying: Mutex::new(occupying),
+            occupation: Mutex::new(DeviceOccupationState::new(initial)),
         }
     }
 
@@ -514,79 +555,143 @@ impl<O: RebootOs, F: Fs> RebootExecutor<O, F> {
         &self.tickets
     }
 
-    /// 设备级占用见证（未决重启生命周期）。
+    /// 设备级占用见证（未决重启生命周期）；锁中毒按占用 fail-closed。
     pub fn device_occupied(&self) -> bool {
-        self.device_occupied.load(Ordering::SeqCst)
+        match self.occupation.lock() {
+            Ok(guard) => !matches!(guard.state, OccupationState::Free),
+            Err(_) => true,
+        }
     }
 
-    /// 当前占用者的 `sub_task_id`（测试见证：占用者未知时返回 `None`）。
+    /// 当前占用者集合中首个 `sub_task_id`（测试见证：空闲或占用者未知时返回 `None`）。
     pub fn occupying_sub_task(&self) -> Option<String> {
-        self.occupying
-            .lock()
-            .ok()
-            .and_then(|guard| guard.as_ref().map(|occ| occ.sub_task_id.clone()))
+        self.occupying_sub_tasks().first().cloned()
     }
 
-    /// 记录占用者身份（占用申请成功后调用）。
-    fn mark_occupied(&self, controller_key: &[u8; 32], sub_task_id: &str, boot_id: &str) {
-        if let Ok(mut guard) = self.occupying.lock() {
-            *guard = Some(Occupation {
-                controller_key: *controller_key,
-                sub_task_id: sub_task_id.to_string(),
-                boot_id: boot_id.to_string(),
-            });
+    /// 当前占用者集合的全部 `sub_task_id`（测试见证：恢复场景可能有多条同 boot 未决记录）。
+    pub fn occupying_sub_tasks(&self) -> Vec<String> {
+        match self.occupation.lock() {
+            Ok(guard) => match &guard.state {
+                OccupationState::Occupied(occupation) => occupation
+                    .tasks
+                    .iter()
+                    .map(|task| task.sub_task_id.clone())
+                    .collect(),
+                _ => Vec::new(),
+            },
+            Err(_) => Vec::new(),
         }
     }
 
-    /// 释放设备级占用（仅在确定未执行拒绝、写入终态或复核确认占用已失效后调用）。
-    fn release_device(&self) {
-        self.device_occupied.store(false, Ordering::SeqCst);
-        if let Ok(mut guard) = self.occupying.lock() {
-            *guard = None;
+    /// 空闲时原子占用（同一临界区内写入占用者与代际），返回本次占用的代际；已占用返回 `None`。
+    fn try_acquire(
+        &self,
+        controller_key: &[u8; 32],
+        sub_task_id: &str,
+        boot_id: &str,
+    ) -> Option<u64> {
+        let mut guard = self.occupation.lock().ok()?;
+        if !matches!(guard.state, OccupationState::Free) {
+            return None;
         }
+        guard.generation = guard.generation.wrapping_add(1);
+        guard.state =
+            OccupationState::Occupied(fresh_occupation(controller_key, sub_task_id, boot_id));
+        Some(guard.generation)
     }
 
-    /// 占用失效复核（正审 fix-1）：在占用阻断新任务前，检查当前占用任务是否已可安全解除。
-    ///
-    /// 解除条件（任一成立即释放并返回 true）：
-    /// 1. 占用任务在持久日志中已进入终态（`Failed` / `Succeeded`）；
-    /// 2. 设备 boot 已变化（占用记录的 `pre_boot_id` 与当前 boot 不同，即发生 boot transition）。
-    ///
-    /// 占用者未知（`new_recovering` 扫描 fail-closed 场景）时回退到再次扫描：扫描确认无同 boot
-    /// 未决 `Attempted` 才释放。任何读取失败 / 记录缺失 / 扫描失败一律 fail-closed 保持占用
-    /// （返回 false），绝不把不确定当失效。
-    fn try_release_stale_occupation(&self, current_boot: &str) -> bool {
-        let occupation = match self.occupying.lock() {
-            Ok(guard) => guard.clone(),
-            Err(_) => return false,
+    /// 代际 CAS 释放：仅当占用状态自 `expected_generation` 起**未被任何线程改写**时才释放。
+    /// 返回 false 表示占用已被并发线程交接 / 改写，本次绝不清除他人的新占用。
+    fn try_release(&self, expected_generation: u64) -> bool {
+        let Ok(mut guard) = self.occupation.lock() else {
+            return false;
         };
-        let stale = match occupation {
-            Some(occupation) => {
-                if occupation.boot_id != current_boot {
-                    // 占用之后设备 boot 已变化（发生 boot transition）：未决重启已被 boot
-                    // 代际更替终结，安全释放
-                    true
-                } else {
-                    match self
-                        .journal
-                        .get(&occupation.controller_key, &occupation.sub_task_id)
-                    {
-                        // 同 boot：仅当持久记录已进入终态（Failed / Succeeded）才释放
-                        Ok(Some(record)) => record.state.is_terminal(),
-                        // 记录缺失或读取失败：无事实证明终态，fail-closed 保持占用
-                        _ => false,
-                    }
-                }
-            }
-            None => match self.journal.scan_pending_attempted(current_boot) {
+        if guard.generation != expected_generation {
+            return false;
+        }
+        guard.generation = guard.generation.wrapping_add(1);
+        guard.state = OccupationState::Free;
+        true
+    }
+
+    /// 代际 CAS 交接：仅当代际仍为复核时看到的 `expected_generation` 时，把占用原子换给新任务，
+    /// 返回交接后的新代际；代际已变（并发线程已交接）则放弃并返回 `None`。
+    fn try_handover(
+        &self,
+        expected_generation: u64,
+        controller_key: &[u8; 32],
+        sub_task_id: &str,
+        boot_id: &str,
+    ) -> Option<u64> {
+        let Ok(mut guard) = self.occupation.lock() else {
+            return None;
+        };
+        if guard.generation != expected_generation {
+            return None;
+        }
+        guard.generation = guard.generation.wrapping_add(1);
+        guard.state =
+            OccupationState::Occupied(fresh_occupation(controller_key, sub_task_id, boot_id));
+        Some(guard.generation)
+    }
+
+    /// 占用失效复核 + 原子交接（正审 fix-1 / 复审 fix-2）。
+    ///
+    /// 次序恒为：锁内快照（占用状态 + 代际）→ 锁外持久日志复核（不持锁做 I/O）→ 代际 CAS 交接。
+    /// CAS 失败说明复核结论已过期（并发线程已完成交接），本次一律放弃并返回 `None`，
+    /// 严禁任何跨锁后无条件释放的行为。
+    fn try_handover_stale_occupation(
+        &self,
+        controller_key: &[u8; 32],
+        sub_task_id: &str,
+        current_boot: &str,
+    ) -> Option<u64> {
+        let snapshot = match self.occupation.lock() {
+            Ok(guard) => (*guard).clone(),
+            Err(_) => return None,
+        };
+        if !self.occupation_is_stale(&snapshot.state, current_boot) {
+            return None;
+        }
+        self.try_handover(
+            snapshot.generation,
+            controller_key,
+            sub_task_id,
+            current_boot,
+        )
+    }
+
+    /// 占用是否已可安全解除（任一成立即失效）：
+    ///
+    /// 1. `Occupied`：占用之后设备 boot 已变化（boot transition 终结未决重启）；或占用集合中
+    ///    **每一条**任务在持久日志里都已进入终态（`Failed` / `Succeeded`）。只要还有一条未决 /
+    ///    缺失 / 读取失败就 fail-closed 保持占用（复审 fix-2：多条未决不得只看第一条）；
+    /// 2. `Unknown`：回退到再次扫描持久日志，确认当前 boot 已无未决 `Attempted` 才失效；
+    /// 3. `Free`：本就无占用（复核窗口内已被他人释放）。
+    fn occupation_is_stale(&self, state: &OccupationState, current_boot: &str) -> bool {
+        match state {
+            OccupationState::Free => true,
+            OccupationState::Unknown => match self.journal.scan_pending_attempted(current_boot) {
                 Ok(pending) => pending.is_empty(),
                 Err(_) => false,
             },
-        };
-        if stale {
-            self.release_device();
+            OccupationState::Occupied(occupation) => {
+                if occupation.boot_id != current_boot {
+                    // 占用之后设备 boot 已变化（发生 boot transition）：未决重启已被 boot
+                    // 代际更替终结，安全释放
+                    return true;
+                }
+                !occupation.tasks.is_empty()
+                    && occupation.tasks.iter().all(|task| {
+                        match self.journal.get(&task.controller_key, &task.sub_task_id) {
+                            // 同 boot：仅当该条持久记录已进入终态（Failed / Succeeded）才算失效
+                            Ok(Some(record)) => record.state.is_terminal(),
+                            // 记录缺失或读取失败：无事实证明终态，fail-closed 保持占用
+                            _ => false,
+                        }
+                    })
+            }
         }
-        stale
     }
 
     /// `device.reboot.prepare`：形状校验 → fresh boot 校验 → 签发票据。
@@ -677,19 +782,27 @@ impl<O: RebootOs, F: Fs> RebootExecutor<O, F> {
         //    此刻尚未产生任何持久写；bootChanged 之后的合法旧请求已在第 1 步 dedup 返回，
         //    不会到达本校验，不得误判 ExecutionTokenInvalid。
         let current_boot = (self.boot_id)();
-        if self.device_occupied.swap(true, Ordering::SeqCst) {
-            // 已占用：先复核占用是否已安全失效（占用任务在持久日志中已进入终态，
-            // 或占用后发生 boot transition）；已失效则释放并重新占用，否则 1005 DeviceBusy。
-            if !self.try_release_stale_occupation(&current_boot)
-                || self.device_occupied.swap(true, Ordering::SeqCst)
-            {
-                return ExecuteOutcome::Rejected(BusinessStatus::DeviceBusy);
-            }
-        }
-        self.mark_occupied(controller_key, &request.sub_task_id, &current_boot);
+        // 占用申请与（必要时）失效复核交接都在占用状态机内以代际 CAS 完成，返回本次占用的代际；
+        // 后续所有释放都必须携带该代际，绝不无条件清除并发线程取得的新占用（复审 fix-2）。
+        let occupation_generation =
+            match self.try_acquire(controller_key, &request.sub_task_id, &current_boot) {
+                Some(generation) => generation,
+                // 已占用：复核占用是否已安全失效（占用集合全部进入终态，或占用后发生 boot
+                // transition）；已失效则原子交接给本任务，否则 1005 DeviceBusy。
+                None => {
+                    match self.try_handover_stale_occupation(
+                        controller_key,
+                        &request.sub_task_id,
+                        &current_boot,
+                    ) {
+                        Some(generation) => generation,
+                        None => return ExecuteOutcome::Rejected(BusinessStatus::DeviceBusy),
+                    }
+                }
+            };
         if current_boot != request.expected_boot_id {
             // 确定未执行：释放占用
-            self.release_device();
+            self.try_release(occupation_generation);
             return ExecuteOutcome::Rejected(BusinessStatus::ExecutionTokenInvalid);
         }
         if let Err(status) = self.tickets.consume(
@@ -703,7 +816,7 @@ impl<O: RebootOs, F: Fs> RebootExecutor<O, F> {
             TicketToken(request.execution_token),
             now,
         ) {
-            self.release_device();
+            self.try_release(occupation_generation);
             return ExecuteOutcome::Rejected(status);
         }
 
@@ -717,27 +830,27 @@ impl<O: RebootOs, F: Fs> RebootExecutor<O, F> {
             Ok((record, DedupOutcome::Inserted)) => record,
             // 竞态窗口：dedup 查询时未见记录、并发请求已先持久化 → 只回已有持久记录，不 mark、无第二 OS
             Ok((record, DedupOutcome::ReusedExisting)) => {
-                self.release_device();
+                self.try_release(occupation_generation);
                 return persisted_outcome(record);
             }
             // 请求确未被接受且 OS 未进边界：安全返回非零错误
             Err(JournalError::DefinitelyNotCommitted) => {
-                self.release_device();
+                self.try_release(occupation_generation);
                 return ExecuteOutcome::Rejected(BusinessStatus::InternalError);
             }
             Err(JournalError::Conflict) => {
-                self.release_device();
+                self.try_release(occupation_generation);
                 return ExecuteOutcome::Rejected(BusinessStatus::TaskConflict);
             }
             Err(JournalError::StorageFull) => {
-                self.release_device();
+                self.try_release(occupation_generation);
                 return ExecuteOutcome::Rejected(BusinessStatus::ResourceExhausted);
             }
             // insert_accepted 提交结果不明（CommitUnknown，OS 边界前）：断流待查、绝不调用 OS；
             // store 已进入 uncertain 隔离态，保持占用直至实例丢弃
             Err(JournalError::CommitUnknown) => return ExecuteOutcome::Indeterminate,
             Err(_) => {
-                self.release_device();
+                self.try_release(occupation_generation);
                 return ExecuteOutcome::Indeterminate;
             }
         };
@@ -751,13 +864,13 @@ impl<O: RebootOs, F: Fs> RebootExecutor<O, F> {
             Err(JournalError::DefinitelyNotCommitted) => {
                 // accepted 已可靠写、attempted 确未提交：绝不调用 OS！
                 // 必须以 status=0 回复最后可靠持久的 accepted，不能返回非零错误暗示未接收
-                self.release_device();
+                self.try_release(occupation_generation);
                 return ExecuteOutcome::Accepted(accepted);
             }
             // mark_attempted 提交结果不明（仍为 OS 边界前）：断流、绝不调用 OS，交由 task.get 核查
             Err(JournalError::CommitUnknown) => return ExecuteOutcome::Indeterminate,
             Err(_) => {
-                self.release_device();
+                self.try_release(occupation_generation);
                 return ExecuteOutcome::Indeterminate;
             }
         };
@@ -765,7 +878,7 @@ impl<O: RebootOs, F: Fs> RebootExecutor<O, F> {
         // 5) 至多一次 OS 调用边界（仅 `attempted` 可靠落盘之后）
         match self.os.reboot() {
             // OS Ok 仅表示「重启已发起」：任务仍是未决 Attempted 中间态（attempted ≠ 成功），
-            // 占用必须覆盖未决生命周期，此处绝不释放 device_occupied。
+            // 占用必须覆盖未决生命周期，此处绝不释放设备占用。
             Ok(()) => ExecuteOutcome::Attempted(attempted),
             Err(_) => match self.journal.finish(
                 controller_key,
@@ -775,7 +888,7 @@ impl<O: RebootOs, F: Fs> RebootExecutor<O, F> {
             ) {
                 // OS 明确报错且 failed/OS_ERROR 可靠落盘：以 status=0 回复真实 failed
                 Ok(record) => {
-                    self.release_device();
+                    self.try_release(occupation_generation);
                     ExecuteOutcome::OsErrorPersisted(record)
                 }
                 // finish 确未提交或结果不明（OS 边界后）：OS 已调用，不返回旧 attempted、
