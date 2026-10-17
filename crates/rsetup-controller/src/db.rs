@@ -882,6 +882,10 @@ trait IdentitySchemaProbe {
     fn validate_data(
         &self,
     ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
+    /// v3 终态门禁专用：以精确版本 3 扫描身份数据。普通启动（v4）不得调用。
+    fn validate_data_at_v3(
+        &self,
+    ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
     fn validate_fk(&self) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
 }
 
@@ -905,12 +909,31 @@ async fn check_identity_schema_with_probe(
     probe.validate_fk().await
 }
 
+/// v3 终态门禁：仅供显式 v3 测试迁移（fresh/legacy 升级）在收尾时校验
+/// “已建成 v3 且数据完整”，不是普通启动门禁。期望版本固定为编译期常量
+/// `IDENTITY_SCHEMA_VERSION`，绝不从数据库行本身推断；v4 启动门禁是
+/// `check_identity_schema_with_probe`。
+async fn check_v3_ready_with_probe(
+    probe: &impl IdentitySchemaProbe,
+) -> Result<(), ControllerError> {
+    let version = probe.read_version().await?;
+    if version != Some(IDENTITY_SCHEMA_VERSION) {
+        return Err(ControllerError::SchemaNotReady {
+            found: version,
+            required: IDENTITY_SCHEMA_VERSION,
+        });
+    }
+    probe.validate_v2_shape().await?;
+    probe.validate_data_at_v3().await?;
+    probe.validate_fk().await
+}
+
 const IDENTITY_SCHEMA_VERSION: i32 = 3;
 
 /// Schema v4 运行时五表的存在性快照：仅由固定字面量的 information_schema
 /// 探测填充，绝不接受外部输入拼装的表名。`integrity::validate_runtime_tables_for_version`
 /// 依据它判定「v4 必须五表齐备、v1..=3 必须五表皆无」。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeTablePresence {
     pub main_tasks: bool,
     pub sub_tasks: bool,
@@ -919,17 +942,47 @@ pub struct RuntimeTablePresence {
     pub recovery_checks: bool,
 }
 
-fn identity_schema_decision(version: Option<i32>) -> Result<(), ControllerError> {
-    match version {
-        Some(IDENTITY_SCHEMA_VERSION) => Ok(()),
-        None | Some(1) | Some(2) => Err(ControllerError::SchemaNotReady {
-            found: version,
-            required: IDENTITY_SCHEMA_VERSION,
-        }),
-        other => Err(ControllerError::Config(format!(
-            "unsupported identity schema version {other:?}"
-        ))),
+/// v4 运行时五表的固定名单：仅用于表集合判定与显式迁移 DDL 白名单，
+/// 绝不从数据库返回值或外部输入拼装。
+const RUNTIME_TABLE_NAMES: [&str; 5] = [
+    "main_tasks",
+    "sub_tasks",
+    "task_previews",
+    "device_operation_locks",
+    "recovery_checks",
+];
+
+/// 表集合判定纯函数：11 张 identity 表必须齐备、不得出现重复行；未知表
+/// 一律拒绝。`allow_runtime_tables` 仅在 v3 契约（v4 启动共用）下放行
+/// `RUNTIME_TABLE_NAMES` 五张固定运行时表，其余契约路径仍要求恰好 11 表。
+fn validate_table_set(
+    present: &[String],
+    allow_runtime_tables: bool,
+) -> Result<(), ControllerError> {
+    let table_set_error = || {
+        ControllerError::Config(
+            "identity schema has missing or unexpected tables; manual inspection required".into(),
+        )
+    };
+    let mut seen = std::collections::HashSet::new();
+    for name in present {
+        let known = TABLES.iter().any(|(table, _, _)| name == table)
+            || (allow_runtime_tables && RUNTIME_TABLE_NAMES.contains(&name.as_str()));
+        if !known || !seen.insert(name.as_str()) {
+            return Err(table_set_error());
+        }
     }
+    if TABLES.iter().any(|(table, _, _)| !seen.contains(table)) {
+        return Err(table_set_error());
+    }
+    Ok(())
+}
+
+/// 普通启动版本决策：委托 `integrity::startup_guard_decision`，仅接受编译期
+/// 配置 `SUPPORTED_SCHEMA_VERSION`（v4）。v1..=3 只能经显式迁移 preflight
+/// （如 `run_schema_v4_migration`）放行，普通启动一律 `SchemaNotReady`。
+fn identity_schema_decision(version: Option<i32>) -> Result<(), ControllerError> {
+    crate::integrity::startup_guard_decision(version)
 }
 
 #[derive(Clone)]
@@ -1308,15 +1361,10 @@ async fn validate_schema_shape_with_policy(
     )
     .fetch_all(&db.0)
     .await?;
-    if present.len() != TABLES.len()
-        || present
-            .iter()
-            .any(|name| !TABLES.iter().any(|(table, _, _)| name == table))
-    {
-        return Err(ControllerError::Config(
-            "identity schema has missing or unexpected tables; manual inspection required".into(),
-        ));
-    }
+    // The v3 contract is shared with v4 startup, where the five fixed runtime
+    // tables additionally exist; every other contract still demands exactly
+    // the eleven identity tables. Unknown tables always fail closed.
+    validate_table_set(&present, migration == V3_MIGRATION)?;
     for &(table, columns, indexes) in TABLES {
         let table_collation = if migration == V3_MIGRATION || legacy_version.is_some() {
             let table_collation: String = sqlx::query_scalar("SELECT CAST(table_collation AS CHAR) AS table_collation FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?")
@@ -1628,6 +1676,9 @@ impl IdentitySchemaProbe for DbPool {
     }
     async fn validate_data(&self) -> Result<(), ControllerError> {
         crate::integrity::check_identity_data(self).await
+    }
+    async fn validate_data_at_v3(&self) -> Result<(), ControllerError> {
+        crate::integrity::validate_identity_rows_at_version(self, IDENTITY_SCHEMA_VERSION).await
     }
     async fn validate_fk(&self) -> Result<(), ControllerError> {
         require_no_identity_foreign_keys(self).await
@@ -2046,7 +2097,7 @@ impl LegacyUpgradeProbe for DbPool {
     }
 
     async fn ready_v3(&self) -> Result<(), ControllerError> {
-        check_identity_schema(self).await
+        check_v3_ready_with_probe(self).await
     }
 }
 
@@ -2240,7 +2291,7 @@ trait FreshIdentityMigrationProbe: IdentitySchemaProbe {
 
 async fn upgrade_fresh_v3(probe: &impl FreshIdentityMigrationProbe) -> Result<(), ControllerError> {
     match probe.read_version().await? {
-        Some(3) => return check_identity_schema_with_probe(probe).await,
+        Some(3) => return check_v3_ready_with_probe(probe).await,
         Some(1 | 2) => {
             return Err(ControllerError::Config(
                 "legacy v3 upgrade not ready".into(),
@@ -2287,7 +2338,7 @@ async fn upgrade_fresh_v3(probe: &impl FreshIdentityMigrationProbe) -> Result<()
             "v3 metadata insert uncertain; inspect schema manually".into(),
         ));
     }
-    check_identity_schema_with_probe(probe).await
+    check_v3_ready_with_probe(probe).await
 }
 
 impl FreshIdentityMigrationProbe for DbPool {
@@ -2355,6 +2406,163 @@ async fn upgrade_identity_schema(
         TestMigrationMode::FixtureV1 | TestMigrationMode::FixturePartialV1 => {
             create_historical_v1_fixture(db, mode).await
         }
+    }
+}
+
+fn v4_migration_error(code: &'static str) -> ControllerError {
+    ControllerError::Config(format!("v4 migration {code}"))
+}
+
+// 固定字面量的五表存在性探测：表名全部硬编码，绝不接受外部输入拼装。
+const RUNTIME_TABLE_PRESENCE_QUERY: &str = "SELECT CAST(table_name AS CHAR) AS table_name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name IN ('main_tasks','sub_tasks','task_previews','device_operation_locks','recovery_checks')";
+
+/// 把 `TASKS_MIGRATION` 解析为五条固定 CREATE 语句：每条必须形如
+/// `CREATE TABLE IF NOT EXISTS <五表白名单之一> (`，不重复、不含
+/// FOREIGN KEY/REFERENCES/CHECK。任何偏差 fail-closed，绝不执行未知 DDL。
+fn tasks_migration_statements() -> Result<Vec<String>, ControllerError> {
+    let mut statements: Vec<(&str, String)> = Vec::new();
+    let sql = TASKS_MIGRATION
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for statement in sql
+        .split(';')
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
+    {
+        let table = statement
+            .strip_prefix("CREATE TABLE IF NOT EXISTS ")
+            .and_then(|rest| rest.split_once(" ("))
+            .map(|(name, _)| name)
+            .ok_or_else(|| v4_migration_error("invalid runtime DDL"))?;
+        let upper = statement.to_ascii_uppercase();
+        if !RUNTIME_TABLE_NAMES.contains(&table)
+            || statements.iter().any(|(seen, _)| *seen == table)
+            || upper.contains("FOREIGN KEY")
+            || upper.contains("REFERENCES")
+            || upper.contains("CHECK (")
+        {
+            return Err(v4_migration_error("invalid runtime DDL"));
+        }
+        statements.push((table, statement.to_owned()));
+    }
+    if statements.len() != RUNTIME_TABLE_NAMES.len() {
+        return Err(v4_migration_error("incomplete runtime DDL"));
+    }
+    Ok(statements.into_iter().map(|(_, sql)| sql).collect())
+}
+
+/// v3 → v4 显式迁移的探针抽象：真实实现仅由 `DbPool` 提供；离线测试注入
+/// 受控 fake 验证流程与失败回滚。期望版本与 DDL 均为编译期固定值。
+trait SchemaV4MigrationProbe {
+    fn read_version(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Option<i32>, ControllerError>> + Send;
+    fn v3_integrity_preflight(
+        &self,
+    ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
+    fn runtime_table_presence(
+        &self,
+    ) -> impl std::future::Future<Output = Result<RuntimeTablePresence, ControllerError>> + Send;
+    fn create_runtime_tables(
+        &self,
+    ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
+    fn cas_version_v3_to_v4(
+        &self,
+    ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
+}
+
+/// v3 → v4 显式迁移：只由测试/操作员显式调用，普通启动路径绝不隐式执行。
+/// 流程：版本必须恰为 3 → v3 完整性 preflight → 五张 runtime 表必须尚不存在
+/// → 执行 `TASKS_MIGRATION` 五表 DDL → 复核五表齐备 → 事务内把
+/// `schema_meta.schema_version` 从 3 CAS 更新为 4 → 重读确认落定为 4。
+/// DDL 非事务：中途失败留下已建表交由操作员核查，绝不自动修复或伪造成功。
+async fn run_schema_v4_migration_with_probe(
+    probe: &impl SchemaV4MigrationProbe,
+) -> Result<(), ControllerError> {
+    if probe.read_version().await? != Some(IDENTITY_SCHEMA_VERSION) {
+        return Err(v4_migration_error("requires schema version 3"));
+    }
+    probe.v3_integrity_preflight().await?;
+    let presence = probe.runtime_table_presence().await?;
+    crate::integrity::validate_runtime_tables_for_version(IDENTITY_SCHEMA_VERSION, &presence)
+        .map_err(|_| v4_migration_error("runtime tables must not exist before DDL"))?;
+    probe.create_runtime_tables().await?;
+    let presence = probe.runtime_table_presence().await?;
+    crate::integrity::validate_runtime_tables_for_version(
+        crate::integrity::SUPPORTED_SCHEMA_VERSION,
+        &presence,
+    )
+    .map_err(|_| v4_migration_error("runtime tables incomplete after DDL"))?;
+    probe.cas_version_v3_to_v4().await?;
+    // A reported successful CAS is insufficient evidence that the persisted
+    // version is 4. Unknown/old/read failure stays uncertain.
+    if probe.read_version().await? != Some(crate::integrity::SUPPORTED_SCHEMA_VERSION) {
+        return Err(v4_migration_error("version CAS outcome uncertain"));
+    }
+    Ok(())
+}
+
+/// 显式 v3 → v4 迁移入口（操作员/测试专用）。绝不在 `check_identity_schema`
+/// 或任何启动路径中被隐式调用；迁移前库必须已是完整 v3（preflight 校验），
+/// 迁移成功后 `schema_version = 4` 且五张 runtime 表齐备。
+pub async fn run_schema_v4_migration(db: &DbPool) -> Result<(), ControllerError> {
+    run_schema_v4_migration_with_probe(db).await
+}
+
+impl SchemaV4MigrationProbe for DbPool {
+    async fn read_version(&self) -> Result<Option<i32>, ControllerError> {
+        read_version(self).await
+    }
+    async fn v3_integrity_preflight(&self) -> Result<(), ControllerError> {
+        validate_v3_schema_shape(self).await?;
+        require_no_identity_foreign_keys(self).await?;
+        crate::integrity::validate_identity_rows_at_version(self, IDENTITY_SCHEMA_VERSION).await
+    }
+    async fn runtime_table_presence(&self) -> Result<RuntimeTablePresence, ControllerError> {
+        let names: Vec<String> = sqlx::query_scalar(RUNTIME_TABLE_PRESENCE_QUERY)
+            .fetch_all(&self.0)
+            .await
+            .map_err(|_| v4_migration_error("runtime table presence read failed"))?;
+        let present = |name: &str| names.iter().any(|seen| seen == name);
+        Ok(RuntimeTablePresence {
+            main_tasks: present("main_tasks"),
+            sub_tasks: present("sub_tasks"),
+            task_previews: present("task_previews"),
+            device_operation_locks: present("device_operation_locks"),
+            recovery_checks: present("recovery_checks"),
+        })
+    }
+    async fn create_runtime_tables(&self) -> Result<(), ControllerError> {
+        for statement in tasks_migration_statements()? {
+            // CREATE is non-transactional: a failed step leaves the partial
+            // schema for an operator, never an automatic repair.
+            sqlx::query(&statement)
+                .execute(&self.0)
+                .await
+                .map_err(|_| v4_migration_error("runtime table CREATE failed"))?;
+        }
+        Ok(())
+    }
+    async fn cas_version_v3_to_v4(&self) -> Result<(), ControllerError> {
+        let mut tx = self
+            .0
+            .begin()
+            .await
+            .map_err(|_| v4_migration_error("version CAS transaction begin failed"))?;
+        let result = sqlx::query(
+            "UPDATE schema_meta SET schema_version = 4 WHERE singleton = 1 AND schema_version = 3",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| v4_migration_error("version CAS failed"))?;
+        if result.rows_affected() != 1 {
+            return Err(v4_migration_error("version CAS affected unexpected rows"));
+        }
+        tx.commit()
+            .await
+            .map_err(|_| v4_migration_error("version CAS commit failed"))
     }
 }
 
@@ -5240,6 +5448,10 @@ mod tests {
                 self.0.lock().unwrap().calls.push("data");
                 Ok(())
             }
+            async fn validate_data_at_v3(&self) -> Result<(), ControllerError> {
+                self.0.lock().unwrap().calls.push("data");
+                Ok(())
+            }
             async fn validate_fk(&self) -> Result<(), ControllerError> {
                 let mut state = self.0.lock().unwrap();
                 state.calls.push("fk");
@@ -5495,6 +5707,9 @@ mod tests {
                     Ok(())
                 }
             }
+            async fn validate_data_at_v3(&self) -> Result<(), ControllerError> {
+                panic!("v4 startup gate must not use the v3-scoped data scan")
+            }
             async fn validate_fk(&self) -> Result<(), ControllerError> {
                 self.calls.lock().unwrap().push("fk");
                 match self.fk {
@@ -5513,9 +5728,11 @@ mod tests {
             (None, false, false, "empty", &[][..], "not-ready"),
             (Some(1), false, false, "empty", &[][..], "not-ready"),
             (Some(2), false, false, "empty", &[][..], "not-ready"),
-            (Some(4), false, false, "empty", &[][..], "unsupported"),
+            // v3 只能经显式迁移 preflight 放行，普通启动（期望 v4）必须拒绝。
+            (Some(3), false, false, "empty", &[][..], "not-ready"),
+            (Some(5), false, false, "empty", &[][..], "not-ready"),
             (
-                Some(3),
+                Some(4),
                 true,
                 false,
                 "empty",
@@ -5523,7 +5740,7 @@ mod tests {
                 "broken shape",
             ),
             (
-                Some(3),
+                Some(4),
                 false,
                 true,
                 "empty",
@@ -5531,7 +5748,7 @@ mod tests {
                 "polluted identity data",
             ),
             (
-                Some(3),
+                Some(4),
                 false,
                 false,
                 "unknown",
@@ -5539,7 +5756,7 @@ mod tests {
                 "identity FK metadata unavailable",
             ),
             (
-                Some(3),
+                Some(4),
                 false,
                 false,
                 "present",
@@ -5547,7 +5764,7 @@ mod tests {
                 "identity foreign keys present",
             ),
             (
-                Some(3),
+                Some(4),
                 false,
                 false,
                 "empty",
@@ -5565,7 +5782,7 @@ mod tests {
             let result = check_identity_schema_with_probe(&fake).await;
             match expected_error {
                 "not-ready" => assert!(
-                    matches!(result, Err(ControllerError::SchemaNotReady { found, required: 3 }) if found == version)
+                    matches!(result, Err(ControllerError::SchemaNotReady { found, required: 4 }) if found == version)
                 ),
                 "ready" => assert!(result.is_ok(), "four valid gates must be ready: {result:?}"),
                 "unsupported" => assert!(result.is_err()),
@@ -5609,6 +5826,9 @@ mod tests {
             async fn validate_data(&self) -> Result<(), ControllerError> {
                 panic!("legacy runner must not scan v3 data")
             }
+            async fn validate_data_at_v3(&self) -> Result<(), ControllerError> {
+                panic!("legacy v2 runner must not use the v3 terminal data scan")
+            }
             async fn validate_fk(&self) -> Result<(), ControllerError> {
                 panic!("legacy v2 terminal check must not use the startup FK gate")
             }
@@ -5631,15 +5851,20 @@ mod tests {
     }
 
     #[test]
-    fn empty_and_legacy_versions_are_not_ready_without_ddl() {
-        for version in [None, Some(1), Some(2)] {
+    fn normal_startup_accepts_only_v4_and_rejects_old_or_unknown_versions() {
+        // 普通启动期望版本来自编译期配置 = 4（`startup_guard_decision`）。
+        assert!(identity_schema_decision(Some(4)).is_ok());
+        // 缺失行与旧版（v1..=3）仅能经显式迁移 preflight 放行，普通启动拒绝。
+        for version in [None, Some(1), Some(2), Some(3)] {
             assert!(
-                matches!(identity_schema_decision(version), Err(ControllerError::SchemaNotReady { found, required: 3 }) if found == version)
+                matches!(identity_schema_decision(version), Err(ControllerError::SchemaNotReady { found, required: 4 }) if found == version)
             );
         }
-        assert!(identity_schema_decision(Some(3)).is_ok());
-        for version in [Some(0), Some(4), Some(-1)] {
-            assert!(identity_schema_decision(version).is_err());
+        // 未知版本（0、负数、v5+）同样 fail-closed，复用 SchemaNotReady 变体。
+        for version in [Some(0), Some(5), Some(-1)] {
+            assert!(
+                matches!(identity_schema_decision(version), Err(ControllerError::SchemaNotReady { found, required: 4 }) if found == version)
+            );
         }
     }
 
@@ -5948,6 +6173,10 @@ mod tests {
             assert_eq!(self.0.lock().unwrap().version, 3);
             self.gate("fresh_data")
         }
+        async fn validate_data_at_v3(&self) -> Result<(), ControllerError> {
+            assert_eq!(self.0.lock().unwrap().version, 3);
+            self.gate("fresh_data")
+        }
         async fn validate_fk(&self) -> Result<(), ControllerError> {
             assert_eq!(self.0.lock().unwrap().version, 3);
             self.gate("fresh_fk")
@@ -6202,7 +6431,7 @@ mod tests {
         assert!(adapter.contains("validate_v3_schema_shape(self).await?"));
         assert!(adapter.contains("require_no_identity_foreign_keys(self).await?"));
         assert!(adapter.contains("preflight_legacy_for_v3(self, version).await?"));
-        assert!(adapter.contains("check_identity_schema(self).await"));
+        assert!(adapter.contains("check_v3_ready_with_probe(self).await"));
         assert!(!adapter.contains("format!(\"ALTER"));
         assert!(!adapter.contains("DROP DATABASE"));
         assert!(!adapter.contains("tidb_enable_check_constraint"));
@@ -6984,8 +7213,8 @@ mod tests {
                 string_columns += 1;
             }
         }
-        assert_eq!(queries, 15);
-        assert_eq!(string_columns, 23);
+        assert_eq!(queries, 16);
+        assert_eq!(string_columns, 24);
     }
 
     #[test]
@@ -8492,5 +8721,297 @@ mod tests {
             audit_code(ReviewDecision::Revoked, AdmissionState::Approved),
             "admission.revoke"
         );
+    }
+
+    fn full_presence() -> RuntimeTablePresence {
+        RuntimeTablePresence {
+            main_tasks: true,
+            sub_tasks: true,
+            task_previews: true,
+            device_operation_locks: true,
+            recovery_checks: true,
+        }
+    }
+
+    fn empty_presence() -> RuntimeTablePresence {
+        RuntimeTablePresence {
+            main_tasks: false,
+            sub_tasks: false,
+            task_previews: false,
+            device_operation_locks: false,
+            recovery_checks: false,
+        }
+    }
+
+    #[test]
+    fn table_set_policy_allows_runtime_tables_only_for_v3_contract() {
+        let identity: Vec<String> = TABLES
+            .iter()
+            .map(|(table, _, _)| table.to_string())
+            .collect();
+        assert!(validate_table_set(&identity, false).is_ok());
+        assert!(validate_table_set(&identity, true).is_ok());
+        // v3 契约（v4 启动共用）放行五张固定 runtime 表；其余契约拒绝。
+        let mut with_runtime = identity.clone();
+        with_runtime.extend(RUNTIME_TABLE_NAMES.iter().map(|table| table.to_string()));
+        assert!(validate_table_set(&with_runtime, true).is_ok());
+        assert!(validate_table_set(&with_runtime, false).is_err());
+        // 部分 runtime 表在集合判定层放行，由迁移 preflight 负责拒绝半成品。
+        let mut partial = identity.clone();
+        partial.push("main_tasks".into());
+        assert!(validate_table_set(&partial, true).is_ok());
+        // 未知表、缺失 identity 表、重复行一律 fail-closed。
+        let mut unknown = identity.clone();
+        unknown.push("evil_table".into());
+        assert!(validate_table_set(&unknown, true).is_err());
+        assert!(validate_table_set(&unknown, false).is_err());
+        assert!(validate_table_set(&identity[1..], true).is_err());
+        let mut duplicate = identity.clone();
+        duplicate.push("users".into());
+        assert!(validate_table_set(&duplicate, true).is_err());
+    }
+
+    #[test]
+    fn tasks_migration_statements_are_five_whitelisted_creates() {
+        let statements = tasks_migration_statements().unwrap();
+        assert_eq!(statements.len(), RUNTIME_TABLE_NAMES.len());
+        for table in RUNTIME_TABLE_NAMES {
+            assert_eq!(
+                statements
+                    .iter()
+                    .filter(|sql| {
+                        sql.starts_with(&format!("CREATE TABLE IF NOT EXISTS {table} ("))
+                    })
+                    .count(),
+                1,
+                "exactly one whitelisted CREATE for {table}"
+            );
+        }
+        let upper = statements.join("\n").to_ascii_uppercase();
+        assert!(!upper.contains("FOREIGN KEY"));
+        assert!(!upper.contains("REFERENCES"));
+        assert!(!upper.contains("CHECK ("));
+    }
+
+    #[derive(Default)]
+    struct V4MigrationState {
+        version: Option<i32>,
+        events: Vec<&'static str>,
+        preflight_ok: bool,
+        presence_before: RuntimeTablePresence,
+        presence_after: RuntimeTablePresence,
+        create_ok: bool,
+        cas_ok: bool,
+        version_after_cas: Option<i32>,
+    }
+    struct V4MigrationFake(std::sync::Mutex<V4MigrationState>);
+    impl V4MigrationFake {
+        fn events(&self) -> Vec<&'static str> {
+            self.0.lock().unwrap().events.clone()
+        }
+    }
+    fn v4_migration_fake() -> V4MigrationFake {
+        V4MigrationFake(std::sync::Mutex::new(V4MigrationState {
+            version: Some(3),
+            preflight_ok: true,
+            presence_before: empty_presence(),
+            presence_after: full_presence(),
+            create_ok: true,
+            cas_ok: true,
+            version_after_cas: Some(4),
+            events: Vec::new(),
+        }))
+    }
+
+    impl SchemaV4MigrationProbe for V4MigrationFake {
+        async fn read_version(&self) -> Result<Option<i32>, ControllerError> {
+            let mut state = self.0.lock().unwrap();
+            let reply = if state.events.contains(&"cas") {
+                state.version_after_cas
+            } else {
+                state.version
+            };
+            state.events.push("read_version");
+            Ok(reply)
+        }
+        async fn v3_integrity_preflight(&self) -> Result<(), ControllerError> {
+            let mut state = self.0.lock().unwrap();
+            state.events.push("preflight");
+            if state.preflight_ok {
+                Ok(())
+            } else {
+                Err(ControllerError::Config("simulated preflight".into()))
+            }
+        }
+        async fn runtime_table_presence(&self) -> Result<RuntimeTablePresence, ControllerError> {
+            let mut state = self.0.lock().unwrap();
+            state.events.push("presence");
+            Ok(if state.events.contains(&"create") {
+                state.presence_after
+            } else {
+                state.presence_before
+            })
+        }
+        async fn create_runtime_tables(&self) -> Result<(), ControllerError> {
+            let mut state = self.0.lock().unwrap();
+            state.events.push("create");
+            if state.create_ok {
+                Ok(())
+            } else {
+                Err(ControllerError::Config("simulated CREATE".into()))
+            }
+        }
+        async fn cas_version_v3_to_v4(&self) -> Result<(), ControllerError> {
+            let mut state = self.0.lock().unwrap();
+            state.events.push("cas");
+            if state.cas_ok {
+                Ok(())
+            } else {
+                Err(ControllerError::Config("simulated CAS".into()))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn v4_migration_happy_path_orders_gates_before_cas_and_confirms_v4() {
+        let fake = v4_migration_fake();
+        run_schema_v4_migration_with_probe(&fake).await.unwrap();
+        assert_eq!(
+            fake.events(),
+            [
+                "read_version",
+                "preflight",
+                "presence",
+                "create",
+                "presence",
+                "cas",
+                "read_version"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_migration_requires_exact_version_three_without_writes() {
+        for version in [None, Some(1), Some(2), Some(4), Some(5)] {
+            let fake = v4_migration_fake();
+            fake.0.lock().unwrap().version = version;
+            let error = run_schema_v4_migration_with_probe(&fake).await.unwrap_err();
+            assert!(format!("{error}").contains("requires schema version 3"));
+            assert_eq!(fake.events(), ["read_version"], "version={version:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn v4_migration_stops_before_ddl_on_preflight_or_presence_failure() {
+        let fake = v4_migration_fake();
+        fake.0.lock().unwrap().preflight_ok = false;
+        assert!(run_schema_v4_migration_with_probe(&fake).await.is_err());
+        assert_eq!(fake.events(), ["read_version", "preflight"]);
+
+        let fake = v4_migration_fake();
+        fake.0.lock().unwrap().presence_before = full_presence();
+        assert!(run_schema_v4_migration_with_probe(&fake).await.is_err());
+        assert_eq!(fake.events(), ["read_version", "preflight", "presence"]);
+
+        // 任一残留 runtime 表都视为半成品库，DDL 前拒绝。
+        let fake = v4_migration_fake();
+        fake.0.lock().unwrap().presence_before.main_tasks = true;
+        let error = run_schema_v4_migration_with_probe(&fake).await.unwrap_err();
+        assert!(format!("{error}").contains("must not exist before DDL"));
+        assert_eq!(fake.events(), ["read_version", "preflight", "presence"]);
+    }
+
+    #[tokio::test]
+    async fn v4_migration_ddl_or_incomplete_tables_prevent_cas() {
+        let fake = v4_migration_fake();
+        fake.0.lock().unwrap().create_ok = false;
+        assert!(run_schema_v4_migration_with_probe(&fake).await.is_err());
+        assert_eq!(
+            fake.events(),
+            ["read_version", "preflight", "presence", "create"]
+        );
+
+        let fake = v4_migration_fake();
+        fake.0.lock().unwrap().presence_after.recovery_checks = false;
+        let error = run_schema_v4_migration_with_probe(&fake).await.unwrap_err();
+        assert!(format!("{error}").contains("incomplete after DDL"));
+        assert_eq!(
+            fake.events(),
+            [
+                "read_version",
+                "preflight",
+                "presence",
+                "create",
+                "presence"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_migration_cas_failure_and_uncertain_version_never_claim_success() {
+        let fake = v4_migration_fake();
+        fake.0.lock().unwrap().cas_ok = false;
+        assert!(run_schema_v4_migration_with_probe(&fake).await.is_err());
+        assert_eq!(
+            fake.events(),
+            [
+                "read_version",
+                "preflight",
+                "presence",
+                "create",
+                "presence",
+                "cas"
+            ]
+        );
+
+        for observed in [Some(3), Some(5), None] {
+            let fake = v4_migration_fake();
+            fake.0.lock().unwrap().version_after_cas = observed;
+            let error = run_schema_v4_migration_with_probe(&fake).await.unwrap_err();
+            assert!(format!("{error}").contains("uncertain"), "{error}");
+            assert_eq!(
+                fake.events(),
+                [
+                    "read_version",
+                    "preflight",
+                    "presence",
+                    "create",
+                    "presence",
+                    "cas",
+                    "read_version"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn v4_migration_entry_is_explicit_never_implicit_on_startup() {
+        let source = include_str!("db.rs");
+        let startup = source
+            .split_once("pub async fn check_identity_schema(")
+            .unwrap()
+            .1
+            .split_once("\n#[derive(Clone, Copy, Debug)]")
+            .unwrap()
+            .0;
+        assert!(!startup.contains("run_schema_v4_migration"));
+        let adapter = source
+            .split_once("impl SchemaV4MigrationProbe for DbPool {")
+            .unwrap()
+            .1
+            .split_once("\ntrait FixtureV2Probe")
+            .unwrap()
+            .0;
+        assert!(adapter.contains(
+            "UPDATE schema_meta SET schema_version = 4 WHERE singleton = 1 AND schema_version = 3"
+        ));
+        assert!(adapter.contains("tasks_migration_statements()?"));
+        assert!(adapter.contains("result.rows_affected() != 1"));
+        assert!(adapter.contains("tx.commit()"));
+        assert!(
+            adapter.contains("validate_identity_rows_at_version(self, IDENTITY_SCHEMA_VERSION)")
+        );
+        assert!(!adapter.contains("DROP DATABASE"));
+        assert!(!adapter.contains("format!(\"CREATE"));
     }
 }

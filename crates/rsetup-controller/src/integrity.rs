@@ -106,28 +106,13 @@ type ActorColumns = (
     Result<i64, sqlx::Error>,
 );
 
-fn validate_guard_rows(rows: GuardRows) -> Result<(), ControllerError> {
-    let rows = rows.map_err(|_| scan_error("meta.guard"))?;
-    if rows.len() != 1 || !matches!(rows[0], Ok((1, 3))) {
-        return Err(scan_error("meta.guard"));
-    }
-    Ok(())
-}
-
+/// 写事务 guard：期望版本固定取编译期配置 `SUPPORTED_SCHEMA_VERSION`，
+/// 委托版本化实现 `lock_schema_guard_for_version`。绝不从数据库行本身
+/// 推断期望版本；v3 及更早、v5 及以后、缺失行一律 fail-closed。
 pub(crate) async fn lock_integrity_guard(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
 ) -> Result<(), ControllerError> {
-    let rows = sqlx::query(
-        "SELECT singleton,schema_version FROM schema_meta ORDER BY singleton FOR UPDATE",
-    )
-    .fetch_all(&mut **tx)
-    .await
-    .map(|rows| {
-        rows.into_iter()
-            .map(|row| Ok((row.try_get("singleton")?, row.try_get("schema_version")?)))
-            .collect()
-    });
-    validate_guard_rows(rows)
+    lock_schema_guard_for_version(tx, SUPPORTED_SCHEMA_VERSION).await
 }
 
 /// 版本化 guard 加锁：在同一事务内以 `FOR UPDATE` 读取 singleton 行，再交给
@@ -300,11 +285,22 @@ pub(crate) async fn validate_identity_rows(
     db: &DbPool,
     require_meta: bool,
 ) -> Result<(), ControllerError> {
-    scan_identity_rows(db, require_meta.then_some(3)).await
+    scan_identity_rows(db, require_meta.then_some(SUPPORTED_SCHEMA_VERSION)).await
 }
 
-// Only the explicit legacy preflight may call this; normal v3 startup remains
-// pinned to version 3 and fresh migration remains pinned to an empty meta table.
+/// 显式迁移 preflight 专用：以调用方给定的精确期望版本扫描身份数据完整性。
+/// v4 迁移入口用它对 v3 库做迁移前完整性检查；普通启动路径不得调用，
+/// 期望版本绝不从数据库行本身推断。
+pub(crate) async fn validate_identity_rows_at_version(
+    db: &DbPool,
+    expected_version: i32,
+) -> Result<(), ControllerError> {
+    scan_identity_rows(db, Some(expected_version)).await
+}
+
+// Only the explicit legacy preflight may call this; normal startup remains
+// pinned to `SUPPORTED_SCHEMA_VERSION` and fresh migration remains pinned to
+// an empty meta table.
 #[allow(dead_code)] // consumed by the following legacy preflight task
 pub(crate) async fn validate_identity_rows_for_version(
     db: &DbPool,
@@ -587,7 +583,7 @@ fn validate_identity_fixture(
     rows: &IdentityRows,
     require_meta: bool,
 ) -> Result<(), ControllerError> {
-    validate_identity_fixture_with_meta(rows, require_meta.then_some(3))
+    validate_identity_fixture_with_meta(rows, require_meta.then_some(SUPPORTED_SCHEMA_VERSION))
 }
 #[cfg(test)]
 fn validate_identity_fixture_with_meta(
@@ -735,26 +731,6 @@ fn valid_permission(permission: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn guard_requires_exactly_one_v3_singleton_and_fails_closed_on_decode_or_read() {
-        assert!(validate_guard_rows(Ok(vec![Ok((1, 3))])).is_ok());
-        for rows in [
-            Ok(vec![]),
-            Ok(vec![Ok((1, 3)), Ok((2, 3))]),
-            Ok(vec![Ok((0, 3))]),
-            Ok(vec![Ok((2, 3))]),
-            Ok(vec![Ok((1, 2))]),
-            Ok(vec![Ok((1, 4))]),
-            Ok(vec![Err(sqlx::Error::RowNotFound)]),
-            Err(sqlx::Error::RowNotFound),
-        ] {
-            assert_eq!(
-                validate_guard_rows(rows).unwrap_err().to_string(),
-                "configuration: identity data meta.guard"
-            );
-        }
-    }
 
     fn guard_rows(pairs: &[(i8, i32)]) -> GuardRows {
         Ok(pairs.iter().map(|pair| Ok(*pair)).collect())
@@ -1035,7 +1011,7 @@ mod tests {
         // A valid but oversized direct grant must be rejected before JSON parsing.
         let json = format!("[\"device.read\"{}]", " ".repeat(4096));
         let rows = IdentityRows {
-            meta: vec![(1, 3)],
+            meta: vec![(1, 4)],
             usernames: vec![],
             booleans: vec![],
             devices: vec![],
@@ -1165,7 +1141,7 @@ mod tests {
     #[test]
     fn fixture_scan_rejects_corrupt_rows_without_echoing_values() {
         let base = || IdentityRows {
-            meta: vec![(1, 3)],
+            meta: vec![(1, SUPPORTED_SCHEMA_VERSION)],
             usernames: vec!["alice".into()],
             booleans: vec![("users.is_admin", vec![0, 1])],
             devices: vec![("PENDING".into(), "none".into())],
@@ -1181,7 +1157,12 @@ mod tests {
             orphans: vec![],
         };
         assert!(validate_identity_fixture(&base(), true).is_ok());
-        for bad in [vec![], vec![(0, 3)], vec![(1, 2)], vec![(1, 3), (1, 3)]] {
+        for bad in [
+            vec![],
+            vec![(0, SUPPORTED_SCHEMA_VERSION)],
+            vec![(1, 3)],
+            vec![(1, SUPPORTED_SCHEMA_VERSION), (1, SUPPORTED_SCHEMA_VERSION)],
+        ] {
             let mut rows = base();
             rows.meta = bad;
             assert!(validate_identity_fixture(&rows, true).is_err());
@@ -1287,7 +1268,7 @@ mod tests {
 
     #[test]
     fn legacy_fixture_reuses_full_scan_with_exact_v1_v2_meta() {
-        // The pre-existing v3 gate rejects clean legacy data. All cases below
+        // The pre-existing v4 gate rejects clean legacy data. All cases below
         // exercise the same fixture row validators, not a database connection.
         fn legacy_scan(rows: &IdentityRows, expected_version: i32) -> Result<(), ControllerError> {
             let version = legacy_expected_version(expected_version)?;
@@ -1341,7 +1322,7 @@ mod tests {
         for version in [1, 2] {
             let rows = clean(version);
             assert!(legacy_scan(&rows, version).is_ok(), "clean v{version}");
-            assert!(validate_identity_fixture(&rows, true).is_err(), "v3 gate");
+            assert!(validate_identity_fixture(&rows, true).is_err(), "v4 gate");
             assert!(
                 validate_identity_fixture(&rows, false).is_err(),
                 "fresh gate"
