@@ -1339,6 +1339,8 @@ mod tests {
             ControllerError::Crypto => ControllerError::Crypto,
             ControllerError::LastAdmin => ControllerError::LastAdmin,
             ControllerError::InvalidState => ControllerError::InvalidState,
+            ControllerError::TaskIdempotencyConflict => ControllerError::TaskIdempotencyConflict,
+            ControllerError::TaskPreviewInvalidState => ControllerError::TaskPreviewInvalidState,
         }
     }
 

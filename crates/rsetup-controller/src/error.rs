@@ -22,4 +22,11 @@ pub enum ControllerError {
     LastAdmin,
     #[error("invalid state for this operation")]
     InvalidState,
+    /// 同一 actor 对相同幂等键提交了不同 `request_hash` 的载荷（HTTP 409
+    /// `IDEMPOTENCY_CONFLICT`）；与 `InvalidState` 分列，避免丢失契约分支。
+    #[error("task idempotency conflict")]
+    TaskIdempotencyConflict,
+    /// 预览快照处于无效状态：过期、已消费或跨进程代际（HTTP 409 `INVALID_STATE`）。
+    #[error("task preview invalid state")]
+    TaskPreviewInvalidState,
 }
