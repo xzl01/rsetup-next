@@ -9,10 +9,14 @@ pub use board_clock::{
 };
 pub use evidence::{TimeEvidence, TimeQuality};
 pub use gate::{
-    BACKOFF_MAX, BACKOFF_MIN, DEFAULT_MAX_EVIDENCE_AGE_MS, DEFAULT_NTP_MAX_RTT_MS,
-    DEFAULT_NTP_REQUEST_TIMEOUT, DEFAULT_REVALIDATE_INTERVAL, NTP_SINGLE_REQUEST_TIMEOUT_CAP,
-    NTP_STARTUP_BUDGET, TimeGateConfig, TimeGateHandle, gate_should_close, next_backoff,
-    run_startup_sample, select_request_timeout, start_time_gate,
+    BACKOFF_MAX, BACKOFF_MIN, CLOCK_STEP_MAX_MS, DEFAULT_MAX_EVIDENCE_AGE_MS,
+    DEFAULT_NTP_MAX_RTT_MS, DEFAULT_NTP_REQUEST_TIMEOUT, DEFAULT_REVALIDATE_INTERVAL,
+    JUMP_BACK_EPS, JUMP_FORWARD_MAX, NTP_SINGLE_REQUEST_TIMEOUT_CAP, NTP_STARTUP_BUDGET,
+    NtpSourceList, NullTimeAuditSink, READY_WAIT_TIMEOUT, SleepFuture, Sleeper, SourceListFuture,
+    StartupTimeSampler, StaticSourceList, SystemWallClock, TimeAuditEvent, TimeAuditSink,
+    TimeGateConfig, TimeGateDeps, TimeGateDriver, TimeGateHandle, TimeSampleFuture, TimeSampler,
+    WallClock, gate_should_close, next_backoff, run_startup_sample, select_request_timeout,
+    start_time_gate, start_time_gate_with,
 };
 pub use ntp::{NtpError, parse_sntp_response};
 pub use socket::{
