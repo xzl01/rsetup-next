@@ -661,6 +661,35 @@ impl<F: Fs> JournalStore<F> {
         }
     }
 
+    /// 去重查询（只读、无 I/O、不改 records/epoch/version）：返回去重键
+    /// `(controller_key, sub_task_id)` 落盘时保存的规范载荷哈希（计划 02 §142–166）。
+    /// 候选 = `controller_hex == encode_journal_hash32(controller_key)`（lowerhex64）且 `sub_task_id` 精确匹配；
+    /// uncertain 隔离态（TR-N2）先于一切：为真直接返回固定去敏 `Io`，绝不回旧内存哈希；
+    /// 毒锁 → 固定去敏 `Io`（fail-closed：直接返回、不 panic、不吞毒继续读）；
+    /// 0 命中 → `Ok(None)`；恰 1 命中 → `decode_journal_hash32` 解码返回 `Ok(Some(hash))`；
+    /// 命中数 >1（同键重复记录，属损坏）→ 固定去敏 `Decode("journal.duplicate_record")`。
+    /// 哈希绝不写入日志或 HTTP。
+    pub fn payload_hash(
+        &self,
+        controller_key: &[u8; 32],
+        sub_task_id: &str,
+    ) -> Result<Option<[u8; 32]>, JournalError> {
+        self.ensure_not_uncertain()?;
+        let expected_controller_hex = encode_journal_hash32(controller_key);
+        let records = self.lock_records()?;
+        self.ensure_not_uncertain()?;
+        let hits: Vec<&StoredRecord> = records
+            .iter()
+            .filter(|r| r.controller_hex == expected_controller_hex && r.sub_task_id == sub_task_id)
+            .collect();
+        match hits.len() {
+            0 => Ok(None),
+            1 => decode_journal_hash32(&hits[0].payload_hash_hex).map(Some),
+            // 同键重复记录 = 损坏：固定去敏错误（绝不返回第一条、不伪 None）
+            _ => Err(JournalError::Decode("journal.duplicate_record".to_owned())),
+        }
+    }
+
     pub fn record_count(&self) -> usize {
         self.records.lock().map(|guard| guard.len()).unwrap_or(0)
     }
@@ -708,7 +737,7 @@ impl<F: Fs> JournalStore<F> {
     }
 
     /// 仅测试用途（`test-seam`）：故意在持锁期间 panic，把 `records` 互斥锁毒化，
-    /// 用于验证 `lock_records` 的 fail-closed 分支（`get`/`insert_accepted`/`mark_attempted`/
+    /// 用于验证 `lock_records` 的 fail-closed 分支（`get`/`payload_hash`/`insert_accepted`/`mark_attempted`/
     /// `merge_evidence` 等入口返回 `JournalError::Io`，绝不 panic、不吞毒继续读）。
     /// `catch_unwind` 吞掉 panic 本身，测试进程继续运行；毒化只影响本实例的锁。
     #[cfg(any(test, feature = "test-seam"))]

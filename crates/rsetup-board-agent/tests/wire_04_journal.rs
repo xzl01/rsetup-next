@@ -175,6 +175,11 @@ fn duplicate_sub_task_id_returns_record_and_conflicting_payload_is_rejected() {
         store.insert_accepted(&key, SUB_TASK, &[2u8; 32], BOOT_OLD),
         Err(JournalError::Conflict)
     );
+    // 冲突拒绝不得改写已落盘的去重哈希
+    assert_eq!(
+        store.payload_hash(&key, SUB_TASK).expect("payload hash"),
+        Some([1u8; 32])
+    );
 
     // 不同 controller 命名空间互不影响
     let (other, outcome) = store
@@ -182,6 +187,58 @@ fn duplicate_sub_task_id_returns_record_and_conflicting_payload_is_rejected() {
         .expect("other key");
     assert_eq!(outcome, DedupOutcome::Inserted);
     assert_eq!(other.sub_task_id, SUB_TASK);
+}
+
+#[test]
+fn payload_hash_returns_stored_hash_only_for_the_same_dedup_key() {
+    let dir = TempDir::new("payload-hash");
+    let key = [9u8; 32];
+    let store = open_store(&dir);
+    let unused_sub_task = "11111111-2222-4333-8444-555555555555";
+
+    // 未命中：尚无任何记录
+    assert_eq!(store.payload_hash(&key, SUB_TASK).expect("miss"), None);
+
+    store
+        .insert_accepted(&key, SUB_TASK, &[7u8; 32], BOOT_OLD)
+        .expect("accepted");
+
+    // 命中：返回 accepted 时落盘的规范载荷哈希
+    assert_eq!(
+        store.payload_hash(&key, SUB_TASK).expect("hit"),
+        Some([7u8; 32])
+    );
+    // 同 controller、不同 sub_task_id → 未命中
+    assert_eq!(
+        store.payload_hash(&key, unused_sub_task).expect("miss"),
+        None
+    );
+    // 同 sub_task_id、不同 controller 命名空间 → 未命中
+    assert_eq!(
+        store.payload_hash(&[7u8; 32], SUB_TASK).expect("miss"),
+        None
+    );
+
+    // 只读查询：不新增记录、不递增 record_version
+    assert_eq!(store.record_count(), 1);
+    assert_eq!(
+        store
+            .get(&key, SUB_TASK)
+            .expect("get")
+            .expect("record")
+            .record_version,
+        1
+    );
+
+    // 哈希是持久字段：重开（新实例）后仍返回同一值
+    drop(store);
+    let reopened = open_store(&dir);
+    assert_eq!(
+        reopened
+            .payload_hash(&key, SUB_TASK)
+            .expect("hit after reopen"),
+        Some([7u8; 32])
+    );
 }
 
 #[test]
@@ -882,6 +939,17 @@ fn poisoned_records_mutex_fails_closed_with_io() {
     );
     // 其余入口同样在加锁处 fail-closed：不 panic、不落盘
     let unused_sub_task = "11111111-2222-4333-8444-555555555555";
+    let hash_err = store
+        .payload_hash(&key, SUB_TASK)
+        .expect_err("payload_hash must fail closed on poisoned records mutex");
+    assert!(
+        matches!(hash_err, JournalError::Io(ref msg) if msg == "journal.records poisoned"),
+        "payload_hash 毒锁必须返回固定去敏 Io，实际 {hash_err:?}"
+    );
+    assert!(matches!(
+        store.payload_hash(&key, unused_sub_task),
+        Err(JournalError::Io(_))
+    ));
     assert!(matches!(
         store.insert_accepted(&key, unused_sub_task, &[0u8; 32], BOOT_OLD),
         Err(JournalError::Io(_))
@@ -916,4 +984,8 @@ fn poisoned_records_mutex_fails_closed_with_io() {
         .expect("get")
         .expect("record survives poison of a different instance");
     assert_eq!(reread, stored);
+    assert_eq!(
+        reopened.payload_hash(&key, SUB_TASK).expect("payload hash"),
+        Some([0u8; 32])
+    );
 }
