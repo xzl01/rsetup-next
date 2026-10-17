@@ -690,6 +690,29 @@ impl<F: Fs> JournalStore<F> {
         }
     }
 
+    /// TR-R6-3 恢复扫描（只读、无 I/O、不改 records/epoch/version）：返回全部
+    /// `state == Attempted` 且 `pre_boot_id == current_boot_id` 的持久记录去重键
+    /// `(controller_key, sub_task_id)`——即「重启已发起但 boot transition 尚未观察到」的未决任务。
+    /// uncertain 隔离态（TR-N2）先于一切；毒锁 → 固定去敏 `Io`（fail-closed）。
+    /// `controller_hex` 解码失败（损坏）→ 固定去敏 `Decode`，绝不静默跳过未决记录。
+    pub fn scan_pending_attempted(
+        &self,
+        current_boot_id: &str,
+    ) -> Result<Vec<([u8; 32], String)>, JournalError> {
+        self.ensure_not_uncertain()?;
+        let attempted = TaskState::Attempted.as_str();
+        let records = self.lock_records()?;
+        self.ensure_not_uncertain()?;
+        let mut pending = Vec::new();
+        for stored in records.iter() {
+            if stored.record.state == attempted && stored.record.pre_boot_id == current_boot_id {
+                let controller_key = decode_journal_hash32(&stored.controller_hex)?;
+                pending.push((controller_key, stored.sub_task_id.clone()));
+            }
+        }
+        Ok(pending)
+    }
+
     pub fn record_count(&self) -> usize {
         self.records.lock().map(|guard| guard.len()).unwrap_or(0)
     }

@@ -719,6 +719,208 @@ fn host_reboot_boundary_is_unsupported_and_never_physically_reboots() {
     );
 }
 
+#[test]
+fn new_recovering_restores_occupation_for_pending_attempted_same_boot() {
+    // TR-R6-3 恢复占用：已持久 Attempted（pre_boot == 当前 boot，重启已发起但 boot transition
+    // 未观察到）在 agent 重建后必须恢复占用，另一 sub_task 持有效票据仍须 1005 DeviceBusy，
+    // 新实例 fake OS 计数恒 0——重建绝不绕过未决任务互斥再次触发重启。
+    let fixture = fixture_with(FakeOs::ok(), BOOT_OLD);
+    let now = Instant::now();
+    let issued_a = fixture
+        .executor
+        .prepare(&KEY, "conn-1", &prepare_request(), now)
+        .expect("prepare a");
+    let request_a = execute_request(issued_a.execution_token);
+    let hash_a = canonical_reboot_payload_hash(&request_a);
+    let outcome_a = fixture
+        .executor
+        .execute(&KEY, "conn-1", &request_a, &hash_a, now);
+    assert!(matches!(outcome_a, ExecuteOutcome::Attempted(_)));
+
+    // agent 重建：同一持久 journal、同 boot 代际，经 new_recovering 恢复
+    let rebuilt = RebootExecutor::new_recovering(
+        Arc::clone(&fixture.journal),
+        FakeOs::ok(),
+        TicketManager::new(),
+        Box::new(|| BOOT_OLD.to_string()),
+        "agent-2",
+    );
+    assert!(
+        rebuilt.device_occupied(),
+        "同 boot 未决 Attempted 在重建后必须恢复占用"
+    );
+    assert_eq!(
+        rebuilt.occupying_sub_task().as_deref(),
+        Some(SUB_TASK),
+        "恢复占用必须记录占用任务"
+    );
+
+    let mut prepare_b = prepare_request();
+    prepare_b.sub_task_id = SUB_TASK_B.to_string();
+    let issued_b = rebuilt
+        .prepare(&KEY, "conn-1", &prepare_b, now)
+        .expect("prepare b");
+    let mut execute_b = execute_request(issued_b.execution_token);
+    execute_b.sub_task_id = SUB_TASK_B.to_string();
+    let hash_b = canonical_reboot_payload_hash(&execute_b);
+    assert!(
+        matches!(
+            rebuilt.execute(&KEY, "conn-1", &execute_b, &hash_b, now),
+            ExecuteOutcome::Rejected(BusinessStatus::DeviceBusy)
+        ),
+        "恢复占用后新任务必须被互斥阻断"
+    );
+    assert_eq!(
+        rebuilt.os().call_count(),
+        0,
+        "恢复占用期间新实例绝不允许触达 OS 边界"
+    );
+}
+
+#[test]
+fn new_recovering_after_boot_transition_starts_unoccupied() {
+    // 未决 Attempted 的 pre_boot = BOOT_OLD；重建时 boot 已变为 BOOT_NEW
+    // （boot transition 已发生，重启已被代际更替终结）→ 不恢复占用。
+    let fixture = fixture_with(FakeOs::ok(), BOOT_OLD);
+    let now = Instant::now();
+    let issued_a = fixture
+        .executor
+        .prepare(&KEY, "conn-1", &prepare_request(), now)
+        .expect("prepare a");
+    let request_a = execute_request(issued_a.execution_token);
+    let hash_a = canonical_reboot_payload_hash(&request_a);
+    let outcome_a = fixture
+        .executor
+        .execute(&KEY, "conn-1", &request_a, &hash_a, now);
+    assert!(matches!(outcome_a, ExecuteOutcome::Attempted(_)));
+
+    let rebuilt = RebootExecutor::new_recovering(
+        Arc::clone(&fixture.journal),
+        FakeOs::ok(),
+        TicketManager::new(),
+        Box::new(|| BOOT_NEW.to_string()),
+        "agent-2",
+    );
+    assert!(
+        !rebuilt.device_occupied(),
+        "boot transition 已观察到的未决记录不得恢复占用"
+    );
+    assert_eq!(rebuilt.occupying_sub_task(), None);
+
+    // 新任务在 BOOT_NEW 上正常占用并进入 OS 边界
+    let mut prepare_b = prepare_request();
+    prepare_b.sub_task_id = SUB_TASK_B.to_string();
+    prepare_b.expected_boot_id = BOOT_NEW.to_string();
+    let issued_b = rebuilt
+        .prepare(&KEY, "conn-1", &prepare_b, now)
+        .expect("prepare b");
+    let mut execute_b = execute_request(issued_b.execution_token);
+    execute_b.sub_task_id = SUB_TASK_B.to_string();
+    execute_b.expected_boot_id = BOOT_NEW.to_string();
+    let hash_b = canonical_reboot_payload_hash(&execute_b);
+    let outcome_b = rebuilt.execute(&KEY, "conn-1", &execute_b, &hash_b, now);
+    assert!(
+        matches!(outcome_b, ExecuteOutcome::Attempted(_)),
+        "boot transition 后新任务应可正常占用, got {outcome_b:?}"
+    );
+    assert_eq!(rebuilt.os().call_count(), 1);
+}
+
+#[test]
+fn external_terminal_state_releases_occupation_for_next_sub_task() {
+    // 占用任务经外部可靠写入终态 Failed（如恢复流程 / 中控核实路径）后，
+    // 同一 executor 必须能观察并解除占用，让新任务重新占用并进入 OS 边界。
+    let fixture = fixture_with(FakeOs::ok(), BOOT_OLD);
+    let now = Instant::now();
+    let issued_a = fixture
+        .executor
+        .prepare(&KEY, "conn-1", &prepare_request(), now)
+        .expect("prepare a");
+    let request_a = execute_request(issued_a.execution_token);
+    let hash_a = canonical_reboot_payload_hash(&request_a);
+    let outcome_a = fixture
+        .executor
+        .execute(&KEY, "conn-1", &request_a, &hash_a, now);
+    assert!(matches!(outcome_a, ExecuteOutcome::Attempted(_)));
+    assert!(fixture.executor.device_occupied());
+
+    // 外部经同一 JournalStore 可靠写入终态 Failed
+    fixture
+        .journal
+        .finish(&KEY, SUB_TASK, TaskState::Failed, Some("OS_ERROR"))
+        .expect("external finish");
+
+    let mut prepare_b = prepare_request();
+    prepare_b.sub_task_id = SUB_TASK_B.to_string();
+    let issued_b = fixture
+        .executor
+        .prepare(&KEY, "conn-1", &prepare_b, now)
+        .expect("prepare b");
+    let mut execute_b = execute_request(issued_b.execution_token);
+    execute_b.sub_task_id = SUB_TASK_B.to_string();
+    let hash_b = canonical_reboot_payload_hash(&execute_b);
+    let outcome_b = fixture
+        .executor
+        .execute(&KEY, "conn-1", &execute_b, &hash_b, now);
+    assert!(
+        matches!(outcome_b, ExecuteOutcome::Attempted(_)),
+        "占用任务终态收敛后新任务必须可重新占用, got {outcome_b:?}"
+    );
+    assert_eq!(fixture.executor.os().call_count(), 2);
+    assert!(fixture.executor.device_occupied());
+    assert_eq!(
+        fixture.executor.occupying_sub_task().as_deref(),
+        Some(SUB_TASK_B),
+        "释放旧占用后占用者必须更新为新任务"
+    );
+}
+
+#[test]
+fn boot_transition_releases_stale_occupation_on_same_executor() {
+    // 占用后设备 boot 代际变化（boot transition）：新任务被阻断前复核发现
+    // 占用记录的 boot 与当前 boot 不同 → 自动安全释放占用。
+    let dir = TempDir::new("boot-change-release");
+    let journal = Arc::new(JournalStore::open(dir.path(), RealFs).expect("open journal"));
+    let boot = Arc::new(Mutex::new(BOOT_OLD.to_string()));
+    let boot_for_closure = Arc::clone(&boot);
+    let executor = RebootExecutor::new(
+        Arc::clone(&journal),
+        FakeOs::ok(),
+        TicketManager::new(),
+        Box::new(move || boot_for_closure.lock().unwrap().clone()),
+        "agent-1",
+    );
+    let now = Instant::now();
+    let issued_a = executor
+        .prepare(&KEY, "conn-1", &prepare_request(), now)
+        .expect("prepare a");
+    let request_a = execute_request(issued_a.execution_token);
+    let hash_a = canonical_reboot_payload_hash(&request_a);
+    let outcome_a = executor.execute(&KEY, "conn-1", &request_a, &hash_a, now);
+    assert!(matches!(outcome_a, ExecuteOutcome::Attempted(_)));
+    assert!(executor.device_occupied());
+
+    // boot 代际变化：未决重启已被 boot transition 终结
+    *boot.lock().unwrap() = BOOT_NEW.to_string();
+
+    let mut prepare_b = prepare_request();
+    prepare_b.sub_task_id = SUB_TASK_B.to_string();
+    prepare_b.expected_boot_id = BOOT_NEW.to_string();
+    let issued_b = executor
+        .prepare(&KEY, "conn-1", &prepare_b, now)
+        .expect("prepare b");
+    let mut execute_b = execute_request(issued_b.execution_token);
+    execute_b.sub_task_id = SUB_TASK_B.to_string();
+    execute_b.expected_boot_id = BOOT_NEW.to_string();
+    let hash_b = canonical_reboot_payload_hash(&execute_b);
+    let outcome_b = executor.execute(&KEY, "conn-1", &execute_b, &hash_b, now);
+    assert!(
+        matches!(outcome_b, ExecuteOutcome::Attempted(_)),
+        "boot transition 后占用必须自动解除, got {outcome_b:?}"
+    );
+    assert_eq!(executor.os().call_count(), 2);
+}
+
 // ---- 落盘故障注入替身：把失败精确投到 execute 的某个写 stage ----
 // `activate_fault` 之后写 stage 按提交次序映射：
 // 第 1 次提交 = insert_accepted，第 2 次 = mark_attempted，第 3 次 = finish。
