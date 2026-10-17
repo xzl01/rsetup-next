@@ -12,6 +12,8 @@ impl DbPool {
 const MIGRATION: &str = include_str!("../migrations/0001_identity_devices.sql");
 const IDENTITY_MIGRATION: &str = include_str!("../migrations/0002_identity_contract.sql");
 const V3_MIGRATION: &str = include_str!("../migrations/0003_identity_application_integrity.sql");
+/// Schema v4 运行时五表 DDL：仅由显式迁移入口消费，普通启动路径绝不隐式执行。
+pub const TASKS_MIGRATION: &str = include_str!("../migrations/0004_tasks.sql");
 const STATISTICS_QUERY: &str = "SELECT CAST(index_name AS CHAR) AS index_name, CAST(column_name AS CHAR) AS column_name, CAST(non_unique AS SIGNED) AS non_unique, CAST(seq_in_index AS SIGNED) AS seq_in_index, CAST(sub_part AS SIGNED) AS sub_part FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? ORDER BY index_name, seq_in_index";
 const FK_CONSTRAINTS_QUERY: &str = "SELECT CAST(table_name AS CHAR) AS table_name, CAST(constraint_name AS CHAR) AS constraint_name FROM information_schema.table_constraints WHERE table_schema = DATABASE() AND constraint_type = 'FOREIGN KEY'";
 const FK_REFERENCES_QUERY: &str = "SELECT CAST(COUNT(*) AS SIGNED) AS fk_count FROM information_schema.referential_constraints WHERE constraint_schema = DATABASE()";
@@ -904,6 +906,18 @@ async fn check_identity_schema_with_probe(
 }
 
 const IDENTITY_SCHEMA_VERSION: i32 = 3;
+
+/// Schema v4 运行时五表的存在性快照：仅由固定字面量的 information_schema
+/// 探测填充，绝不接受外部输入拼装的表名。`integrity::validate_runtime_tables_for_version`
+/// 依据它判定「v4 必须五表齐备、v1..=3 必须五表皆无」。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeTablePresence {
+    pub main_tasks: bool,
+    pub sub_tasks: bool,
+    pub task_previews: bool,
+    pub device_operation_locks: bool,
+    pub recovery_checks: bool,
+}
 
 fn identity_schema_decision(version: Option<i32>) -> Result<(), ControllerError> {
     match version {
@@ -7014,6 +7028,45 @@ mod tests {
                 "missing {table}"
             );
         }
+    }
+
+    #[test]
+    fn tasks_migration_declares_exactly_five_runtime_tables_without_constraints() {
+        const RUNTIME_TABLES: [&str; 5] = [
+            "task_previews",
+            "main_tasks",
+            "sub_tasks",
+            "device_operation_locks",
+            "recovery_checks",
+        ];
+        let sql = TASKS_MIGRATION
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let statements: Vec<&str> = sql
+            .split(';')
+            .map(str::trim)
+            .filter(|statement| !statement.is_empty())
+            .collect();
+        assert_eq!(statements.len(), RUNTIME_TABLES.len(), "one DDL per table");
+        let mut declared = Vec::with_capacity(statements.len());
+        for statement in &statements {
+            let words: Vec<&str> = statement.split_whitespace().collect();
+            assert_eq!(
+                words[..5],
+                ["CREATE", "TABLE", "IF", "NOT", "EXISTS"],
+                "runtime tables must be idempotent CREATE TABLE"
+            );
+            declared.push(words[5]);
+        }
+        for table in RUNTIME_TABLES {
+            assert!(declared.contains(&table), "missing runtime table {table}");
+        }
+        let upper = TASKS_MIGRATION.to_ascii_uppercase();
+        assert!(!upper.contains("FOREIGN KEY"));
+        assert!(!upper.contains("REFERENCES"));
+        assert!(!upper.contains("CHECK ("));
     }
 
     #[test]

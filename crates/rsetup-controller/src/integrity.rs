@@ -130,6 +130,27 @@ pub(crate) async fn lock_integrity_guard(
     validate_guard_rows(rows)
 }
 
+/// 版本化 guard 加锁：在同一事务内以 `FOR UPDATE` 读取 singleton 行，再交给
+/// `validate_guard_rows_for_version` 校验。期望版本必须来自编译期配置
+/// （`SUPPORTED_SCHEMA_VERSION`）并由调用方显式传入，**绝对禁止**先读数据库行
+/// 的版本再拿它验证自己。
+pub async fn lock_schema_guard_for_version(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    expected_version: i32,
+) -> Result<(), ControllerError> {
+    let rows = sqlx::query(
+        "SELECT singleton,schema_version FROM schema_meta WHERE singleton = 1 FOR UPDATE",
+    )
+    .fetch_all(&mut **tx)
+    .await
+    .map(|rows| {
+        rows.into_iter()
+            .map(|row| Ok((row.try_get("singleton")?, row.try_get("schema_version")?)))
+            .collect()
+    });
+    validate_guard_rows_for_version(rows, expected_version)
+}
+
 fn validate_actor_row(
     row: Result<Option<ActorColumns>, sqlx::Error>,
 ) -> Result<(), ControllerError> {
@@ -176,6 +197,103 @@ pub(crate) async fn require_active_admin(
 
 pub async fn check_identity_data(db: &DbPool) -> Result<(), ControllerError> {
     validate_identity_rows(db, true).await
+}
+
+/// v4 运行时数据只读扫描：任一违规返回 `Err(Config)`，登录/启动路径据此
+/// fail-closed。全部 SQL 为函数内固定字面量，绝不从外部输入插值表名或列名；
+/// 不加 `FOR UPDATE`、不写库。必须在版本 guard 通过后调用（此时
+/// `version == SUPPORTED_SCHEMA_VERSION` 已被确认），更高版本由 guard 层拒绝。
+pub async fn check_runtime_data(db: &DbPool, version: i32) -> Result<(), ControllerError> {
+    // v1..=3 未建五张 runtime 表，直接放行。
+    if version < SUPPORTED_SCHEMA_VERSION {
+        return Ok(());
+    }
+    // 更高未知版本（>=5）已在上游 `validate_schema_version` 被拒绝，不会到达此处；
+    // 此处保持 `Ok` 以维持本函数“仅 v4 做数据扫描”的契约。
+    if version != SUPPORTED_SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    // (1) `sub_tasks.main_task_id` 无孤儿主任务
+    const ORPHAN_SUB_TASKS: &str = "SELECT st.id FROM sub_tasks st \
+        LEFT JOIN main_tasks mt ON st.main_task_id = mt.id \
+        WHERE mt.id IS NULL LIMIT 1";
+    if sqlx::query(ORPHAN_SUB_TASKS)
+        .fetch_optional(&db.0)
+        .await
+        .map_err(|_| scan_error("runtime.sub_tasks_orphan_main_task_id"))?
+        .is_some()
+    {
+        return Err(ControllerError::Config(
+            "runtime data sub_tasks orphan main_task_id".into(),
+        ));
+    }
+
+    // (2) `sub_tasks.state` 必须属于 10 个已知合法值（对齐 `tasks::model::SubTaskState`）
+    const BAD_SUB_TASK_STATE: &str = "SELECT id FROM sub_tasks WHERE state NOT IN \
+        ('queued', 'held', 'dispatching', 'accepted', 'verifying', \
+         'succeeded', 'failed', 'unknown', 'cancelled', 'expired') LIMIT 1";
+    if sqlx::query(BAD_SUB_TASK_STATE)
+        .fetch_optional(&db.0)
+        .await
+        .map_err(|_| scan_error("runtime.sub_tasks_invalid_state"))?
+        .is_some()
+    {
+        return Err(ControllerError::Config(
+            "runtime data sub_tasks invalid state".into(),
+        ));
+    }
+
+    // (3) `device_operation_locks.owner_sub_task_id` 必须指向存在的子任务
+    const ORPHAN_DEVICE_LOCKS: &str = "SELECT l.device_id FROM device_operation_locks l \
+        LEFT JOIN sub_tasks st ON l.owner_sub_task_id = st.id \
+        WHERE st.id IS NULL LIMIT 1";
+    if sqlx::query(ORPHAN_DEVICE_LOCKS)
+        .fetch_optional(&db.0)
+        .await
+        .map_err(|_| scan_error("runtime.device_operation_locks_orphan_owner"))?
+        .is_some()
+    {
+        return Err(ControllerError::Config(
+            "runtime data device_operation_locks orphan owner_sub_task_id".into(),
+        ));
+    }
+
+    // (4) `main_tasks.outcome` 在非 `completed` 状态时必须为 NULL
+    const OUTCOME_NOT_NULL: &str = "SELECT id FROM main_tasks \
+        WHERE state != 'completed' AND outcome IS NOT NULL LIMIT 1";
+    if sqlx::query(OUTCOME_NOT_NULL)
+        .fetch_optional(&db.0)
+        .await
+        .map_err(|_| scan_error("runtime.main_tasks_outcome_not_null"))?
+        .is_some()
+    {
+        return Err(ControllerError::Config(
+            "runtime data main_tasks outcome not null for non-completed state".into(),
+        ));
+    }
+
+    // (5) `counts_json` 必须解析为合法 JSON 对象（固定语句 + 应用层扫描，精确区分“解析失败/非 object”）
+    const COUNTS_JSON: &str = "SELECT id, counts_json FROM main_tasks";
+    let rows = sqlx::query(COUNTS_JSON)
+        .fetch_all(&db.0)
+        .await
+        .map_err(|_| scan_error("runtime.main_tasks_counts_json"))?;
+    for row in &rows {
+        let raw: String = row
+            .try_get(1)
+            .map_err(|_| scan_error("runtime.main_tasks_counts_json"))?;
+        let value: Value = serde_json::from_str(&raw).map_err(|_| {
+            ControllerError::Config("runtime data main_tasks invalid counts_json".into())
+        })?;
+        if !value.is_object() {
+            return Err(ControllerError::Config(
+                "runtime data main_tasks invalid counts_json".into(),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 pub(crate) async fn validate_identity_rows(
@@ -515,7 +633,89 @@ fn validate_identity_fixture_with_meta(
     }
     Ok(())
 }
-pub(crate) const SUPPORTED_SCHEMA_VERSION: i32 = 4;
+pub const SUPPORTED_SCHEMA_VERSION: i32 = 4;
+pub const MIN_SUPPORTED_SCHEMA_VERSION: i32 = 1;
+
+/// 编译期可识别的 schema 版本区间：`MIN_SUPPORTED_SCHEMA_VERSION..=SUPPORTED_SCHEMA_VERSION`。
+/// 区间外（0、负数、`SUPPORTED_SCHEMA_VERSION + 1` 及以上）一律不识别，fail-closed。
+pub fn is_recognized_schema_version(version: i32) -> bool {
+    (MIN_SUPPORTED_SCHEMA_VERSION..=SUPPORTED_SCHEMA_VERSION).contains(&version)
+}
+
+/// 版本化 Guard 纯函数：仅接受编译期配置 `SUPPORTED_SCHEMA_VERSION`。
+/// `None`（缺失 singleton 行）、旧版 v1..=3、未知 v5+、0 与负数一律
+/// `Err(SchemaNotReady)`；期望版本绝不从数据库行本身推断。
+pub fn validate_schema_version(found: Option<i32>) -> Result<(), ControllerError> {
+    if found == Some(SUPPORTED_SCHEMA_VERSION) {
+        Ok(())
+    } else {
+        Err(ControllerError::SchemaNotReady {
+            found,
+            required: SUPPORTED_SCHEMA_VERSION,
+        })
+    }
+}
+
+/// 普通启动决策：与 `validate_schema_version` 同一 fail-closed 契约。
+/// 旧版（v1..=3）仅在显式迁移前置检查（preflight）路径中按版本单独校验，
+/// 普通启动不接受任何非编译期配置版本。
+pub fn startup_guard_decision(db_version: Option<i32>) -> Result<(), ControllerError> {
+    validate_schema_version(db_version)
+}
+
+/// 版本化 guard 行校验：恰好一行 `singleton = 1` 且版本与**期望版本**一致。
+/// 期望版本由调用方从编译期配置传入（`SUPPORTED_SCHEMA_VERSION`），
+/// 版本不匹配即拒绝，覆盖“库结构仍是 v3 但声称 v4”这类脏数据。
+pub fn validate_guard_rows_for_version(
+    rows: GuardRows,
+    expected_version: i32,
+) -> Result<(), ControllerError> {
+    let rows = rows.map_err(|_| scan_error("meta.guard"))?;
+    if rows.len() != 1 {
+        return Err(scan_error("meta.guard"));
+    }
+    match rows[0] {
+        Ok((singleton, version)) if singleton == 1 && version == expected_version => Ok(()),
+        Ok(_) | Err(_) => Err(scan_error("meta.guard")),
+    }
+}
+
+/// 运行时五表存在性校验：v4 必须五表齐备；v1..=3 必须五表皆无（历史库仍可
+/// 只读通过）；未识别版本直接拒绝。存在性快照来自固定字面量的
+/// information_schema 探测，本函数不接触数据库。
+pub fn validate_runtime_tables_for_version(
+    version: i32,
+    present: &crate::db::RuntimeTablePresence,
+) -> Result<(), ControllerError> {
+    if !is_recognized_schema_version(version) {
+        return Err(ControllerError::SchemaNotReady {
+            found: Some(version),
+            required: SUPPORTED_SCHEMA_VERSION,
+        });
+    }
+    let tables = [
+        ("main_tasks", present.main_tasks),
+        ("sub_tasks", present.sub_tasks),
+        ("task_previews", present.task_previews),
+        ("device_operation_locks", present.device_operation_locks),
+        ("recovery_checks", present.recovery_checks),
+    ];
+    if version == SUPPORTED_SCHEMA_VERSION {
+        if let Some((name, _)) = tables.iter().find(|(_, exists)| !exists) {
+            return Err(ControllerError::Config(format!(
+                "runtime schema table missing: {name}"
+            )));
+        }
+        return Ok(());
+    }
+    if let Some((name, _)) = tables.iter().find(|(_, exists)| *exists) {
+        return Err(ControllerError::Config(format!(
+            "runtime schema table {name} must not exist before v{}",
+            SUPPORTED_SCHEMA_VERSION
+        )));
+    }
+    Ok(())
+}
 
 pub(crate) fn raw_bool(raw: i64, code: &'static str) -> Result<bool, ControllerError> {
     match raw {
@@ -552,6 +752,110 @@ mod tests {
             assert_eq!(
                 validate_guard_rows(rows).unwrap_err().to_string(),
                 "configuration: identity data meta.guard"
+            );
+        }
+    }
+
+    fn guard_rows(pairs: &[(i8, i32)]) -> GuardRows {
+        Ok(pairs.iter().map(|pair| Ok(*pair)).collect())
+    }
+
+    #[test]
+    fn guard_accepts_supported_versions_and_rejects_unknown() {
+        assert!(is_recognized_schema_version(MIN_SUPPORTED_SCHEMA_VERSION)); // 1
+        assert!(is_recognized_schema_version(2));
+        assert!(is_recognized_schema_version(3));
+        assert!(is_recognized_schema_version(SUPPORTED_SCHEMA_VERSION)); // 4
+        assert!(!is_recognized_schema_version(0));
+        assert!(!is_recognized_schema_version(5));
+        assert!(!is_recognized_schema_version(999));
+        assert!(!is_recognized_schema_version(-1));
+    }
+
+    #[test]
+    fn startup_guard_rejects_old_unknown_and_dirty_versions() {
+        // 普通启动期望版本来自编译期配置 = 4，而不是从数据库行本身推断期望。
+        assert!(startup_guard_decision(Some(SUPPORTED_SCHEMA_VERSION)).is_ok());
+        // 旧版本（v1..=3）仅能用于显式迁移 preflight，普通启动坚决拒绝。
+        assert!(startup_guard_decision(Some(3)).is_err());
+        assert!(startup_guard_decision(Some(2)).is_err());
+        assert!(startup_guard_decision(Some(1)).is_err());
+        // 未知或非法版本/缺失行。
+        assert!(startup_guard_decision(Some(5)).is_err());
+        assert!(startup_guard_decision(Some(0)).is_err());
+        assert!(startup_guard_decision(None).is_err());
+        // 拒绝路径复用 SchemaNotReady，不新增第二套错误变体。
+        for found in [None, Some(3), Some(5)] {
+            assert!(
+                matches!(
+                    startup_guard_decision(found),
+                    Err(ControllerError::SchemaNotReady { found: f, required: 4 }) if f == found
+                ),
+                "expected SchemaNotReady {{ found: {found:?}, required: 4 }}"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_row_validation_is_version_scoped_and_fail_closed() {
+        // 恰好一行 singleton=1 且版本与期望一致。
+        assert!(validate_guard_rows_for_version(guard_rows(&[(1, 3)]), 3).is_ok());
+        assert!(validate_guard_rows_for_version(guard_rows(&[(1, 4)]), 4).is_ok());
+        // singleton 不是 1。
+        assert!(validate_guard_rows_for_version(guard_rows(&[(0, 3)]), 3).is_err());
+        // 多行 / 空行。
+        assert!(validate_guard_rows_for_version(guard_rows(&[(1, 3), (1, 3)]), 3).is_err());
+        assert!(validate_guard_rows_for_version(guard_rows(&[]), 3).is_err());
+        // 版本与期望不一致（例如 v3 结构残留但库声称 4）。
+        assert!(validate_guard_rows_for_version(guard_rows(&[(1, 3)]), 4).is_err());
+        // 行本身是失败行。
+        assert!(
+            validate_guard_rows_for_version(Err(sqlx::Error::RowNotFound), 4).is_err(),
+            "scan error must fail closed"
+        );
+    }
+
+    #[test]
+    fn runtime_tables_are_required_exactly_from_v4() {
+        let full = crate::db::RuntimeTablePresence {
+            main_tasks: true,
+            sub_tasks: true,
+            task_previews: true,
+            device_operation_locks: true,
+            recovery_checks: true,
+        };
+        let empty = crate::db::RuntimeTablePresence {
+            main_tasks: false,
+            sub_tasks: false,
+            task_previews: false,
+            device_operation_locks: false,
+            recovery_checks: false,
+        };
+        assert!(validate_runtime_tables_for_version(4, &full).is_ok());
+        assert!(validate_runtime_tables_for_version(4, &empty).is_err());
+        // v1..=v3 不得要求 runtime 表存在（历史库仍可只读通过）。
+        assert!(validate_runtime_tables_for_version(3, &empty).is_ok());
+        assert!(validate_runtime_tables_for_version(3, &full).is_err());
+        // 未识别版本一律拒绝。
+        assert!(validate_runtime_tables_for_version(5, &full).is_err());
+        assert!(validate_runtime_tables_for_version(0, &full).is_err());
+    }
+
+    #[test]
+    fn schema_version_guard_accepts_v4_and_rejects_others() {
+        // 正例：编译期配置版本 v4 通过。
+        assert!(validate_schema_version(Some(SUPPORTED_SCHEMA_VERSION)).is_ok());
+        // 负例表：缺失行 None、旧版 v1..=3、未知 v5+、0 与负数一律 fail-closed。
+        // `ControllerError` 未派生 `PartialEq`，统一用 `matches!` 断言变体与字段值。
+        let rejected: [Option<i32>; 7] =
+            [None, Some(3), Some(2), Some(1), Some(5), Some(0), Some(-1)];
+        for found in rejected {
+            assert!(
+                matches!(
+                    validate_schema_version(found),
+                    Err(ControllerError::SchemaNotReady { found: f, required: 4 }) if f == found
+                ),
+                "expected SchemaNotReady {{ found: {found:?}, required: 4 }}"
             );
         }
     }
