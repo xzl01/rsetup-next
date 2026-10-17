@@ -175,7 +175,8 @@ pub fn time_review_verdict(
 
 /// 解析主任务 `created_time_json` 为创建时时钟证据；缺失或不可解析一律 `None`
 /// （无法证明原期限有效，fail-closed 保持 `held`），绝不猜测近似值。
-fn parse_created_time_evidence(raw: &str) -> Option<TimeEvidence> {
+/// 生产 `TaskApi` 适配器组装 `TaskDetail.created_time` 时复用同一解析口径。
+pub(crate) fn parse_created_time_evidence(raw: &str) -> Option<TimeEvidence> {
     serde_json::from_str(raw).ok()
 }
 

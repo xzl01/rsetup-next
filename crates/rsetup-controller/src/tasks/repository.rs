@@ -101,6 +101,9 @@ where
 }
 
 /// 主任务领域行（不含期限列；期限由恢复/调度路径单独读取）。
+///
+/// `created_time_json` 是 `TaskDetail.created_time`（创建时时钟证据）的唯一来源；
+/// `created_at` 是 `(created_at, id)` keyset 列表游标的排序键，生产读路径必需。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MainTaskRow {
     pub id: Uuid,
@@ -109,11 +112,17 @@ pub struct MainTaskRow {
     pub outcome: Option<MainTaskOutcome>,
     pub revision: u64,
     pub counts_json: String,
+    pub created_time_json: String,
+    pub created_at: DateTime<Utc>,
 }
 
 /// 子任务领域行（列表投影；两条期限列都不进列表行：`queue_deadline` 是排队截止、
 /// 只由时限复核/调度路径读取，`observe_deadline` 是派发后的观察窗截止，
 /// 两者语义独立，都不属于列表展示字段）。
+///
+/// `evidence_json` 是 children 页 `result_evidence` 的原始 JSON 文本（当前无生产
+/// 者写入、恒 NULL；读取侧防御性解码）；`created_at` 供 children 签名游标的
+/// `created_at_ms` payload 使用。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubTaskRow {
     pub id: Uuid,
@@ -121,6 +130,8 @@ pub struct SubTaskRow {
     pub state: SubTaskState,
     pub reason_code: Option<ReasonCode>,
     pub revision: u64,
+    pub evidence_json: Option<String>,
+    pub created_at: DateTime<Utc>,
 }
 
 /// `main_tasks` 原始行：`BINARY` 列以 `Vec<u8>` 承接、枚举列以 `String` 承接。
@@ -132,6 +143,8 @@ pub(crate) struct MainTaskRawRow {
     pub outcome: Option<String>,
     pub revision: u64,
     pub counts_json: String,
+    pub created_time_json: String,
+    pub created_at: DateTime<Utc>,
 }
 
 /// `sub_tasks` 原始行。
@@ -142,6 +155,8 @@ pub(crate) struct SubTaskRawRow {
     pub state: String,
     pub reason_code: Option<String>,
     pub revision: u64,
+    pub evidence_json: Option<String>,
+    pub created_at: DateTime<Utc>,
 }
 
 impl MainTaskRawRow {
@@ -154,6 +169,8 @@ impl MainTaskRawRow {
             outcome: column::<Option<String>>(row, "outcome")?,
             revision: column::<u64>(row, "revision")?,
             counts_json: column::<String>(row, "counts_json")?,
+            created_time_json: column::<String>(row, "created_time_json")?,
+            created_at: column::<DateTime<Utc>>(row, "created_at")?,
         })
     }
 }
@@ -166,6 +183,8 @@ impl SubTaskRawRow {
             state: column::<String>(row, "state")?,
             reason_code: column::<Option<String>>(row, "reason_code")?,
             revision: column::<u64>(row, "revision")?,
+            evidence_json: column::<Option<String>>(row, "evidence_json")?,
+            created_at: column::<DateTime<Utc>>(row, "created_at")?,
         })
     }
 }
@@ -186,6 +205,8 @@ impl TryFrom<MainTaskRawRow> for MainTaskRow {
             },
             revision: raw.revision,
             counts_json: raw.counts_json,
+            created_time_json: raw.created_time_json,
+            created_at: raw.created_at,
         })
     }
 }
@@ -205,6 +226,8 @@ impl TryFrom<SubTaskRawRow> for SubTaskRow {
                 }
             },
             revision: raw.revision,
+            evidence_json: raw.evidence_json,
+            created_at: raw.created_at,
         })
     }
 }
@@ -243,12 +266,18 @@ pub(crate) async fn tx_row(
         .await?)
 }
 
-/// `main_tasks` 列表/详情投影的统一列集合（`counts_json` 经 `CAST(... AS CHAR)` 取文本）。
+/// `main_tasks` 列表/详情投影的统一列集合（JSON 列经 `CAST(... AS CHAR)` 取文本）。
+/// `created_time_json` 供详情 `created_time`；`created_at` 是列表 keyset 排序键。
 const MAIN_TASK_COLUMNS: &str = "id, actor_user_id, state, outcome, revision, \
-                                 CAST(counts_json AS CHAR) AS counts_json";
+                                 CAST(counts_json AS CHAR) AS counts_json, \
+                                 CAST(created_time_json AS CHAR) AS created_time_json, \
+                                 created_at";
 
-/// `sub_tasks` 列表投影的统一列集合（不含期限列）。
-const SUB_TASK_COLUMNS: &str = "id, device_id, state, reason_code, revision";
+/// `sub_tasks` 列表投影的统一列集合（不含期限列）。`evidence_json` 供 children 页
+/// `result_evidence`（当前恒 NULL，读取侧防御性解码）；`created_at` 供 children
+/// 签名游标 payload。
+const SUB_TASK_COLUMNS: &str = "id, device_id, state, reason_code, revision, \
+                                CAST(evidence_json AS CHAR) AS evidence_json, created_at";
 
 /// 解析 keyset 游标：恰 32 位小写 hex（对应 `BINARY(16)` 主键）。大写、长度不符、
 /// 非 hex 一律 `None`，由调用方映射 `InvalidArgument`，绝不退化为「返回首页」。
@@ -343,6 +372,158 @@ impl SqlxTaskRepository {
     pub fn pool(&self) -> &MySqlPool {
         &self.pool
     }
+
+    /// 主任务 keyset 扫描一页（生产列表读路径）。
+    ///
+    /// - `actor_filter`：`Some(user)` 只扫该用户发起的主任务（普通用户），`None` 全域
+    ///   扫描（会话侧 admin；权威 admin 判定仍由调用方的授权快照事务内重验兜底）；
+    /// - `after`：上一页末候选的 `(created_at, id)`；keyset 条件展开为
+    ///   `created_at > ? OR (created_at = ? AND id > ?)`，与
+    ///   `ix_main_tasks_actor_created` 索引同向，不做 OFFSET；
+    /// - `next`：**最后一条已扫描候选**的 keyset 键（扫描满 `limit` 行才给出，
+    ///   不足即 `None`）。可见性过滤发生在扫描之后，故下一页游标以「已扫描候选」
+    ///   为准：不重扫、不死循环，也不泄漏过滤前总数。
+    pub async fn list_main_tasks_page(
+        &self,
+        actor_filter: Option<Uuid>,
+        state_filter: Option<MainTaskState>,
+        after: Option<(DateTime<Utc>, Uuid)>,
+        limit: usize,
+    ) -> Result<MainTaskScanPage, ControllerError> {
+        let mut conditions: Vec<&str> = Vec::new();
+        if actor_filter.is_some() {
+            conditions.push("actor_user_id = ?");
+        }
+        if state_filter.is_some() {
+            conditions.push("state = ?");
+        }
+        if after.is_some() {
+            conditions.push("(created_at > ? OR (created_at = ? AND id > ?))");
+        }
+        let where_clause = if conditions.is_empty() {
+            "1 = 1".to_owned()
+        } else {
+            conditions.join(" AND ")
+        };
+        let sql = format!(
+            "SELECT {MAIN_TASK_COLUMNS} FROM main_tasks WHERE {where_clause} \
+             ORDER BY created_at ASC, id ASC LIMIT ?"
+        );
+        let mut args = MySqlArguments::default();
+        if let Some(actor) = &actor_filter {
+            push_arg(&mut args, &actor.as_bytes().as_slice())?;
+        }
+        if let Some(state) = &state_filter {
+            push_arg(&mut args, &enum_wire(state)?)?;
+        }
+        if let Some((created_at, id)) = after {
+            push_arg(&mut args, &created_at)?;
+            push_arg(&mut args, &created_at)?;
+            push_arg(&mut args, &id.as_bytes().as_slice())?;
+        }
+        let limit = i64::try_from(limit).map_err(|_| ControllerError::InvalidArgument)?;
+        push_arg(&mut args, &limit)?;
+        let mut tx = self.pool.begin().await?;
+        let rows = tx_rows(&mut tx, &sql, args).await?;
+        // fail-closed：任一行损坏即整页失败，不跳行、不截断
+        let mut items = Vec::with_capacity(rows.len());
+        for row in &rows {
+            items.push(MainTaskRow::try_from(MainTaskRawRow::from_row(row)?)?);
+        }
+        tx.commit().await?;
+        let next = if limit > 0 && items.len() as i64 == limit {
+            items.last().map(|row| (row.created_at, row.id))
+        } else {
+            None
+        };
+        Ok(MainTaskScanPage { rows: items, next })
+    }
+
+    /// 一次读事务批量读出多张主任务的全部子任务（列表可见性评估的唯一批量入口）。
+    /// 返回按 `(main_task_id, id)` 升序的扁平列表；空输入零查询。
+    pub async fn list_subtasks_for_main_tasks(
+        &self,
+        main_task_ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, SubTaskRow)>, ControllerError> {
+        if main_task_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; main_task_ids.len()].join(", ");
+        let sql = format!(
+            "SELECT main_task_id, {SUB_TASK_COLUMNS} FROM sub_tasks \
+             WHERE main_task_id IN ({placeholders}) ORDER BY main_task_id ASC, id ASC"
+        );
+        let mut args = MySqlArguments::default();
+        for id in main_task_ids {
+            push_arg(&mut args, &id.as_bytes().as_slice())?;
+        }
+        let mut tx = self.pool.begin().await?;
+        let rows = tx_rows(&mut tx, &sql, args).await?;
+        let mut items = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let main_task_id = mysql_uuid(&column::<Vec<u8>>(row, "main_task_id")?)?;
+            items.push((
+                main_task_id,
+                SubTaskRow::try_from(SubTaskRawRow::from_row(row)?)?,
+            ));
+        }
+        tx.commit().await?;
+        Ok(items)
+    }
+
+    /// 同一读事务内读出主任务行与其全部子任务（详情/取消编排的唯一读取入口，
+    /// 主/子行因此来自同一一致性快照）。主任务不存在返回 `Ok(None)`。
+    pub async fn load_main_task_with_subtasks(
+        &self,
+        main_task_id: Uuid,
+    ) -> Result<Option<(MainTaskRow, Vec<SubTaskRow>)>, ControllerError> {
+        let mut tx = self.pool.begin().await?;
+        let main = tx_row(
+            &mut tx,
+            &format!("SELECT {MAIN_TASK_COLUMNS} FROM main_tasks WHERE id = ?"),
+            params![main_task_id.as_bytes().as_slice()],
+        )
+        .await?;
+        let Some(main) = main else {
+            // 主任务不存在：显式回滚退出，不占读事务
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let main = MainTaskRow::try_from(MainTaskRawRow::from_row(&main)?)?;
+        let rows = tx_rows(
+            &mut tx,
+            &format!(
+                "SELECT {SUB_TASK_COLUMNS} FROM sub_tasks WHERE main_task_id = ? \
+                 ORDER BY id ASC"
+            ),
+            params![main_task_id.as_bytes().as_slice()],
+        )
+        .await?;
+        let mut subtasks = Vec::with_capacity(rows.len());
+        for row in &rows {
+            subtasks.push(SubTaskRow::try_from(SubTaskRawRow::from_row(row)?)?);
+        }
+        tx.commit().await?;
+        Ok(Some((main, subtasks)))
+    }
+}
+
+/// 主任务 keyset 扫描一页的结果：候选行 + 下一页 keyset 键（见
+/// [`SqlxTaskRepository::list_main_tasks_page`]）。
+#[derive(Clone, Debug)]
+pub struct MainTaskScanPage {
+    pub rows: Vec<MainTaskRow>,
+    pub next: Option<(DateTime<Utc>, Uuid)>,
+}
+
+/// 条件参数的逐个绑定：与 `params!` 宏完全同口径（编码失败 → `Database(Encode)`
+/// 503），用于 WHERE 条件按参数存在性动态拼装的多形态 SQL。
+fn push_arg<'q, T>(args: &mut MySqlArguments, value: &'q T) -> Result<(), ControllerError>
+where
+    T: sqlx::Type<MySql> + sqlx::Encode<'q, MySql>,
+{
+    sqlx::Arguments::add(args, value)
+        .map_err(|err| ControllerError::Database(sqlx::Error::Encode(err)))
 }
 
 /// 方法签名刻意写成 `-> impl Future + Send`（而非 `async fn`）：与
@@ -617,6 +798,10 @@ impl<R: TaskRepository + Sync> TaskRepository for &R {
 mod tests {
     use super::*;
 
+    fn fixed_created_at() -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp(1_800_000_000, 0).expect("fixed instant in range")
+    }
+
     fn raw_main_task(outcome: Option<&str>, state: &str) -> MainTaskRawRow {
         MainTaskRawRow {
             id: [7u8; 16].to_vec(),
@@ -625,6 +810,8 @@ mod tests {
             outcome: outcome.map(str::to_owned),
             revision: 3,
             counts_json: "{}".to_owned(),
+            created_time_json: "{}".to_owned(),
+            created_at: fixed_created_at(),
         }
     }
 
@@ -636,6 +823,8 @@ mod tests {
         assert_eq!(row.state, MainTaskState::Running);
         assert_eq!(row.outcome, Some(MainTaskOutcome::Partial));
         assert_eq!(row.revision, 3);
+        assert_eq!(row.created_time_json, "{}");
+        assert_eq!(row.created_at, fixed_created_at());
     }
 
     #[test]
@@ -658,10 +847,14 @@ mod tests {
             state: "queued".to_owned(),
             reason_code: Some("DEVICE_BUSY".to_owned()),
             revision: 1,
+            evidence_json: None,
+            created_at: fixed_created_at(),
         };
         let row = SubTaskRow::try_from(base.clone()).expect("domain row");
         assert_eq!(row.state, SubTaskState::Queued);
         assert_eq!(row.reason_code, Some(ReasonCode::DeviceBusy));
+        assert_eq!(row.evidence_json, None);
+        assert_eq!(row.created_at, fixed_created_at());
 
         let mut broken = base.clone();
         broken.reason_code = Some("not_a_reason".to_owned());
