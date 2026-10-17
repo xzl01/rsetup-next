@@ -11,7 +11,9 @@
 //!
 //! 授权唯一真源：读路径一律经 `SqlxAuthorizationSnapshotRepository::load_snapshot`
 //! 与 `snapshot_effective_permissions` 求值，本模块**不写第二套** grant/role/group
-//! 求值，也不得把「整批 has_any」类布尔当可见性判据。
+//! 求值，也不得把「整批 has_any」类布尔当可见性判据。owner/admin 门控同样以快照
+//! actor（`is_current_admin`）为唯一权威：会话 `Session.is_admin` 只是廉价前置
+//! 过滤，快照取得后必须二次门控（并发降级重验，M2）。
 //!
 //! 时钟口径（RT-N5，fail-closed）：本适配器按简报固定结构不持有 `TimeGateHandle`；
 //! `submit` 的创建时证据与 `time_review` 的比对时钟取进程内墙钟快照
@@ -23,6 +25,8 @@
 //! 游标纪律：`/tasks` 与 `/tasks/{id}/children` 的下一页游标一律经
 //! `encode_task_cursor`（HMAC 签名，密钥由本结构构造入参显式注入，HTTP 层不经手）
 //! 签发；解码失败（篡改/跨端点/换密钥）一律 `InvalidArgument`，绝不回退首页。
+//! `/tasks` 的 keyset 比较与排序在仓储层统一到**毫秒时间轴**（与游标 payload 的
+//! 毫秒截断同轴，同毫秒行由 `id` 决胜），保证跨页不重复、不丢行、不死循环。
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, OnceLock};
@@ -46,7 +50,7 @@ use crate::tasks::http::{
 use crate::tasks::model::{EvidenceKind, MainTaskState, ReasonCode, SubTaskState};
 use crate::tasks::preview::{
     PreviewOutcome, PreviewTarget, preview_token_bytes, preview_token_digest, preview_token_nonce,
-    request_hash as preview_request_hash,
+    request_hash as preview_request_hash, validate_target_count,
 };
 use crate::tasks::repository::{
     MainTaskRow, SqlxTaskRepository, SubTaskRow, TaskRepository, task_row_decode_error,
@@ -152,8 +156,12 @@ pub(crate) fn child_entries_of(
         .collect()
 }
 
-/// `can_cancel`：任一**可见**目标可取消即为 true（与 cancel 编排同一判据
-/// `cancel_permitted`；隐藏目标不参与）。
+/// `can_cancel`：传入清单中任一目标可取消即为 true（与 cancel 编排同一判据
+/// `cancel_permitted`，逐目标查 `DeviceReboot` 权限独立判定）。
+///
+/// 调用方必须传**全量子任务**（M1）：`actions.can_cancel` 按操作权限/状态独立
+/// 判定，不偷与 `device.task.read` 绑定——用户对某隐藏目标持有 `device.reboot`
+/// 时 `cancel` 确实会取消它，入口不得因该目标不可见而误关闭。
 pub(crate) fn can_cancel_any(
     snapshot: &AuthorizationSnapshot,
     admin_mode: bool,
@@ -165,6 +173,51 @@ pub(crate) fn can_cancel_any(
             .contains(&Permission::DeviceReboot);
         cancel_permitted(admin_mode, is_owner, has_reboot, subtask.state)
     })
+}
+
+/// 权威 owner/admin 门控（M2）：owner 或快照有效 admin 才放行，否则与不存在
+/// 同投影 `NotFound`（404）。detail/children/cancel 在取得授权快照后必须过这道
+/// 二次门控——会话伪称 admin 而快照 actor 已降级时，绝不凭会话声明放行。
+pub(crate) fn snapshot_owner_gate(is_owner: bool, admin_mode: bool) -> Result<(), ControllerError> {
+    if is_owner || admin_mode {
+        Ok(())
+    } else {
+        Err(ControllerError::NotFound)
+    }
+}
+
+/// 列表逐行扫描域（M2）：权威快照非有效 admin 时只保留本人发起的行——即使扫描
+/// 域按会话伪称 admin 走了全域，他人任务也逐行丢弃（fail-closed，不泄漏存在性）。
+pub(crate) fn list_row_in_scope(admin_mode: bool, row_actor: Uuid, caller: Uuid) -> bool {
+    admin_mode || row_actor == caller
+}
+
+/// children 的 A-06 全集门控（M3）：非有效 admin 且该主任务在当前快照下**全集**
+/// 没有任何 `device.task.read` 可读目标 → 与不存在同投影 `NotFound`（404），与
+/// `task_detail` 的 `visible_states` 为空口径完全一致；绝不返回 200 空页让 owner
+/// 探测「任务存在但当前无可读目标」。有效 admin 不受该门控（全域可见）。
+pub(crate) fn children_fully_invisible(admin_mode: bool, readable_count: usize) -> bool {
+    !admin_mode && readable_count == 0
+}
+
+/// 分批授权快照的合并（M4）：各批共享同一 actor（actor 行由同一用户读出），
+/// grants 取并集、roles/device_groups/devices 按键合并，`authz_epoch` 取最小值
+/// （保守）。设备 id 入参已去重、跨批不重复，映射键无冲突。
+fn merge_snapshot(base: &mut AuthorizationSnapshot, other: AuthorizationSnapshot) {
+    base.authz_epoch = base.authz_epoch.min(other.authz_epoch);
+    base.grants.extend(other.grants);
+    for (role_id, role) in other.roles {
+        base.roles.entry(role_id).or_insert(role);
+    }
+    for (device_id, groups) in other.device_groups {
+        base.device_groups
+            .entry(device_id)
+            .or_default()
+            .extend(groups);
+    }
+    for (public_key, device) in other.devices {
+        base.devices.entry(public_key).or_insert(device);
+    }
 }
 
 /// 游标 payload 的 `created_at_ms` → keyset 时间键；越界（不可表示为 UTC 时刻）
@@ -206,13 +259,17 @@ fn unique_device_ids(device_ids: impl Iterator<Item = [u8; 32]>) -> Vec<[u8; 32]
 ///
 /// - 可见全集为空 → `NotFound`（完全不可见与不存在统一 404，不输出零值汇总）；
 /// - `view_scope` 仅当快照 actor 为有效 admin 时 `full`；
-/// - `counts`/`can_cancel` 只按可见全集计算，隐藏目标不计入任何 counts。
+/// - `counts`/`visible_states` **严格仅按 `visible`（task.read 可见子集）计算**，
+///   隐藏目标不计入任何 counts、不泄漏隐藏数量；
+/// - `actions.can_cancel` 按 `all_subtasks`（**全量**子任务，M1）逐目标查
+///   `DeviceReboot` 权限独立判定，不偷与 `device.task.read` 绑定。
 pub(crate) fn assemble_detail(
     row: &MainTaskRow,
     snapshot: &AuthorizationSnapshot,
     admin_mode: bool,
     is_owner: bool,
     visible: &[&SubTaskRow],
+    all_subtasks: &[SubTaskRow],
 ) -> Result<TaskDetail, ControllerError> {
     let visible_states: Vec<SubTaskState> = visible.iter().map(|subtask| subtask.state).collect();
     if visible_states.is_empty() {
@@ -220,6 +277,7 @@ pub(crate) fn assemble_detail(
     }
     let created_time =
         parse_created_time_evidence(&row.created_time_json).ok_or_else(task_row_decode_error)?;
+    let all_refs: Vec<&SubTaskRow> = all_subtasks.iter().collect();
     Ok(TaskDetail {
         id: row.id,
         operation: persisted_task_operation(),
@@ -234,7 +292,7 @@ pub(crate) fn assemble_detail(
         },
         counts: task_counts_of(&visible_states),
         actions: TaskActions {
-            can_cancel: can_cancel_any(snapshot, admin_mode, is_owner, visible),
+            can_cancel: can_cancel_any(snapshot, admin_mode, is_owner, &all_refs),
         },
         visible_states,
     })
@@ -275,6 +333,26 @@ impl SqlxTaskApi {
             .await
     }
 
+    /// 分批授权快照（M4）：单页列表的 unique 设备数可达 `200 × 1024`，一次
+    /// `IN (...)` 会撞上 MySQL 预处理语句 65,535 占位符上限（整页 503）。按
+    /// [`SNAPSHOT_DEVICE_CHUNK`] 分批读取后合并；空设备清单保持一次空查询
+    /// （快照仍需 actor 行）。
+    async fn load_snapshot_chunked(
+        &self,
+        actor: &Session,
+        device_ids: &[[u8; 32]],
+    ) -> Result<AuthorizationSnapshot, ControllerError> {
+        const SNAPSHOT_DEVICE_CHUNK: usize = 1024;
+        let mut chunks = device_ids.chunks(SNAPSHOT_DEVICE_CHUNK);
+        let first = chunks.next().unwrap_or(&[]);
+        let mut merged = self.load_snapshot(actor, first).await?;
+        for chunk in chunks {
+            let next = self.load_snapshot(actor, chunk).await?;
+            merge_snapshot(&mut merged, next);
+        }
+        Ok(merged)
+    }
+
     async fn preview_inner(
         &self,
         actor: &Session,
@@ -285,9 +363,9 @@ impl SqlxTaskApi {
         // 提交侧 `device_target_hash` 恒以空 groups 比对）；本实现不展开分组，
         // 目标恒为显式传入的 `device_ids`（fail-closed，不静默扩大授权面）。
         let _ = group_ids;
-        if device_ids.is_empty() {
-            return Err(ControllerError::InvalidArgument);
-        }
+        // M4：目标数量校验（1..=1024）前移到读快照**之前**——超限/空清单绝不
+        // 先用请求里的设备清单放大一次授权读（service 层同口径校验保留兜底）。
+        validate_target_count(device_ids.len())?;
         let snapshot = self.load_snapshot(actor, device_ids).await?;
         let mut targets = Vec::with_capacity(device_ids.len());
         let mut any_visible = false;
@@ -375,9 +453,8 @@ impl SqlxTaskApi {
             }
         };
         // 会话侧 admin → 全域扫描；普通用户只扫本人发起（spec 01 §6 A-06）。
-        // 权威 admin 判定以授权快照事务内重读的 actor 行为准（下方 `admin_mode`）：
-        // 会话伪称 admin 而 DB 否定时，可见性求值自然为空集 → 整页被过滤，
-        // fail-closed 且不泄漏任何存在性信号。
+        // 这只是廉价前置过滤：权威 admin 判定以授权快照事务内重读的 actor 行为准
+        // （下方 `admin_mode`），会话伪称 admin 而快照已降级时逐行丢弃（M2）。
         let actor_filter = if actor.user.is_admin {
             None
         } else {
@@ -396,7 +473,8 @@ impl SqlxTaskApi {
         let main_ids: Vec<Uuid> = scan.rows.iter().map(|row| row.id).collect();
         let children = self.repo.list_subtasks_for_main_tasks(&main_ids).await?;
         let device_ids = unique_device_ids(children.iter().map(|(_, subtask)| subtask.device_id));
-        let snapshot = self.load_snapshot(actor, &device_ids).await?;
+        // M4：本页 unique 设备数可达 200 × 1024，分批读授权快照后合并。
+        let snapshot = self.load_snapshot_chunked(actor, &device_ids).await?;
         let admin_mode = is_current_admin(&snapshot.actor);
         let mut by_main: HashMap<Uuid, Vec<SubTaskRow>> = HashMap::new();
         for (main_id, subtask) in children {
@@ -404,8 +482,14 @@ impl SqlxTaskApi {
         }
         let mut items = Vec::new();
         for row in &scan.rows {
+            // M2：权威快照已非 admin 时，他人发起的行逐行丢弃（即使扫描域是全域，
+            // fail-closed，不泄漏任何存在性信号）。
+            if !list_row_in_scope(admin_mode, row.actor_user_id, caller) {
+                continue;
+            }
             let empty: Vec<SubTaskRow> = Vec::new();
-            let visible = readable_subtasks(&snapshot, by_main.get(&row.id).unwrap_or(&empty));
+            let all = by_main.get(&row.id).unwrap_or(&empty);
+            let visible = readable_subtasks(&snapshot, all);
             if visible.is_empty() {
                 // 完全不可见主任务：跳过，不计入页、不泄漏过滤前总数。
                 continue;
@@ -416,10 +500,12 @@ impl SqlxTaskApi {
                 admin_mode,
                 row.actor_user_id == caller,
                 &visible,
+                all,
             )?);
         }
-        // 下一页游标 = 最后一条**已扫描候选**的 keyset 键（扫描满页才有）：
-        // 不重扫、不死循环；游标经 HMAC 签名。
+        // 下一页游标 = 最后一条**已扫描候选**的 keyset 键（扫描满页才有）：仓储层
+        // 已把比较与排序统一到毫秒时间轴（与游标 payload 同轴，同毫秒由 id 决胜），
+        // 故不重扫、不死循环；游标经 HMAC 签名。
         let next_cursor = scan.next.map(|(created_at, id)| {
             encode_task_cursor(
                 TaskCursorScope::Tasks,
@@ -443,15 +529,18 @@ impl SqlxTaskApi {
             .await?
             .ok_or(ControllerError::NotFound)?;
         let is_owner = row.actor_user_id == caller;
-        // owner 身份先于设备可见性判定：非 owner 且非 admin → 404（与不存在同投影）。
+        // owner 身份先于设备可见性判定：会话侧廉价前置过滤（非 owner 且会话非
+        // admin → 404），权威门控在快照后二次重验（M2）。
         if !is_owner && !actor.user.is_admin {
             return Err(ControllerError::NotFound);
         }
         let device_ids = unique_device_ids(subtasks.iter().map(|subtask| subtask.device_id));
         let snapshot = self.load_snapshot(actor, &device_ids).await?;
         let admin_mode = is_current_admin(&snapshot.actor);
+        // M2：会话伪称 admin 而快照 actor 已降级 → 404（与不存在同投影）。
+        snapshot_owner_gate(is_owner, admin_mode)?;
         let visible = readable_subtasks(&snapshot, &subtasks);
-        assemble_detail(&row, &snapshot, admin_mode, is_owner, &visible)
+        assemble_detail(&row, &snapshot, admin_mode, is_owner, &visible, &subtasks)
     }
 
     async fn children_inner(
@@ -463,12 +552,17 @@ impl SqlxTaskApi {
     ) -> Result<ChildrenPage, ControllerError> {
         let secret = self.cursor_secret;
         let caller = Uuid::from_bytes(actor.user.id);
-        let row = self
+        // 主任务行与**全集**子任务同一读事务取出（M3）：A-06 门控必须按全部目标
+        // 判定，只看当前页会把「本页恰无可读目标」误判成「整单不可见」（反之
+        // 漏判）。
+        let (row, all_subtasks) = self
             .repo
-            .find_main_task(task_id)
+            .load_main_task_with_subtasks(task_id)
             .await?
             .ok_or(ControllerError::NotFound)?;
-        if row.actor_user_id != caller && !actor.user.is_admin {
+        let is_owner = row.actor_user_id == caller;
+        // 会话侧廉价前置过滤；权威门控在快照后二次重验（M2）。
+        if !is_owner && !actor.user.is_admin {
             return Err(ControllerError::NotFound);
         }
         // children 页 keyset 键是子任务 id（`uq_sub_tasks_main_device` 下唯一稳定
@@ -486,8 +580,17 @@ impl SqlxTaskApi {
             .repo
             .list_subtasks_page(task_id, raw_cursor, limit)
             .await?;
-        let device_ids = unique_device_ids(subtasks.iter().map(|subtask| subtask.device_id));
+        let device_ids = unique_device_ids(all_subtasks.iter().map(|subtask| subtask.device_id));
         let snapshot = self.load_snapshot(actor, &device_ids).await?;
+        let admin_mode = is_current_admin(&snapshot.actor);
+        // M2：会话伪称 admin 而快照 actor 已降级 → 404（与不存在同投影）。
+        snapshot_owner_gate(is_owner, admin_mode)?;
+        // M3：全集没有任何 `device.task.read` 可读目标 → 404（与 detail 的
+        // `visible_states` 为空同口径），绝不返回 200 空页。
+        let readable_count = readable_subtasks(&snapshot, &all_subtasks).len();
+        if children_fully_invisible(admin_mode, readable_count) {
+            return Err(ControllerError::NotFound);
+        }
         let items = child_entries_of(&snapshot, &subtasks);
         let next_cursor = match (raw_next, subtasks.last()) {
             (Some(_), Some(last)) => Some(encode_task_cursor(
@@ -515,6 +618,7 @@ impl SqlxTaskApi {
             .await?
             .ok_or(ControllerError::NotFound)?;
         let is_owner = row.actor_user_id == caller;
+        // 会话侧廉价前置过滤；权威门控在快照后二次重验（M2）。
         if !is_owner && !actor.user.is_admin {
             return Err(ControllerError::NotFound);
         }
@@ -525,6 +629,8 @@ impl SqlxTaskApi {
         let device_ids = unique_device_ids(subtasks.iter().map(|subtask| subtask.device_id));
         let snapshot = self.load_snapshot(actor, &device_ids).await?;
         let admin_mode = is_current_admin(&snapshot.actor);
+        // M2：会话伪称 admin 而快照 actor 已降级 → 404，绝不进入取消编排。
+        snapshot_owner_gate(is_owner, admin_mode)?;
         let ctx = self.auth_ctx(actor);
         let mut cancelled = Vec::new();
         for subtask in &subtasks {
@@ -550,9 +656,14 @@ impl SqlxTaskApi {
                     device_id: subtask.device_id,
                     readable_in_tx,
                 }),
-                // 单目标业务性结果（终态/不可取消/逐行并发冲突/授权兜底）
-                // 不整体失败；存储级故障必须上抛（503），不伪装成部分成功。
-                Ok(_) | Err(CancelError::PermissionDenied) => {}
+                // 单目标业务性结果（终态/不可取消/逐行并发冲突）不整体失败；
+                // 存储级故障必须上抛（503），不伪装成部分成功。
+                Ok(_) => {}
+                // L3：`PermissionDenied` 是请求级授权失败（actor 失效/待改密），
+                // 不是单目标业务结果——必须上抛 403，绝不吞成 `{accepted:true}` 200。
+                Err(CancelError::PermissionDenied) => {
+                    return Err(ControllerError::PermissionDenied);
+                }
                 Err(CancelError::Backend(err)) => return Err(err),
             }
         }
@@ -889,7 +1000,7 @@ mod tests {
     fn assemble_detail_rejects_fully_invisible_main_task() {
         let snapshot = reader_snapshot();
         let row = main_row();
-        let err = assemble_detail(&row, &snapshot, false, true, &[]).unwrap_err();
+        let err = assemble_detail(&row, &snapshot, false, true, &[], &[]).unwrap_err();
         assert!(matches!(err, ControllerError::NotFound));
     }
 
@@ -904,7 +1015,8 @@ mod tests {
             subtask(DEVICE_B, SubTaskState::Dispatching),
         ];
         let visible = readable_subtasks(&snapshot, &subtasks);
-        let detail = assemble_detail(&row, &snapshot, false, true, &visible).expect("detail");
+        let detail =
+            assemble_detail(&row, &snapshot, false, true, &visible, &subtasks).expect("detail");
         assert_eq!(detail.view_scope, ViewScope::AuthorizedSubset);
         assert_eq!(
             detail.visible_states,
@@ -916,7 +1028,7 @@ mod tests {
         assert_eq!(detail.revision, 9);
         assert_eq!(detail.outcome, None);
         assert_eq!(detail.created_time, evidence_fixture());
-        // owner 只有 task.read、无 reboot：不可取消
+        // owner 只有 task.read、无 reboot（隐藏目标 B 也无 reboot）：不可取消
         assert!(!detail.actions.can_cancel);
     }
 
@@ -926,7 +1038,8 @@ mod tests {
         let row = main_row();
         let subtasks = vec![subtask(DEVICE_A, SubTaskState::Queued)];
         let visible = readable_subtasks(&snapshot, &subtasks);
-        let detail = assemble_detail(&row, &snapshot, true, false, &visible).expect("detail");
+        let detail =
+            assemble_detail(&row, &snapshot, true, false, &visible, &subtasks).expect("detail");
         assert_eq!(detail.view_scope, ViewScope::Full);
         assert!(detail.actions.can_cancel);
     }
@@ -938,7 +1051,7 @@ mod tests {
         row.created_time_json = "not-json".to_owned();
         let subtasks = vec![subtask(DEVICE_A, SubTaskState::Queued)];
         let visible = readable_subtasks(&snapshot, &subtasks);
-        let err = assemble_detail(&row, &snapshot, true, false, &visible).unwrap_err();
+        let err = assemble_detail(&row, &snapshot, true, false, &visible, &subtasks).unwrap_err();
         assert!(matches!(err, ControllerError::Database(_)));
     }
 
@@ -1022,7 +1135,106 @@ mod tests {
         row.outcome = Some(MainTaskOutcome::Partial);
         let subtasks = vec![subtask(DEVICE_A, SubTaskState::Succeeded)];
         let visible = readable_subtasks(&snapshot, &subtasks);
-        let detail = assemble_detail(&row, &snapshot, true, false, &visible).expect("detail");
+        let detail =
+            assemble_detail(&row, &snapshot, true, false, &visible, &subtasks).expect("detail");
         assert_eq!(detail.outcome, Some(MainTaskOutcome::Partial));
+    }
+
+    #[test]
+    fn can_cancel_covers_hidden_reboot_targets_without_leaking_counts() {
+        // M1：A 仅 task.read（可见）、B 仅 reboot（隐藏）。can_cancel 按全量
+        // 子任务逐目标独立判定 → true（cancel 实际会取消 B）；counts 与
+        // visible_states 仍只含 A，绝不泄漏隐藏目标数量。
+        let snapshot = snapshot_with(
+            false,
+            vec![
+                direct_grant(DEVICE_A, vec![Permission::DeviceTaskRead]),
+                direct_grant(DEVICE_B, vec![Permission::DeviceReboot]),
+            ],
+            vec![device_view(DEVICE_A, false), device_view(DEVICE_B, false)],
+        );
+        let row = main_row();
+        let subtasks = vec![
+            subtask(DEVICE_A, SubTaskState::Succeeded),
+            subtask(DEVICE_B, SubTaskState::Queued),
+        ];
+        let visible = readable_subtasks(&snapshot, &subtasks);
+        let detail =
+            assemble_detail(&row, &snapshot, false, true, &visible, &subtasks).expect("detail");
+        assert!(detail.actions.can_cancel);
+        assert_eq!(detail.visible_states, vec![SubTaskState::Succeeded]);
+        assert_eq!(detail.counts.succeeded, 1);
+        assert_eq!(detail.counts.queued, 0);
+        // 非 owner 时隐藏 reboot 目标同样不可取消（owner 门控不放宽）
+        let not_owner =
+            assemble_detail(&row, &snapshot, false, false, &visible, &subtasks).expect("detail");
+        assert!(!not_owner.actions.can_cancel);
+    }
+
+    #[test]
+    fn snapshot_owner_gate_rejects_stale_session_admin() {
+        // M2：会话伪称 admin、快照 actor 已降级且非 owner → 404（与不存在同投影）。
+        assert!(matches!(
+            snapshot_owner_gate(false, false),
+            Err(ControllerError::NotFound)
+        ));
+        assert!(snapshot_owner_gate(true, false).is_ok());
+        assert!(snapshot_owner_gate(false, true).is_ok());
+    }
+
+    #[test]
+    fn list_row_scope_requires_ownership_when_snapshot_not_admin() {
+        // M2：权威快照非 admin 时，列表逐行丢弃他人发起的行（即使扫描域是全域）。
+        let caller = Uuid::from_u128(0xC0);
+        let other = Uuid::from_u128(0xFF);
+        assert!(!list_row_in_scope(false, other, caller));
+        assert!(list_row_in_scope(false, caller, caller));
+        assert!(list_row_in_scope(true, other, caller));
+    }
+
+    #[test]
+    fn children_gate_404s_when_no_target_readable() {
+        // M3：owner 对全部目标都没有 device.task.read（全集不可见）→ 404；
+        // 任一目标可读 → 不触发；有效 admin 不受该门控（与 detail 全域可见同口径）。
+        let snapshot = snapshot_with(
+            false,
+            vec![direct_grant(DEVICE_B, vec![Permission::DeviceReboot])],
+            vec![device_view(DEVICE_A, false), device_view(DEVICE_B, false)],
+        );
+        let subtasks = vec![
+            subtask(DEVICE_A, SubTaskState::Queued),
+            subtask(DEVICE_B, SubTaskState::Queued),
+        ];
+        assert_eq!(readable_subtasks(&snapshot, &subtasks).len(), 0);
+        assert!(children_fully_invisible(false, 0));
+        assert!(!children_fully_invisible(false, 1));
+        assert!(!children_fully_invisible(true, 0));
+    }
+
+    #[test]
+    fn merge_snapshot_unions_devices_grants_and_keeps_min_epoch() {
+        // M4：分批设备清单的快照合并口径——grants/devices 取并集、epoch 取最小
+        // （保守），合并后两批设备都能独立求值。
+        let mut base = snapshot_with(
+            false,
+            vec![direct_grant(DEVICE_A, vec![Permission::DeviceTaskRead])],
+            vec![device_view(DEVICE_A, false)],
+        );
+        base.authz_epoch = 7;
+        let mut other = snapshot_with(
+            false,
+            vec![direct_grant(DEVICE_B, vec![Permission::DeviceReboot])],
+            vec![device_view(DEVICE_B, false)],
+        );
+        other.authz_epoch = 5;
+        merge_snapshot(&mut base, other);
+        assert_eq!(base.authz_epoch, 5);
+        assert_eq!(base.grants.len(), 2);
+        assert!(
+            snapshot_effective_permissions(&base, DEVICE_A).contains(&Permission::DeviceTaskRead)
+        );
+        assert!(
+            snapshot_effective_permissions(&base, DEVICE_B).contains(&Permission::DeviceReboot)
+        );
     }
 }

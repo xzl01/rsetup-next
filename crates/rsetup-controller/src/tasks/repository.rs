@@ -279,6 +279,66 @@ const MAIN_TASK_COLUMNS: &str = "id, actor_user_id, state, outcome, revision, \
 const SUB_TASK_COLUMNS: &str = "id, device_id, state, reason_code, revision, \
                                 CAST(evidence_json AS CHAR) AS evidence_json, created_at";
 
+/// 主任务 keyset 的毫秒时间轴唯一表达式（游标谓词与 `ORDER BY` 共用，二者必须
+/// 同轴，否则跨页顺序漂移）。
+///
+/// 根因（H1）：`main_tasks.created_at` 是 `DATETIME(6)`（`NOW(6)` 写入，带微秒），
+/// 而游标 payload 只携带毫秒（`timestamp_millis()` 向下截断）。若谓词与排序按微秒
+/// 时间轴进行，上一页最后一毫秒内的行在下一页会被重新命中（`limit=1` 时游标完全
+/// 重复、永不前进）。统一到本表达式后，SQL 与游标落在同一毫秒时间轴上：同毫秒行
+/// 的先后完全由 `id` 裁决，不重复、不丢行、不死循环。
+///
+/// 必须是 `FLOOR`（向下截断）而非 `ROUND`：与游标编码的截断语义逐位一致——四舍五入
+/// 会把微秒 ≥0.5ms 的行归入下一毫秒桶，游标行仍会被下一页重新命中，死循环复现。
+/// 口径前提：会话时区为 UTC（与本 crate `NOW(6)` 写入、DATETIME 按 UTC 解码的既有
+/// 全库口径同一前提）。
+const MAIN_TASK_KEYSET_MILLIS_EXPR: &str = "FLOOR(UNIX_TIMESTAMP(created_at) * 1000)";
+
+/// 单行的毫秒 keyset 键：与游标编码 `timestamp_millis()` 同口径向下截断（chrono
+/// 的 `timestamp()` 向下取整 + 非负小数毫秒分量，合成即毫秒向下取整）；越界
+/// （不可表示为 i64 毫秒）返回 `None`，由调用方映射 `InvalidArgument`，绝不钳位。
+fn keyset_millis(created_at: DateTime<Utc>) -> Option<i64> {
+    created_at
+        .timestamp()
+        .checked_mul(1000)?
+        .checked_add(i64::from(created_at.timestamp_subsec_millis()))
+}
+
+/// 游标谓词的 Rust 侧镜像（与 [`build_list_main_tasks_sql`] 的 SQL 条件逐字同
+/// 口径，供无 DB 的纯分页回归）：行 `(row_ms, row_id)` 是否严格位于游标之后。
+/// 生产谓词只存在于 SQL 中，本镜像仅测试期存在。
+#[cfg(test)]
+fn keyset_after(row_ms: i64, row_id: &Uuid, cursor_ms: i64, cursor_id: &Uuid) -> bool {
+    row_ms > cursor_ms || (row_ms == cursor_ms && row_id > cursor_id)
+}
+
+/// 组装主任务 keyset 列表 SQL（纯函数，供单测锁定形状）：WHERE 条件按参数存在性
+/// 动态拼装；`ORDER BY` 恒与游标谓词同轴（毫秒时间轴 + `id` 决胜），首页与后续页
+/// 共用同一全序，跨页不漂移。
+fn build_list_main_tasks_sql(has_actor: bool, has_state: bool, has_after: bool) -> String {
+    let mut conditions: Vec<String> = Vec::new();
+    if has_actor {
+        conditions.push("actor_user_id = ?".to_owned());
+    }
+    if has_state {
+        conditions.push("state = ?".to_owned());
+    }
+    if has_after {
+        conditions.push(format!(
+            "({MAIN_TASK_KEYSET_MILLIS_EXPR} > ? OR ({MAIN_TASK_KEYSET_MILLIS_EXPR} = ? AND id > ?))"
+        ));
+    }
+    let where_clause = if conditions.is_empty() {
+        "1 = 1".to_owned()
+    } else {
+        conditions.join(" AND ")
+    };
+    format!(
+        "SELECT {MAIN_TASK_COLUMNS} FROM main_tasks WHERE {where_clause} \
+         ORDER BY {MAIN_TASK_KEYSET_MILLIS_EXPR} ASC, id ASC LIMIT ?"
+    )
+}
+
 /// 解析 keyset 游标：恰 32 位小写 hex（对应 `BINARY(16)` 主键）。大写、长度不符、
 /// 非 hex 一律 `None`，由调用方映射 `InvalidArgument`，绝不退化为「返回首页」。
 fn parse_id_cursor(raw: &str) -> Option<Vec<u8>> {
@@ -377,9 +437,10 @@ impl SqlxTaskRepository {
     ///
     /// - `actor_filter`：`Some(user)` 只扫该用户发起的主任务（普通用户），`None` 全域
     ///   扫描（会话侧 admin；权威 admin 判定仍由调用方的授权快照事务内重验兜底）；
-    /// - `after`：上一页末候选的 `(created_at, id)`；keyset 条件展开为
-    ///   `created_at > ? OR (created_at = ? AND id > ?)`，与
-    ///   `ix_main_tasks_actor_created` 索引同向，不做 OFFSET；
+    /// - `after`：上一页末候选的 `(created_at, id)`；比较与排序统一在**毫秒时间轴**
+    ///   上进行（[`MAIN_TASK_KEYSET_MILLIS_EXPR`]，与游标 payload 的毫秒截断同轴），
+    ///   谓词为 `毫秒(created_at) > ? OR (毫秒(created_at) = ? AND id > ?)`，
+    ///   同毫秒行完全由 `id` 决胜——不重复、不丢行、`limit=1` 也正常推进（H1）；
     /// - `next`：**最后一条已扫描候选**的 keyset 键（扫描满 `limit` 行才给出，
     ///   不足即 `None`）。可见性过滤发生在扫描之后，故下一页游标以「已扫描候选」
     ///   为准：不重扫、不死循环，也不泄漏过滤前总数。
@@ -390,24 +451,10 @@ impl SqlxTaskRepository {
         after: Option<(DateTime<Utc>, Uuid)>,
         limit: usize,
     ) -> Result<MainTaskScanPage, ControllerError> {
-        let mut conditions: Vec<&str> = Vec::new();
-        if actor_filter.is_some() {
-            conditions.push("actor_user_id = ?");
-        }
-        if state_filter.is_some() {
-            conditions.push("state = ?");
-        }
-        if after.is_some() {
-            conditions.push("(created_at > ? OR (created_at = ? AND id > ?))");
-        }
-        let where_clause = if conditions.is_empty() {
-            "1 = 1".to_owned()
-        } else {
-            conditions.join(" AND ")
-        };
-        let sql = format!(
-            "SELECT {MAIN_TASK_COLUMNS} FROM main_tasks WHERE {where_clause} \
-             ORDER BY created_at ASC, id ASC LIMIT ?"
+        let sql = build_list_main_tasks_sql(
+            actor_filter.is_some(),
+            state_filter.is_some(),
+            after.is_some(),
         );
         let mut args = MySqlArguments::default();
         if let Some(actor) = &actor_filter {
@@ -417,8 +464,10 @@ impl SqlxTaskRepository {
             push_arg(&mut args, &enum_wire(state)?)?;
         }
         if let Some((created_at, id)) = after {
-            push_arg(&mut args, &created_at)?;
-            push_arg(&mut args, &created_at)?;
+            // 游标按毫秒时间轴绑定（与 SQL 表达式同轴）；越界即请求错误，不钳位。
+            let cursor_ms = keyset_millis(created_at).ok_or(ControllerError::InvalidArgument)?;
+            push_arg(&mut args, &cursor_ms)?;
+            push_arg(&mut args, &cursor_ms)?;
             push_arg(&mut args, &id.as_bytes().as_slice())?;
         }
         let limit = i64::try_from(limit).map_err(|_| ControllerError::InvalidArgument)?;
@@ -910,5 +959,85 @@ mod tests {
             fixed_mysql_bytes::<32>(&[5u8; 33]),
             Err(ControllerError::Database(_))
         ));
+    }
+
+    #[test]
+    fn list_main_tasks_sql_aligns_keyset_to_millisecond_timeline() {
+        let paged = build_list_main_tasks_sql(true, true, true);
+        assert!(paged.contains("actor_user_id = ?"));
+        assert!(paged.contains("state = ?"));
+        // 游标谓词与 ORDER BY 共用同一毫秒时间轴表达式（共出现 3 次）：同毫秒行
+        // 的先后完全由 id 裁决，游标（毫秒截断）与 SQL 比较落在同一时间轴，
+        // 不重复、不丢行、limit=1 也正常推进。
+        assert_eq!(paged.matches(MAIN_TASK_KEYSET_MILLIS_EXPR).count(), 3);
+        assert!(paged.contains(&format!(
+            "({MAIN_TASK_KEYSET_MILLIS_EXPR} > ? OR ({MAIN_TASK_KEYSET_MILLIS_EXPR} = ? AND id > ?))"
+        )));
+        assert!(paged.ends_with(&format!(
+            "ORDER BY {MAIN_TASK_KEYSET_MILLIS_EXPR} ASC, id ASC LIMIT ?"
+        )));
+        // 首页（无游标）与后续页共用同一排序键，否则跨页顺序漂移。
+        let first = build_list_main_tasks_sql(false, false, false);
+        assert!(first.contains("WHERE 1 = 1"));
+        assert!(first.ends_with(&format!(
+            "ORDER BY {MAIN_TASK_KEYSET_MILLIS_EXPR} ASC, id ASC LIMIT ?"
+        )));
+    }
+
+    #[test]
+    fn keyset_millis_truncates_microseconds_to_millisecond_floor() {
+        // 与游标编码 `timestamp_millis()` 同口径：向下截断（非四舍五入），
+        // 微秒 .123999 必须归入 …123 毫秒桶，否则游标行会被下一页重新命中。
+        let micro = DateTime::<Utc>::from_timestamp(1_800_000_000, 123_999_000).expect("in range");
+        assert_eq!(keyset_millis(micro), Some(1_800_000_000_123));
+        let exact = DateTime::<Utc>::from_timestamp(1_800_000_000, 0).expect("in range");
+        assert_eq!(keyset_millis(exact), Some(1_800_000_000_000));
+    }
+
+    /// 模拟 `list_main_tasks_page` 的 keyset 分页：排序键 `(keyset_millis, id)`、
+    /// 游标谓词 [`keyset_after`]、每页取 `limit` 行；页数超过行数+1 即游标不推进
+    /// （死循环），直接 panic。
+    fn simulate_keyset_pages(rows: &[(i64, Uuid)], limit: usize) -> Vec<(i64, Uuid)> {
+        let mut sorted = rows.to_vec();
+        sorted.sort();
+        let mut cursor: Option<(i64, Uuid)> = None;
+        let mut seen = Vec::new();
+        for _ in 0..=sorted.len() {
+            let page: Vec<(i64, Uuid)> = sorted
+                .iter()
+                .copied()
+                .filter(|(ms, id)| match cursor {
+                    None => true,
+                    Some((cursor_ms, cursor_id)) => keyset_after(*ms, id, cursor_ms, &cursor_id),
+                })
+                .take(limit)
+                .collect();
+            if page.is_empty() {
+                return seen;
+            }
+            cursor = page.last().copied();
+            seen.extend(page);
+        }
+        panic!("keyset 分页在行数+1 页内未终止（游标不推进，死循环）");
+    }
+
+    #[test]
+    fn keyset_pagination_same_millisecond_rows_never_repeat_or_stall() {
+        // 同毫秒三行（微秒 .001/.456/.999，NOW(6) 的真实形状）+ 前后毫秒行。
+        // 旧「微秒时间轴谓词 + 毫秒截断游标」下，最后一毫秒的行会被下一页反复
+        // 命中，limit=1 时游标完全重复、永不前进；毫秒时间轴对齐后由 id 决胜。
+        let base_ms = 1_800_000_000_123i64;
+        let rows = vec![
+            (base_ms - 1, Uuid::from_u128(3)),
+            (base_ms, Uuid::from_u128(5)),
+            (base_ms, Uuid::from_u128(9)),
+            (base_ms, Uuid::from_u128(1)),
+            (base_ms + 1, Uuid::from_u128(2)),
+        ];
+        let mut expected = rows.clone();
+        expected.sort();
+        assert_eq!(simulate_keyset_pages(&rows, 1), expected);
+        assert_eq!(simulate_keyset_pages(&rows, 2), expected);
+        assert_eq!(simulate_keyset_pages(&rows, 10), expected);
     }
 }
