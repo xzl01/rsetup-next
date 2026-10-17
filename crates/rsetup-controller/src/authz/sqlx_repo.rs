@@ -261,6 +261,9 @@ pub fn decode_grant(
     scope_device_id: Option<Vec<u8>>,
     revision: u64,
 ) -> Result<GrantRecord, ControllerError> {
+    // 持久行字段污染：`validate_grant_fields` 的 `InvalidArgument` 只是内部形状，
+    // 管理读/快照读共用本解码，必须统一换成固定去敏 `Config`（503 形状），
+    // 绝不把已落库的脏行当客户端 400 传出。
     crate::integrity::validate_grant_fields(
         &source_kind,
         role_id.is_some(),
@@ -268,7 +271,8 @@ pub fn decode_grant(
         &scope_kind,
         scope_group_id.is_some(),
         scope_device_id.is_some(),
-    )?;
+    )
+    .map_err(|_| read_error("grants.fields"))?;
     let source = match source_kind.as_str() {
         "role" => GrantSource::Role(uuid_from(role_id)?),
         "direct" => {
@@ -411,6 +415,37 @@ pub fn decode_snapshot_group_rows(
     Ok(out)
 }
 
+/// 管理侧 `device_groups_for_device` 行解码（列序与 `DEVICE_GROUPS_FOR_DEVICE_SQL` 一致：
+/// `group_id, group_exists, group_archived, device_exists, device_archived`）。
+/// member 指向缺失/已归档的 device 行，或 group 行缺失，都是持久污染 → 固定去敏 `Config`
+/// （503 形状），不得静默返回空集当"该设备无 group"；只有 group 归档才正常过滤。
+pub fn decode_group_memberships_for_device(
+    rows: &[(Vec<u8>, i64, i64, i64, i64)],
+) -> Result<HashSet<Uuid>, ControllerError> {
+    let mut out: HashSet<Uuid> = HashSet::new();
+    for (group_id, group_exists, group_archived, device_exists, device_archived) in rows {
+        let group_exists = crate::integrity::raw_bool(*group_exists, "groups.for_device")
+            .map_err(|_| read_error("groups.for_device"))?;
+        let group_archived = crate::integrity::raw_bool(*group_archived, "groups.for_device")
+            .map_err(|_| read_error("groups.for_device"))?;
+        let device_exists = crate::integrity::raw_bool(*device_exists, "groups.for_device")
+            .map_err(|_| read_error("groups.for_device"))?;
+        let device_archived = crate::integrity::raw_bool(*device_archived, "groups.for_device")
+            .map_err(|_| read_error("groups.for_device"))?;
+        if !group_exists || !device_exists {
+            return Err(read_error("groups.for_device.dangling"));
+        }
+        if device_archived {
+            return Err(read_error("groups.for_device.archived_device"));
+        }
+        if group_archived {
+            continue;
+        }
+        out.insert(uuid16(group_id.clone(), "groups.for_device")?);
+    }
+    Ok(out)
+}
+
 pub fn decode_device_admin_view(
     public_key: Vec<u8>,
     display_name: String,
@@ -468,8 +503,25 @@ pub fn build_authorization_snapshot(
 ) -> Result<AuthorizationSnapshot, ControllerError> {
     for grant in &grants {
         if let GrantSource::Role(rid) = &grant.source {
-            if !roles.contains_key(rid) {
-                return Err(read_error("snapshot.role_ref"));
+            let role = roles
+                .get(rid)
+                .ok_or_else(|| read_error("snapshot.role_ref"))?;
+            // 归档 role 允许合法清空 permissions（父行保留 = 该 grant 无权，而非污染）；
+            // 被引用的当前有效 role 必须非空且无重复权限，否则是持久污染，
+            // 不得按"该 grant 无权限"继续降级求值。
+            if role.archived {
+                continue;
+            }
+            if role.permissions.is_empty()
+                || role
+                    .permissions
+                    .iter()
+                    .copied()
+                    .collect::<HashSet<_>>()
+                    .len()
+                    != role.permissions.len()
+            {
+                return Err(read_error("snapshot.role_permission"));
             }
         }
     }
@@ -566,15 +618,17 @@ pub(crate) const LIST_USERS_FIRST_SQL: &str = "SELECT id, username, display_name
 pub(crate) const LIST_ROLES_SQL: &str = "SELECT id, name, CAST(builtin AS SIGNED) AS builtin, CAST(archived AS SIGNED) AS archived, revision FROM roles WHERE id > ? ORDER BY id LIMIT ?";
 pub(crate) const LIST_ROLES_FIRST_SQL: &str = "SELECT id, name, CAST(builtin AS SIGNED) AS builtin, CAST(archived AS SIGNED) AS archived, revision FROM roles ORDER BY id LIMIT ?";
 
-pub(crate) const LIST_GRANTS_SQL: &str = "SELECT id, user_id, source_kind, role_id, CAST(permissions AS CHAR) AS permissions, scope_kind, scope_group_id, scope_device_id, revision FROM grants WHERE (? IS NULL OR user_id = ?) AND (? IS NULL OR id > ?) ORDER BY id LIMIT ?";
-pub(crate) const LIST_GRANTS_FOR_USER_SQL: &str = "SELECT id, user_id, source_kind, role_id, CAST(permissions AS CHAR) AS permissions, scope_kind, scope_group_id, scope_device_id, revision FROM grants WHERE user_id = ? ORDER BY id";
+/// 管理读 grant 查询：列 + 持久引用存在性四列（owner/role/group/device）。全部 LEFT JOIN
+/// 走主键，1:1 不放大行数；引用缺失由 `validate_snapshot_grant_references` 判为固定去敏 `Config`。
+pub(crate) const LIST_GRANTS_SQL: &str = "SELECT g.id, g.user_id, g.source_kind, g.role_id, CAST(g.permissions AS CHAR) AS permissions, g.scope_kind, g.scope_group_id, g.scope_device_id, g.revision, CAST(u.id IS NOT NULL AS SIGNED) AS owner_exists, CAST(r.id IS NOT NULL AS SIGNED) AS role_exists, CAST(dg.id IS NOT NULL AS SIGNED) AS group_exists, CAST(d.public_key IS NOT NULL AS SIGNED) AS device_exists FROM grants g LEFT JOIN users u ON u.id = g.user_id LEFT JOIN roles r ON r.id = g.role_id LEFT JOIN device_groups dg ON dg.id = g.scope_group_id LEFT JOIN devices d ON d.public_key = g.scope_device_id WHERE (? IS NULL OR g.user_id = ?) AND (? IS NULL OR g.id > ?) ORDER BY g.id LIMIT ?";
+pub(crate) const LIST_GRANTS_FOR_USER_SQL: &str = "SELECT g.id, g.user_id, g.source_kind, g.role_id, CAST(g.permissions AS CHAR) AS permissions, g.scope_kind, g.scope_group_id, g.scope_device_id, g.revision, CAST(u.id IS NOT NULL AS SIGNED) AS owner_exists, CAST(r.id IS NOT NULL AS SIGNED) AS role_exists, CAST(dg.id IS NOT NULL AS SIGNED) AS group_exists, CAST(d.public_key IS NOT NULL AS SIGNED) AS device_exists FROM grants g LEFT JOIN users u ON u.id = g.user_id LEFT JOIN roles r ON r.id = g.role_id LEFT JOIN device_groups dg ON dg.id = g.scope_group_id LEFT JOIN devices d ON d.public_key = g.scope_device_id WHERE g.user_id = ? ORDER BY g.id";
 
 pub(crate) const LIST_GROUPS_SQL: &str = "SELECT g.id, g.name, CAST(g.archived AS SIGNED) AS archived, g.revision, COUNT(m.device_id) AS member_count FROM device_groups g LEFT JOIN group_members m ON m.group_id = g.id WHERE g.id > ? GROUP BY g.id ORDER BY g.id LIMIT ?";
 pub(crate) const LIST_GROUPS_FIRST_SQL: &str = "SELECT g.id, g.name, CAST(g.archived AS SIGNED) AS archived, g.revision, COUNT(m.device_id) AS member_count FROM device_groups g LEFT JOIN group_members m ON m.group_id = g.id GROUP BY g.id ORDER BY g.id LIMIT ?";
 
 pub(crate) const FIND_USER_SQL: &str = "SELECT id, username, display_name, CAST(active AS SIGNED) AS active, CAST(is_admin AS SIGNED) AS is_admin, CAST(must_change_password AS SIGNED) AS must_change_password, revision FROM users WHERE id = ?";
 pub(crate) const FIND_ROLE_SQL: &str = "SELECT id, name, CAST(builtin AS SIGNED) AS builtin, CAST(archived AS SIGNED) AS archived, revision FROM roles WHERE id = ?";
-pub(crate) const FIND_GRANT_SQL: &str = "SELECT id, user_id, source_kind, role_id, CAST(permissions AS CHAR) AS permissions, scope_kind, scope_group_id, scope_device_id, revision FROM grants WHERE id = ?";
+pub(crate) const FIND_GRANT_SQL: &str = "SELECT g.id, g.user_id, g.source_kind, g.role_id, CAST(g.permissions AS CHAR) AS permissions, g.scope_kind, g.scope_group_id, g.scope_device_id, g.revision, CAST(u.id IS NOT NULL AS SIGNED) AS owner_exists, CAST(r.id IS NOT NULL AS SIGNED) AS role_exists, CAST(dg.id IS NOT NULL AS SIGNED) AS group_exists, CAST(d.public_key IS NOT NULL AS SIGNED) AS device_exists FROM grants g LEFT JOIN users u ON u.id = g.user_id LEFT JOIN roles r ON r.id = g.role_id LEFT JOIN device_groups dg ON dg.id = g.scope_group_id LEFT JOIN devices d ON d.public_key = g.scope_device_id WHERE g.id = ?";
 pub(crate) const FIND_GROUP_SQL: &str = "SELECT g.id, g.name, CAST(g.archived AS SIGNED) AS archived, g.revision, COUNT(m.device_id) AS member_count FROM device_groups g LEFT JOIN group_members m ON m.group_id = g.id WHERE g.id = ? GROUP BY g.id";
 
 pub(crate) const LIST_GROUP_DEVICE_IDS_SQL: &str = "SELECT m.device_id FROM group_members m JOIN devices d ON d.public_key = m.device_id JOIN device_groups g ON g.id = m.group_id WHERE m.group_id = ? AND d.archived = 0 AND g.archived = 0 ORDER BY m.device_id";
@@ -1274,7 +1328,7 @@ impl AuthzRepository for SqlxAuthzRepository {
                         ),
                         None => None,
                     };
-                    Some(decode_grant(
+                    let grant = decode_grant(
                         r.try_get("id").map_err(|_| read_error("grants.decode"))?,
                         r.try_get("user_id")
                             .map_err(|_| read_error("grants.decode"))?,
@@ -1291,7 +1345,23 @@ impl AuthzRepository for SqlxAuthzRepository {
                             .map_err(|_| read_error("grants.decode"))?,
                         r.try_get("revision")
                             .map_err(|_| read_error("grants.decode"))?,
-                    )?)
+                    )
+                    .map_err(|_| read_error("grants.decode"))?;
+                    // 持久引用完整性：owner/role/group/device 任一缺失 = 污染，固定去敏 Config，
+                    // 绝不把孤儿 grant 当合法行返回。
+                    validate_snapshot_grant_references(
+                        &grant,
+                        r.try_get("owner_exists")
+                            .map_err(|_| read_error("grants.reference"))?,
+                        r.try_get("role_exists")
+                            .map_err(|_| read_error("grants.reference"))?,
+                        r.try_get("group_exists")
+                            .map_err(|_| read_error("grants.reference"))?,
+                        r.try_get("device_exists")
+                            .map_err(|_| read_error("grants.reference"))?,
+                    )
+                    .map_err(|_| read_error("grants.reference"))?;
+                    Some(grant)
                 }
                 None => None,
             };
@@ -1342,7 +1412,7 @@ impl AuthzRepository for SqlxAuthzRepository {
                     }
                     None => None,
                 };
-                items.push(decode_grant(
+                let grant = decode_grant(
                     r.try_get("id").map_err(|_| read_error("grants.decode"))?,
                     r.try_get("user_id")
                         .map_err(|_| read_error("grants.decode"))?,
@@ -1359,7 +1429,23 @@ impl AuthzRepository for SqlxAuthzRepository {
                         .map_err(|_| read_error("grants.decode"))?,
                     r.try_get("revision")
                         .map_err(|_| read_error("grants.decode"))?,
-                )?);
+                )
+                .map_err(|_| read_error("grants.decode"))?;
+                // 持久引用完整性：owner/role/group/device 任一缺失 = 污染，固定去敏 Config，
+                // 绝不把孤儿 grant 当合法行返回。
+                validate_snapshot_grant_references(
+                    &grant,
+                    r.try_get("owner_exists")
+                        .map_err(|_| read_error("grants.reference"))?,
+                    r.try_get("role_exists")
+                        .map_err(|_| read_error("grants.reference"))?,
+                    r.try_get("group_exists")
+                        .map_err(|_| read_error("grants.reference"))?,
+                    r.try_get("device_exists")
+                        .map_err(|_| read_error("grants.reference"))?,
+                )
+                .map_err(|_| read_error("grants.reference"))?;
+                items.push(grant);
             }
 
             let (take, next_cursor) = if items.len() > limit {
@@ -1401,7 +1487,7 @@ impl AuthzRepository for SqlxAuthzRepository {
                     }
                     None => None,
                 };
-                items.push(decode_grant(
+                let grant = decode_grant(
                     r.try_get("id").map_err(|_| read_error("grants.decode"))?,
                     r.try_get("user_id")
                         .map_err(|_| read_error("grants.decode"))?,
@@ -1418,7 +1504,23 @@ impl AuthzRepository for SqlxAuthzRepository {
                         .map_err(|_| read_error("grants.decode"))?,
                     r.try_get("revision")
                         .map_err(|_| read_error("grants.decode"))?,
-                )?);
+                )
+                .map_err(|_| read_error("grants.decode"))?;
+                // 持久引用完整性：owner/role/group/device 任一缺失 = 污染，固定去敏 Config，
+                // 绝不把孤儿 grant 当合法行返回。
+                validate_snapshot_grant_references(
+                    &grant,
+                    r.try_get("owner_exists")
+                        .map_err(|_| read_error("grants.reference"))?,
+                    r.try_get("role_exists")
+                        .map_err(|_| read_error("grants.reference"))?,
+                    r.try_get("group_exists")
+                        .map_err(|_| read_error("grants.reference"))?,
+                    r.try_get("device_exists")
+                        .map_err(|_| read_error("grants.reference"))?,
+                )
+                .map_err(|_| read_error("grants.reference"))?;
+                items.push(grant);
             }
             tx.commit().await?;
             Ok(items)
@@ -1536,42 +1638,24 @@ impl AuthzRepository for SqlxAuthzRepository {
                 .await
                 .map_err(|_| read_error("groups.for_device"))?;
 
-            let mut out = HashSet::new();
-            for r in rows {
-                let dev_exists = crate::integrity::raw_bool(
-                    r.try_get("device_exists")
-                        .map_err(|_| read_error("groups.for_device"))?,
-                    "groups.for_device",
-                )?;
-                let dev_archived = crate::integrity::raw_bool(
-                    r.try_get("device_archived")
-                        .map_err(|_| read_error("groups.for_device"))?,
-                    "groups.for_device",
-                )?;
-                let grp_exists = crate::integrity::raw_bool(
-                    r.try_get("group_exists")
-                        .map_err(|_| read_error("groups.for_device"))?,
-                    "groups.for_device",
-                )?;
-                let grp_archived = crate::integrity::raw_bool(
-                    r.try_get("group_archived")
-                        .map_err(|_| read_error("groups.for_device"))?,
-                    "groups.for_device",
-                )?;
-
-                if !dev_exists || !grp_exists {
-                    return Err(read_error("groups.for_device.dangling"));
-                }
-                if dev_archived || grp_archived {
-                    continue;
-                }
-                let gid_raw: Vec<u8> = r
-                    .try_get("group_id")
-                    .map_err(|_| read_error("groups.for_device"))?;
-                let gid =
-                    Uuid::from_slice(&gid_raw).map_err(|_| read_error("groups.for_device"))?;
-                out.insert(gid);
-            }
+            let raw: Vec<(Vec<u8>, i64, i64, i64, i64)> = rows
+                .iter()
+                .map(|r| -> Result<_, ControllerError> {
+                    Ok((
+                        r.try_get("group_id")
+                            .map_err(|_| read_error("groups.for_device"))?,
+                        r.try_get("group_exists")
+                            .map_err(|_| read_error("groups.for_device"))?,
+                        r.try_get("group_archived")
+                            .map_err(|_| read_error("groups.for_device"))?,
+                        r.try_get("device_exists")
+                            .map_err(|_| read_error("groups.for_device"))?,
+                        r.try_get("device_archived")
+                            .map_err(|_| read_error("groups.for_device"))?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let out = decode_group_memberships_for_device(&raw)?;
 
             tx.commit().await?;
             Ok(out)
@@ -1806,7 +1890,38 @@ mod tests {
         // 每页查询恰好两个绑定：(cursor, limit)。绑定数与列顺序漂移必须在离线就暴露。
         assert_eq!(LIST_USERS_SQL.matches('?').count(), 2);
         assert_eq!(LIST_ROLES_SQL.matches('?').count(), 2);
-        assert_eq!(LIST_GRANTS_SQL.matches('?').count(), 5); // (? IS NULL OR user_id = ?) AND (? IS NULL OR id > ?) LIMIT ?
+        assert_eq!(LIST_GRANTS_SQL.matches('?').count(), 5); // (? IS NULL OR g.user_id = ?) AND (? IS NULL OR g.id > ?) LIMIT ?
+        assert_eq!(LIST_GRANTS_FOR_USER_SQL.matches('?').count(), 1);
+        assert_eq!(FIND_GRANT_SQL.matches('?').count(), 1);
+        assert_eq!(DEVICE_GROUPS_FOR_DEVICE_SQL.matches('?').count(), 1);
+        // 管理读 grant 三查询必须自带 owner/role/group/device 引用存在性四列：
+        // 孤儿 grant 只能在解码处失败关闭为固定去敏 Config，不得原样返回。
+        for sql in [FIND_GRANT_SQL, LIST_GRANTS_SQL, LIST_GRANTS_FOR_USER_SQL] {
+            for column in [
+                "owner_exists",
+                "role_exists",
+                "group_exists",
+                "device_exists",
+            ] {
+                assert!(
+                    sql.contains(column),
+                    "admin grant read SQL must pin reference column {column}: {sql}"
+                );
+            }
+        }
+        // 管理侧 member→device 查询必须同时带 group 与 device 的存在/归档四列。
+        for column in [
+            "group_exists",
+            "group_archived",
+            "device_exists",
+            "device_archived",
+        ] {
+            assert!(
+                DEVICE_GROUPS_FOR_DEVICE_SQL.contains(column),
+                "device_groups_for_device SQL must pin {column}: {DEVICE_GROUPS_FOR_DEVICE_SQL}"
+            );
+        }
+
         assert_eq!(LIST_GROUPS_SQL.matches('?').count(), 2);
         assert_eq!(DEVICE_PAGE_KEYS_SQL.matches('?').count(), 2); // (cursor, limit+1)：候选公钥扫描，取代旧全列 DEVICE_PAGE_SQL
         assert_eq!(DEVICE_PAGE_KEYS_FIRST_SQL.matches('?').count(), 1);
@@ -1985,6 +2100,212 @@ mod tests {
             matches!(&err, ControllerError::Config(m) if m == "identity admin read snapshot.role_ref"),
             "missing role reference must be the exact fixed redacted Config, got {err:?}",
         );
+    }
+
+    #[test]
+    fn decode_grant_maps_persistent_field_pollution_to_fixed_config() {
+        // 已落库的 source/scope 列不成对 = 持久污染：必须是固定去敏 Config（503 形状），
+        // 绝不能以 InvalidArgument 透传成客户端 400。
+        let id = uuid::Uuid::from_bytes([0x11; 16]);
+        let id_bytes = id.as_bytes().to_vec();
+        let user = [1u8; 16].to_vec();
+        let polluted = decode_grant(
+            id_bytes.clone(),
+            user.clone(),
+            "role".into(),
+            None,
+            None,
+            "all".into(),
+            None,
+            None,
+            1,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                &polluted,
+                ControllerError::Config(m) if m == "identity admin read grants.fields"
+            ),
+            "persisted grant pollution must be the exact fixed redacted Config, got {polluted:?}",
+        );
+        // direct 权限数组含重复项 / 未知权限 / scope 与列不成对，同样失败关闭为 Config。
+        for (source_kind, role_id, permissions, scope_kind, scope_group_id, scope_device_id) in [
+            (
+                "direct",
+                None,
+                Some(serde_json::json!(["device.read", "device.read"])),
+                "all",
+                None,
+                None,
+            ),
+            (
+                "direct",
+                None,
+                Some(serde_json::json!(["device.fly"])),
+                "all",
+                None,
+                None,
+            ),
+            (
+                "direct",
+                None,
+                Some(serde_json::json!(["device.read"])),
+                "group",
+                None,
+                None,
+            ),
+            (
+                "direct",
+                None,
+                Some(serde_json::json!(["device.read"])),
+                "device",
+                None,
+                None,
+            ),
+        ] {
+            let err = decode_grant(
+                id_bytes.clone(),
+                user.clone(),
+                source_kind.into(),
+                role_id,
+                permissions,
+                scope_kind.into(),
+                scope_group_id,
+                scope_device_id,
+                1,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, ControllerError::Config(_)),
+                "polluted row must be Config, got {err:?}",
+            );
+        }
+        // 合法行仍按原语义解码。
+        let ok = decode_grant(
+            id_bytes,
+            user,
+            "direct".into(),
+            None,
+            Some(serde_json::json!(["device.read"])),
+            "all".into(),
+            None,
+            None,
+            4,
+        )
+        .expect("legal grant row decodes");
+        assert_eq!(ok.id, id);
+        assert_eq!(ok.revision, 4);
+    }
+
+    #[test]
+    fn snapshot_build_fails_closed_on_active_role_empty_or_duplicate_permissions() {
+        // 纯快照构建：被引用的当前有效 role 必须非空且无重复 permissions；
+        // 归档 role 允许合法清空 permissions（保留父行 = 无权而非污染）。
+        let role_id = Uuid::from_bytes([0x5a; 16]);
+        let actor = SnapshotActor {
+            id: [1u8; 16],
+            active: true,
+            is_admin: false,
+            must_change_password: false,
+        };
+        let grants = vec![GrantRecord {
+            id: Uuid::from_bytes([0x0e; 16]),
+            user_id: [1u8; 16],
+            source: GrantSource::Role(role_id),
+            scope: GrantScope::All,
+            revision: 1,
+        }];
+        let build_with = |archived: bool, permissions: Vec<Permission>| {
+            let mut roles = HashMap::new();
+            roles.insert(
+                role_id,
+                RoleRecord {
+                    id: role_id,
+                    name: "viewer".into(),
+                    builtin: false,
+                    archived,
+                    revision: 1,
+                    permissions,
+                },
+            );
+            build_authorization_snapshot(
+                actor,
+                1,
+                grants.clone(),
+                roles,
+                HashMap::new(),
+                HashMap::new(),
+            )
+        };
+        let empty = build_with(false, vec![]).unwrap_err();
+        assert!(
+            matches!(
+                &empty,
+                ControllerError::Config(m) if m == "identity admin read snapshot.role_permission"
+            ),
+            "active role without permissions must be the exact fixed redacted Config, got {empty:?}",
+        );
+        let duplicated =
+            build_with(false, vec![Permission::DeviceRead, Permission::DeviceRead]).unwrap_err();
+        assert!(
+            matches!(
+                &duplicated,
+                ControllerError::Config(m) if m == "identity admin read snapshot.role_permission"
+            ),
+            "active role with duplicate permissions must be the exact fixed redacted Config, got {duplicated:?}",
+        );
+        assert!(
+            build_with(true, vec![]).is_ok(),
+            "archived role may keep empty permissions"
+        );
+        assert!(
+            build_with(
+                false,
+                vec![Permission::DeviceRead, Permission::DeviceReboot]
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn group_memberships_for_device_fails_closed_on_archived_or_missing_device() {
+        // 列序：(group_id, group_exists, group_archived, device_exists, device_archived)。
+        let group = Uuid::from_bytes([0x67; 16]);
+        let group_bytes = group.as_bytes().to_vec();
+        let archived_device =
+            decode_group_memberships_for_device(&[(group_bytes.clone(), 1, 0, 1, 1)]).unwrap_err();
+        assert!(
+            matches!(
+                &archived_device,
+                ControllerError::Config(m) if m == "identity admin read groups.for_device.archived_device"
+            ),
+            "member on archived device must be the exact fixed redacted Config, got {archived_device:?}",
+        );
+        let missing_device =
+            decode_group_memberships_for_device(&[(group_bytes.clone(), 1, 0, 0, 0)]).unwrap_err();
+        assert!(matches!(
+            &missing_device,
+            ControllerError::Config(m) if m == "identity admin read groups.for_device.dangling"
+        ));
+        let missing_group =
+            decode_group_memberships_for_device(&[(group_bytes.clone(), 0, 0, 1, 0)]).unwrap_err();
+        assert!(matches!(
+            &missing_group,
+            ControllerError::Config(m) if m == "identity admin read groups.for_device.dangling"
+        ));
+        // 脏布尔（2）同样失败关闭，不得当 true/false。
+        assert!(matches!(
+            decode_group_memberships_for_device(&[(group_bytes.clone(), 1, 2, 1, 0)]),
+            Err(ControllerError::Config(_))
+        ));
+        // 只有 group 归档才正常过滤；未归档 group 正常入集合。
+        let other = Uuid::from_bytes([0x68; 16]);
+        let ok = decode_group_memberships_for_device(&[
+            (group_bytes, 1, 1, 1, 0),
+            (other.as_bytes().to_vec(), 1, 0, 1, 0),
+        ])
+        .expect("legal member rows decode");
+        assert_eq!(ok, HashSet::from([other]));
     }
 
     #[test]
