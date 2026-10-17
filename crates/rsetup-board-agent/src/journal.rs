@@ -638,6 +638,19 @@ impl<F: Fs> JournalStore<F> {
             }
             _ => return Err(JournalError::Decode("journal.duplicate_record".to_owned())),
         }
+        // 新插入分支：触碰文件系统之前校验 UUIDv4 格式（与 validate_loaded_journal 同标准）。
+        // 若不拦截，非法 sub_task_id/pre_boot_id 会持久化到磁盘，导致下次 open 时
+        // validate_loaded_journal 判定整个 journal 损坏、破坏既有有效记录的恢复。
+        if !rsetup_protocol::wire::is_canonical_uuid_v4(sub_task_id) {
+            return Err(JournalError::Decode(
+                "invalid sub_task_id format".to_string(),
+            ));
+        }
+        if !rsetup_protocol::wire::is_canonical_uuid_v4(pre_boot_id) {
+            return Err(JournalError::Decode(
+                "invalid pre_boot_id format".to_string(),
+            ));
+        }
         let stored = StoredRecord {
             controller_hex,
             sub_task_id: sub_task_id.to_owned(),

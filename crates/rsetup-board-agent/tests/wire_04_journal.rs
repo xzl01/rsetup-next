@@ -556,3 +556,73 @@ fn open_fails_closed_on_corrupted_or_malformed_journal_entries() {
         matches!(err, JournalError::Decode(ref msg) if msg == "succeeded record must have valid boot transition evidence")
     );
 }
+
+/// Task 3.1 修复负例：`insert_accepted` 新插入分支必须在触碰文件系统之前校验
+/// `sub_task_id` 与 `pre_boot_id` 的规范 UUIDv4（与 `validate_loaded_journal` 同标准），
+/// 否则非法记录落盘后会让下次 open 判定整个 journal 损坏、破坏既有有效记录的恢复。
+#[test]
+fn insert_accepted_rejects_non_canonical_uuid_v4_before_touching_disk() {
+    let dir = TempDir::new("uuid-validate");
+    let key = [9u8; 32];
+    let store = open_store(&dir);
+    // 先落 1 条有效记录，作为「既有有效记录不受影响」的见证
+    store
+        .insert_accepted(&key, SUB_TASK, &[0u8; 32], BOOT_OLD)
+        .expect("accepted");
+    let logs_path = dir.path().join(JournalStore::<RealFs>::LOG_FILE);
+    let logs_before = std::fs::read(&logs_path).expect("read logs");
+
+    // 非法 sub_task_id：非 UUID、大写、版本位非 4、variant 位非 8/9/a/b、空串
+    let bad_sub_task_ids = [
+        "not-a-uuid",
+        "9C858901-8A57-4791-81FE-4C455B099BC9",
+        "9c858901-8a57-5791-81fe-4c455b099bc9",
+        "9c858901-8a57-4791-01fe-4c455b099bc9",
+        "",
+    ];
+    for bad in bad_sub_task_ids {
+        assert_eq!(
+            store.insert_accepted(&key, bad, &[1u8; 32], BOOT_OLD),
+            Err(JournalError::Decode(
+                "invalid sub_task_id format".to_string()
+            )),
+            "must reject invalid sub_task_id: {bad}"
+        );
+    }
+
+    // 非法 pre_boot_id：sub_task_id 用有效且未占用的 UUID，避免先命中去重分支
+    let unused_sub_task = "11111111-2222-4333-8444-555555555555";
+    let bad_pre_boot_ids = [
+        "not-a-uuid",
+        "6F8B1C2D-0000-4000-8000-000000000001",
+        "6f8b1c2d-0000-4000-8000-00000000000",
+    ];
+    for bad in bad_pre_boot_ids {
+        assert_eq!(
+            store.insert_accepted(&key, unused_sub_task, &[0u8; 32], bad),
+            Err(JournalError::Decode(
+                "invalid pre_boot_id format".to_string()
+            )),
+            "must reject invalid pre_boot_id: {bad}"
+        );
+    }
+
+    // 全部拒绝路径零写盘：LOG_FILE 字节不变、内存记录数不变
+    assert_eq!(
+        std::fs::read(&logs_path).expect("re-read logs"),
+        logs_before,
+        "rejected inserts must not touch disk"
+    );
+    assert_eq!(store.record_count(), 1);
+    drop(store);
+
+    // 既有有效记录不受影响：重开正常、记录仍在
+    let reopened = open_store(&dir);
+    assert_eq!(reopened.record_count(), 1);
+    let reread = reopened
+        .get(&key, SUB_TASK)
+        .expect("get")
+        .expect("valid record must survive reopen");
+    assert_eq!(reread.state, TaskState::Accepted);
+    assert_eq!(reread.pre_boot_id, BOOT_OLD);
+}
