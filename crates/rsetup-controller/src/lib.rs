@@ -13,6 +13,7 @@ pub mod http_security;
 pub mod integrity;
 pub mod model;
 pub mod polling;
+pub mod tasks;
 pub mod time;
 
 pub use bootstrap::{BootstrapSecretSink, bootstrap_admin};
