@@ -295,7 +295,7 @@ describe('TaskDetailView held time review', () => {
       }))
       // 结果以服务端返回为准并重取 children，不本地宣布"已恢复/已延期"
       await waitFor(() => expect(reloaded).toHaveBeenCalledWith(TASK_ID, null))
-      expect(screen.getByText(i18n.t('task.mainState.queued'))).toBeTruthy()
+      expect(screen.getByTestId('task-state').textContent).toContain(i18n.t('task.mainState.queued'))
       expect(screen.getByText(i18n.t('task.held.reviewNoHeld'))).toBeTruthy()
       wrapper.unmount()
     }
