@@ -187,14 +187,17 @@ pub async fn check_identity_data(db: &DbPool) -> Result<(), ControllerError> {
 /// v4 运行时数据只读扫描：任一违规返回 `Err(Config)`，登录/启动路径据此
 /// fail-closed。全部 SQL 为函数内固定字面量，绝不从外部输入插值表名或列名；
 /// 不加 `FOR UPDATE`、不写库。必须在版本 guard 通过后调用（此时
-/// `version == SUPPORTED_SCHEMA_VERSION` 已被确认），更高版本由 guard 层拒绝。
+/// `version == SUPPORTED_SCHEMA_VERSION` 已被确认）。期望版本来自编译期
+/// 配置，未识别版本（0、负数、v5 及以上）直接 `SchemaNotReady`，绝不静默放行。
 pub async fn check_runtime_data(db: &DbPool, version: i32) -> Result<(), ControllerError> {
-    // v1..=3 未建五张 runtime 表，直接放行。
-    if version < SUPPORTED_SCHEMA_VERSION {
-        return Ok(());
+    // 未识别版本 fail-closed：本函数不接受编译期区间之外的期望版本。
+    if !is_recognized_schema_version(version) {
+        return Err(ControllerError::SchemaNotReady {
+            found: Some(version),
+            required: SUPPORTED_SCHEMA_VERSION,
+        });
     }
-    // 更高未知版本（>=5）已在上游 `validate_schema_version` 被拒绝，不会到达此处；
-    // 此处保持 `Ok` 以维持本函数“仅 v4 做数据扫描”的契约。
+    // v1..=3 尚未建五张 runtime 表，保持只读放行。
     if version != SUPPORTED_SCHEMA_VERSION {
         return Ok(());
     }
@@ -730,6 +733,7 @@ fn valid_permission(permission: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::RuntimeTablePresence;
     use serde_json::json;
 
     fn guard_rows(pairs: &[(i8, i32)]) -> GuardRows {
@@ -815,6 +819,102 @@ mod tests {
         // 未识别版本一律拒绝。
         assert!(validate_runtime_tables_for_version(5, &full).is_err());
         assert!(validate_runtime_tables_for_version(0, &full).is_err());
+        // v4 逐张缺失都必须拒绝，且点名缺失的表；普通启动据此 fail-closed。
+        let missing = [
+            (
+                "main_tasks",
+                RuntimeTablePresence {
+                    main_tasks: false,
+                    ..full
+                },
+            ),
+            (
+                "sub_tasks",
+                RuntimeTablePresence {
+                    sub_tasks: false,
+                    ..full
+                },
+            ),
+            (
+                "task_previews",
+                RuntimeTablePresence {
+                    task_previews: false,
+                    ..full
+                },
+            ),
+            (
+                "device_operation_locks",
+                RuntimeTablePresence {
+                    device_operation_locks: false,
+                    ..full
+                },
+            ),
+            (
+                "recovery_checks",
+                RuntimeTablePresence {
+                    recovery_checks: false,
+                    ..full
+                },
+            ),
+        ];
+        for (name, presence) in missing {
+            assert!(
+                matches!(
+                    validate_runtime_tables_for_version(4, &presence),
+                    Err(ControllerError::Config(ref reason))
+                        if reason == &format!("runtime schema table missing: {name}")
+                ),
+                "v4 缺 {name} 必须拒绝"
+            );
+        }
+        // v3 逐张残留都必须拒绝：半成品库不得被当作可只读放行的历史库。
+        let leftover = [
+            (
+                "main_tasks",
+                RuntimeTablePresence {
+                    main_tasks: true,
+                    ..empty
+                },
+            ),
+            (
+                "sub_tasks",
+                RuntimeTablePresence {
+                    sub_tasks: true,
+                    ..empty
+                },
+            ),
+            (
+                "task_previews",
+                RuntimeTablePresence {
+                    task_previews: true,
+                    ..empty
+                },
+            ),
+            (
+                "device_operation_locks",
+                RuntimeTablePresence {
+                    device_operation_locks: true,
+                    ..empty
+                },
+            ),
+            (
+                "recovery_checks",
+                RuntimeTablePresence {
+                    recovery_checks: true,
+                    ..empty
+                },
+            ),
+        ];
+        for (name, presence) in leftover {
+            assert!(
+                matches!(
+                    validate_runtime_tables_for_version(3, &presence),
+                    Err(ControllerError::Config(ref reason))
+                        if reason == &format!("runtime schema table {name} must not exist before v4")
+                ),
+                "v3 残留 {name} 必须拒绝"
+            );
+        }
     }
 
     #[test]
