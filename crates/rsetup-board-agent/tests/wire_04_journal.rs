@@ -404,12 +404,133 @@ fn merge_rejects_succeeded_without_boot_evidence() {
     );
 }
 
+/// `finish_succeeded_with_boot` 是本任务唯一允许写入 `Succeeded` 的入口：boot 证据由签名强制，
+/// 且必须已有可靠 `Attempted`（04 §6 成功条件 2）、观察到的 boot 必须与 `pre_boot_id` 不同。
+#[test]
+fn finish_succeeded_with_boot_writes_evidence_and_closes_terminal_state() {
+    let dir = TempDir::new("finish-boot");
+    let key = [9u8; 32];
+    let store = open_store(&dir);
+    store
+        .insert_accepted(&key, SUB_TASK, &[0u8; 32], BOOT_OLD)
+        .expect("accepted");
+    // 尚无可靠 attempted 记录：不得直接成功
+    assert_eq!(
+        store.finish_succeeded_with_boot(&key, SUB_TASK, BOOT_NEW),
+        Err(JournalError::Conflict)
+    );
+    let attempted = store.mark_attempted(&key, SUB_TASK).expect("attempted");
+    // 同一 boot 不是成功证据
+    assert_eq!(
+        store.finish_succeeded_with_boot(&key, SUB_TASK, BOOT_OLD),
+        Err(JournalError::Conflict)
+    );
+    let succeeded = store
+        .finish_succeeded_with_boot(&key, SUB_TASK, BOOT_NEW)
+        .expect("succeeded with boot");
+    assert_eq!(succeeded.state, TaskState::Succeeded);
+    assert_eq!(succeeded.observed_boot_id.as_deref(), Some(BOOT_NEW));
+    assert_eq!(
+        succeeded.evidence_kind.as_deref(),
+        Some("boot_transition_observed")
+    );
+    assert_eq!(succeeded.record_version, attempted.record_version + 1);
+    // 终态全封闭：任何后续跃迁一律 Conflict，版本不动
+    assert_eq!(
+        store.mark_attempted(&key, SUB_TASK),
+        Err(JournalError::Conflict)
+    );
+    assert_eq!(
+        store.finish(&key, SUB_TASK, TaskState::Failed, Some("OS_ERROR")),
+        Err(JournalError::Conflict)
+    );
+    drop(store);
+    // 携带完整证据的成功记录可通过持久校验并原样恢复
+    let reopened = open_store(&dir);
+    let record = reopened.get(&key, SUB_TASK).expect("get").expect("record");
+    assert_eq!(record, succeeded);
+}
+
+/// 非法跃迁与非法 reason 必须在写盘之前拒绝：磁盘字节与版本绝对不动。
+#[test]
+fn finish_rejects_illegal_transitions_and_reasons_without_touching_disk() {
+    let dir = TempDir::new("finish-guards");
+    let key = [9u8; 32];
+    let store = open_store(&dir);
+    store
+        .insert_accepted(&key, SUB_TASK, &[0u8; 32], BOOT_OLD)
+        .expect("accepted");
+    // Accepted 不是 Attempted：必须先可靠 attempted 才允许落终态
+    assert_eq!(
+        store.finish(&key, SUB_TASK, TaskState::Failed, Some("OS_ERROR")),
+        Err(JournalError::Conflict)
+    );
+    store.mark_attempted(&key, SUB_TASK).expect("attempted");
+    let logs_path = dir.path().join(JournalStore::<RealFs>::LOG_FILE);
+    let logs_before = std::fs::read(&logs_path).expect("read logs");
+    // Succeeded 只能经 finish_succeeded_with_boot
+    assert_eq!(
+        store.finish(&key, SUB_TASK, TaskState::Succeeded, None),
+        Err(JournalError::Conflict)
+    );
+    // 词表外 reason 在触碰文件系统之前拒绝
+    assert_eq!(
+        store.finish(&key, SUB_TASK, TaskState::Failed, Some("NOT_A_REASON")),
+        Err(JournalError::Decode("invalid reason code".to_string()))
+    );
+    // 未知去重键 → NotFound，绝不新建记录
+    assert_eq!(
+        store.mark_attempted(&key, "11111111-2222-4333-8444-555555555555"),
+        Err(JournalError::NotFound)
+    );
+    assert_eq!(
+        std::fs::read(&logs_path).expect("re-read logs"),
+        logs_before,
+        "被拒绝的跃迁必须零写盘"
+    );
+    assert_eq!(store.record_count(), 1);
+    // 内存记录同样原样不动：仍是 Attempted(v2)
+    let unchanged = store.get(&key, SUB_TASK).expect("get").expect("record");
+    assert_eq!(unchanged.state, TaskState::Attempted);
+    assert_eq!(unchanged.record_version, 2);
+    assert_eq!(unchanged.reason_code, None);
+}
+
+/// 崩溃恢复不得改写已确认终态：boot 变了也不得把 `Failed/OS_ERROR` 误写成 `Succeeded`。
+#[test]
+fn confirmed_failed_terminal_state_survives_recover_with_changed_boot() {
+    let dir = TempDir::new("terminal-recover");
+    let key = [9u8; 32];
+    {
+        let store = open_store(&dir);
+        store
+            .insert_accepted(&key, SUB_TASK, &[0u8; 32], BOOT_OLD)
+            .expect("accepted");
+        store.mark_attempted(&key, SUB_TASK).expect("attempted");
+        let failed = store
+            .finish(&key, SUB_TASK, TaskState::Failed, Some("OS_ERROR"))
+            .expect("finish");
+        assert_eq!(failed.state, TaskState::Failed);
+        // 终态记录不得再被 boot 证据改写
+        assert_eq!(
+            store.finish_succeeded_with_boot(&key, SUB_TASK, BOOT_NEW),
+            Err(JournalError::Conflict)
+        );
+    }
+    let recovered = JournalStore::recover(dir.path(), RealFs, BOOT_NEW).expect("recover");
+    let record = recovered.get(&key, SUB_TASK).expect("get").expect("record");
+    assert_eq!(record.state, TaskState::Failed);
+    assert_eq!(record.reason_code.as_deref(), Some("OS_ERROR"));
+    assert_eq!(record.observed_boot_id, None);
+    assert_eq!(record.evidence_kind, None);
+}
+
 #[test]
 fn journal_errors_are_not_silently_swallowed() {
     // 目录不存在时不得假装成功
     let dir = TempDir::new("missing");
     let missing = dir.path().join("nope");
-    assert!(matches!(JournalStore::open(&missing, RealFs), Err(_)));
+    assert!(JournalStore::open(&missing, RealFs).is_err());
     // JournalError 必须区分「确未提交」与「提交结果不明」
     assert_ne!(
         JournalError::DefinitelyNotCommitted,

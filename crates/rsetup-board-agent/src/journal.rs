@@ -48,6 +48,12 @@ impl TaskState {
             _ => None,
         }
     }
+
+    /// 终态（04 规格 §3「succeeded/failed 不可反向变为执行中」）：一旦可靠落盘即全封闭，
+    /// 任何后续状态跃迁——无论版本多高——都不得改写或降级。
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -445,6 +451,76 @@ fn task_record_from(stored: &StoredTaskRecord) -> Result<TaskRecord, JournalErro
     })
 }
 
+/// boot transition 证据完整性（TR-R9-1，与 `validate_loaded_journal` 同标准的三重条件）：
+/// `evidence_kind == "boot_transition_observed"` 且 `observed_boot_id` 存在且与 `pre_boot_id` 不同。
+fn has_valid_boot_transition_evidence(record: &TaskRecord) -> bool {
+    record.evidence_kind.as_deref() == Some("boot_transition_observed")
+        && record.observed_boot_id.is_some()
+        && record.observed_boot_id.as_deref() != Some(record.pre_boot_id.as_str())
+}
+
+/// 入站字段合法性（与 `validate_loaded_journal` 同标准）：非法值一旦落盘，下次 `open`
+/// 会判定整个 journal 损坏并破坏既有有效记录的恢复，因此必须在任何写盘之前拒绝。
+fn persisted_shape_is_valid(record: &TaskRecord) -> bool {
+    if !rsetup_protocol::wire::is_canonical_uuid_v4(&record.sub_task_id) {
+        return false;
+    }
+    if !rsetup_protocol::wire::is_canonical_uuid_v4(&record.pre_boot_id) {
+        return false;
+    }
+    if let Some(observed) = record.observed_boot_id.as_deref() {
+        if !rsetup_protocol::wire::is_canonical_uuid_v4(observed) {
+            return false;
+        }
+    }
+    if let Some(code) = record.reason_code.as_deref() {
+        if !rsetup_protocol::wire::TASK_REASON_CODES.contains(&code) {
+            return false;
+        }
+    }
+    match record.evidence_kind.as_deref() {
+        None => true,
+        Some("boot_transition_observed") => has_valid_boot_transition_evidence(record),
+        _ => false,
+    }
+}
+
+/// 按去重键 `(controller_hex, sub_task_id)` 唯一定位记录下标：
+/// 0 命中 → `NotFound`；>1 命中（同键重复，属损坏）→ 固定去敏 `Decode`。
+fn find_record_index(
+    records: &[StoredRecord],
+    controller_hex: &str,
+    sub_task_id: &str,
+) -> Result<usize, JournalError> {
+    let mut hits = records.iter().enumerate().filter(|(_, stored)| {
+        stored.controller_hex == controller_hex && stored.sub_task_id == sub_task_id
+    });
+    let Some((first, _)) = hits.next() else {
+        return Err(JournalError::NotFound);
+    };
+    if hits.next().is_some() {
+        return Err(JournalError::Decode("journal.duplicate_record".to_owned()));
+    }
+    Ok(first)
+}
+
+/// `record_version` 严格 +1：u64 溢出绝不静默回绕（会破坏同 epoch 内版本单调性）。
+fn next_version(current: u64) -> Result<u64, JournalError> {
+    current.checked_add(1).ok_or_else(|| {
+        JournalError::Io("journal record version overflow: cannot bump record_version".to_string())
+    })
+}
+
+/// 同版本内容一致性比较：版本、epoch、身份与 schema 已由守卫保证相等，这里只比剩余证据字段。
+fn same_evidence_content(incoming: &TaskRecord, stored: &TaskRecord) -> bool {
+    incoming.state == stored.state
+        && incoming.pre_boot_id == stored.pre_boot_id
+        && incoming.observed_boot_id == stored.observed_boot_id
+        && incoming.reason_code == stored.reason_code
+        && incoming.updated_unix_ms == stored.updated_unix_ms
+        && incoming.evidence_kind == stored.evidence_kind
+}
+
 impl<F: Fs> JournalStore<F> {
     pub const META_FILE: &'static str = "journal-meta.json";
     pub const LOG_FILE: &'static str = "journal-logs.json";
@@ -515,17 +591,44 @@ impl<F: Fs> JournalStore<F> {
         }
     }
 
-    /// 普通启动：3.1 委托 `open`，绝不做自动状态改写。
-    pub fn recover(dir: &Path, fs: F, _current_boot_id: &str) -> Result<Self, JournalError> {
-        Self::open(dir, fs)
+    /// 普通启动：同 `open`（沿用已持久化 epoch，语义等价 `JournalRecovery::ReusedEpoch`），
+    /// 随后只读应用 boot transition 证据（`Accepted` 记录绝不被改写、绝不自动补调用）。
+    pub fn recover(dir: &Path, fs: F, current_boot_id: &str) -> Result<Self, JournalError> {
+        let store = Self::open(dir, fs)?;
+        store.apply_boot_transition_evidence(current_boot_id)?;
+        Ok(store)
     }
 
-    /// 显式重建路径（仅在已知日志不可逆损坏时调用）：3.3 实现。
-    pub fn rebuild_after_loss(
-        _dir: &Path,
-        _fs: F,
-    ) -> Result<(Self, JournalRecovery), JournalError> {
-        Err(JournalError::NotFound) // 桩：3.3 实现
+    /// 显式重建路径（仅在已知日志不可逆损坏时调用）：更换 `journal_epoch` 并整文件重写空记录集，
+    /// 旧记录跨 epoch 不可再比较，调用方必须向中控报告 `JOURNAL_LOST`。
+    /// 与 `open` 的首次初始化同序：先落 LOG_FILE、再落 META_FILE，两条都成功才返回。
+    pub fn rebuild_after_loss(dir: &Path, fs: F) -> Result<(Self, JournalRecovery), JournalError> {
+        let epoch = uuid::Uuid::new_v4().to_string();
+        let empty_logs = JournalLogs {
+            v: JOURNAL_SCHEMA_VERSION,
+            epoch: epoch.clone(),
+            records: Vec::new(),
+        };
+        let logs_body =
+            serde_json::to_vec(&empty_logs).map_err(|e| JournalError::Decode(e.to_string()))?;
+        write_durable(&fs, dir, &dir.join(Self::LOG_FILE), &logs_body)?;
+        let meta = JournalMeta {
+            v: JOURNAL_SCHEMA_VERSION,
+            epoch: epoch.clone(),
+        };
+        let meta_body =
+            serde_json::to_vec(&meta).map_err(|e| JournalError::Decode(e.to_string()))?;
+        write_durable(&fs, dir, &dir.join(Self::META_FILE), &meta_body)?;
+        Ok((
+            Self {
+                dir: dir.to_path_buf(),
+                epoch,
+                fs,
+                records: Mutex::new(Vec::new()),
+                uncertain: AtomicBool::new(false),
+            },
+            JournalRecovery::RebuiltAfterLoss { journal_lost: true },
+        ))
     }
 
     pub fn journal_epoch(&self) -> &str {
@@ -544,11 +647,7 @@ impl<F: Fs> JournalStore<F> {
     ) -> Result<Option<TaskRecord>, JournalError> {
         self.ensure_not_uncertain()?;
         let expected_controller_hex = encode_journal_hash32(controller_key);
-        let records = match self.records.lock() {
-            Ok(guard) => guard,
-            // fail-closed：毒锁 → 直接返回（消息去敏，不含记录内容）
-            Err(_) => return Err(JournalError::Io("journal.records poisoned".to_string())),
-        };
+        let records = self.lock_records()?;
         self.ensure_not_uncertain()?;
         let hits: Vec<&StoredRecord> = records
             .iter()
@@ -601,6 +700,41 @@ impl<F: Fs> JournalStore<F> {
         Ok(())
     }
 
+    /// 加锁读取内存记录集；毒锁 fail-closed：直接返回固定去敏 `Io`，不 panic、不吞毒继续读。
+    fn lock_records(&self) -> Result<std::sync::MutexGuard<'_, Vec<StoredRecord>>, JournalError> {
+        self.records
+            .lock()
+            .map_err(|_| JournalError::Io("journal.records poisoned".to_string()))
+    }
+
+    /// 以当前 epoch 把整份记录集两阶段落盘（唯一整文件提交入口，统一经 `commit_durable`，
+    /// 因此 `CommitUnknown` 必然先置 uncertain 隔离态再返回）。
+    fn write_logs(&self, records: &[StoredRecord]) -> Result<(), JournalError> {
+        let logs = JournalLogs {
+            v: JOURNAL_SCHEMA_VERSION,
+            epoch: self.epoch.clone(),
+            records: records.to_vec(),
+        };
+        let body = serde_json::to_vec(&logs).map_err(|e| JournalError::Decode(e.to_string()))?;
+        let logs_path = self.dir.join(Self::LOG_FILE);
+        self.commit_durable(&logs_path, &body)
+    }
+
+    /// 状态跃迁的统一提交路径：先在内存克隆构造候选记录集，落盘成功后才替换内存状态，
+    /// 杜绝「先改内存再落盘失败」的窗口；`DefinitelyNotCommitted`/`CommitUnknown` 时内存原样不动。
+    fn commit_replacement(
+        &self,
+        records: &mut Vec<StoredRecord>,
+        index: usize,
+        replacement: StoredTaskRecord,
+    ) -> Result<TaskRecord, JournalError> {
+        let mut candidate = records.clone();
+        candidate[index].record = replacement;
+        self.write_logs(&candidate)?;
+        *records = candidate;
+        task_record_from(&records[index].record)
+    }
+
     /// accepted：`pre_boot_id` 必须在本次调用内即确定并落盘。
     ///
     /// 去重命名空间 = `controller_key` + `sub_task_id`：命中且载荷哈希相同 → 复用原记录
@@ -617,10 +751,7 @@ impl<F: Fs> JournalStore<F> {
         self.ensure_not_uncertain()?;
         let controller_hex = encode_journal_hash32(controller_key);
         let payload_hash_hex = encode_journal_hash32(payload_hash);
-        let mut records = match self.records.lock() {
-            Ok(guard) => guard,
-            Err(_) => return Err(JournalError::Io("journal.records poisoned".to_string())),
-        };
+        let mut records = self.lock_records()?;
         self.ensure_not_uncertain()?;
         let hits: Vec<&StoredRecord> = records
             .iter()
@@ -637,6 +768,11 @@ impl<F: Fs> JournalStore<F> {
                     .map(|record| (record, DedupOutcome::ReusedExisting));
             }
             _ => return Err(JournalError::Decode("journal.duplicate_record".to_owned())),
+        }
+        // 容量上限（03 §5）：满仓时拒绝新任务，绝不淘汰既有去重记录——
+        // 淘汰会让同一 sub_task_id 的重复 execute 被当成新任务再次穿过 OS 边界。
+        if records.len() >= JOURNAL_MAX_RECORDS {
+            return Err(JournalError::StorageFull);
         }
         // 新插入分支：触碰文件系统之前校验 UUIDv4 格式（与 validate_loaded_journal 同标准）。
         // 若不拦截，非法 sub_task_id/pre_boot_id 会持久化到磁盘，导致下次 open 时
@@ -670,69 +806,203 @@ impl<F: Fs> JournalStore<F> {
         };
         let mut candidate = records.clone();
         candidate.push(stored.clone());
-        let logs = JournalLogs {
-            v: JOURNAL_SCHEMA_VERSION,
-            epoch: self.epoch.clone(),
-            records: candidate.clone(),
-        };
-        let body = serde_json::to_vec(&logs).map_err(|e| JournalError::Decode(e.to_string()))?;
-        let logs_path = self.dir.join(Self::LOG_FILE);
-        self.commit_durable(&logs_path, &body)?;
+        self.write_logs(&candidate)?;
         // 落盘成功后才替换内存状态
         *records = candidate;
         Ok((task_record_from(&stored.record)?, DedupOutcome::Inserted))
     }
 
-    /// 3.3 实现。
+    /// `Accepted → Attempted` 唯一入口：其余任何状态（含 `Failed`/`Succeeded` 终态）一律
+    /// `Conflict` 且零写盘；成功跃迁 `record_version` +1 并整文件可靠落盘。
     pub fn mark_attempted(
         &self,
-        _controller_key: &[u8; 32],
-        _sub_task_id: &str,
+        controller_key: &[u8; 32],
+        sub_task_id: &str,
     ) -> Result<TaskRecord, JournalError> {
-        self.ensure_not_uncertain()?; // uncertain 隔离态先于一切（TR-N2）
-        Err(JournalError::NotFound) // 桩
+        self.ensure_not_uncertain()?;
+        let controller_hex = encode_journal_hash32(controller_key);
+        let mut records = self.lock_records()?;
+        self.ensure_not_uncertain()?;
+        let index = find_record_index(&records, &controller_hex, sub_task_id)?;
+        let stored = task_record_from(&records[index].record)?;
+        if stored.state != TaskState::Accepted {
+            return Err(JournalError::Conflict);
+        }
+        let mut replacement = records[index].record.clone();
+        replacement.state = TaskState::Attempted.as_str().to_owned();
+        replacement.record_version = next_version(stored.record_version)?;
+        self.commit_replacement(&mut records, index, replacement)
     }
 
-    /// 3.3 实现。
+    /// `Attempted → {Failed, Unknown}` 收敛：`Succeeded` 必须走 `finish_succeeded_with_boot`
+    /// （boot 证据由签名强制），`Accepted` 与既有终态一律 `Conflict`。
+    /// `reason` 必须在落盘前通过十二词表校验，否则下次 `open` 会判定整个 journal 损坏。
     pub fn finish(
         &self,
-        _controller_key: &[u8; 32],
-        _sub_task_id: &str,
-        _state: TaskState,
-        _reason: Option<&str>,
+        controller_key: &[u8; 32],
+        sub_task_id: &str,
+        state: TaskState,
+        reason: Option<&str>,
     ) -> Result<TaskRecord, JournalError> {
-        self.ensure_not_uncertain()?; // uncertain 隔离态先于一切（TR-N2）
-        Err(JournalError::NotFound) // 桩
+        self.ensure_not_uncertain()?;
+        if !matches!(state, TaskState::Failed | TaskState::Unknown) {
+            return Err(JournalError::Conflict);
+        }
+        if let Some(code) = reason {
+            if !rsetup_protocol::wire::TASK_REASON_CODES.contains(&code) {
+                return Err(JournalError::Decode("invalid reason code".to_string()));
+            }
+        }
+        let controller_hex = encode_journal_hash32(controller_key);
+        let mut records = self.lock_records()?;
+        self.ensure_not_uncertain()?;
+        let index = find_record_index(&records, &controller_hex, sub_task_id)?;
+        let stored = task_record_from(&records[index].record)?;
+        if stored.state != TaskState::Attempted {
+            return Err(JournalError::Conflict);
+        }
+        let mut replacement = records[index].record.clone();
+        replacement.state = state.as_str().to_owned();
+        replacement.reason_code = reason.map(str::to_owned);
+        replacement.record_version = next_version(stored.record_version)?;
+        self.commit_replacement(&mut records, index, replacement)
     }
 
-    /// 3.3 实现。
+    /// 成功终态唯一入口：同时写入 `observed_boot_id` 与
+    /// `evidence_kind = "boot_transition_observed"`（04 §6：成功 = 意图之后观察到不同启动代际）。
+    /// 仅允许 `Attempted → Succeeded`；与 `pre_boot_id` 相同的 boot 不是成功证据 → `Conflict`。
     pub fn finish_succeeded_with_boot(
         &self,
-        _controller_key: &[u8; 32],
-        _sub_task_id: &str,
-        _observed_boot_id: &str,
+        controller_key: &[u8; 32],
+        sub_task_id: &str,
+        observed_boot_id: &str,
     ) -> Result<TaskRecord, JournalError> {
-        self.ensure_not_uncertain()?; // uncertain 隔离态先于一切（TR-N2）
-        Err(JournalError::NotFound) // 桩
+        self.ensure_not_uncertain()?;
+        if !rsetup_protocol::wire::is_canonical_uuid_v4(observed_boot_id) {
+            return Err(JournalError::Decode(
+                "invalid observed_boot_id format".to_string(),
+            ));
+        }
+        let controller_hex = encode_journal_hash32(controller_key);
+        let mut records = self.lock_records()?;
+        self.ensure_not_uncertain()?;
+        let index = find_record_index(&records, &controller_hex, sub_task_id)?;
+        let stored = task_record_from(&records[index].record)?;
+        if stored.state != TaskState::Attempted || observed_boot_id == stored.pre_boot_id.as_str() {
+            return Err(JournalError::Conflict);
+        }
+        let mut replacement = records[index].record.clone();
+        replacement.state = TaskState::Succeeded.as_str().to_owned();
+        replacement.observed_boot_id = Some(observed_boot_id.to_owned());
+        replacement.evidence_kind = Some("boot_transition_observed".to_owned());
+        replacement.record_version = next_version(stored.record_version)?;
+        self.commit_replacement(&mut records, index, replacement)
     }
 
-    /// 3.3 实现。
+    /// 只读恢复证据应用：仅对「有可靠 `Attempted` 记录、且 `pre_boot_id != current_boot_id`」
+    /// 的任务逐条原子落盘为 `Succeeded` 并附 boot 证据；`Accepted` 记录绝不被改写，
+    /// 绝不自动补调用、绝不自动重发。每条记录独立提交，单条失败不牵连其余记录。
+    /// `current_boot_id` 非 canonical UUIDv4 时视为「无可靠 boot 证据」：零写盘返回空集，
+    /// 否则非法 `observed_boot_id` 落盘会让下次 `open` 判定整个 journal 损坏。
     pub fn apply_boot_transition_evidence(
         &self,
-        _current_boot_id: &str,
+        current_boot_id: &str,
     ) -> Result<Vec<TaskRecord>, JournalError> {
-        self.ensure_not_uncertain()?; // uncertain 隔离态先于一切（TR-N2）
-        Err(JournalError::NotFound) // 桩
+        self.ensure_not_uncertain()?;
+        if !rsetup_protocol::wire::is_canonical_uuid_v4(current_boot_id) {
+            return Ok(Vec::new());
+        }
+        let attempted = TaskState::Attempted.as_str();
+        let mut records = self.lock_records()?;
+        self.ensure_not_uncertain()?;
+        let targets: Vec<usize> = records
+            .iter()
+            .enumerate()
+            .filter(|(_, stored)| {
+                stored.record.state == attempted && stored.record.pre_boot_id != current_boot_id
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let mut applied = Vec::with_capacity(targets.len());
+        for index in targets {
+            let stored = task_record_from(&records[index].record)?;
+            if stored.state != TaskState::Attempted {
+                continue;
+            }
+            let mut replacement = records[index].record.clone();
+            replacement.state = TaskState::Succeeded.as_str().to_owned();
+            replacement.observed_boot_id = Some(current_boot_id.to_owned());
+            replacement.evidence_kind = Some("boot_transition_observed".to_owned());
+            replacement.record_version = next_version(stored.record_version)?;
+            applied.push(self.commit_replacement(&mut records, index, replacement)?);
+        }
+        Ok(applied)
     }
 
-    /// 3.3 实现。
+    /// 证据合并：先做合法性守卫（任一不满足 → `Conflict(stored)`，零写盘、绝不改原记录），
+    /// 全部守卫通过后才比较版本。守卫顺序：
+    /// 1. 同一 `journal_epoch`（`record_version` 只在当前 epoch 内可比，跨 epoch 高版本也不得采用）、
+    ///    同一 `sub_task_id`、同一 `schema_version`，且入站记录形状本身可安全持久化；
+    /// 2. TR-R10-1 已存终态全封闭（04 规格 L69–70、L119–124）：`stored` 处于 `Failed`/`Succeeded`
+    ///    时，任何不同状态的后续跃迁——无论版本多高、无论是中间态回退、矛盾的另一终态还是
+    ///    `Unknown` 中继——一律 `Conflict`，封死 `Failed(v3)→Unknown(v4)→Succeeded(v5)` 两步绕过；
+    /// 3. TR-R9-1 `Succeeded` 必须携带完整 boot transition 证据；
+    /// 4. 已存中间态只允许向终态收敛（同状态的高版本更新除外），不得借合并回退。
     pub fn merge_evidence(
         &self,
-        _controller_key: &[u8; 32],
-        _incoming: &TaskRecord,
+        controller_key: &[u8; 32],
+        incoming: &TaskRecord,
     ) -> Result<EvidenceMerge, JournalError> {
-        self.ensure_not_uncertain()?; // uncertain 隔离态先于一切（TR-N2）
-        Err(JournalError::NotFound) // 桩
+        self.ensure_not_uncertain()?;
+        let controller_hex = encode_journal_hash32(controller_key);
+        let mut records = self.lock_records()?;
+        self.ensure_not_uncertain()?;
+        let index = find_record_index(&records, &controller_hex, &incoming.sub_task_id)?;
+        let stored = task_record_from(&records[index].record)?;
+        if incoming.journal_epoch != stored.journal_epoch
+            || incoming.sub_task_id != stored.sub_task_id
+            || incoming.schema_version != stored.schema_version
+            || !persisted_shape_is_valid(incoming)
+        {
+            return Ok(EvidenceMerge::Conflict(stored));
+        }
+        if stored.state.is_terminal() && incoming.state != stored.state {
+            return Ok(EvidenceMerge::Conflict(stored));
+        }
+        if incoming.state == TaskState::Succeeded && !has_valid_boot_transition_evidence(incoming) {
+            return Ok(EvidenceMerge::Conflict(stored));
+        }
+        if !incoming.state.is_terminal() && incoming.state != stored.state {
+            return Ok(EvidenceMerge::Conflict(stored));
+        }
+        match incoming.record_version.cmp(&stored.record_version) {
+            // 迟到/重复的较低版本：按协议丢弃，原记录不动
+            std::cmp::Ordering::Less => Ok(EvidenceMerge::StaleVersion(stored)),
+            std::cmp::Ordering::Equal => {
+                if same_evidence_content(incoming, &stored) {
+                    Ok(EvidenceMerge::StaleVersion(stored))
+                } else {
+                    // 同版本不同内容 = 一致性异常，绝不覆盖
+                    Ok(EvidenceMerge::Conflict(stored))
+                }
+            }
+            std::cmp::Ordering::Greater => {
+                let replacement = StoredTaskRecord {
+                    schema_version: incoming.schema_version,
+                    sub_task_id: incoming.sub_task_id.clone(),
+                    journal_epoch: incoming.journal_epoch.clone(),
+                    record_version: incoming.record_version,
+                    state: incoming.state.as_str().to_owned(),
+                    pre_boot_id: incoming.pre_boot_id.clone(),
+                    observed_boot_id: incoming.observed_boot_id.clone(),
+                    reason_code: incoming.reason_code.clone(),
+                    updated_unix_ms: incoming.updated_unix_ms,
+                    evidence_kind: incoming.evidence_kind.clone(),
+                };
+                let applied = self.commit_replacement(&mut records, index, replacement)?;
+                Ok(EvidenceMerge::Applied(applied))
+            }
+        }
     }
 }
 
