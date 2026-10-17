@@ -1454,4 +1454,152 @@ describe('signed_in session management UI (Task 5)', () => {
     expect(fetcher.mock.calls.some((call) => String(call[0]).includes('/api/v1/devices'))).toBe(true)
     expect(window.location.hash).toBe('#/tasks')
   })
+
+  // ── Task 10 Fix 1：授权变更（permissions.changed）销毁任务内存态 + 非管理员详情页接线 ──
+  const TASK_DETAIL_ID = 'f47ac10b-58cc-4372-a567-0e02b2c3d479'
+  const SUBTASK_UNKNOWN_ID = '1b4e28ba-2fa1-4d73-a3e2-3c1d4e5f6a7b'
+  const SUBTASK_DEVICE_ID = 'c'.repeat(64)
+  // 普通用户（is_admin: false）：/auth/me 的 user_public 投影，非管理员不得出现管理员专属危险控件
+  const NON_ADMIN_ME = {
+    user: { ...CONTRACT_USER, username: 'operator', is_admin: false },
+    csrf_token: 'mem-token',
+    authz_epoch: '7',
+  }
+  // 主任务：view_scope=authorized_subset（普通用户投影），counts.unknown='1'
+  const DETAIL_TASK_ITEM = {
+    id: TASK_DETAIL_ID, operation: 'reboot', state: 'running', outcome: null, revision: '7',
+    created_time: {
+      system_wall_utc: '2026-10-16T00:00:00Z', reference_utc: '2026-10-16T00:00:00Z',
+      quality: 'system_fallback', clock_epoch: '0f8fad5b-d9cb-469f-a165-70867728950e',
+      source: null, sample_age_ms: null, offset_ms: null, uncertainty_ms: null,
+    },
+    counts: { queued: '0', held: '0', dispatching: '0', accepted: '0', verifying: '0', succeeded: '0', failed: '0', unknown: '1', cancelled: '0', expired: '0' },
+    view_scope: 'authorized_subset',
+    actions: { can_cancel: false },
+  }
+  // 子任务含 state=unknown 的目标：管理员视图下必然渲染释放锁控件，非管理员必须不渲染
+  const DETAIL_CHILDREN_PAGE = {
+    items: [{
+      id: SUBTASK_UNKNOWN_ID, device_id: SUBTASK_DEVICE_ID, state: 'unknown',
+      reason_code: 'RESULT_TIMEOUT', revision: '3', result_evidence: 'none',
+    }],
+    next_cursor: null,
+  }
+
+  function stubTaskDetailFetch(counters: { detail: number; children: number; devices: number }) {
+    const fetcher = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit): Promise<Response> => {
+      const url = String(input)
+      if (url.includes('/api/v1/auth/me')) return jsonResponse({ data: NON_ADMIN_ME, request_id: RID_ME })
+      if (url.includes(`/api/v1/tasks/${TASK_DETAIL_ID}/children`)) {
+        counters.children += 1
+        return jsonResponse({ data: DETAIL_CHILDREN_PAGE, request_id: RID_TASKS })
+      }
+      if (url.includes(`/api/v1/tasks/${TASK_DETAIL_ID}`)) {
+        counters.detail += 1
+        return jsonResponse({ data: DETAIL_TASK_ITEM, request_id: RID_TASKS })
+      }
+      if (url.includes('/api/v1/tasks')) {
+        return jsonResponse({ data: { items: [], next_cursor: null }, request_id: RID_TASKS })
+      }
+      if (url.includes('/api/v1/devices')) {
+        counters.devices += 1
+        return jsonResponse({ data: { items: [], next_cursor: null }, request_id: RID_DEV })
+      }
+      return jsonResponse({ error: { code: 'NOT_FOUND', message_key: 'errors.notFound' }, request_id: RID_NF }, 404)
+    })
+    vi.stubGlobal('fetch', fetcher)
+    return fetcher
+  }
+
+  test('非管理员（is_admin: false）直达 task-detail：渲染 unknown 子任务但不渲染管理员专属释放锁控件', async () => {
+    const counters = { detail: 0, children: 0, devices: 0 }
+    const fetcher = stubTaskDetailFetch(counters)
+
+    window.location.hash = `#/tasks/${TASK_DETAIL_ID}`
+    render(App)
+
+    await vi.waitFor(() => expect(screen.getByRole('heading', { name: '任务详情' })).toBeTruthy())
+    // 数据确实到位：unknown 子任务行已渲染 → 释放锁控件缺失只能归因于非管理员身份，而非无数据
+    await vi.waitFor(() => expect(screen.getByTestId(`subtask-row-${SUBTASK_UNKNOWN_ID}`)).toBeTruthy())
+    expect(counters.detail).toBe(1)
+    expect(counters.children).toBe(1)
+    // 普通用户按 authorized_subset 投影渲染
+    expect(screen.getByTestId('task-scope').textContent).toContain('仅显示当前已授权的目标')
+    // 管理员专属危险控件一律不渲染
+    expect(screen.queryByTestId(`release-lock-${SUBTASK_UNKNOWN_ID}`)).toBeNull()
+    expect(screen.queryByRole('button', { name: '释放设备占用' })).toBeNull()
+    expect(screen.queryByTestId('time-review-evidence')).toBeNull()
+    // 全程未发起任何释放锁写请求
+    const writes = fetcher.mock.calls.filter(([, init]) => (init as RequestInit | undefined)?.method === 'POST')
+    expect(writes).toHaveLength(0)
+  })
+
+  test('permissions.changed 重建任务列表视图：销毁本地勾选与在途任务态并重新拉取任务与设备投影', async () => {
+    const devA = 'a'.repeat(64)
+    const devB = 'b'.repeat(64)
+    let tasksCalls = 0
+    let devicesCalls = 0
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input)
+      if (url.includes('/api/v1/auth/me')) return jsonResponse({ data: ME_DATA, request_id: RID_ME })
+      if (url.includes('/api/v1/devices')) {
+        devicesCalls += 1
+        return jsonResponse({ data: { items: [
+          { device_id: devA, display_name: 'Alpha', effective_permissions: ['device.read', 'device.task.read', 'device.reboot'] },
+          { device_id: devB, display_name: 'Beta', effective_permissions: ['device.read', 'device.task.read', 'device.reboot'] },
+        ], next_cursor: null }, request_id: RID_DEV })
+      }
+      if (url.includes('/api/v1/tasks')) {
+        tasksCalls += 1
+        return jsonResponse({ data: { items: [{
+          id: TASK_DETAIL_ID, operation: 'reboot', state: 'running', outcome: null, revision: '7',
+          created_time: {
+            system_wall_utc: '2026-10-16T00:00:00Z', reference_utc: '2026-10-16T00:00:00Z',
+            quality: 'system_fallback', clock_epoch: '0f8fad5b-d9cb-469f-a165-70867728950e',
+            source: null, sample_age_ms: null, offset_ms: null, uncertainty_ms: null,
+          },
+          counts: { queued: '0', held: '0', dispatching: '0', accepted: '0', verifying: '0', succeeded: '0', failed: '0', unknown: '0', cancelled: '0', expired: '0' },
+          view_scope: 'authorized_subset',
+        }], next_cursor: null }, request_id: RID_TASKS })
+      }
+      return jsonResponse({ error: { code: 'NOT_FOUND', message_key: 'errors.notFound' }, request_id: RID_NF }, 404)
+    }))
+
+    window.location.hash = '#/tasks'
+    render(App)
+    await vi.waitFor(() => expect(screen.getByRole('heading', { name: '任务列表' })).toBeTruthy())
+    await vi.waitFor(() => expect(tasksCalls).toBe(1))
+    // TasksView 组件内存状态：用户手动勾选的目标设备
+    await fireEvent.click(screen.getByTestId(`task-device-${devB}`))
+    expect((screen.getByTestId(`task-device-${devB}`) as HTMLInputElement).checked).toBe(true)
+
+    window.dispatchEvent(new Event('permissions.changed'))
+
+    // 视图随授权代际卸载重建 → 重新拉取任务列表（旧实例的 tasks 内存列表作废）
+    await vi.waitFor(() => expect(tasksCalls).toBe(2))
+    // 待处理设备勾选随组件销毁，绝不跨授权代际残留
+    await vi.waitFor(() => expect((screen.getByTestId(`task-device-${devB}`) as HTMLInputElement).checked).toBe(false))
+    // 设备权限投影 fail-closed：清空后按当前授权重载
+    expect(devicesCalls).toBe(2)
+    expect(window.location.hash).toBe('#/tasks')
+  })
+
+  test('permissions.changed 重建任务详情视图：重新拉取主任务与子任务，不残留旧授权代际数据', async () => {
+    const counters = { detail: 0, children: 0, devices: 0 }
+    stubTaskDetailFetch(counters)
+
+    window.location.hash = `#/tasks/${TASK_DETAIL_ID}`
+    render(App)
+    await vi.waitFor(() => expect(screen.getByTestId(`subtask-row-${SUBTASK_UNKNOWN_ID}`)).toBeTruthy())
+    expect(counters.detail).toBe(1)
+    expect(counters.children).toBe(1)
+
+    window.dispatchEvent(new Event('permissions.changed'))
+
+    await vi.waitFor(() => expect(counters.detail).toBe(2))
+    await vi.waitFor(() => expect(counters.children).toBe(2))
+    // 详情页仍在原路由上，且仍不出现管理员专属释放锁控件
+    expect(window.location.hash).toBe(`#/tasks/${TASK_DETAIL_ID}`)
+    expect(screen.queryByTestId(`release-lock-${SUBTASK_UNKNOWN_ID}`)).toBeNull()
+  })
 });

@@ -235,6 +235,48 @@ watch(
   { immediate: true },
 )
 
+// 授权代际（04-router-and-acceptance.md:35）：登出或授权变更时递增，作为任务相关视图的 :key，
+// 强制卸载并重建 TasksView / TaskDetailView —— 其内存中的 tasks 列表、待处理设备勾选与幂等键
+// 全部是组件局部状态，随组件卸载一并销毁，绝不跨授权代际残留。
+const tasksGeneration = ref(0)
+
+function handleAuthorizationChanged() {
+  // ① 任务视图整体重建：旧实例与其在途请求（onBeforeUnmount 的 abort）一起作废
+  tasksGeneration.value += 1
+  // ② 设备权限投影同样失效：先清空旧投影（fail-closed，绝不继续用旧授权放行危险操作），再按当前授权重载
+  devicesGeneration++
+  devicesList.value = []
+  devicesNextCursor.value = null
+  devicesError.value = null
+  devicesLoading.value = false
+  if (auth.status.value === 'signed_in') void loadDevices()
+}
+
+// 授权变更的三个来源：① 登出/会话失效（auth.status 离开 signed_in）；② /auth/me 返回的 authz_epoch
+// 前进或身份切换；③ SSE 客户端转发的 `permissions.changed` 命名事件（window 事件，见 onMounted）。
+// 初值 null 只作基线记录：首次 me()/login 建立 epoch/身份时尚无旧授权可失效，不触发重建。
+let lastAuthzUserId: string | null = null
+let lastAuthzEpoch: string | null = null
+
+watch(
+  [() => auth.status.value, () => auth.user.value?.id ?? null, () => auth.authzEpoch.value ?? null],
+  ([status, userId, epoch]) => {
+    if (status !== 'signed_in') {
+      // 登出：任务视图随 signed_in 分区一起卸载；代际仍递增，确保任何旧实例/旧响应一律作废
+      tasksGeneration.value += 1
+      lastAuthzUserId = null
+      lastAuthzEpoch = null
+      return
+    }
+    const identityChanged = lastAuthzUserId !== null && userId !== null && userId !== lastAuthzUserId
+    const epochAdvanced = lastAuthzEpoch !== null && epoch !== null && epoch !== lastAuthzEpoch
+    if (identityChanged || epochAdvanced) handleAuthorizationChanged()
+    lastAuthzUserId = userId
+    lastAuthzEpoch = epoch
+  },
+  { immediate: true },
+)
+
 function changeLocale(event: Event) {
   setLocale((event.target as HTMLSelectElement).value as Locale)
 }
@@ -271,6 +313,8 @@ async function retryRefresh() {
 }
 
 onMounted(async () => {
+  // SSE 客户端（后续任务）收到 `permissions.changed` 命名事件后在 window 上转发，App 层据此销毁任务态
+  window.addEventListener('permissions.changed', handleAuthorizationChanged)
   try {
     await auth.refresh()
   } finally {
@@ -279,6 +323,7 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  window.removeEventListener('permissions.changed', handleAuthorizationChanged)
   router.cleanup()
 })
 </script>
@@ -368,6 +413,7 @@ onUnmounted(() => {
       </template>
       <template v-else-if="route.name === 'tasks'">
         <TasksView
+          :key="`tasks-${tasksGeneration}`"
           :devices="devicesList"
           :pending-device-id="tasksPendingDevice"
           :csrf-token="auth.csrfToken.value ?? ''"
@@ -380,6 +426,7 @@ onUnmounted(() => {
       </template>
       <template v-else-if="route.name === 'task-detail'">
         <TaskDetailView
+          :key="`task-detail-${tasksGeneration}`"
           :task-id="route.params.id"
           :is-admin="auth.user.value?.is_admin === true"
           :device-permissions="taskPermissionByDevice"
