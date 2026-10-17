@@ -1027,9 +1027,6 @@ mod routes {
         if let Err(response) = require_business_session(&session) {
             return response;
         }
-        if let Err(response) = require_admin_session(&session) {
-            return response;
-        }
         let task_id = match parse_path_id(&raw_id) {
             Ok(task_id) => task_id,
             Err(err) => return task_error_response(&err),
@@ -1041,21 +1038,30 @@ mod routes {
         if let Err(err) = parse_decimal_u64(&request.expected_revision) {
             return task_error_response(&err);
         }
+        if let Err(response) = require_admin_session(&session) {
+            return response;
+        }
         match state.api.time_review(&session, task_id, request).await {
             Ok(detail) => match project_detail(&detail) {
                 Ok(view) => ok_response(view),
                 Err(err) => task_error_response(&err),
             },
-            // 本端点 DTO 已拒绝未知字段与未知枚举，服务侧 `InvalidArgument` 的唯一
-            // 业务成因是「主任务无 held 子任务」（Task 4 `time_review_in_tx` 的
-            // `rows.is_empty` 分支）；专用 message_key 需 error.rs 新变体，越出本
-            // 任务写作用域，故在此端点内以固定键输出。
-            Err(ControllerError::InvalidArgument) => err_response(
-                StatusCode::BAD_REQUEST,
-                "INVALID_ARGUMENT",
-                "task.no_held",
-                json!({}),
-            ),
+            // 本端点 DTO 已拒绝未知字段与未知枚举；服务侧 `InvalidArgument` 仍有两
+            // 个业务成因——「任务不存在」与「主任务无 held 子任务」（Task 4
+            // `time_review_in_tx` 两处分支共用同一变体，service.rs 越出本任务写
+            // 作用域，HTTP 层以只读 `task_detail` 复核区分）：复核确认 NotFound →
+            // 标准 404；其余（任务存在、复核不可用等）→ 400 `task.no_held`。
+            Err(ControllerError::InvalidArgument) => {
+                match state.api.task_detail(&session, task_id).await {
+                    Err(err @ ControllerError::NotFound) => task_error_response(&err),
+                    _ => err_response(
+                        StatusCode::BAD_REQUEST,
+                        "INVALID_ARGUMENT",
+                        "task.no_held",
+                        json!({}),
+                    ),
+                }
+            }
             Err(err) => task_error_response(&err),
         }
     }
@@ -1072,9 +1078,6 @@ mod routes {
             Err(response) => return response,
         };
         if let Err(response) = require_business_session(&session) {
-            return response;
-        }
-        if let Err(response) = require_admin_session(&session) {
             return response;
         }
         let subtask_id = match parse_path_id(&raw_id) {
@@ -1103,6 +1106,9 @@ mod routes {
         }
         if let Err(err) = parse_decimal_u64(&request.expected_revision) {
             return task_error_response(&err);
+        }
+        if let Err(response) = require_admin_session(&session) {
+            return response;
         }
         match state.api.release_lock(&session, subtask_id, request).await {
             Ok(response) => ok_response(strict_json(&response)),
@@ -1808,6 +1814,10 @@ mod tests {
     struct FakeTaskApi {
         calls: Mutex<Vec<&'static str>>,
         failure: Option<FakeFailure>,
+        /// 仅作用于 `task_detail` 的失败注入（优先于 `failure`）：用于模拟
+        /// 「time_review 报 InvalidArgument 而任务不存在（detail 报 NotFound）」
+        /// 的服务层组合。
+        detail_failure: Option<FakeFailure>,
         detail: TaskDetail,
         page: TaskPage,
         children: ChildrenPage,
@@ -1823,6 +1833,7 @@ mod tests {
             Self {
                 calls: Mutex::new(Vec::new()),
                 failure: None,
+                detail_failure: None,
                 preview: PreviewOutcome {
                     preview_token: "cd".repeat(32),
                     targets: vec![
@@ -1934,7 +1945,7 @@ mod tests {
         ) -> TaskFuture<'a, TaskDetail> {
             self.record("task_detail");
             let detail = self.detail.clone();
-            let failure = self.failure.map(FakeFailure::error);
+            let failure = self.detail_failure.or(self.failure).map(FakeFailure::error);
             Box::pin(async move { failure.map_or(Ok(detail), Err) })
         }
 
@@ -2611,6 +2622,79 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["code"], "INVALID_ARGUMENT");
         assert_eq!(body["error"]["message_key"], "task.no_held");
+    }
+
+    #[tokio::test]
+    async fn time_review_missing_task_maps_to_404_not_no_held() {
+        // 服务层对「任务不存在」同样报 InvalidArgument（与 no_held 共用变体），
+        // handler 必须以只读 task_detail 复核区分：NotFound → 标准 404。
+        let mut fake = FakeTaskApi::new();
+        fake.failure = Some(FakeFailure::InvalidArgument);
+        fake.detail_failure = Some(FakeFailure::NotFound);
+        let api = Arc::new(fake);
+        let task_id = api.detail.id;
+        let response = app(api.clone(), true, false, true)
+            .oneshot(post_request(
+                &format!("/api/v1/tasks/{task_id}/time-review"),
+                r#"{"expected_revision":"3","decision":"expire","evidence":"inconclusive"}"#,
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        let (status, body) = envelope(response).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "任务不存在必须 404 而非 400");
+        assert_eq!(body["error"]["code"], "NOT_FOUND");
+        assert_eq!(body["error"]["message_key"], "system.not_found");
+        assert_eq!(api.calls(), vec!["time_review", "task_detail"]);
+    }
+
+    #[tokio::test]
+    async fn non_admin_malformed_write_requests_prefer_400_over_403() {
+        // 门禁顺序钉死：path/body 参数解析与校验先于 require_admin_session，
+        // 非管理员的非法输入优先 400，不得先 403。
+        let task_id = Uuid::new_v4();
+        let time_review_body =
+            r#"{"expected_revision":"3","decision":"expire","evidence":"inconclusive"}"#;
+        let release_lock_body =
+            r#"{"expected_revision":"4","acknowledge_unknown":true,"reason":"ok"}"#;
+        for (uri, body, key) in [
+            (
+                format!("/api/v1/tasks/{task_id}/time-review"),
+                "{not-json",
+                "request.invalid_body",
+            ),
+            (
+                "/api/v1/tasks/not-a-uuid/time-review".to_owned(),
+                time_review_body,
+                "task.invalid_request",
+            ),
+            (
+                format!("/api/v1/subtasks/{task_id}/release-lock"),
+                "{not-json",
+                "request.invalid_body",
+            ),
+            (
+                "/api/v1/subtasks/not-a-uuid/release-lock".to_owned(),
+                release_lock_body,
+                "task.invalid_request",
+            ),
+        ] {
+            let api = Arc::new(FakeTaskApi::new());
+            let response = app(api.clone(), false, false, true)
+                .oneshot(post_request(&uri, body, true, None))
+                .await
+                .unwrap();
+            let (status, value) = envelope(response).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{uri} 非管理员非法输入必须优先 400 而非 403"
+            );
+            assert_eq!(value["error"]["code"], "INVALID_ARGUMENT");
+            assert_eq!(value["error"]["message_key"], key);
+            assert!(api.calls().is_empty(), "非法输入不得触达业务仓储");
+        }
     }
 
     #[tokio::test]
