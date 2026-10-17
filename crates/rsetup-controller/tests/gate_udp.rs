@@ -1,7 +1,12 @@
-//! Runtime Task 1b 受控测试：真请求关联（correlate）、门禁纯函数与启动总预算。
+//! Runtime Task 1b/1c 受控测试：
+//! - Task 1b：真请求关联（correlate）、门禁纯函数与启动总预算（顶层用例 + `startup_budget`）；
+//! - Task 1c：后台 `TimeGateDriver` 契约 1–8（源列表重读、周期/stale 复验、单调退避、跳钟失效、
+//!   脱敏审计、共享权威快照与线程安全通知、换代契约 7、`start_time_gate_with` 装配接线）
+//!   与 `wait_ready` RT-N4 断言（`driver_contracts`）。
 //!
 //! 全部使用进程内受控 fake（构造 48B NTP 响应、受控 `SntpResolver`/`SntpBindFuture`、
-//! 本地 127.0.0.1 fake UDP 服务器），不访问真实网络/NTP 服务。
+//! 本地 127.0.0.1 fake UDP 服务器、可编程 `TimeSampler`/`NtpSourceList`/`WallClock`/`Sleeper`/
+//! `TimeAuditSink`），不访问真实网络/NTP 服务。
 //! 时间控制 = 真实时间 + 短预算（300ms）+ `#[tokio::test]` 当前线程运行时；
 //! `startup_budget::startup_single_request_never_exceeds_3s_cap_when_configured_larger`
 //! 是本文件唯一 3s 量级用例（选定的单次上限本身为 3s，必须真实时间运行约 3s）。
@@ -573,6 +578,7 @@ mod driver_contracts {
         BACKOFF_MAX, BACKOFF_MIN, JUMP_FORWARD_MAX, NtpSourceList, READY_WAIT_TIMEOUT, SleepFuture,
         Sleeper, SourceListFuture, TimeAuditEvent, TimeAuditSink, TimeGateConfig, TimeGateDeps,
         TimeGateDriver, TimeGateHandle, TimeSampleFuture, TimeSampler, WallClock, next_backoff,
+        start_time_gate_with,
     };
     use rsetup_controller::time::socket::NtpSample;
 
@@ -889,6 +895,16 @@ mod driver_contracts {
         build(steps, revalidate_ms, max_age_ms, false)
     }
 
+    /// 取某类审计事件的**最后**一条（driver 持续运行，断言只看最新状态）。
+    fn last_event(h: &Harness, kind: &str) -> TimeAuditEvent {
+        h.audit
+            .events()
+            .into_iter()
+            .rev()
+            .find(|event| event.kind == kind)
+            .expect("审计事件")
+    }
+
     /// 真实短轮询（2ms 步进）：只等被测行为发生，不做精确计时断言。
     async fn wait_until<F: FnMut() -> bool>(mut cond: F, timeout: Duration, what: &str) {
         let deadline = tokio::time::Instant::now() + timeout;
@@ -1039,6 +1055,60 @@ mod driver_contracts {
             "driver 持久降级（非仅读取侧动态降级）"
         );
         assert_eq!(evidence.source, None, "失效清空 source");
+
+        // 契约 7（M1）：失效后重新恢复采样时，旧源与旧锚点已被清空、连续性不可证明，
+        // 必须保守换代（RT-R13-2 fail-closed）：新 clock_epoch + 紧跟的换代审计，
+        // 使失效前创建的 held 任务在恢复后被判定为参考系断裂，而非同纪元连续。
+        let epoch_before_stale = stale.clock_epoch;
+        assert_eq!(
+            h.audit.count_of("clock_epoch_renewed"),
+            0,
+            "失效本身不换代（换代由恢复承接）"
+        );
+        h.sampler.succeed_after(1);
+        wait_until(
+            || h.audit.count_of("ntp_recovered") >= 1,
+            Duration::from_secs(3),
+            "退避后恢复采样",
+        )
+        .await;
+        let events = h.audit.events();
+        let recovered = events
+            .iter()
+            .rev()
+            .find(|event| event.kind == "ntp_recovered")
+            .expect("恢复审计事件");
+        let renewed = events
+            .iter()
+            .rev()
+            .find(|event| event.kind == "clock_epoch_renewed")
+            .expect("M1：失效后恢复必须写换代审计");
+        assert_ne!(
+            recovered.clock_epoch, epoch_before_stale,
+            "M1：evidence_stale 失效后恢复不得沿用旧 clock_epoch"
+        );
+        assert_eq!(
+            renewed.clock_epoch, recovered.clock_epoch,
+            "换代审计与恢复事件同纪元"
+        );
+        assert_eq!(
+            (recovered.from, recovered.to, recovered.reason),
+            (
+                TimeQuality::SystemFallback,
+                TimeQuality::NtpValid,
+                "ntp_recovered"
+            )
+        );
+        let after = h.handle.current().await;
+        assert_eq!(after.quality, TimeQuality::NtpValid);
+        assert_eq!(
+            after.clock_epoch, recovered.clock_epoch,
+            "换代后 handle 读到新纪元"
+        );
+        assert_ne!(
+            after.clock_epoch, epoch_before_stale,
+            "权威快照的纪元必须已更新"
+        );
     }
 
     /// Stale 分支：不可信但不放行、不降级；按 `revalidate_interval` 复验，成功转 NtpValid。
@@ -1174,6 +1244,114 @@ mod driver_contracts {
         assert_eq!(ready.clock_epoch, switched.clock_epoch);
     }
 
+    /// 契约 7（RT-R12-2 / RT-R13-2）：**同源**阶跃校正双向均须换代。
+    /// 源列表全程不变（换代只可能由阶跃触发）：
+    /// - 同源平滑（参考系 +200ms，偏差 ≤ `CLOCK_STEP_MAX_MS`）→ 沿用旧纪元、零换代审计；
+    /// - 同源快进（+2s）→ 换代 + 换代审计；
+    /// - 同源回跳（−2s，相对外推期望 −4s）→ 再次换代 + 换代审计；
+    /// - 换代后继续同源平滑 → 不反复换代（换代次数稳定）。
+    #[tokio::test]
+    async fn driver_same_source_clock_step_renews_epoch_both_directions() {
+        let h = harness(vec![Step::ok(0)], 15, 60_000);
+        wait_until(
+            || h.handle.is_ready(),
+            Duration::from_secs(2),
+            "启动转 ready",
+        )
+        .await;
+        let startup = h.audit.find("ntp_startup").expect("启动审计事件");
+        let epoch_initial = startup.clock_epoch;
+
+        // ① 同源平滑：+200ms ≤ 1s → 沿用旧纪元，且全程不得出现换代审计
+        h.sampler.set_repeated(Step::ok(200));
+        let smooth_base = h.audit.count_of("ntp_revalidated");
+        wait_until(
+            || h.audit.count_of("ntp_revalidated") >= smooth_base + 3,
+            Duration::from_secs(2),
+            "同源平滑复验（+200ms）",
+        )
+        .await;
+        assert_eq!(
+            h.audit.count_of("clock_epoch_renewed"),
+            0,
+            "RT-R12-2：同源且外推偏差 ≤1s 不得换代"
+        );
+        assert_eq!(
+            last_event(&h, "ntp_revalidated").clock_epoch,
+            epoch_initial,
+            "同源平滑沿用旧纪元"
+        );
+
+        // ② 同源快进 +2s（> 1s）→ 换代
+        h.sampler.set_repeated(Step::ok(2_000));
+        wait_until(
+            || h.audit.count_of("clock_epoch_renewed") >= 1,
+            Duration::from_secs(2),
+            "同源快进换代",
+        )
+        .await;
+        let forward = last_event(&h, "clock_epoch_renewed");
+        let epoch_forward = forward.clock_epoch;
+        assert_ne!(
+            epoch_forward, epoch_initial,
+            "RT-R13-2：同源快进 >1s 必须换代"
+        );
+        assert_eq!(
+            last_event(&h, "ntp_revalidated").clock_epoch,
+            epoch_forward,
+            "换代审计与触发它的复验变迁同纪元"
+        );
+        assert_eq!(forward.reason, "clock_epoch_renewed");
+        assert_eq!(
+            h.handle.current().await.clock_epoch,
+            epoch_forward,
+            "快进换代后 handle 读到新纪元"
+        );
+
+        // ③ 同源回跳 −2s（相对外推期望 −4s，> 1s）→ 再次换代
+        h.sampler.set_repeated(Step::ok(-2_000));
+        wait_until(
+            || h.audit.count_of("clock_epoch_renewed") >= 2,
+            Duration::from_secs(2),
+            "同源回跳换代",
+        )
+        .await;
+        let backward = last_event(&h, "clock_epoch_renewed");
+        assert_ne!(
+            backward.clock_epoch, epoch_forward,
+            "RT-R13-2：同源回跳同样必须换代（双向触发）"
+        );
+        assert_ne!(backward.clock_epoch, epoch_initial);
+        assert_eq!(
+            last_event(&h, "ntp_revalidated").clock_epoch,
+            backward.clock_epoch,
+            "回跳换代审计与复验变迁同纪元"
+        );
+        let after = h.handle.current().await;
+        assert_eq!(after.quality, TimeQuality::NtpValid);
+        assert_eq!(after.clock_epoch, backward.clock_epoch);
+        assert_eq!(
+            after.source.as_deref(),
+            Some(SOURCE_A),
+            "全程同源：换代只可能由阶跃触发"
+        );
+
+        // ④ 换代后同源平滑：换代次数稳定在 2，不反复换代、纪元不再漂移
+        let settled_base = h.audit.count_of("ntp_revalidated");
+        wait_until(
+            || h.audit.count_of("ntp_revalidated") >= settled_base + 3,
+            Duration::from_secs(2),
+            "换代后同源平滑复验",
+        )
+        .await;
+        assert_eq!(
+            h.audit.count_of("clock_epoch_renewed"),
+            2,
+            "同源平滑复验不得反复换代"
+        );
+        assert_eq!(h.handle.current().await.clock_epoch, backward.clock_epoch);
+    }
+
     /// 契约 5：每次状态变迁写一条脱敏审计事件；载荷只含约定字段，不含源地址/端口/nonce。
     #[tokio::test]
     async fn driver_emits_redacted_audit_event_on_each_transition() {
@@ -1290,6 +1468,20 @@ mod driver_contracts {
             recovered.attempt >= 1,
             "恢复事件记录复位前消耗的退避尝试数：{}",
             recovered.attempt
+        );
+        // M1：失效后恢复必须换代——恢复事件之后紧跟换代审计，且纪元与失效前不同
+        let (renewed_after_recovery, _) = kinds
+            .iter()
+            .enumerate()
+            .find(|(index, kind)| *index > recovered_at && **kind == "clock_epoch_renewed")
+            .expect("M1：失效后恢复必须写换代审计");
+        assert_eq!(
+            events[renewed_after_recovery].clock_epoch, recovered.clock_epoch,
+            "换代审计与恢复事件同纪元"
+        );
+        assert_ne!(
+            recovered.clock_epoch, stale.clock_epoch,
+            "M1：evidence_stale 失效后恢复不得沿用旧 clock_epoch"
         );
         assert_eq!(h.handle.retry_attempt(), 0, "恢复后 attempt 归零");
         assert!(
@@ -1479,6 +1671,107 @@ mod driver_contracts {
         assert!(
             elapsed >= Duration::from_millis(150) && elapsed < Duration::from_secs(5),
             "一次 notify 唤醒全部调用方，无一因丢通知死等超时：{elapsed:?}"
+        );
+    }
+
+    // --------------------------------------------------------------------------
+    // C. 契约 8：公开装配路径 `start_time_gate_with` 的真实 spawn 接线
+    // --------------------------------------------------------------------------
+
+    /// 契约 8：公开装配函数 `start_time_gate_with` 必须真正完成「校验配置 → 构造 handle →
+    /// 组装 `TimeGateDriver` → `tokio::spawn`」接线：由 spawn 出的 driver 执行启动采样，
+    /// 把 handle 从初始 `Stale` 推到 `NtpValid` + ready，并写 `ntp_startup` 脱敏审计。
+    /// 若装配或 spawn 回归被破坏，`is_ready` 永不置位，本用例在 2s 轮询处失败。
+    #[tokio::test]
+    async fn start_time_gate_with_spawns_driver_that_reaches_ready() {
+        let config = TimeGateConfig {
+            servers: vec![SOURCE_A.to_string()],
+            request_timeout: Duration::from_millis(50),
+            startup_budget: Duration::from_millis(200),
+            max_rtt_ms: 2_000,
+            revalidate_interval: Duration::from_millis(20),
+            max_evidence_age_ms: 60_000,
+        };
+        let sampler = FakeSampler::new(vec![Step::ok(0)]);
+        let sources = FakeSources::new(vec![SOURCE_A.to_string()]);
+        let wall = FakeWallClock::new();
+        let sleeper = RecordingSleeper::new();
+        let audit = Arc::new(MemAuditSink::default());
+        let sampler_dep: Arc<dyn TimeSampler> = sampler.clone();
+        let sources_dep: Arc<dyn NtpSourceList> = sources.clone();
+        let wall_dep: Arc<dyn WallClock> = wall.clone();
+        let sleeper_dep: Arc<dyn Sleeper> = sleeper.clone();
+        let audit_dep: Arc<dyn TimeAuditSink> = audit.clone();
+        let clock_epoch = Uuid::new_v4();
+
+        let handle = start_time_gate_with(
+            config,
+            clock_epoch,
+            TimeGateDeps {
+                sampler: sampler_dep,
+                sources: sources_dep,
+                wall_clock: wall_dep,
+                sleeper: sleeper_dep,
+                audit: audit_dep,
+            },
+        );
+
+        wait_until(
+            || handle.is_ready(),
+            Duration::from_secs(2),
+            "start_time_gate_with spawn 的 driver 完成启动采样并转 ready",
+        )
+        .await;
+        let evidence = handle.current().await;
+        assert_eq!(
+            evidence.quality,
+            TimeQuality::NtpValid,
+            "契约 8：启动采样成功 → NtpValid"
+        );
+        assert_eq!(
+            evidence.clock_epoch, clock_epoch,
+            "契约 7 情形 1：首次采样沿用调用方传入的 clock_epoch"
+        );
+        assert_eq!(evidence.source.as_deref(), Some(SOURCE_A));
+        assert!(
+            !handle.background_retry_active(),
+            "启动采样成功即停止后台退避重试"
+        );
+        assert!(sampler.calls() >= 1, "spawn 出的 driver 必须真实调用采样器");
+        assert_eq!(
+            sampler.seen(0),
+            vec![SOURCE_A.to_string()],
+            "driver 通过注入的源列表读取源"
+        );
+
+        // 已 ready 的 handle 上 `wait_ready` 立即返回同一权威快照（接线端到端可用）
+        let ready = handle.wait_ready().await;
+        assert_eq!(ready.quality, TimeQuality::NtpValid);
+        assert_eq!(ready.clock_epoch, clock_epoch);
+
+        let events = audit.events();
+        let startup = events.first().expect("启动审计事件");
+        assert_eq!(
+            (startup.kind, startup.from, startup.to, startup.reason),
+            (
+                "ntp_startup",
+                TimeQuality::Stale,
+                TimeQuality::NtpValid,
+                "ntp_startup"
+            )
+        );
+        assert_eq!(startup.clock_epoch, clock_epoch);
+        assert_eq!(
+            audit.count_of("clock_epoch_renewed"),
+            0,
+            "首次采样沿用调用方纪元，不写换代审计"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| matches!(event.kind, "ntp_startup" | "ntp_revalidated")),
+            "装配路径事件种类封闭：{:?}",
+            events.iter().map(|event| event.kind).collect::<Vec<_>>()
         );
     }
 }

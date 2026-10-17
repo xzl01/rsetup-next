@@ -539,6 +539,12 @@ pub struct TimeGateDriver {
     attempt: u32,
     /// 跳钟检测基线（契约 4）。
     last_wall: Option<SystemTime>,
+    /// 契约 7（M1）：本进程是否**曾经**取得过合格样本。
+    /// 失效（`invalidate`）会把快照 `evidence.source` 清空为 `None`，与「从未采样」在快照上
+    /// 表现相同；仅凭 `source == None` 无法区分两者，会让失效后恢复的采样沿用旧 `clock_epoch`，
+    /// 把参考系断裂误判为连续（违反 RT-R13-2 的 fail-closed 意图）。故单独记一位：
+    /// `source == None && has_ever_sampled` ⟺ 「曾有效、已失效」→ 恢复时必须换代。
+    has_ever_sampled: bool,
 }
 
 impl TimeGateDriver {
@@ -558,6 +564,7 @@ impl TimeGateDriver {
             sleeper: deps.sleeper,
             attempt: 0,
             last_wall: None,
+            has_ever_sampled: false,
         }
     }
 
@@ -670,8 +677,21 @@ impl TimeGateDriver {
     }
 
     /// 取得合格样本：更新证据、必要时换代（RT-R12-2 / RT-R13-2）、写脱敏审计、必要时转 ready。
+    ///
+    /// 契约 7 换代判定的三种情形：
+    /// 1. 系统启动以来**首次**取得样本（`!has_ever_sampled`）：无前序参考系可比对，沿用调用方
+    ///    传入的进程 `clock_epoch`，不换代；
+    /// 2. 曾取得有效样本、其后被 `invalidate` 清空 `source`（`source == None` 且
+    ///    `has_ever_sampled`）：连续性已无法证明（旧源与旧锚点均被清空），保守判定不连续 →
+    ///    换代并写 `clock_epoch_renewed`，杜绝失效前创建的 held 任务在恢复后被误判为同参考系；
+    /// 3. 有前序源：来源切换，或同源但单调外推期望参考偏差 > `CLOCK_STEP_MAX_MS`（回跳与快进
+    ///    双向）→ 换代；同源且偏差 ≤ 阈值 → 沿用旧纪元。
     async fn transition(&mut self, sample: NtpSample, source: String, kind: &'static str) {
         let attempt_before_reset = self.attempt;
+        // M1：`source == None` 同时对应「从未采样」与「失效后恢复」，必须在进入写锁前固定
+        // 本次是否首次采样，避免把失效后的恢复误判为首次采样而沿用旧纪元。
+        let first_sample = !self.has_ever_sampled;
+        self.has_ever_sampled = true;
         let (from, clock_epoch, renewed) = {
             // 契约 6：证据与锚点在同一写锁内原子写入；换代判定也在同一写锁内基于旧快照完成。
             let mut snap = self.snapshot.write().await;
@@ -695,8 +715,10 @@ impl TimeGateDriver {
                 - i128::from(expected_ref_ms))
             .abs();
             let discontinuous = match snap.evidence.source.as_deref() {
-                // 首次取得样本：无前序参考系可比对，沿用调用方给定的进程 clock_epoch。
-                None => false,
+                // 情形 1：首次取得样本 → 沿用调用方给定的进程 clock_epoch；
+                // 情形 2：曾有效、已被失效清空 source → 连续性不可证明，保守换代。
+                None => !first_sample,
+                // 情形 3：来源切换，或同源但阶跃（回跳/快进双向）超过阈值。
                 Some(previous) => previous != source || step_ms > i128::from(CLOCK_STEP_MAX_MS),
             };
             if discontinuous {
@@ -742,13 +764,19 @@ impl TimeGateDriver {
             });
         }
         // 契约 6：转 ready 统一在此 store + notify_waiters（wait_ready 先注册后复查，不丢通知）。
-        self.is_ready.store(true, Ordering::SeqCst);
-        self.ready.notify_waiters();
+        // N1：仅**首次**由未 ready 翻转为 ready 时唤醒等待者；后续 60s 周期复验的幂等 store
+        // 不再无意义唤醒（swap 返回旧值，SeqCst 与 wait_ready 的 load 全序一致）。
+        if !self.is_ready.swap(true, Ordering::SeqCst) {
+            self.ready.notify_waiters();
+        }
     }
 
     /// 失效降级：同一写锁内清空证据（source/offset/uncertainty/age 与单调锚点）、置
     /// `SystemFallback`，必要时换代（跳钟，RT-R8-1）；`attempt = 0`、`retry_active = true`，
     /// 随后写脱敏审计（契约 5）。
+    ///
+    /// 契约 7（M1）：`evidence_stale` 这类不换代失效只清空证据，**不**在此处生成新纪元；
+    /// 连续性断裂由下一次成功采样在 `transition` 中依据 `has_ever_sampled` 保守换代承接。
     async fn invalidate(&mut self, kind: &'static str, renew_epoch: bool) {
         let (from, clock_epoch, wall) = {
             let mut snap = self.snapshot.write().await;
