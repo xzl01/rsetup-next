@@ -257,11 +257,13 @@ pub(crate) async fn list_devices(
 // GET /api/v1/devices/{id}：device.read 详情 + 单次实时探针
 // ---------------------------------------------------------------------------
 
+/// 传输准入状态按 spec 02 §2 固定为大写 `PENDING`/`APPROVED`/`REVOKED`；
+/// 小写形式仅属于应用审核决定（`review_decision_str`），两者不得混用。
 fn admission_state_str(state: AdmissionState) -> &'static str {
     match state {
-        AdmissionState::Pending => "pending",
-        AdmissionState::Approved => "approved",
-        AdmissionState::Revoked => "revoked",
+        AdmissionState::Pending => "PENDING",
+        AdmissionState::Approved => "APPROVED",
+        AdmissionState::Revoked => "REVOKED",
     }
 }
 
@@ -1015,7 +1017,7 @@ mod tests {
         let value = body_json(res).await;
         assert_eq!(value["data"]["device_id"], hex::encode([0x22u8; 32]));
         assert_eq!(value["data"]["display_name"], "fixture-device");
-        assert_eq!(value["data"]["admission_state"], "approved");
+        assert_eq!(value["data"]["admission_state"], "APPROVED");
         assert_eq!(value["data"]["review_decision"], "none");
         assert_eq!(value["data"]["revision"], "7");
         assert_eq!(
@@ -1033,6 +1035,14 @@ mod tests {
             value["data"]["effective_permissions"],
             serde_json::json!(["device.read"])
         );
+    }
+
+    #[test]
+    fn admission_state_str_matches_uppercase_wire_contract() {
+        // spec 02 §2：传输准入为大写；小写仅属于 review_decision。
+        assert_eq!(admission_state_str(AdmissionState::Pending), "PENDING");
+        assert_eq!(admission_state_str(AdmissionState::Approved), "APPROVED");
+        assert_eq!(admission_state_str(AdmissionState::Revoked), "REVOKED");
     }
 
     #[tokio::test]
