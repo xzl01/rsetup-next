@@ -506,20 +506,17 @@ pub fn build_authorization_snapshot(
             let role = roles
                 .get(rid)
                 .ok_or_else(|| read_error("snapshot.role_ref"))?;
-            // 归档 role 允许合法清空 permissions（父行保留 = 该 grant 无权，而非污染）；
-            // 被引用的当前有效 role 必须非空且无重复权限，否则是持久污染，
+            // 归档 role 仅可豁免"非空"要求（合法清空 permissions 后保留父行 = 该 grant 无权，
+            // 而非污染）；重复权限无论是否归档都是持久污染，必须失败关闭，
             // 不得按"该 grant 无权限"继续降级求值。
-            if role.archived {
-                continue;
-            }
-            if role.permissions.is_empty()
-                || role
-                    .permissions
-                    .iter()
-                    .copied()
-                    .collect::<HashSet<_>>()
-                    .len()
-                    != role.permissions.len()
+            if role
+                .permissions
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>()
+                .len()
+                != role.permissions.len()
+                || (!role.archived && role.permissions.is_empty())
             {
                 return Err(read_error("snapshot.role_permission"));
             }
@@ -2264,6 +2261,75 @@ mod tests {
                 vec![Permission::DeviceRead, Permission::DeviceReboot]
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn snapshot_build_fails_closed_on_archived_role_duplicate_permissions() {
+        // 归档 role 仅豁免"permissions 非空"，绝不豁免"无重复权限"：
+        // archived + 重复 permissions 仍是持久污染，必须与 decode_snapshot_roles 一致失败关闭。
+        let role_id = Uuid::from_bytes([0x5b; 16]);
+        let actor = SnapshotActor {
+            id: [1u8; 16],
+            active: true,
+            is_admin: false,
+            must_change_password: false,
+        };
+        let grants = vec![GrantRecord {
+            id: Uuid::from_bytes([0x0f; 16]),
+            user_id: [1u8; 16],
+            source: GrantSource::Role(role_id),
+            scope: GrantScope::All,
+            revision: 1,
+        }];
+        let build_with = |permissions: Vec<Permission>| {
+            let mut roles = HashMap::new();
+            roles.insert(
+                role_id,
+                RoleRecord {
+                    id: role_id,
+                    name: "viewer".into(),
+                    builtin: false,
+                    archived: true,
+                    revision: 1,
+                    permissions,
+                },
+            );
+            build_authorization_snapshot(
+                actor,
+                1,
+                grants.clone(),
+                roles,
+                HashMap::new(),
+                HashMap::new(),
+            )
+        };
+        let duplicated =
+            build_with(vec![Permission::DeviceRead, Permission::DeviceRead]).unwrap_err();
+        assert!(
+            matches!(
+                &duplicated,
+                ControllerError::Config(m) if m == "identity admin read snapshot.role_permission"
+            ),
+            "archived role with duplicate permissions must be the exact fixed redacted Config, got {duplicated:?}",
+        );
+        let duplicated_three = build_with(vec![
+            Permission::DeviceRead,
+            Permission::DeviceReboot,
+            Permission::DeviceRead,
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            &duplicated_three,
+            ControllerError::Config(m) if m == "identity admin read snapshot.role_permission"
+        ));
+        assert!(
+            build_with(vec![]).is_ok(),
+            "archived role may keep empty permissions"
+        );
+        assert!(
+            build_with(vec![Permission::DeviceRead, Permission::DeviceReboot]).is_ok(),
+            "archived role with distinct permissions is legal"
         );
     }
 
