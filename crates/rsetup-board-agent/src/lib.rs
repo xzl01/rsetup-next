@@ -7,15 +7,21 @@ pub mod journal;
 pub mod read_only;
 #[cfg(any(test, feature = "test-seam"))]
 pub mod test_seam;
+pub mod tickets;
 
 pub use actions::{
     ACTION_ALLOWLIST, ActionKind, ActionSpec, allowed_action_names, is_reserved, lookup_action,
 };
 pub use dispatch::{
-    BoardAgent, BusinessResponse, BusinessStatus, JournalEpochSource, TaskJournalReader,
+    BoardAgent, BusinessResponse, BusinessStatus, ExecuteOutcome, HostRebootOs, JournalEpochSource,
+    RebootDispatcher, RebootExecutor, RebootOs, RecordingOs, TaskJournalReader,
 };
 pub use journal::{
     DedupOutcome, EvidenceMerge, Fs, JOURNAL_MAX_RECORDS, JOURNAL_SCHEMA_VERSION, JournalError,
     JournalRecovery, JournalStore, RealFs, TaskJournal, TaskRecord, TaskState,
 };
 pub use read_only::{PeerContext, ReadOnlyMutationGuard, ReadOnlySource};
+pub use tickets::{
+    TICKET_TOKEN_BYTES, TICKET_TTL_MS, TICKET_TTL_SECS, TicketBinding, TicketManager, TicketOrigin,
+    TicketToken,
+};
