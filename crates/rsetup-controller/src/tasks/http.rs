@@ -1046,20 +1046,30 @@ mod routes {
                 Ok(view) => ok_response(view),
                 Err(err) => task_error_response(&err),
             },
-            // 本端点 DTO 已拒绝未知字段与未知枚举；服务侧 `InvalidArgument` 仍有两
-            // 个业务成因——「任务不存在」与「主任务无 held 子任务」（Task 4
-            // `time_review_in_tx` 两处分支共用同一变体，service.rs 越出本任务写
-            // 作用域，HTTP 层以只读 `task_detail` 复核区分）：复核确认 NotFound →
-            // 标准 404；其余（任务存在、复核不可用等）→ 400 `task.no_held`。
+            // 本端点 DTO 已拒绝未知字段与未知枚举；服务侧 `InvalidArgument` 仍有三
+            // 个业务成因——「任务不存在」「主任务无 held 子任务」与「决策与现状矛
+            // 盾」（Task 4 `time_review_in_tx` 多处分支共用同一变体，service.rs 越
+            // 出本任务写作用域，HTTP 层以只读 `task_detail` 复核区分）：
+            // - 复核 Ok 且可见全集仍含 held → 任务确有 held 子任务，属矛盾等非法
+            //   请求 → 标准 400 `task.invalid_request`，不得谎报 `task.no_held`；
+            // - 复核 Ok 且无 held → 400 `task.no_held`；
+            // - 复核 Err（NotFound → 404；Database 等 → 503）→ 原样透传，
+            //   不得把复核自身的失败吞没成 400。
             Err(ControllerError::InvalidArgument) => {
                 match state.api.task_detail(&session, task_id).await {
-                    Err(err @ ControllerError::NotFound) => task_error_response(&err),
-                    _ => err_response(
-                        StatusCode::BAD_REQUEST,
-                        "INVALID_ARGUMENT",
-                        "task.no_held",
-                        json!({}),
-                    ),
+                    Ok(detail) => {
+                        if detail.visible_states.contains(&SubTaskState::Held) {
+                            task_error_response(&ControllerError::InvalidArgument)
+                        } else {
+                            err_response(
+                                StatusCode::BAD_REQUEST,
+                                "INVALID_ARGUMENT",
+                                "task.no_held",
+                                json!({}),
+                            )
+                        }
+                    }
+                    Err(err) => task_error_response(&err),
                 }
             }
             Err(err) => task_error_response(&err),
@@ -1818,6 +1828,10 @@ mod tests {
         /// 「time_review 报 InvalidArgument 而任务不存在（detail 报 NotFound）」
         /// 的服务层组合。
         detail_failure: Option<FakeFailure>,
+        /// 为真时 `task_detail` 忽略 `failure` 注入直接返回 `detail`：用于模拟
+        /// 「time_review 报 InvalidArgument 但只读复核成功」的组合（no_held 与
+        /// 决策矛盾两条分支）。
+        detail_ok: bool,
         detail: TaskDetail,
         page: TaskPage,
         children: ChildrenPage,
@@ -1834,6 +1848,7 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
                 failure: None,
                 detail_failure: None,
+                detail_ok: false,
                 preview: PreviewOutcome {
                     preview_token: "cd".repeat(32),
                     targets: vec![
@@ -1945,7 +1960,12 @@ mod tests {
         ) -> TaskFuture<'a, TaskDetail> {
             self.record("task_detail");
             let detail = self.detail.clone();
-            let failure = self.detail_failure.or(self.failure).map(FakeFailure::error);
+            let failure = if self.detail_ok {
+                None
+            } else {
+                self.detail_failure.or(self.failure)
+            }
+            .map(FakeFailure::error);
             Box::pin(async move { failure.map_or(Ok(detail), Err) })
         }
 
@@ -2605,8 +2625,10 @@ mod tests {
 
     #[tokio::test]
     async fn time_review_no_held_maps_to_400_task_no_held() {
+        // 复核成功且可见全集（Succeeded/Unknown）不含 held → 确实无 held 子任务。
         let mut fake = FakeTaskApi::new();
         fake.failure = Some(FakeFailure::InvalidArgument);
+        fake.detail_ok = true;
         let api = Arc::new(fake);
         let task_id = api.detail.id;
         let response = app(api.clone(), true, false, true)
@@ -2622,6 +2644,58 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["code"], "INVALID_ARGUMENT");
         assert_eq!(body["error"]["message_key"], "task.no_held");
+        assert_eq!(api.calls(), vec!["time_review", "task_detail"]);
+    }
+
+    #[tokio::test]
+    async fn time_review_contradiction_with_held_maps_to_400_invalid_request() {
+        // 复核成功但可见全集仍含 held：服务侧 InvalidArgument 的成因是决策矛盾
+        // （Contradiction）等非法请求，任务确有 held 子任务，不得谎报 task.no_held。
+        let mut fake = FakeTaskApi::new();
+        fake.failure = Some(FakeFailure::InvalidArgument);
+        fake.detail_ok = true;
+        fake.detail.visible_states = vec![SubTaskState::Held, SubTaskState::Succeeded];
+        let api = Arc::new(fake);
+        let task_id = api.detail.id;
+        let response = app(api.clone(), true, false, true)
+            .oneshot(post_request(
+                &format!("/api/v1/tasks/{task_id}/time-review"),
+                r#"{"expected_revision":"3","decision":"expire","evidence":"inconclusive"}"#,
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        let (status, body) = envelope(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "INVALID_ARGUMENT");
+        assert_eq!(body["error"]["message_key"], "task.invalid_request");
+        assert_eq!(api.calls(), vec!["time_review", "task_detail"]);
+    }
+
+    #[tokio::test]
+    async fn time_review_detail_database_error_maps_to_503() {
+        // 复核自身失败（Database）必须原样透传 503，不得被吞没为 400 task.no_held。
+        let mut fake = FakeTaskApi::new();
+        fake.failure = Some(FakeFailure::InvalidArgument);
+        fake.detail_failure = Some(FakeFailure::Database);
+        let api = Arc::new(fake);
+        let task_id = api.detail.id;
+        let response = app(api.clone(), true, false, true)
+            .oneshot(post_request(
+                &format!("/api/v1/tasks/{task_id}/time-review"),
+                r#"{"expected_revision":"3","decision":"expire","evidence":"inconclusive"}"#,
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        let (status, body) = envelope(response).await;
+        // 复核自身失败不得被吞没为 400 `task.no_held`。
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["code"], "STORAGE_UNAVAILABLE");
+        assert_eq!(body["error"]["message_key"], "system.storage_unavailable");
+        assert_eq!(api.calls(), vec!["time_review", "task_detail"]);
     }
 
     #[tokio::test]
