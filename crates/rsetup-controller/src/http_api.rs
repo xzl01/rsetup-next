@@ -12,6 +12,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
 use crate::auth::service::IdentityUser;
+use crate::authz::sqlx_repo::UserRecord;
 
 /// Fresh per-response correlation id: a random (v4) UUID, canonical lowercase.
 pub fn request_id() -> String {
@@ -53,6 +54,21 @@ pub fn user_public(u: &IdentityUser) -> Value {
     json!({
         "id": uuid::Uuid::from_bytes(u.id).to_string(),
         "username": u.username,
+        "active": u.active,
+        "is_admin": u.is_admin,
+        "must_change_password": u.must_change_password,
+        "revision": u.revision.to_string(),
+    })
+}
+
+/// 管理侧用户投影（spec 02 §4）：canonical 小写 UUID 字符串 id、`display_name`、
+/// 严格 JSON 布尔与十进制字符串 `revision`；`UserRecord` 本身不含密码哈希，
+/// 投影亦不得新增任何凭据字段。
+pub fn user_admin_public(u: &UserRecord) -> Value {
+    json!({
+        "id": uuid::Uuid::from_bytes(u.id).to_string(),
+        "username": u.username,
+        "display_name": u.display_name,
         "active": u.active,
         "is_admin": u.is_admin,
         "must_change_password": u.must_change_password,
