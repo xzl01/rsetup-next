@@ -197,6 +197,19 @@ pub trait AuthorizationSnapshotRepository: Send + Sync {
         target_user: [u8; 16],
         device_ids: &'a [[u8; 32]],
     ) -> RepoFuture<'a, AuthorizationSnapshot>;
+
+    /// protected 管理来源页：同一受保护读事务内按 target 用户投影有效权限与来源归因。
+    /// 可编译默认可失败关闭；未覆盖该方法的旧 fixture 不得因此得到成功空页。
+    fn load_admin_target_page<'a>(
+        &'a self,
+        _caller: &'a Session,
+        _target: [u8; 16],
+        _device_id: Option<[u8; 32]>,
+        _cursor: Option<[u8; 32]>,
+        _limit: usize,
+    ) -> RepoFuture<'a, serde_json::Value> {
+        Box::pin(async { Err(ControllerError::PermissionDenied) })
+    }
 }
 
 pub struct SqlxAuthzRepository {
@@ -839,6 +852,10 @@ pub(crate) const LIST_GROUP_DEVICE_IDS_SQL: &str = "SELECT m.device_id FROM grou
 
 pub(crate) const DEVICE_GROUPS_FOR_DEVICE_SQL: &str = "SELECT gm.group_id, CAST(dg.id IS NOT NULL AS SIGNED) AS group_exists, CAST(dg.archived AS SIGNED) AS group_archived, CAST(d.public_key IS NOT NULL AS SIGNED) AS device_exists, CAST(d.archived AS SIGNED) AS device_archived FROM group_members gm LEFT JOIN device_groups dg ON dg.id = gm.group_id LEFT JOIN devices d ON d.public_key = gm.device_id WHERE gm.device_id = ? ORDER BY gm.group_id";
 
+/// 管理来源页的候选设备 keyset 扫描（Task 13a）：只收未归档设备，3 个绑定
+/// （`cursor` 两次 + `limit + 1`）。`device_id` 筛选在调用侧短路，不进本 SQL。
+pub(crate) const ADMIN_TARGET_DEVICE_KEYS_SQL: &str = "SELECT public_key FROM devices WHERE archived=FALSE AND (? IS NULL OR public_key > ?) ORDER BY public_key LIMIT ?";
+
 pub(crate) async fn acquire_authorization_read_connection(
     db: &DbPool,
 ) -> Result<sqlx::pool::PoolConnection<sqlx::MySql>, ControllerError> {
@@ -1238,6 +1255,101 @@ impl AuthorizationSnapshotRepository for SqlxAuthorizationSnapshotRepository {
                 load_admin_target_snapshot_in_tx(&mut tx, caller, target_user, device_ids).await?;
             tx.commit().await.map_err(|_| read_error("snapshot.tx"))?;
             Ok(snapshot)
+        })
+    }
+
+    fn load_admin_target_page<'a>(
+        &'a self,
+        caller: &'a Session,
+        target: [u8; 16],
+        device_id: Option<[u8; 32]>,
+        cursor: Option<[u8; 32]>,
+        limit: usize,
+    ) -> RepoFuture<'a, serde_json::Value> {
+        let db = &self.db;
+        Box::pin(async move {
+            if !(1..=200).contains(&limit) {
+                return Err(ControllerError::InvalidArgument);
+            }
+            let mut connection = acquire_authorization_read_connection(db).await?;
+            let mut tx = sqlx::Connection::begin(&mut *connection).await?;
+            // 同连接同事务：caller 当前 admin（DB raw_bool），行缺失 → PermissionDenied。
+            ensure_actor_admin_readonly(&mut tx, caller).await?;
+            // target 存在性同 tx 检查：缺失是 protected 目标 404，不误映 PermissionDenied；
+            // target inactive / must_change_password 属合法存在，来源/权限可为空。
+            let exists = sqlx::query_scalar::<_, Vec<u8>>("SELECT id FROM users WHERE id=?")
+                .bind(target.as_slice())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|_| read_error("snapshot.actor"))?;
+            if exists.is_none() {
+                return Err(ControllerError::NotFound);
+            }
+            let keys: Vec<[u8; 32]> = match device_id {
+                Some(id) => vec![id],
+                None => {
+                    let scan_limit =
+                        u64::try_from(limit + 1).map_err(|_| ControllerError::InvalidArgument)?;
+                    sqlx::query_scalar::<_, Vec<u8>>(ADMIN_TARGET_DEVICE_KEYS_SQL)
+                        .bind(cursor.map(|key| key.to_vec()))
+                        .bind(cursor.map(|key| key.to_vec()))
+                        .bind(scan_limit)
+                        .fetch_all(&mut *tx)
+                        .await?
+                        .into_iter()
+                        .map(|raw| raw.try_into().map_err(|_| read_error("snapshot.device_id")))
+                        .collect::<Result<Vec<_>, _>>()?
+                }
+            };
+            // 单快照：target 的 grants/roles/device_groups/devices 全部在同一 tx 内加载，
+            // schema_meta 单例与版本防线由 load_snapshot_in_tx 承担，不另开第二套。
+            let snapshot = load_snapshot_in_tx(&mut tx, target, &keys).await?;
+            if let Some(id) = device_id {
+                if !snapshot.devices.get(&id).is_some_and(|view| !view.archived) {
+                    return Err(ControllerError::NotFound);
+                }
+            }
+            let has_next = device_id.is_none() && keys.len() > limit;
+            let mut items = Vec::new();
+            let mut last = None;
+            for key in keys.iter().take(limit) {
+                let permissions =
+                    crate::authz::service::snapshot_effective_permissions(&snapshot, *key);
+                let mut effective: Vec<_> = permissions
+                    .iter()
+                    .map(|permission| permission.as_str())
+                    .collect();
+                effective.sort_unstable();
+                let sources = crate::authz::service::snapshot_permission_sources(&snapshot, *key)
+                    .into_iter()
+                    .map(|entry| {
+                        let source = match entry.source {
+                            crate::authz::policy::PermissionSourceKind::Admin => {
+                                serde_json::json!({"kind":"admin"})
+                            }
+                            crate::authz::policy::PermissionSourceKind::Role(id) => {
+                                serde_json::json!({"kind":"role","role_id":id.to_string()})
+                            }
+                            crate::authz::policy::PermissionSourceKind::Direct(id) => {
+                                serde_json::json!({"kind":"direct","grant_id":id.to_string()})
+                            }
+                        };
+                        serde_json::json!({"permission":entry.permission.as_str(),"source":source})
+                    })
+                    .collect::<Vec<_>>();
+                items.push(serde_json::json!({
+                    "device_id": hex::encode(key),
+                    "effective_permissions": effective,
+                    "sources": sources,
+                }));
+                last = Some(*key);
+            }
+            tx.commit().await?;
+            // 内部 raw key（末项公钥 hex64）；出口签名归 HTTP 层。
+            Ok(serde_json::json!({
+                "items": items,
+                "next_cursor": if has_next { last.map(hex::encode) } else { None },
+            }))
         })
     }
 }
@@ -2879,9 +2991,7 @@ impl AuthzRepository for SqlxAuthzRepository {
 mod tests {
     use super::*;
     use crate::authz::policy::{GrantScope, GrantSource, Permission};
-    use crate::devices::repository::{
-        AUDIT_PAGE_SQL, DEVICE_PAGE_KEYS_FIRST_SQL, DEVICE_PAGE_KEYS_SQL,
-    };
+    use crate::devices::repository::{APPROVAL_PAGE_SQL, AUDIT_PAGE_SQL, DEVICE_FILTER_KEYS_SQL};
 
     #[test]
     fn user_decode_fails_closed_on_polluted_boolean_and_username() {
@@ -2983,8 +3093,6 @@ mod tests {
         }
 
         assert_eq!(LIST_GROUPS_SQL.matches('?').count(), 2);
-        assert_eq!(DEVICE_PAGE_KEYS_SQL.matches('?').count(), 2); // (cursor, limit+1)：候选公钥扫描，取代旧全列 DEVICE_PAGE_SQL
-        assert_eq!(DEVICE_PAGE_KEYS_FIRST_SQL.matches('?').count(), 1);
         assert_eq!(AUDIT_PAGE_SQL.matches('?').count(), 11); // filter 4 + cursor 6 + limit 1
         // 内部快照层：固定 SQL 绑定数与模板占位符标记漂移必须离线暴露（占位符由同事务层按去重 id 数 1:1 展开，不拼进模板字面量）。
         assert_eq!(SNAPSHOT_META_SQL.matches('?').count(), 0);
@@ -2993,6 +3101,32 @@ mod tests {
         assert!(ROLE_PERMISSIONS_BY_ROLE_IDS_SQL_TEMPLATE.contains("IN ({placeholders})"));
         assert!(GROUPS_FOR_DEVICES_SQL_TEMPLATE.contains("IN ({placeholders})"));
         assert!(DEVICES_BY_IDS_SQL_TEMPLATE.contains("IN ({placeholders})"));
+    }
+
+    #[test]
+    fn management_page_filter_sql_binds_are_pinned_to_seven_five_three() {
+        // Task 13a 三条新 SQL 的绑定数与关键形状必须离线钉死；这只是 SQL 文本形状检查，
+        // 不声称真实引擎过滤/隔离行为（真实过滤归 Task 14 受控真库用例）。
+        // 设备统一扫描：cursor 2 + search 2 + group 2 + limit 1 = 7。
+        assert_eq!(DEVICE_FILTER_KEYS_SQL.matches('?').count(), 7);
+        for token in [
+            "LOCATE",
+            "group_members",
+            "ORDER BY d.public_key",
+            "dg.archived=FALSE",
+        ] {
+            assert!(
+                DEVICE_FILTER_KEYS_SQL.contains(token),
+                "device filter SQL must pin {token}: {DEVICE_FILTER_KEYS_SQL}"
+            );
+        }
+        // 审批页：cursor 2 + decision 2 + limit 1 = 5。
+        assert_eq!(APPROVAL_PAGE_SQL.matches('?').count(), 5);
+        assert!(APPROVAL_PAGE_SQL.contains("review_decision"));
+        assert!(APPROVAL_PAGE_SQL.contains("CAST(archived AS SIGNED)"));
+        // 来源页 keyset：cursor 2 + limit 1 = 3。
+        assert_eq!(ADMIN_TARGET_DEVICE_KEYS_SQL.matches('?').count(), 3);
+        assert!(ADMIN_TARGET_DEVICE_KEYS_SQL.contains("archived=FALSE"));
     }
 
     #[test]

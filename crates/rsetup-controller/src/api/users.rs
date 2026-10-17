@@ -88,15 +88,14 @@ pub(crate) struct UsersListQuery {
     pub(crate) limit: Option<usize>,
 }
 
-/// `GET /api/v1/users/{id}/effective-permissions` 的严格 query DTO。
-///
-/// 本端点不在 `management_cursor_profile` 的封闭白名单内，没有签名 cursor 契约，
-/// 而裸内部键直传被计划禁止，因此 `cursor` 属未知字段 → 400，网关侧 cursor 恒 `None`；
-/// 该端点的分页游标契约属后续修订，不在本任务伪造。
+/// `GET /api/v1/users/{id}/effective-permissions` 的严格 query DTO（spec 02 §121：
+/// `device_id?,cursor?,limit?` → Page）。`cursor` 是统一签名游标，绑定 actor + 目标用户 +
+/// `device_id` 筛选；篡改/换筛选/跨端点一律 400。
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EffectivePermissionsQuery {
     pub(crate) device_id: Option<String>,
+    pub(crate) cursor: Option<String>,
     pub(crate) limit: Option<usize>,
 }
 
@@ -326,24 +325,44 @@ async fn reset_password(
     ok_response(rotated)
 }
 
+// ---------------------------------------------------------------------------
+// GET /api/v1/users/{id}/effective-permissions：来源页 + 统一签名 cursor
+// ---------------------------------------------------------------------------
+
+/// `effective-permissions` 的 filter schema 固定 tag 表：tag 1 = 目标用户 UUID raw 16 字节
+/// （恒有值）、tag 2 = `device_id` 32 字节（缺省 → `None`）；schema 恒含两字段，`limit`
+/// 不进 schema。tag 一经发布不得改值或顺序（cursor 跨版本兼容的唯一依据）。
+const EFFECTIVE_PERMISSIONS_FILTER_TAG_TARGET: u8 = 1;
+const EFFECTIVE_PERMISSIONS_FILTER_TAG_DEVICE: u8 = 2;
+
 /// `GET /api/v1/users/{id}/effective-permissions`：目标用户有效权限及来源归因。
 /// 目标不存在/不可见由网关统一 404；`device_id` 必须恰 64 位小写 hex，否则 400。
-async fn effective_permissions(
-    State(state): State<UsersApiState>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    uri: Uri,
-) -> Response {
-    let actor = match authenticate_read(&state.auth, &headers, EndpointId::EffectivePermissionsRead)
-        .await
-    {
-        Ok(session) => session,
-        Err(response) => return response,
-    };
+///
+/// `secret_provider` 为唯一密钥入口（生产 wrapper 恒只经 `management_cursor_secret()`，
+/// 测试 wrapper 从局部 `OnceLock` 槽读取）。调用顺序固定：`authenticate_read` →
+/// `require_admin_session` → query/limit → 路径 target → `device_id` → filter ctx →
+/// **取密钥（`cursor = None` 也不得短路跳过）** → cursor 解码 → 网关 → 出口签名。
+/// cursor 走统一签名 cursor 的 `Device` profile，filter 绑定 target 用户 + `device_id`
+/// 筛选（spec 02 §3/§121）：篡改、换筛选、换 target、跨端点一律 400。
+async fn effective_permissions_with_secret_provider<F>(
+    state: &UsersApiState,
+    path_id: &str,
+    headers: &HeaderMap,
+    uri: &Uri,
+    secret_provider: F,
+) -> Response
+where
+    F: FnOnce() -> Result<[u8; 32], ControllerError>,
+{
+    let actor =
+        match authenticate_read(&state.auth, headers, EndpointId::EffectivePermissionsRead).await {
+            Ok(session) => session,
+            Err(response) => return response,
+        };
     if let Err(response) = require_admin_session(&actor) {
         return response;
     }
-    let query = match Query::<EffectivePermissionsQuery>::try_from_uri(&uri) {
+    let query = match Query::<EffectivePermissionsQuery>::try_from_uri(uri) {
         Ok(query) => query.0,
         Err(_) => return map_error(ControllerError::InvalidArgument),
     };
@@ -351,7 +370,7 @@ async fn effective_permissions(
         Ok(limit) => limit,
         Err(response) => return response,
     };
-    let target = match parse_uuid_path(&id) {
+    let target = match parse_uuid_path(path_id) {
         Ok(target) => target,
         Err(response) => return response,
     };
@@ -362,15 +381,70 @@ async fn effective_permissions(
             Err(response) => return response,
         },
     };
+    // filter schema 恒含两字段：tag 1 = target 用户 UUID raw 16B（恒有值）、
+    // tag 2 = `device_id` 32B（缺省 → None）；`limit` 不进 schema。
+    let target_raw = target.into_bytes();
+    let filter = match CursorFilterCtx::from_ordered_fields(&[
+        (
+            EFFECTIVE_PERMISSIONS_FILTER_TAG_TARGET,
+            Some(target_raw.as_slice()),
+        ),
+        (
+            EFFECTIVE_PERMISSIONS_FILTER_TAG_DEVICE,
+            device_id.as_ref().map(|id| id.as_slice()),
+        ),
+    ]) {
+        Ok(filter) => filter,
+        Err(error) => return map_error(error),
+    };
+    let secret = match secret_provider() {
+        Ok(secret) => secret,
+        Err(error) => return map_error(error),
+    };
+    let cursor = match decode_management_list_cursor(
+        &secret,
+        EndpointId::EffectivePermissionsRead,
+        actor.user.id,
+        &filter,
+        query.cursor.as_deref(),
+    ) {
+        Ok(None) => None,
+        Ok(Some(CursorKey::DeviceKey(raw))) => Some(raw),
+        // 本端点 profile 恒 Device；解出其它键形属装配错误，按非法 cursor 400。
+        Ok(Some(CursorKey::Uuid(_))) => return map_error(ControllerError::InvalidArgument),
+        Err(error) => return map_error(error),
+    };
     let page = match state
         .gateway
-        .effective_permissions(&actor, target.into_bytes(), device_id, None, limit)
+        .effective_permissions(&actor, target_raw, device_id, cursor, limit)
         .await
     {
         Ok(page) => page,
         Err(error) => return map_error(error),
     };
+    let page = match sign_management_list_page(
+        &secret,
+        EndpointId::EffectivePermissionsRead,
+        actor.user.id,
+        &filter,
+        page,
+    ) {
+        Ok(page) => page,
+        Err(error) => return map_error(error),
+    };
     ok_response(page)
+}
+
+pub(crate) async fn effective_permissions(
+    State(state): State<UsersApiState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    effective_permissions_with_secret_provider(&state, &id, &headers, &uri, || {
+        management_cursor_secret().copied()
+    })
+    .await
 }
 
 /// 挂载 users 的 5 条管理路由：集合级 `GET`/`POST` 同 path 共存，
@@ -680,13 +754,14 @@ pub(crate) mod test_fixture {
                 if matches!(gateway, Self::Echo) {
                     return Ok(serde_json::json!({
                         "items": [],
+                        "next_cursor": null,
                         "target": hex::encode(target),
                         "device_id": device_id.map(hex::encode),
                         "cursor": cursor.map(hex::encode),
                         "limit": limit,
                     }));
                 }
-                Ok(serde_json::json!({ "items": [] }))
+                Ok(serde_json::json!({ "items": [], "next_cursor": null }))
             })
         }
     }
@@ -738,10 +813,21 @@ pub(crate) mod test_fixture {
 
 #[cfg(test)]
 mod tests {
+    use super::effective_permissions_with_secret_provider;
     use super::test_fixture::*;
+    use super::{UsersApiState, UsersGateway};
+    use crate::api::{CursorFilterCtx, CursorKey, ManagementFuture, encode_signed_cursor};
+    use crate::auth::service::Session;
+    use crate::error::ControllerError;
+    use crate::http_auth::EndpointId;
     use axum::body::Body;
-    use axum::http::{Request, StatusCode, header};
+    use axum::extract::{Path, State};
+    use axum::http::{HeaderMap, Request, StatusCode, Uri, header};
+    use axum::response::Response;
+    use axum::routing::get;
+    use std::sync::Arc;
     use tower::ServiceExt;
+    use uuid::Uuid;
 
     /// canonical 小写 UUIDv4 路径样本（`067e6162-…-0b3c`）。
     const TARGET_ID: &str = "067e6162-ea94-4431-836c-7d8fa2010b3c";
@@ -749,6 +835,17 @@ mod tests {
     /// 64 位小写 hex 设备 ID 路径/query 样本。
     const TARGET_DEVICE: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const TARGET_DEVICE_RAW: &str = TARGET_DEVICE;
+    /// 另一 canonical v4 目标用户与另一设备：只用于「换筛选/换 target」负例。
+    const OTHER_TARGET_ID: &str = "1f1e1d1c-1b1a-4918-8716-151413121110";
+    const OTHER_DEVICE: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    fn target_bytes(id: &str) -> [u8; 16] {
+        Uuid::try_parse(id).expect("canonical uuid").into_bytes()
+    }
+
+    fn device_bytes(raw: &str) -> [u8; 32] {
+        <[u8; 32]>::try_from(hex::decode(raw).expect("hex")).expect("32B")
+    }
 
     async fn error_code(res: axum::response::Response) -> (StatusCode, String, String) {
         let status = res.status();
@@ -761,6 +858,329 @@ mod tests {
                 .unwrap_or("")
                 .to_string(),
         )
+    }
+
+    // -----------------------------------------------------------------------
+    // effective-permissions 签名 cursor 真实接线（test-only wrapper + 局部密钥槽）
+    // -----------------------------------------------------------------------
+    //
+    // 生产 `effective_permissions` 恒只经 `management_cursor_secret()`；测试进程内全局
+    // `MANAGEMENT_CURSOR_SECRET` 未安装，挂生产 router 的本端点恒 503。因此正例不挂生产
+    // router，改挂只包 `effective_permissions_with_secret_provider` 的 test-only wrapper：
+    // 真实 gate/query/codec/gateway 顺序不绕过，密钥经 `cursor_secret_of` 从本测试局部槽读取。
+    // 红线：不 set 全局 OnceLock、不给 `UsersApiState` 扩密钥字段、不用假 handler 绕真实链路。
+
+    /// 与 devices/roles/grants 区同值的测试合成 key，不引用任何 secret 文件。
+    const SYNTHETIC_SECRET: [u8; 32] = [7u8; 32];
+    /// 网关内部 raw 64 hex（Device profile 32B），出口必须替换为 96 字符签名 token。
+    const NEXT_RAW_HEX: &str = "abababababababababababababababababababababababababababababababab";
+
+    /// 网关单次调用记录：`(target, device_id, cursor, limit)`。
+    type PageCall = ([u8; 16], Option<[u8; 32]>, Option<[u8; 32]>, usize);
+
+    /// 记录 typed 参数的来源页桩：`cursor = None` 返回带 raw `next_cursor` 的第一页。
+    #[derive(Default)]
+    struct PagePermissionsGateway {
+        calls: std::sync::Mutex<Vec<PageCall>>,
+    }
+
+    impl PagePermissionsGateway {
+        fn recorded(&self) -> Vec<PageCall> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl UsersGateway for PagePermissionsGateway {
+        fn list<'a>(
+            &'a self,
+            _actor: &'a Session,
+            _cursor: Option<[u8; 16]>,
+            _limit: usize,
+        ) -> ManagementFuture<'a, serde_json::Value> {
+            Box::pin(async { Err(ControllerError::InvalidArgument) })
+        }
+        fn create<'a>(
+            &'a self,
+            _actor: &'a Session,
+            _username: &'a str,
+            _display_name: &'a str,
+            _is_admin: bool,
+        ) -> ManagementFuture<'a, serde_json::Value> {
+            Box::pin(async { Err(ControllerError::InvalidArgument) })
+        }
+        fn patch<'a>(
+            &'a self,
+            _actor: &'a Session,
+            _id: [u8; 16],
+            _revision: u64,
+            _active: Option<bool>,
+            _is_admin: Option<bool>,
+            _display_name: Option<&'a str>,
+        ) -> ManagementFuture<'a, serde_json::Value> {
+            Box::pin(async { Err(ControllerError::InvalidArgument) })
+        }
+        fn reset_password<'a>(
+            &'a self,
+            _actor: &'a Session,
+            _id: [u8; 16],
+            _revision: u64,
+        ) -> ManagementFuture<'a, serde_json::Value> {
+            Box::pin(async { Err(ControllerError::InvalidArgument) })
+        }
+        fn effective_permissions<'a>(
+            &'a self,
+            _actor: &'a Session,
+            target: [u8; 16],
+            device_id: Option<[u8; 32]>,
+            cursor: Option<[u8; 32]>,
+            limit: usize,
+        ) -> ManagementFuture<'a, serde_json::Value> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((target, device_id, cursor, limit));
+                let next_cursor = if cursor.is_none() {
+                    serde_json::json!(NEXT_RAW_HEX)
+                } else {
+                    serde_json::Value::Null
+                };
+                Ok(serde_json::json!({
+                    "items": [],
+                    "next_cursor": next_cursor,
+                    "target": hex::encode(target),
+                    "device_id": device_id.map(hex::encode),
+                    "cursor": cursor.map(hex::encode),
+                    "limit": limit,
+                }))
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct SignedPermissionsTestState {
+        users: UsersApiState,
+        secret_slot: Arc<std::sync::OnceLock<[u8; 32]>>,
+    }
+
+    /// test-only wrapper handler：内部调用同一个 `effective_permissions_with_secret_provider`，
+    /// 真实 gate/query/codec/gateway 顺序不绕过，provider 经 `cursor_secret_of` 从本测试
+    /// 局部槽读取。
+    async fn effective_permissions_with_test_secret(
+        State(state): State<SignedPermissionsTestState>,
+        Path(id): Path<String>,
+        headers: HeaderMap,
+        uri: Uri,
+    ) -> Response {
+        let slot = state.secret_slot.clone();
+        effective_permissions_with_secret_provider(&state.users, &id, &headers, &uri, move || {
+            crate::api::cursor_secret_of(&slot).copied()
+        })
+        .await
+    }
+
+    /// fixture helper：只挂 wrapper 的本端点 GET 路由；`Some` 经
+    /// `install_cursor_secret_into` 装入测试合成 key、`None` 留空作网关前 503 负例。
+    fn signed_permissions_router(
+        secret: Option<[u8; 32]>,
+        gateway: Arc<dyn UsersGateway>,
+    ) -> axum::Router<()> {
+        let secret_slot = Arc::new(std::sync::OnceLock::new());
+        if let Some(secret) = secret {
+            crate::api::install_cursor_secret_into(&secret_slot, &secret)
+                .expect("synthetic key 安装必须成功");
+        }
+        let state = SignedPermissionsTestState {
+            users: UsersApiState {
+                auth: fixture_auth(fixture_session(true)),
+                gateway,
+            },
+            secret_slot,
+        };
+        axum::Router::new()
+            .route(
+                "/api/v1/users/{id}/effective-permissions",
+                get(effective_permissions_with_test_secret),
+            )
+            .with_state(state)
+    }
+
+    fn permissions_uri(
+        cursor: Option<&str>,
+        device_id: Option<&str>,
+        limit: Option<usize>,
+    ) -> String {
+        let mut query = Vec::new();
+        if let Some(cursor) = cursor {
+            query.push(format!("cursor={cursor}"));
+        }
+        if let Some(device_id) = device_id {
+            query.push(format!("device_id={device_id}"));
+        }
+        if let Some(limit) = limit {
+            query.push(format!("limit={limit}"));
+        }
+        let suffix = if query.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", query.join("&"))
+        };
+        format!("/api/v1/users/{TARGET_ID}/effective-permissions{suffix}")
+    }
+
+    #[tokio::test]
+    async fn effective_permissions_signs_96_hex_cursor_and_decodes_second_page() {
+        let gateway = Arc::new(PagePermissionsGateway::default());
+        let router = signed_permissions_router(Some(SYNTHETIC_SECRET), gateway.clone());
+        let res = router
+            .oneshot(authenticated_get(&permissions_uri(
+                None,
+                Some(TARGET_DEVICE),
+                Some(20),
+            )))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let value = body_json(res).await;
+        let token = value["data"]["next_cursor"]
+            .as_str()
+            .expect("签名 token")
+            .to_string();
+        assert_eq!(token.len(), 96, "Device profile 签名 token 恒 96 hex");
+        assert!(
+            token
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
+        assert_ne!(token, NEXT_RAW_HEX, "裸内部 raw key 不得直传出口");
+        assert!(
+            !value["data"]["next_cursor"]
+                .as_str()
+                .is_some_and(|raw| raw.len() == 64),
+            "出口不得是裸 hex64"
+        );
+        assert!(value["data"]["cursor"].is_null(), "首页网关 cursor 恒 None");
+
+        // 第二页：同一 target 与 device_id 筛选 + 换 limit（limit 不进 schema）→ 200。
+        let router = signed_permissions_router(Some(SYNTHETIC_SECRET), gateway.clone());
+        let res = router
+            .oneshot(authenticated_get(&permissions_uri(
+                Some(&token),
+                Some(TARGET_DEVICE),
+                Some(7),
+            )))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let value = body_json(res).await;
+        assert!(value["data"]["next_cursor"].is_null());
+        let calls = gateway.recorded();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0],
+            (
+                target_bytes(TARGET_ID),
+                Some(device_bytes(TARGET_DEVICE)),
+                None,
+                20
+            )
+        );
+        assert_eq!(
+            calls[1],
+            (
+                target_bytes(TARGET_ID),
+                Some(device_bytes(TARGET_DEVICE)),
+                Some([0xabu8; 32]),
+                7
+            ),
+            "网关必须收到 token 解回的 [u8;32] raw key"
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_permissions_cursor_binds_target_and_device_filter() {
+        let gateway = Arc::new(PagePermissionsGateway::default());
+        let router = signed_permissions_router(Some(SYNTHETIC_SECRET), gateway.clone());
+        let res = router
+            .oneshot(authenticated_get(&permissions_uri(
+                None,
+                Some(TARGET_DEVICE),
+                None,
+            )))
+            .await
+            .unwrap();
+        let value = body_json(res).await;
+        let token = value["data"]["next_cursor"]
+            .as_str()
+            .expect("签名 token")
+            .to_string();
+        let mut tampered = token.clone();
+        let last = token.chars().last().expect("非空 token");
+        let replacement = if last == 'a' { 'b' } else { 'a' };
+        tampered.pop();
+        tampered.push(replacement);
+        // 真实 MAC 但属另一端点（DevicesRead）的合法 token：跨端点必须 400。
+        let cross = encode_signed_cursor(
+            &SYNTHETIC_SECRET,
+            EndpointId::DevicesRead,
+            fixture_session(true).user.id,
+            &CursorFilterCtx::empty(),
+            CursorKey::DeviceKey([0xabu8; 32]),
+        );
+        let cases: Vec<(&str, String)> = vec![
+            (
+                "篡改 token",
+                permissions_uri(Some(&tampered), Some(TARGET_DEVICE), None),
+            ),
+            (
+                "换 device_id 筛选",
+                permissions_uri(Some(&token), Some(OTHER_DEVICE), None),
+            ),
+            (
+                "缺 device_id 筛选",
+                permissions_uri(Some(&token), None, None),
+            ),
+            (
+                "换 target 路径",
+                format!(
+                    "/api/v1/users/{OTHER_TARGET_ID}/effective-permissions?cursor={token}&device_id={TARGET_DEVICE}"
+                ),
+            ),
+            (
+                "跨端点 token",
+                permissions_uri(Some(&cross), Some(TARGET_DEVICE), None),
+            ),
+        ];
+        for (case, uri) in cases {
+            let before = gateway.recorded().len();
+            let router = signed_permissions_router(Some(SYNTHETIC_SECRET), gateway.clone());
+            let res = router.oneshot(authenticated_get(&uri)).await.unwrap();
+            let (status, code, _) = error_code(res).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{case}");
+            assert_eq!(code, "INVALID_ARGUMENT", "{case}");
+            assert_eq!(gateway.recorded().len(), before, "{case} 不得触网关");
+        }
+    }
+
+    #[tokio::test]
+    async fn effective_permissions_without_installed_secret_returns_503_before_gateway() {
+        let gateway = Arc::new(PagePermissionsGateway::default());
+        let router = signed_permissions_router(None, gateway.clone());
+        let res = router
+            .oneshot(authenticated_get(&permissions_uri(None, None, None)))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let value = body_json(res).await;
+        assert_eq!(value["error"]["code"], "STORAGE_UNAVAILABLE");
+        // 固定去敏：不回显密钥、内部 raw key 或任何按键片段。
+        let text = value.to_string();
+        assert!(!text.contains(&hex::encode(SYNTHETIC_SECRET)));
+        assert!(!text.contains(NEXT_RAW_HEX));
+        assert!(
+            gateway.recorded().is_empty(),
+            "取密钥必须在网关之前（含 cursor=None 路径）"
+        );
     }
 
     // RED 前置：骨架 `users_router` 挂载 0 条路由，以下断言在实现前必须失败于
@@ -858,7 +1278,6 @@ mod tests {
                 &format!("/api/v1/users/{TARGET_ID}/reset-password"),
                 serde_json::json!({ "expected_revision": "1" }),
             ),
-            authenticated_get(&format!("/api/v1/users/{TARGET_ID}/effective-permissions")),
         ];
         // `Router` 不 `Clone`：每个请求装配一份等价 fixture router。
         for req in requests {
@@ -868,6 +1287,18 @@ mod tests {
             assert_eq!(status, StatusCode::NOT_FOUND);
             assert_eq!(code, "NOT_FOUND");
         }
+        // 本端点走签名 cursor 链路：404 同样必须在取到密钥之后由网关给出。
+        let router = signed_permissions_router(
+            Some(SYNTHETIC_SECRET),
+            Arc::new(FixtureUsersGateway::Missing),
+        );
+        let res = router
+            .oneshot(authenticated_get(&permissions_uri(None, None, None)))
+            .await
+            .unwrap();
+        let (status, code, _) = error_code(res).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(code, "NOT_FOUND");
     }
 
     #[tokio::test]
@@ -941,28 +1372,32 @@ mod tests {
 
     #[tokio::test]
     async fn effective_permissions_projects_items_and_parses_device_id() {
-        let (router, _state) = admin_state_with(FixtureUsersGateway::Echo);
-        let req = authenticated_get(&format!(
-            "/api/v1/users/{TARGET_ID}/effective-permissions?device_id={TARGET_DEVICE}&limit=20"
-        ));
-        let res = router.oneshot(req).await.unwrap();
+        let gateway = Arc::new(PagePermissionsGateway::default());
+        let router = signed_permissions_router(Some(SYNTHETIC_SECRET), gateway.clone());
+        let res = router
+            .oneshot(authenticated_get(&permissions_uri(
+                None,
+                Some(TARGET_DEVICE),
+                Some(20),
+            )))
+            .await
+            .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         let value = body_json(res).await;
         assert_eq!(value["data"]["items"], serde_json::json!([]));
         assert_eq!(value["data"]["target"], TARGET_ID_RAW);
         assert_eq!(value["data"]["device_id"], TARGET_DEVICE_RAW);
-        // 本端点无签名 cursor 契约：网关侧 cursor 恒 None，limit 走严格域。
+        // 无 cursor 入参：网关侧 cursor 恒 None；出口 next_cursor 是签名 token（另用例断言）。
         assert!(value["data"]["cursor"].is_null());
         assert_eq!(value["data"]["limit"], 20);
     }
 
     #[tokio::test]
     async fn effective_permissions_defaults_limit_and_rejects_bad_inputs() {
-        let (router, _state) = admin_state_with(FixtureUsersGateway::Echo);
+        let gateway = Arc::new(PagePermissionsGateway::default());
+        let router = signed_permissions_router(Some(SYNTHETIC_SECRET), gateway.clone());
         let defaults = router
-            .oneshot(authenticated_get(&format!(
-                "/api/v1/users/{TARGET_ID}/effective-permissions"
-            )))
+            .oneshot(authenticated_get(&permissions_uri(None, None, None)))
             .await
             .unwrap();
         assert_eq!(defaults.status(), StatusCode::OK);
@@ -970,6 +1405,7 @@ mod tests {
         assert_eq!(value["data"]["limit"], 50);
         assert!(value["data"]["device_id"].is_null());
 
+        // 客户端侧入参校验都发生在取密钥之前，因此挂生产 router 即 400。
         for query in [
             format!("device_id={}0", TARGET_DEVICE),
             format!("device_id={}", TARGET_DEVICE.to_uppercase()),
@@ -977,7 +1413,6 @@ mod tests {
             "limit=0".to_string(),
             "limit=201".to_string(),
             "limit=abc".to_string(),
-            "cursor=0123456789abcdef".to_string(),
             "unknown=1".to_string(),
         ] {
             let (router, _state) = admin_state_with(FixtureUsersGateway::Echo);

@@ -24,10 +24,15 @@ pub struct AuditCursor {
 
 pub(crate) const AUDIT_PAGE_SQL: &str = "SELECT id, actor_kind, actor_user_id, event_type, target_kind, target_id, params_redacted, outcome, process_epoch, event_seq, time_evidence AS created_evidence FROM audit_events WHERE (? IS NULL OR actor_user_id = ?) AND (? IS NULL OR (target_kind = 'device' AND target_id = ?)) AND (? IS NULL OR process_epoch > ? OR (process_epoch = ? AND (event_seq > ? OR (event_seq = ? AND id > ?)))) ORDER BY process_epoch, event_seq, id LIMIT ?";
 
-pub(crate) const DEVICE_PAGE_KEYS_FIRST_SQL: &str =
-    "SELECT public_key FROM devices ORDER BY public_key LIMIT ?";
-pub(crate) const DEVICE_PAGE_KEYS_SQL: &str =
-    "SELECT public_key FROM devices WHERE public_key > ? ORDER BY public_key LIMIT ?";
+/// 统一设备候选公钥扫描 SQL（Task 13a）：游标、`search` 文字子串（`LOCATE` 避免 LIKE
+/// 通配扩展）与 `group_id` 成员关系（`EXISTS` + 父 group 行 `archived=FALSE`）三条件单一
+/// 模板，7 个绑定顺序即 `device_page_filtered` 代码顺序；首页传三个 `None` 即退化为纯
+/// keyset 扫描。真实引擎过滤行为归 Task 14 受控真库用例，本常量只固定 SQL 形状。
+pub(crate) const DEVICE_FILTER_KEYS_SQL: &str = "SELECT d.public_key FROM devices d WHERE (? IS NULL OR d.public_key > ?) AND (? IS NULL OR LOCATE(?, d.display_name) > 0) AND (? IS NULL OR EXISTS (SELECT 1 FROM group_members gm JOIN device_groups dg ON dg.id=gm.group_id WHERE gm.device_id=d.public_key AND gm.group_id=? AND dg.archived=FALSE)) ORDER BY d.public_key LIMIT ?";
+
+/// 审批持久真相页 SQL（Task 13a）：keyset + 可选 `review_decision` 筛选，5 个绑定；
+/// `archived` 走 `CAST(... AS SIGNED)` 与既有解码器同形。连接状态不在本投影内。
+pub(crate) const APPROVAL_PAGE_SQL: &str = "SELECT public_key,display_name,descriptor_json,admission_state,review_decision,revision,CAST(archived AS SIGNED) AS archived FROM devices WHERE (? IS NULL OR public_key > ?) AND (? IS NULL OR review_decision = ?) ORDER BY public_key LIMIT ?";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceAdminView {
@@ -85,6 +90,37 @@ pub trait DeviceRepository: Send + Sync {
             Option<[u8; 32]>,
         ),
     >;
+
+    /// 唯一带筛选的设备管理扫描：`search` 走 `LOCATE` 文字子串、`group_id` 走当前成员
+    /// 关系，两者都在同一 RR 事务内真实过滤；`device_page` 只是 `None/None` 特化。
+    /// 请求层已规范化 `search`（1..=128 Unicode 字符、≤512B、无 control）与 `group_id`，
+    /// 本方法不静默忽略也不 truncate。
+    #[allow(clippy::type_complexity)]
+    fn device_page_filtered<'a>(
+        &'a self,
+        actor: &'a Session,
+        cursor: Option<[u8; 32]>,
+        limit: usize,
+        group_id: Option<Uuid>,
+        search: Option<&'a str>,
+    ) -> RepoFuture<
+        'a,
+        (
+            Vec<(DeviceAdminView, HashSet<Permission>)>,
+            Option<[u8; 32]>,
+        ),
+    >;
+
+    /// 审批持久真相页：只返回持久列的可去敏投影，`next_cursor` 为内部 raw 公钥 hex
+    /// （出口签名归 HTTP 层）；同事务前置 `verify_management_read` 含 schema_meta 单例
+    /// 与版本防线，wrong/extra meta 固定去敏 Config 503。
+    fn approval_page<'a>(
+        &'a self,
+        actor: &'a Session,
+        decision: Option<ReviewDecision>,
+        cursor: Option<[u8; 32]>,
+        limit: usize,
+    ) -> RepoFuture<'a, serde_json::Value>;
 
     fn find_device<'a>(
         &'a self,
@@ -232,6 +268,24 @@ impl DeviceRepository for SqlxDeviceRepository {
             Option<[u8; 32]>,
         ),
     > {
+        self.device_page_filtered(actor, cursor, limit, None, None)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn device_page_filtered<'a>(
+        &'a self,
+        actor: &'a Session,
+        cursor: Option<[u8; 32]>,
+        limit: usize,
+        group_id: Option<Uuid>,
+        search: Option<&'a str>,
+    ) -> RepoFuture<
+        'a,
+        (
+            Vec<(DeviceAdminView, HashSet<Permission>)>,
+            Option<[u8; 32]>,
+        ),
+    > {
         Box::pin(async move {
             let mut page = VisibleDevicePage::new(limit)?;
             let mut connection = acquire_authorization_read_connection(&self.db).await?;
@@ -241,21 +295,16 @@ impl DeviceRepository for SqlxDeviceRepository {
                 u64::try_from(limit + 1).map_err(|_| ControllerError::InvalidArgument)?;
             let mut after = cursor;
             loop {
-                let raw_keys = match after {
-                    Some(key) => {
-                        sqlx::query_scalar::<_, Vec<u8>>(DEVICE_PAGE_KEYS_SQL)
-                            .bind(key.as_slice())
-                            .bind(scan_limit)
-                            .fetch_all(&mut *tx)
-                            .await?
-                    }
-                    None => {
-                        sqlx::query_scalar::<_, Vec<u8>>(DEVICE_PAGE_KEYS_FIRST_SQL)
-                            .bind(scan_limit)
-                            .fetch_all(&mut *tx)
-                            .await?
-                    }
-                };
+                let raw_keys = sqlx::query_scalar::<_, Vec<u8>>(DEVICE_FILTER_KEYS_SQL)
+                    .bind(after.map(|key| key.to_vec()))
+                    .bind(after.map(|key| key.to_vec()))
+                    .bind(search)
+                    .bind(search)
+                    .bind(group_id.map(|id| id.as_bytes().to_vec()))
+                    .bind(group_id.map(|id| id.as_bytes().to_vec()))
+                    .bind(scan_limit)
+                    .fetch_all(&mut *tx)
+                    .await?;
                 if raw_keys.is_empty() {
                     break;
                 }
@@ -291,6 +340,76 @@ impl DeviceRepository for SqlxDeviceRepository {
             }
             tx.commit().await?;
             Ok(page.finish())
+        })
+    }
+
+    fn approval_page<'a>(
+        &'a self,
+        actor: &'a Session,
+        decision: Option<ReviewDecision>,
+        cursor: Option<[u8; 32]>,
+        limit: usize,
+    ) -> RepoFuture<'a, serde_json::Value> {
+        Box::pin(async move {
+            if !(1..=200).contains(&limit) {
+                return Err(ControllerError::InvalidArgument);
+            }
+            let mut connection = acquire_authorization_read_connection(&self.db).await?;
+            let mut tx = sqlx::Connection::begin(&mut *connection).await?;
+            // 审批页 meta 防线：同一 lease 同一事务内重验 actor 当前 admin + schema_meta
+            // 单例与版本（`verify_management_read` → `decode_snapshot_meta`），wrong meta /
+            // extra meta 行固定去敏 Config 503，不降级为未过滤页面。
+            crate::authz::sqlx_repo::verify_management_read(&mut tx, actor).await?;
+            let decision = decision.map(|value| match value {
+                ReviewDecision::None => "none",
+                ReviewDecision::Approved => "approved",
+                ReviewDecision::Denied => "denied",
+                ReviewDecision::Revoked => "revoked",
+            });
+            let rows = sqlx::query(APPROVAL_PAGE_SQL)
+                .bind(cursor.map(|key| key.to_vec()))
+                .bind(cursor.map(|key| key.to_vec()))
+                .bind(decision)
+                .bind(decision)
+                .bind(u64::try_from(limit + 1).map_err(|_| ControllerError::InvalidArgument)?)
+                .fetch_all(&mut *tx)
+                .await?;
+
+            use sqlx::Row;
+            let mut items = Vec::new();
+            let mut last = None;
+            let has_next = rows.len() > limit;
+            for row in rows.iter().take(limit) {
+                let view = crate::authz::sqlx_repo::decode_device_admin_view(
+                    row.try_get("public_key")?,
+                    row.try_get("display_name")?,
+                    row.try_get("descriptor_json")?,
+                    row.try_get("admission_state")?,
+                    row.try_get("review_decision")?,
+                    row.try_get("revision")?,
+                    row.try_get("archived")?,
+                )?;
+                last = Some(view.public_key);
+                let decision = match view.review_decision {
+                    ReviewDecision::None => "none",
+                    ReviewDecision::Approved => "approved",
+                    ReviewDecision::Denied => "denied",
+                    ReviewDecision::Revoked => "revoked",
+                };
+                items.push(serde_json::json!({
+                    "device_id": hex::encode(view.public_key),
+                    "fingerprint": hex::encode(view.public_key),
+                    "descriptor": view.descriptor,
+                    "decision": decision,
+                    "revision": view.revision.to_string(),
+                }));
+            }
+            tx.commit().await?;
+            // 内部 raw key（末项公钥 hex64）；出口签名归 HTTP 层。
+            Ok(serde_json::json!({
+                "items": items,
+                "next_cursor": if has_next { last.map(hex::encode) } else { None },
+            }))
         })
     }
 
@@ -777,6 +896,54 @@ mod tests {
         assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(keys.len(), 3);
         assert_eq!(AUDIT_PAGE_SQL.matches('?').count(), 11);
+    }
+
+    /// 只用于离线门禁用例的 lazy 池：构造不连接，任何真实取连接都会失败成 503 Config，
+    /// 因此"400 `InvalidArgument`"只能来自仓储自身的 `limit` 合法域门禁。
+    fn unreachable_pool() -> DbPool {
+        DbPool(
+            sqlx::mysql::MySqlPoolOptions::new()
+                .acquire_timeout(std::time::Duration::from_millis(50))
+                .connect_lazy("mysql://invalid:invalid@127.0.0.1:1/rsetup-offline")
+                .expect("lazy pool 构造不触网"),
+        )
+    }
+
+    fn repo_actor() -> Session {
+        Session {
+            user: crate::auth::service::IdentityUser {
+                id: [1u8; 16],
+                username: "actor".into(),
+                password_hash: "fixture-only".into(),
+                active: true,
+                is_admin: true,
+                must_change_password: false,
+                revision: 1,
+            },
+            digest: [2u8; 32],
+        }
+    }
+
+    /// 离线可证：两条管理读页的 `limit` 合法域（`1..=200`）必须在取连接之前拒绝，
+    /// 不得先开事务再报错，也不得把域外 limit 当默认值继续扫描。
+    #[tokio::test]
+    async fn management_read_pages_reject_out_of_domain_limit_before_connection() {
+        let repo = SqlxDeviceRepository::new(unreachable_pool());
+        let actor = repo_actor();
+        for limit in [0usize, 201] {
+            let approval = repo.approval_page(&actor, None, None, limit).await;
+            assert!(
+                matches!(approval, Err(ControllerError::InvalidArgument)),
+                "approval_page limit {limit} 必须 InvalidArgument，实际 {approval:?}"
+            );
+            let devices = repo
+                .device_page_filtered(&actor, None, limit, None, None)
+                .await;
+            assert!(
+                matches!(devices, Err(ControllerError::InvalidArgument)),
+                "device_page_filtered limit {limit} 必须 InvalidArgument，实际 {devices:?}"
+            );
+        }
     }
 
     #[test]

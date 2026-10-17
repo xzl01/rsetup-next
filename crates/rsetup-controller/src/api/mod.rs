@@ -649,9 +649,11 @@ pub(crate) enum ManagementCursorProfile {
     Device,
 }
 
-/// endpoint → profile 的封闭白名单（唯一真源，失败关闭）：只有 6 个管理分页读端点有
-/// profile，其余端点（含 `AuditRead` 独立 MAC profile 与 `EffectivePermissionsRead`
-/// 独立分页 contract）一律固定去敏 `Config`，不写默认兜底掩盖装配错误。
+/// endpoint → profile 的封闭白名单（唯一真源，失败关闭）：只有 7 个管理分页读端点有
+/// profile，其余端点（含 `AuditRead` 独立 MAC profile）一律固定去敏 `Config`，不写默认
+/// 兜底掩盖装配错误。`EffectivePermissionsRead` 自 Task 13a 起按 spec 02 §3/§121 支持
+/// `cursor?` + Page：其分页键是设备公钥 `[u8;32]`，故复用统一 `Device` profile（外部
+/// 96 hex），cursor 的 filter 绑定 target 用户 + `device_id` 筛选——不另造第二套 MAC codec。
 #[allow(dead_code)]
 pub(crate) fn management_cursor_profile(
     endpoint: EndpointId,
@@ -661,7 +663,9 @@ pub(crate) fn management_cursor_profile(
         | EndpointId::RolesRead
         | EndpointId::GrantsRead
         | EndpointId::GroupsRead => Ok(ManagementCursorProfile::Uuid),
-        EndpointId::DevicesRead | EndpointId::ApprovalsRead => Ok(ManagementCursorProfile::Device),
+        EndpointId::DevicesRead
+        | EndpointId::ApprovalsRead
+        | EndpointId::EffectivePermissionsRead => Ok(ManagementCursorProfile::Device),
         _ => Err(ControllerError::Config(
             "management cursor endpoint profile".to_string(),
         )),
@@ -1367,7 +1371,7 @@ mod management_cursor_helper_tests {
     }
 
     #[test]
-    fn management_cursor_profile_is_closed_whitelist_of_six_read_endpoints() {
+    fn management_cursor_profile_is_closed_whitelist_of_seven_read_endpoints() {
         for endpoint in [
             EndpointId::UsersRead,
             EndpointId::RolesRead,
@@ -1379,17 +1383,22 @@ mod management_cursor_helper_tests {
                 ManagementCursorProfile::Uuid
             );
         }
-        for endpoint in [EndpointId::DevicesRead, EndpointId::ApprovalsRead] {
+        // `EffectivePermissionsRead` 的分页键是设备公钥 `[u8;32]` → 复用 Device profile，
+        // filter 绑定 target 用户 + `device_id` 筛选（spec 02 §121），不另造第二套 codec。
+        for endpoint in [
+            EndpointId::DevicesRead,
+            EndpointId::ApprovalsRead,
+            EndpointId::EffectivePermissionsRead,
+        ] {
             assert_eq!(
                 management_cursor_profile(endpoint).expect("device profile"),
                 ManagementCursorProfile::Device
             );
         }
-        // 其余 10 个端点全部落 `_ =>` 固定去敏 Config：无默认兜底。
+        // 其余 9 个端点全部落 `_ =>` 固定去敏 Config：无默认兜底。
         for endpoint in [
             EndpointId::Me,
             EndpointId::Sessions,
-            EndpointId::EffectivePermissionsRead,
             EndpointId::DeviceDetailRead,
             EndpointId::AuditRead,
             EndpointId::SystemStatusRead,
@@ -1626,19 +1635,58 @@ mod management_cursor_helper_tests {
                 .expect_err("非白名单端点不得放行");
         assert_backend_fail_closed(err);
         // 出口：next_cursor 为 null 同样被第一行白名单拦截，不得回吐未校验的原始 page。
+        // `AuditRead` 保持独立 MAC profile（audit cursor 自有 codec），本链路必须继续拒绝它。
         let err =
             sign_management_list_page(&SECRET, EndpointId::AuditRead, ACTOR, &filter, page(None))
                 .expect_err("非白名单端点不得签名放行");
         assert_backend_fail_closed(err);
-        // EffectivePermissionsRead 走独立分页 contract，同样不得进入本链路。
-        let err = sign_management_list_page(
+    }
+
+    #[test]
+    fn effective_permissions_read_is_device_profile_whitelisted_end_to_end() {
+        // Task 13a 契约修订：`EffectivePermissionsRead` 是 Device profile 白名单端点，
+        // 入口/出口共用同一 codec；filter 绑定 target 用户 + device_id 筛选。
+        let filter = CursorFilterCtx::from_ordered_fields(&[
+            (1u8, Some(&fixture_uuid()[..])),
+            (2u8, Some(&fixture_device_key()[..])),
+        ])
+        .expect("fixture filter");
+        let signed = sign_management_list_page(
             &SECRET,
             EndpointId::EffectivePermissionsRead,
             ACTOR,
             &filter,
-            page(Some(UUID_RAW_HEX)),
+            page(Some(DEVICE_RAW_HEX)),
         )
-        .expect_err("独立 contract 端点不得签名放行");
-        assert_backend_fail_closed(err);
+        .expect("有效权限页必须可签名");
+        let token = signed["next_cursor"]
+            .as_str()
+            .expect("签名 token")
+            .to_owned();
+        assert_eq!(token.len(), CURSOR_DEVICE_HEX);
+        assert_eq!(
+            decode_management_list_cursor(
+                &SECRET,
+                EndpointId::EffectivePermissionsRead,
+                ACTOR,
+                &filter,
+                Some(&token),
+            )
+            .expect("同一 filter 解回"),
+            Some(CursorKey::DeviceKey(fixture_device_key()))
+        );
+        // 换筛选（去掉 device_id 一项）→ 同一 token 必须 400，不得跨 filter 复用。
+        let changed = CursorFilterCtx::from_ordered_fields(&[(1u8, Some(&fixture_uuid()[..]))])
+            .expect("changed filter");
+        let err = decode_management_list_cursor(
+            &SECRET,
+            EndpointId::EffectivePermissionsRead,
+            ACTOR,
+            &changed,
+            Some(&token),
+        )
+        .expect_err("换筛选必须拒绝");
+        assert!(matches!(err, ControllerError::InvalidArgument));
+        assert_eq!(map_error(err).status(), StatusCode::BAD_REQUEST);
     }
 }

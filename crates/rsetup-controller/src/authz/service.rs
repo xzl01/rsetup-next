@@ -100,6 +100,24 @@ impl<S: AuthorizationSnapshotRepository, W: AuthzRepository> AuthzService<S, W> 
             .await?;
         Ok((record, plain))
     }
+
+    /// 管理来源页编排：单次 protected 同连接 RR 事务内完成 target 投影（不逐设备另开事务）。
+    /// `limit` 合法域 `1..=200`，域外 `InvalidArgument`（HTTP 前置一次、仓储权威再一次）。
+    pub async fn effective_permissions_page(
+        &self,
+        caller: &Session,
+        target: [u8; 16],
+        device_id: Option<[u8; 32]>,
+        cursor: Option<[u8; 32]>,
+        limit: usize,
+    ) -> Result<serde_json::Value, ControllerError> {
+        if !(1..=200).contains(&limit) {
+            return Err(ControllerError::InvalidArgument);
+        }
+        self.snapshots
+            .load_admin_target_page(caller, target, device_id, cursor, limit)
+            .await
+    }
 }
 
 /// 快照生命周期 + 设备存在性统一求值：actor `!active || must_change_password`，或目标设备
@@ -691,6 +709,49 @@ mod tests {
                 if *id == Uuid::from_bytes([0x0a; 16]))
         );
         repo.assert_protected_only();
+    }
+
+    /// Task 13a：`load_admin_target_page` 的 trait 默认可编译实现必须**失败关闭**——
+    /// 未覆盖该方法的旧 fixture 绝不能因此得到成功空页；`limit` 合法域也在 service 处校验。
+    #[tokio::test]
+    async fn effective_permissions_page_fails_closed_on_default_repo_and_limit() {
+        let snapshot = AuthorizationSnapshot {
+            actor: SnapshotActor {
+                id: [1u8; 16],
+                active: true,
+                is_admin: true,
+                must_change_password: false,
+            },
+            authz_epoch: 1,
+            grants: vec![],
+            roles: HashMap::new(),
+            device_groups: HashMap::new(),
+            devices: HashMap::new(),
+        };
+        // StubSnapshotRepo 不覆盖 `load_admin_target_page` → 只能走 trait 默认实现。
+        let service = AuthzService::new(
+            Arc::new(StubSnapshotRepo { snapshot }),
+            Arc::new(StubAuthzRepo),
+        );
+        let caller = source_caller_session(true);
+        for limit in [0, 201] {
+            assert!(
+                matches!(
+                    service
+                        .effective_permissions_page(&caller, [2u8; 16], None, None, limit)
+                        .await,
+                    Err(ControllerError::InvalidArgument)
+                ),
+                "limit {limit} 必须 InvalidArgument"
+            );
+        }
+        let page = service
+            .effective_permissions_page(&caller, [2u8; 16], None, None, 50)
+            .await;
+        assert!(
+            matches!(page, Err(ControllerError::PermissionDenied)),
+            "默认实现必须失败关闭，不得出现成功空页：{page:?}"
+        );
     }
 
     #[test]
