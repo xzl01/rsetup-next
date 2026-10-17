@@ -8,6 +8,7 @@
 //! - 所有管理分页端点的 `cursor`/`next_cursor` 一律经本模块的签名函数对签发与校验，
 //!   废弃裸内部键直传；密钥只经第一调用参数传入，codec 内不读取任何环境变量。
 
+pub mod adapters;
 pub mod approvals;
 pub mod audit;
 pub mod devices;
