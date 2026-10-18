@@ -8,11 +8,34 @@ import unittest
 from contextlib import contextmanager
 from pathlib import Path
 
-from scripts.check_controller_acceptance import _cells, default_report, validate
+from scripts.check_controller_acceptance import ALL_IDS, HEADER, _cells, default_report, validate
+
+SEPARATOR = "| --- | --- | --- | --- | --- | --- |"
 
 
 def _row(rid: str, status: str = "未验证", rest: tuple = ("", "", "", "")) -> str:
     return f"| {rid} | {status} | {rest[0]} | {rest[1]} | {rest[2]} | {rest[3]} |"
+
+
+def _ledger_doc(header_line: str | None = HEADER) -> str:
+    """合成文档：正文保留完整行合同引用，真实账本表头可整行删除或改列名。"""
+    lines = ["# Controller V1 集成验收报告", "Spec: 06 §6", "",
+             "> 本报告按行合同 `" + HEADER + "` 登记事实", ""]
+    if header_line is not None:
+        lines.append(header_line)
+    lines.append(SEPARATOR)
+    lines.extend(_row(rid) for rid in ALL_IDS)
+    return "\n".join(lines) + "\n"
+
+
+def _insert_after(text: str, anchor_rid: str, row: str) -> str:
+    """把 row 插入到账本内部（anchor 行之后），模拟真实模板中间插入非法行。"""
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith(f"| {anchor_rid} |"):
+            lines.insert(index + 1, row)
+            return "\n".join(lines) + "\n"
+    raise AssertionError(f"anchor row {anchor_rid} not found")
 
 
 def _drop(text: str, rid: str) -> str:
@@ -82,6 +105,73 @@ class AcceptanceReportContractTest(unittest.TestCase):
     def test_missing_table_header_rejected(self):
         text = _drop_line(default_report(), "| ID | status | executed_at | layer | command_or_steps | evidence |")
         self.assertIn("table header missing", validate(text))
+
+    # --- F1：真实账本表头必须紧邻分隔线，正文引用行合同不得代替 ---
+
+    def test_ledger_doc_with_intact_header_passes(self):
+        self.assertEqual(validate(_ledger_doc()), [])
+
+    def test_real_header_removed_but_quoted_contract_kept_rejected(self):
+        text = _ledger_doc(None)
+        self.assertIn(HEADER, text)  # 正文引用仍在：旧实现的全文子串判断会误判通过
+        self.assertEqual(validate(text), ["table header missing"])
+        with _cli_workspace_dir() as d:
+            path = d / "SYNTHETIC_PATH_SENTINEL.md"
+            path.write_text(text, encoding="utf-8")
+            res = subprocess.run([sys.executable, SCRIPT_PATH, str(path)], capture_output=True, text=True)
+            self.assertEqual((res.returncode, res.stdout, res.stderr), (1, "", "table header missing\n"))
+
+    def test_real_header_renamed_column_rejected(self):
+        renamed = "| ID | status | execution_time | layer | command_or_steps | evidence |"
+        text = _ledger_doc(renamed)
+        self.assertIn(HEADER, text)  # 顶部合同引用保留，仅真实表头改列名
+        self.assertEqual(validate(text), ["table header missing"])
+        with _cli_workspace_dir() as d:
+            path = d / "SYNTHETIC_PATH_SENTINEL.md"
+            path.write_text(text, encoding="utf-8")
+            res = subprocess.run([sys.executable, SCRIPT_PATH, str(path)], capture_output=True, text=True)
+            self.assertEqual((res.returncode, res.stdout, res.stderr), (1, "", "table header missing\n"))
+            self.assertNotIn("execution_time", res.stdout + res.stderr)
+            self.assertNotIn(str(path), res.stdout + res.stderr)
+
+    def test_header_not_adjacent_to_separator_rejected(self):
+        text = _ledger_doc().replace(HEADER + "\n" + SEPARATOR,
+                                     HEADER + "\n>\n" + SEPARATOR)
+        self.assertIn(HEADER, text)
+        self.assertEqual(validate(text), ["table header missing"])
+
+    # --- F2：账本数据区域内不得混入未定义 ID，且错误不回显原值 ---
+
+    def test_unknown_id_row_inside_ledger_rejected(self):
+        cases = [("ZZ-01", "malformed id"), ("t4-01", "malformed id"),
+                 ("at-01", "malformed id"), ("T4-13", "out of range id")]
+        for rid, expected in cases:
+            with self.subTest(rid=rid), _cli_workspace_dir() as d:
+                text = _insert_after(default_report(), "T4-01", _row(rid))
+                self.assertEqual(validate(text), [expected])
+                path = d / "SYNTHETIC_PATH_SENTINEL.md"
+                path.write_text(text, encoding="utf-8")
+                res = subprocess.run([sys.executable, SCRIPT_PATH, str(path)], capture_output=True, text=True)
+                self.assertEqual((res.returncode, res.stdout, res.stderr), (1, "", expected + "\n"))
+                self.assertNotIn(rid, res.stdout + res.stderr)
+                self.assertNotIn(str(path), res.stdout + res.stderr)
+                self.assertNotIn("Traceback", res.stdout + res.stderr)
+
+    def test_unknown_id_row_appended_after_ledger_rows_rejected(self):
+        cases = [("ZZ-01", "malformed id"), ("t4-01", "malformed id"), ("AT-99", "out of range id")]
+        for rid, expected in cases:
+            with self.subTest(rid=rid):
+                text = default_report() + _row(rid) + "\n"
+                self.assertEqual(validate(text), [expected])
+
+    def test_unknown_id_row_in_ledger_doc_rejected(self):
+        text = _ledger_doc() + _row("ZZ-01", "DONE") + "\n"
+        self.assertEqual(validate(text), ["malformed id"])
+
+    def test_other_tables_outside_ledger_ignored(self):
+        # 账本之外的说明表格不参与行合同校验，但账本本身仍须完整。
+        text = default_report() + "\n## 其他说明\n\n| 说明 | 值 |\n| --- | --- |\n| ZZ-01 | 说明 |\n"
+        self.assertEqual(validate(text), [])
 
     def test_counter_examples_data_driven(self):
         base = default_report()
