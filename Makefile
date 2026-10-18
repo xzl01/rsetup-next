@@ -41,6 +41,19 @@ test:
 	cargo test --workspace --locked
 	node --test ui/*.test.mjs
 
+# 中控离线测试轨道：只跑前端 Vitest/typecheck/构建、Rust 资源测试与既有回归，
+# 绝不初始化数据库。真实 MySQL/TiDB 用例属操作员逐引擎显式授权的 `--ignored`
+# 轨道，不在本目标内；普通 CI 缺库 URL 时只记未验证，不在此隐式跑真库。
+# 顺序是硬约束：web_assets 直接读取 apps/controller-web/dist 的真实构建字节，
+# 前端必须先构建，Rust 资源测试才能拿到预期源。
+.PHONY: controller-test-offline
+controller-test-offline:
+	npm --prefix apps/controller-web test -- --run
+	npm --prefix apps/controller-web run typecheck
+	npm --prefix apps/controller-web run build
+	cargo test -p rsetup-controller --test web_assets --locked
+	$(MAKE) test
+
 lint: fmt-check
 	cargo clippy --workspace --all-targets -- -D warnings
 

@@ -24,12 +24,33 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy,rustfmt
+      # 中控前端必须先于任何 Rust 编译：rsetup-controller 的 web.rs 用
+      # include_str!/include_bytes! 在编译期嵌入 apps/controller-web/dist 的产物，
+      # dist 缺失时 cargo 直接失败（fail-closed），web_assets 还要读同一份磁盘字节
+      # 作为独立预期源。顺序固定「锁定安装 → 测试 → 类型检查 → 构建」，与
+      # make controller-test-offline 一致。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/controller-web/package-lock.json
+      - name: Install controller web dependencies
+        run: npm --prefix apps/controller-web ci
+      - name: Test controller web
+        run: npm --prefix apps/controller-web test -- --run
+      - name: Typecheck controller web
+        run: npm --prefix apps/controller-web run typecheck
+      - name: Build controller web
+        run: npm --prefix apps/controller-web run build
       - name: Check formatting
         run: make fmt-check
       - name: Lint Rust workspace
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test Rust workspace
         run: cargo test --workspace
+      # 单独再跑一次资源测试，让「嵌入资源交付」在 CI 里有独立可见的用例。
+      - name: Test controller embedded web assets
+        run: cargo test -p rsetup-controller --test web_assets --locked
       # The pinned deviceinfo crate is excluded from our workspace, so the
       # workspace commands above never compile or test it, even though it owns
       # the system/thermal/storage sampling and the difference logic.
@@ -46,6 +67,10 @@ jobs:
         run: cargo test -p rsetup-core curl_benchmark_fixture --locked -- --ignored
       - name: Test browser localization and async handlers
         run: node --test ui/*.test.mjs
+      # 配置合同：钉住 make controller-test-offline 目标与本作业里「前端构建
+      # 先于 --test web_assets」的顺序——本作业被自己的合同检查，改坏接线即红。
+      - name: Test CI configuration contracts
+        run: node --test scripts/tests/*.test.mjs
 
   rust-multi-arch-check:
     runs-on: ubuntu-latest
@@ -66,6 +91,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
+      # 交叉 --check 也要编译 rsetup-controller，编译期嵌入的前端产物必须先构建。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/controller-web/package-lock.json
+      - name: Build controller web assets
+        run: |
+          npm --prefix apps/controller-web ci
+          npm --prefix apps/controller-web run build
       - name: Check workspace across target architectures
         run: cargo check --workspace --all-targets --locked --target ${{ matrix.target }}
 
@@ -101,6 +136,17 @@ jobs:
                 ;;
             esac
           done
+      # msrv-check 跑 cargo test --workspace，其中 rsetup-controller 编译期嵌入
+      # 前端产物，因此先构建 dist。Node 22 只是构建产物的宿主，被测版本仍是 1.85.0。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/controller-web/package-lock.json
+      - name: Build controller web assets
+        run: |
+          npm --prefix apps/controller-web ci
+          npm --prefix apps/controller-web run build
       - name: Test minimum supported Rust version
         run: make msrv-check
 
@@ -157,10 +203,17 @@ jobs:
           apt-get update &&
           apt-get install -y --no-install-recommends
           build-essential ca-certificates cargo debhelper devscripts dpkg-dev
-          git lintian nodejs rustc
+          git lintian nodejs npm rustc
       - uses: actions/checkout@v7
         with:
           submodules: recursive
+      # dh_auto_test 跑 cargo test --workspace，而 rsetup-controller 在编译期嵌入
+      # apps/controller-web/dist，打包前必须先产出前端产物。Debian trixie 的 nodejs
+      # 为 20.19.x，正好满足 Vite 8 的 ^20.19.0 下限。
+      - name: Build controller web assets
+        run: |
+          npm --prefix apps/controller-web ci
+          npm --prefix apps/controller-web run build
       - name: Prepare offline Cargo cache
         run: CARGO_HOME="$GITHUB_WORKSPACE/debian/cargo-home" cargo fetch --locked
       - name: Build Debian package
