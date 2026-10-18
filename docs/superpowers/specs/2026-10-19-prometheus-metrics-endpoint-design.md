@@ -52,6 +52,7 @@
 - **I4 失败关闭**：配置非法、凭据缺失、采集失败一律 fail-closed（启动失败或 5xx），不得降级为"看起来正常"的空指标或常量 0。
 - **I5 去敏**：所有错误消息、日志、指标文本与测试报告都不得回显密码、base64 凭据原文或配置文件的行原文。
 - **I6 不污染业务契约**：不新增 `EndpointId` 变体、不新增 permission、不写 `audit_events`（抓取是高频只读行为，写审计会造成写入放大并污染安全审计的可读性）。
+- **I7 生命周期对齐**：指标线每一条连接从借出、查询到关闭的整个生命周期都被**恰好一个**并发闸许可（permit）持有，许可只有在底层连接**完全关闭完毕**后才释放（指标连接一律销毁、不回空闲池，§5.5.1）。由此无条件成立：任何时刻指标线"在途 + 关闭中"的连接总数 ≤ `MAX_CONCURRENT_SCRAPE = 4`，共享池默认 `max_connections = 10`，业务线恒保有 ≥ 6 个空闲槽位额度——连续多波慢抓取**不得**发生连接累积饥饿。
 
 ---
 
@@ -243,7 +244,7 @@ impl EnvRead {
    - 两者皆已设置（非空）→ 覆盖/注入凭据字段（`override_pair = Some((user, password))`）：`username`、`password` 一律替换为环境变量值；Raw 里**没有** `[metrics.auth]` 段时按覆盖语义**合成**该段；Raw 里 `kind` 缺失（`None`）时一并注入 `kind = Some("basic")`——用环境变量交付凭据本身即表达"basic 认证"的意图，不要求再补一行 `type`。Raw 里已显式写了 `kind` 时**保留原值**（含非法值）交给阶段三拒绝：覆盖不猜意图、不偷偷改协议。
    - **只设置其一 → `Err`（固定消息 `"metrics auth override must set both user and password"`）**。禁止把文件里的 username 与环境里的 password 拼成一半新一半旧的凭据：这类混搭会让轮换出现不可预期的组合，且排障时无法从任一来源还原实际生效值。
    - 覆盖发生在阶段三门禁**之前**，因此"文件里禁用 + 环境变量给凭据"合法（凭据在阶段三被丢弃），"文件里启用 + 环境变量补凭据"合法。
-4. **阶段三：统一门禁校验**：`from_parts` 按 §3.4（endpoint 与保留路径）、§3.5（`kind`）、§3.6（凭据完整性与终态裁决）顺序校验，任一失败返回 `ControllerError::Config(固定去敏消息)`。凭据字段的必填、非空与字符集校验**只在这里**发生，且只在 `enabled == true` 分支执行。
+4. **阶段三：统一门禁校验**：`from_parts` 先校验 endpoint 格式与保留路径（§3.4，两种 `enabled` 状态通用），随后进入 §3.6 的**唯一凭据判定顺序**（分支 1–5 短路求值）。§3.6 是所有凭据相关错误消息的**唯一权威顺序**：§3.5 的 `kind` 规则只是其分支 3 的执行内容，MUST NOT 先于分支 2（凭据存在性）单独执行。任一失败返回 `ControllerError::Config(固定去敏消息)`。凭据字段的必填、非空与字符集校验**只在这里**发生，且只在 `enabled == true` 分支执行。
 
 优先级结论（后者覆盖前者）：`内置默认值` → `controller.toml`（或 `CONTROLLER_CONFIG` 指定文件） → `PROMETHEUS_AUTH_USER`/`PROMETHEUS_AUTH_PASSWORD`。`enabled` 与 `endpoint` **没有**环境变量覆盖通道，只能来自文件或内置默认值（避免用环境变量悄悄打开一个未配置凭据的端点）。
 
@@ -258,9 +259,9 @@ impl EnvRead {
 | `[metrics]` 存在但缺 `enabled` | 无缺省 | `true`/`false` 必须显式 | 3（门禁） | `Err`：`"metrics.enabled is required"`（表已存在即必须显式声明意图） |
 | `endpoint` | `"/metrics"` | `len ≤ 128`；首字符 `/`；仅由 `/` 分隔的非空 ASCII 小写段组成（`[a-z0-9_-]+`）；不得以 `/` 结尾；不得含 `?`/`#`/`%`/空白/`..` | 3（门禁，两种 `enabled` 都校验） | `Err`：`"metrics.endpoint is invalid"` |
 | `endpoint` 与既有路由冲突 | — | 不得等于/落在 §6.5 的保留路径集合内 | 3（门禁，两种 `enabled` 都校验） | `Err`：`"metrics.endpoint collides with an existing route"` |
-| `[metrics.auth].type` | 无缺省 | 恰好 `"basic"`（区分大小写，不做 trim）；`enabled = true` 时必填（缺失只可由环境变量凭据对推导，§3.3 第 3 步） | 3（门禁，仅 `enabled = true`） | `Err`：`"metrics.auth.type must be \"basic\""` |
-| `[metrics.auth].username` | 无缺省 | 非空；不含 `:`；不含 `< 0x20` 或 `0x7F` 控制字符 | 3（门禁，仅 `enabled = true`） | `Err`：`"metrics.auth.username is invalid"` |
-| `[metrics.auth].password` | 无缺省 | 非空；**可以包含 `:`**；不含 `< 0x20` 或 `0x7F` 控制字符 | 3（门禁，仅 `enabled = true`） | `Err`：`"metrics.auth.password is invalid"` |
+| `[metrics.auth].type` | 无缺省 | 恰好 `"basic"`（区分大小写，不做 trim）；`enabled = true` 时必填（缺失只可由环境变量凭据对推导，§3.3 第 3 步） | 3（门禁，仅 `enabled = true`，且**凭据存在性检查通过后**才到达——§3.6 分支 3） | `Err`：`"metrics.auth.type must be \"basic\""` |
+| `[metrics.auth].username` | 无缺省 | 非空；不含 `:`；不含 `< 0x20` 或 `0x7F` 控制字符 | 3（门禁，仅 `enabled = true`，且存在性与 `kind` 均通过后才到达——§3.6 分支 4） | `Err`：`"metrics.auth.username is invalid"` |
+| `[metrics.auth].password` | 无缺省 | 非空；**可以包含 `:`**；不含 `< 0x20` 或 `0x7F` 控制字符 | 3（门禁，仅 `enabled = true`，且存在性与 `kind` 均通过后才到达——§3.6 分支 4） | `Err`：`"metrics.auth.password is invalid"` |
 
 统一规则：
 
@@ -274,23 +275,28 @@ impl EnvRead {
 
 ### 3.5 认证类型门禁
 
-`kind`（TOML 键 `type`）在 Raw DTO 里是 `Option<String>`（§3.2），门禁规则：
+`kind`（TOML 键 `type`）在 Raw DTO 里是 `Option<String>`（§3.2）。本节只定义 kind 的**合法性规则与唯一推导出口**；**触发顺序的唯一权威判定序列是 §3.6**——kind 校验必须在凭据存在性检查（§3.6 分支 2）通过之后才到达："auth 段完全缺失"或"`username`/`password` 缺失"一律先命中分支 2 的 `"metrics.auth is required when metrics.enabled is true"`，MUST NOT 抢报本节的 kind 错误。
 
 1. `Some(v)`：`v` 必须逐字节等于 `"basic"`（区分大小写、不做 trim）。`"none"`、`"bearer"`、`"token"`、空串及任何未知值一律 `Err("metrics.auth.type must be \"basic\"")` 并拒绝启动，不回落到"免认证"或"默认 basic"。免认证公开指标在本期是不可用能力，而不是可用但需自行加固的能力。
-2. `None`：**只有一种**合法出路——凭据来自环境变量覆盖对，由阶段二推导注入 `Some("basic")`（§3.3 第 3 步）。除此之外 `enabled = true` 且 `kind == None` 即 `Err("metrics.auth.type must be \"basic\"")`：文件里写了 auth 段却不声明 `type` 是配置缺陷，猜成 basic 会让将来的第二种协议静默改变既有部署的语义。
+2. `None`：**只有一种**合法出路——凭据来自环境变量覆盖对，由阶段二推导注入 `Some("basic")`（§3.3 第 3 步）。除此之外、且**凭据已齐备**（否则会先命中 §3.6 分支 2）时 `kind == None` 即 `Err("metrics.auth.type must be \"basic\"")`：文件里写了 auth 段却不声明 `type` 是配置缺陷，猜成 basic 会让将来的第二种协议静默改变既有部署的语义。
 3. `enabled = false` 时本节整体跳过（不校验、不推导，`kind` 随整段一起丢弃）。
 
 ### 3.6 安全启动门禁（Fail-Closed）
 
-终态裁决是阶段三的最后一步，按顺序执行（各分支触发条件互斥，不重叠）：
+终态裁决是阶段三的最后一步，也是所有凭据相关错误的**唯一权威判定顺序**：按下列顺序求值，**命中第一条立即返回（短路），不叠加、不收集多个错误**，因此任一非法配置对应的错误消息唯一。
 
-1. `enabled == false` → 丢弃整个 `[metrics.auth]`（无论其内容是否完整、`type` 是否合法），终态 `credentials = None`，**不校验任何凭据字段**。合法配置示例：`enabled = false` 且不写 auth；以及"禁用 + 写了半截 auth（例如只写 `username`）"——后者被安全忽略，不阻断主业务启动。
-2. `enabled == true` 且凭据既不在文件也不在环境变量里（阶段二后 `username`/`password` 至少有一个仍是 `None`） → `Err`：`"metrics.auth is required when metrics.enabled is true"`。
-3. `enabled == true` 且凭据齐备但 `kind` 非法或缺失且未由环境变量推导 → 由 §3.5 拦截，返回 `"metrics.auth.type must be \"basic\""`。
-4. `enabled == true` 且 `kind == "basic"`，但 `username`/`password` 为空串或含非法字符 → 由 §3.4 的字段校验拦截，返回更具体的 `"metrics.auth.username is invalid"` 或 `"metrics.auth.password is invalid"`（同一条件只有一个消息，不重复报告）。
-5. 全部通过 → `credentials = Some(BasicCredentials { username, password })`。
+1. **分支 1（禁用放行）**：`enabled == false` → 丢弃整个 `[metrics.auth]`（无论其内容是否完整、`type` 是否合法），终态 `credentials = None`，**不校验任何凭据字段**。合法配置示例：`enabled = false` 且不写 auth；以及"禁用 + 写了半截 auth（例如只写 `username`）"——后者被安全忽略，不阻断主业务启动。
+2. **分支 2（凭据存在性，优先于 `kind` 与字段合法性）**：`enabled == true` 且 `[metrics.auth]` 段**完全缺失**，或阶段二之后 `username`/`password` 至少有一个仍是 `None`（既不在文件也不在环境变量里） → `Err`：`"metrics.auth is required when metrics.enabled is true"`。**即使段内已写的 `type` 是非法值（如 `type = "bearer"`）、或已写字段含非法字符，本分支的统一消息仍优先**——"启用但凭据没配全"是修复动作唯一的第一因，先报告它。
+3. **分支 3（协议类型）**：凭据齐备但 `kind != "basic"`，或 `kind == None` 且未由环境变量推导 → `Err`：`"metrics.auth.type must be \"basic\""`（合法性规则见 §3.5；空串 `type = ""` 属于本分支的非法值）。
+4. **分支 4（字段合法性）**：`username`/`password` 为空串或含非法字符（username 含 `:` 或控制字符、password 含控制字符）→ `Err`：`"metrics.auth.username is invalid"` 或 `"metrics.auth.password is invalid"`（先算 username 再算 password，同一条件只有一个消息，不重复报告）。
+5. **分支 5（装配）**：全部通过 → `credentials = Some(BasicCredentials { username, password })`。
 
-空凭据的可达路径唯一：`[metrics.auth]` 里写了空串，命中分支 4。环境变量侧的空串按"未设置"处理（§3.3 第 3 步），因此要么整个凭据缺失（分支 2），要么在 §3.3 第 3 步就被 partial 拒绝；`NotUnicode` 则在第 3 步就报错（§3.4 规则 7）。三条路径互斥，不存在同一条件对应两个消息的情形。
+边界裁决（消除优先级歧义，§7.2 的优先级用例逐条钉住）：
+
+- **存在性看 `Option`，不看取值**：`[metrics.auth]` 写了 `username = ""` 是"已提供但非法"（`Some("")`），命中分支 4 而非分支 2；完全没写 `username` 键才是"缺失"，命中分支 2。
+- **kind 滞后于存在性**："auth 段完全缺失"与"段里只写 `type` 不写凭据"都命中分支 2，绝不命中分支 3；`kind == None` 报缺失的情形只在凭据齐备时可达（§3.5 第 2 条）。
+- **环境变量侧**：空串按"未设置"处理（§3.3 第 3 步），因此环境变量组合只可能产生"整对覆盖"、partial 拒绝或回到分支 2 的缺失，不存在第三种形态；`NotUnicode` 则在第 3 步就报错（§3.4 规则 7）。
+- 环境变量凭据经阶段二后与文件凭据等价，分支 2–4 同样校验（环境变量 `username` 含 `:` 同样命中分支 4）。
 
 分支 2、3、4 即需求的核心安全门禁：**启用指标但没有完整、合法的凭据，服务在启动期直接拒绝启动**，错误经 `main()` 的 `?` 上抛，进程不绑定端口。所有上述固定消息 MUST NOT 含用户名、密码、路径或文件内容；测试以断言"`err.message()` 不含配置里写入的密码字面量"（§7.2）反向保证。
 
@@ -369,8 +375,8 @@ fn ct_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool;   // subtle::ConstantTimeEq 的
 1. `verify` 先比较**用户名**、再比较**密码**，两次比较**都必须执行**，结果以按位与合并：
 
    ```rust
-   let ok_user = ct_eq_32(&sha256(user.as_bytes()), &sha256(&expected.username));
-   let ok_password = ct_eq_32(&sha256(password.as_bytes()), &sha256(&expected.password));
+   let ok_user = ct_eq_32(&sha256(user.as_bytes()), &sha256(expected.username.as_bytes()));
+   let ok_password = ct_eq_32(&sha256(password.as_bytes()), &sha256(expected.password.as_bytes()));
    ok_user & ok_password
    ```
 
@@ -409,13 +415,13 @@ GET 与 HEAD 是**同一认证域**的两种方法（§6.2 说明 Axum 的 HEAD 
 | `enabled = true`、scheme/base64/UTF-8 非法、无冒号或用户名为空 | `401` | §4.4 | 是 | 否 |
 | `enabled = true`、凭据不匹配 | `401` | §4.4 | 是（两次比较都执行） | 否 |
 | GET、合法凭据、采集成功 | `200` | §5.1 | 是 | 是 |
-| HEAD、合法凭据 | `200` | **空体** + §5.1 的三个响应头（`Content-Type` 常量、`Cache-Control: no-store`、`X-Content-Type-Options: nosniff`）；不占并发闸 | 是 | **否**（§6.2 HEAD 短路） |
+| HEAD、合法凭据 | `200` | **空体** + §5.1 的三个响应头（`Content-Type` 常量、`Cache-Control: no-store`、`X-Content-Type-Options: nosniff`）；**无 `Allow` 头**（`Allow` 只出现在 405 fallback，200 不携带，§6.2 字节事实）；不占并发闸 | 是 | **否**（§6.2 HEAD 短路） |
 | GET、合法凭据、采集失败/超时/并发闸满/渲染超上限 | `503` | 空体 + `Cache-Control: no-store` + `Retry-After: 5` | 是 | 是（已失败） |
 | HEAD、采集类失败不适用 | — | HEAD 不采集，因此不会因采集失败产生 503；仅可能 401/404 | — | — |
-| 其他方法（`POST`/`PUT`/`PATCH`/`DELETE`/`OPTIONS` 等） | `405` | 由 Axum 方法匹配给出，并带 `Allow: GET, HEAD`（禁用态亦如此，见 §8 残余风险 R5） | 否 | 否 |
+| 其他方法（`POST`/`PUT`/`PATCH`/`DELETE`/`OPTIONS` 等） | `405` | 由 Axum 方法匹配给出，并带**无空格**的 `Allow: GET,HEAD`（Axum 0.8.9 源码 `append_allow_header` 以 `","` 连接方法名，逐字节事实见 §6.2；禁用态亦如此，见 §8 残余风险 R5） | 否 | 否 |
 | 其他路径 | `404` | 顶层 router 默认未匹配响应 | 否 | 否 |
 
-handler 内部顺序 MUST 固定为：①`enabled` 门禁 → ②Basic 认证 → ③`HEAD` 短路（直接 200 空体，不取并发闸、不采集）→ ④并发闸 `try_acquire` → ⑤快照采集（含超时与连接防护，§5.5）→ ⑥渲染与上限校验 → ⑦响应。（HTTP 方法匹配由路由层在此之前完成；`HEAD` 之外没有第二种方法能进入 handler。）先判 `enabled` 再判认证，保证禁用态无论是否携带凭据都恒 404；认证先于 HEAD 短路，保证 HEAD 绝不在未鉴权下触达任何数据源。
+handler 内部顺序 MUST 固定为：①`enabled` 门禁 → ②Basic 认证 → ③`HEAD` 短路（直接 200 空体，不取并发闸、不采集）→ ④并发闸 `try_acquire_owned`（`OwnedPermit` 移交采集任务持有，直到连接完全关闭——即 ⑤⑥ 全部结束——才释放，§5.5.1）→ ⑤快照采集（含超时与连接防护，§5.5）→ ⑥渲染与上限校验 → ⑦响应。（HTTP 方法匹配由路由层在此之前完成；`HEAD` 之外没有第二种方法能进入 handler。）先判 `enabled` 再判认证，保证禁用态无论是否携带凭据都恒 404；认证先于 HEAD 短路，保证 HEAD 绝不在未鉴权下触达任何数据源。
 
 ### 4.6 认证失败不引入进程内限速（本期决策）
 
@@ -480,11 +486,11 @@ pub const EDITION: &str = "2024";
 | `APPROVED` | `APPROVED` | 已准入 |
 | `PENDING` | `PENDING` | 待审批 |
 | `REVOKED` | `REJECTED` | 未获准入（含先批准后吊销） |
-| 其他任意字符串 | **fail-closed 503** | 绝不静默归入任一桶（§5.3 的二进制分组保证这类值真的成为独立分组，而不是被大小写不敏感校对吞并） |
+| 其他任意字符串 | **fail-closed 503** | 绝不静默归入任一桶（§5.3 的 `CAST(... AS BINARY)` 字节级分组保证这类值真的成为独立分组——既不被大小写不敏感的默认排序规则吞并，也不被 `PAD SPACE` 校对规则的尾部空格折叠吞并） |
 
-命名映射是刻意选择并在本文留档的偏差：持久层用 `REVOKED` 描述"当前不处于准入态"（`AdmissionState::Revoked`），监控侧统一用 `REJECTED` 表达"未获准入"这一告警语义，使告警规则可以写 `rsetup_controller_devices_total{admission="REJECTED"}` 而不必了解内部 `REVOKED`/`Denied` 的状态机细节。映射 MUST 在 Rust 侧纯函数完成（`fn admission_label(raw: &str) -> Option<AdmissionBucket>`），MUST NOT 依赖 SQL 端的隐式转换。
+命名映射是刻意选择并在本文留档的偏差：持久层用 `REVOKED` 描述"当前不处于准入态"（`AdmissionState::Revoked`），监控侧统一用 `REJECTED` 表达"未获准入"这一告警语义，使告警规则可以写 `rsetup_controller_devices_total{admission="REJECTED"}` 而不必了解内部 `REVOKED`/`Denied` 的状态机细节。映射 MUST 在 Rust 侧纯函数完成（`fn admission_label(raw: &[u8]) -> Option<AdmissionBucket>`，与 `b"APPROVED"`/`b"PENDING"`/`b"REVOKED"` **逐字节比较**；§5.3 的解码层给出 `Vec<u8>`，非 UTF-8 字节值因无法匹配任何合法值而天然落入未知桶），MUST NOT 依赖 SQL 端的隐式转换。
 
-**事实修正（必读）**：`chk_devices_state CHECK (admission_state IN ('PENDING','APPROVED','REVOKED'))` 只存在于最初的 `0001_identity_devices.sql`。**v3（`0003_identity_application_integrity.sql`）重建 `devices` 表时不再携带任何 CHECK 约束**，且 v3 迁移路径显式执行 `ALTER TABLE devices DROP CHECK chk_devices_state`（`db.rs` 的 `LEGACY_CHECK_DROPS` 白名单之一）。因此现网 schema 里**没有**数据库层的三值约束，异常枚举值（历史脏数据、旁路写入、大小写变体）在数据库侧完全可能落库：枚举防御只有"SQL 二进制分组 + Rust 显式穷举映射 + 未知值 503"这一条路，MUST NOT 以"DDL 已经约束了"作为省略防御的理由。同理，v4 任务表按 `0004_tasks.sql` 文件头约定"五张表、无外键、无 CHECK 约束"。
+**事实修正（必读）**：`chk_devices_state CHECK (admission_state IN ('PENDING','APPROVED','REVOKED'))` 只存在于最初的 `0001_identity_devices.sql`。**v3（`0003_identity_application_integrity.sql`）重建 `devices` 表时不再携带任何 CHECK 约束**，且 v3 迁移路径显式执行 `ALTER TABLE devices DROP CHECK chk_devices_state`（`db.rs` 的 `LEGACY_CHECK_DROPS` 白名单之一）。因此现网 schema 里**没有**数据库层的三值约束，异常枚举值（历史脏数据、旁路写入、大小写变体、尾部空格变体）在数据库侧完全可能落库：枚举防御只有"SQL 字节级分组（`CAST(... AS BINARY)`）+ Rust 字节精确映射 + 未知值 503"这一条路，MUST NOT 以"DDL 已经约束了"作为省略防御的理由。同理，v4 任务表按 `0004_tasks.sql` 文件头约定"五张表、无外键、无 CHECK 约束"。
 
 **主任务状态**（`main_tasks.state` / `main_tasks.outcome`，v4 表不建 CHECK 约束，故 MUST 用显式穷举映射；`state` 取值域按 `2026-09-23-controller-v1-04-task-lifecycle.md` 为 `queued`/`running`/`held`/`completed`，`outcome` 为 `success`/`cancelled`/`unknown`/`partial`/`failed` 或 `NULL`）：
 
@@ -499,37 +505,40 @@ pub const EDITION: &str = "2024";
 | `completed` | **不属于上述 5 个已知值且非 `NULL`** 的任意字符串（含大小写变体，如 `Success`） | **fail-closed 503**（`task_bucket` 返回 `None`） |
 | 其他任意字符串（`state` 不在四值域内，含大小写/pad 变体） | — | **fail-closed 503**，绝不静默归入任一桶 |
 
+**统计口径（唯一判据）**：非终态（`queued`/`running`/`held`）只按 `state` 列聚合——`outcome` 列**既不校验也不参与**（非终态 `outcome` 理论上为 `NULL`，其合法性由 `integrity.rs` 的"非 completed 必须 NULL"不变量另行守护；非终态行的脏 `outcome` 不触发本端点 503，属完整性对账层的职责）。终态 `completed` **严格校验** `success`/`cancelled`/`unknown`/`partial`/`failed` 五值与 `NULL`（后者按上表归 `failed`），字节级任何其他取值 → fail-closed 503。
+
 未知 `outcome` 与未知 `state` 一样是 fail-closed：把没见过的终态原因猜成 `failed` 或 `succeeded` 都是伪造数据。区分两条去敏消息：`task_bucket` 返回 `None` 时，若 `state` 本身不在四值域内 → `ControllerError::Config("metrics task aggregate: unknown task state")`；若 `state` 合法但 `outcome` 不在枚举内 → `ControllerError::Config("metrics task aggregate: unknown task outcome")`。两条消息都 MUST NOT 回显数据库里的原始取值（I5）。
 
-纯函数 `fn task_bucket(state: &str, outcome: Option<&str>) -> Option<TaskBucket>` 承载该表；`("completed", None) → Some(Failed)` 是唯一的 `NULL` 分支，其余 `Option::None`（非终态传 `None`）按"任意"处理。
+纯函数 `fn task_bucket(state: &[u8], outcome: Option<&[u8]>) -> Option<TaskBucket>` 承载该表（字节精确比较，非 UTF-8 字节值同样只能 → `None`，与大小写/尾部空格变体同等处置）；`(b"completed", None) → Some(Failed)` 是唯一的 `NULL` 分支，其余 `Option::None`（非终态传 `None`）按"任意"处理（统计口径见上）。
 
 `held`（等待人工 time-review 的暂停态）并入 `pending`：两者都是"尚未在执行中"的非终态，四桶标签由对齐设计固定为 `pending|running|succeeded|failed`，并入可保证四条序列求和恰等于表行数（若另立第五桶则违反 §1.3 的固定标签域）。
 
 ### 5.3 采集与查询
 
-两条聚合查询 + 一次内存读取，全部在 `metrics/collect.rs`。分组 MUST 使用**二进制校对语义**（逐字节区分大小写、不做 `NO PAD`/`PAD SPACE` 尾部空格折叠）：
+两条聚合查询 + 一次内存读取，全部在 `metrics/collect.rs`。分组 MUST 使用**字节级二进制分组**：`CAST(<列> AS BINARY)`，按字节逐字节比较（`memcmp` 语义）、区分大小写、无尾部空格 `PAD` 折叠——**不得（MUST NOT）使用 `COLLATE utf8mb4_bin` 方案**（v2 拼法已被二轮复审否决，根因见约束 2）：
 
 ```sql
--- 设备准入分布（二进制分组：'APPROVED' 与 'approved'/'APPROVED ' 是两个独立分组）
-SELECT CAST(admission_state AS CHAR) COLLATE utf8mb4_bin AS bucket, COUNT(*) AS n
+-- 设备准入分布（字节级分组：'APPROVED' 与 'approved'/'APPROVED ' 是三个独立分组）
+SELECT CAST(admission_state AS BINARY) AS bucket, COUNT(*) AS n
 FROM devices
-GROUP BY CAST(admission_state AS CHAR) COLLATE utf8mb4_bin;
+GROUP BY CAST(admission_state AS BINARY);
 
--- 主任务状态分布（state 与 outcome 两列都按二进制分组）
-SELECT CAST(state AS CHAR) COLLATE utf8mb4_bin AS state,
-       CAST(outcome AS CHAR) COLLATE utf8mb4_bin AS outcome,
+-- 主任务状态分布（state 与 outcome 两列都按字节分组）
+SELECT CAST(state AS BINARY) AS state,
+       CAST(outcome AS BINARY) AS outcome,
        COUNT(*) AS n
 FROM main_tasks
-GROUP BY CAST(state AS CHAR) COLLATE utf8mb4_bin, CAST(outcome AS CHAR) COLLATE utf8mb4_bin;
+GROUP BY CAST(state AS BINARY), CAST(outcome AS BINARY);
 ```
 
 约束：
 
-1. 两条查询 MUST 在**同一条池连接**上顺序执行（同一连接不保证跨语句快照，因此下面第 3 条明确语义边界），MUST NOT 用 `query!` 宏（本仓库不使用编译期 SQL 宏，保持与 `db.rs`、`tasks/repository.rs` 一致的 `query_as` 运行期写法）。
-2. **为什么必须二进制分组**：`utf8mb4` 的默认排序规则大小写不敏感且 pad-space，`GROUP BY admission_state` 会把 `APPROVED` 与 `approved` 折叠成一组、把尾部空格视为相等，于是 §5.2.2 依赖的"未知枚举值 → 独立分组 → Rust 映射失败 → 503"这条 fail-closed 链路在 SQL 层就被吞掉，脏数据被静默计入合法桶（伪造 PASS）。写法上 MUST 让**选择列表里的表达式与 `GROUP BY` 表达式逐字符相同**（即两侧都写 `CAST(... AS CHAR) COLLATE utf8mb4_bin`），否则在默认开启 `ONLY_FULL_GROUP_BY` 的 MySQL 8/TiDB 上会因表达式不同而报 1055。`COLLATE` 只影响比较/分组，不改变返回的字节值，`bucket` 拿到的仍是原始字符串。
-   - 不采用 `GROUP BY BINARY admission_state`/`GROUP BY CAST(admission_state AS BINARY)`：`BINARY` 运算符在 MySQL 8.0 已弃用（产生 deprecation 告警），且同样触发"选择列与分组表达式不一致"的 1055 风险；语义等价、可移植性更好的拼法是显式 `COLLATE utf8mb4_bin`。
-   - 该 SQL 的确切拼法 MUST 由 §7.7 的 L4 用例在 MySQL 与 TiDB 双引擎上实测通过（含大小写变体不折叠的断言）；任一引擎不接受该写法时，MUST 修改本规范并重新评审，MUST NOT 静默退化为无 `COLLATE` 的写法。
-3. `COUNT(*)` 以 `i64` 接收，再 `u64::try_from`；负值（不可能出现）→ fail-closed 503。`CAST(... AS CHAR)` 与本仓库既有查询写法一致，固定字符串类型不受会话字符集影响。
+1. 两条查询 MUST 在**同一条池连接**上顺序执行（同一连接不保证跨语句快照，因此下面第 4 条明确语义边界），MUST NOT 用 `query!` 宏（本仓库不使用编译期 SQL 宏，保持与 `db.rs`、`tasks/repository.rs` 一致的 `query_as` 运行期写法）。
+2. **为什么必须是 `CAST(... AS BINARY)` 而不是 `COLLATE utf8mb4_bin`（二轮复审 R2 的根因）**：MySQL 8.0 官方文档（Reference Manual 的 "NO PAD and PAD SPACE Collations" 一节）明确：只有名字含 `_0900_` 的校对规则是 NO PAD，**其余校对规则一律 `PAD SPACE`——`utf8mb4_bin` 正是 `PAD SPACE`**：比较时忽略尾部空格填充，`'PENDING' = 'PENDING '` 恒为真，`GROUP BY ... COLLATE utf8mb4_bin` 会把带尾部空格的脏值折叠进 `PENDING` 合法分组。也就是说 v2 的 `COLLATE utf8mb4_bin` 拼法在 SQL 层就吞掉了 §5.2.2 的 fail-closed 链路（尾部空格脏数据逃逸检测、伪造 PASS），无论 Rust 侧映射多么严格都看不到这个脏值。`CAST(x AS BINARY)` 则把值转为**字节串**（BINARY 类型）：比较是逐字节 `memcmp` 语义，**没有校对规则、没有 PAD 概念**，`'PENDING'` 与 `'PENDING '` 长度不同必然成为独立分组，大小写差异天然保留；该语义在 MySQL 8.0 与 TiDB 上一致且确定，不依赖任何校对规则的存在或改名。
+   - 不采用 `BINARY` **运算符**（`GROUP BY BINARY admission_state`）：它在 MySQL 8.0 已弃用（产生 deprecation 告警），官方给出的替代恰是 `CAST(... AS BINARY)`——**`CAST` 形式本身不在弃用范围**，不得因运算符的弃用而连坐否掉 `CAST(... AS BINARY)`。
+   - 写法上 MUST 让**选择列表里的表达式与 `GROUP BY` 表达式逐字符相同**（两侧都写 `CAST(<列> AS BINARY)`），否则在默认开启 `ONLY_FULL_GROUP_BY` 的 MySQL 8/TiDB 上会因表达式不同而报 1055。
+   - 该 SQL 的确切拼法 MUST 由 §7.7 的 L4 用例在 MySQL 与 TiDB 双引擎上实测通过（含大小写与尾部空格变体不折叠的断言，及 `utf8mb4_bin` 会折叠的对照断言）；任一引擎不接受该写法时，MUST 修改本规范并重新评审，MUST NOT 静默退化为无 `CAST` 或 `COLLATE` 写法。
+3. **接收端解码与严格映射**：`CAST(x AS BINARY)` 的结果列是字节串，Rust 侧 MUST 以 `Vec<u8>` 接收（可空列用 `Option<Vec<u8>>`），映射函数（`admission_label`/`task_bucket` 的 `&[u8]` 版本）与 ASCII 字节字面量（`b"APPROVED"` 等）**逐字节比较**，MUST NOT 先 lossy 解码再 `String` 比较；`'PENDING '`、`'approved'` 与任何非 UTF-8 字节值都无法匹配合法值，全部成为独立未知桶并稳定触发 503。`CAST(NULL AS BINARY)` 为 `NULL`、自成一族分组（`outcome` 的 `NULL` 分支依赖该语义）。`COUNT(*)` 以 `i64` 接收，再 `u64::try_from`；负值（不可能出现）→ fail-closed 503。字节串结果不受会话字符集与 `collation_connection` 影响，这是该写法相对字符串比较的额外确定性收益。
 4. **语义边界**：两条聚合之间不做事务，因此两个族之间允许存在毫秒级偏差。该指标语义是"抓取时点的近似瞬时 gauge"，MUST NOT 为此持有长事务或 `SERIALIZABLE` 快照；如需强一致对账，走 SQL 而非本端点。
 5. 连接池 gauge 直接读内存：`active = pool.size().saturating_sub(pool.num_idle() as u32)`、`idle = pool.num_idle()`（`sqlx::Pool::size()` 返回当前打开连接总数、含空闲；`num_idle()` 返回空闲数；两者都以 `u64` 渲染），MUST NOT 为此发起任何连接或查询，两条序列永远可得、永不变错。`state="max"` 本期不输出（`Pool::options().get_max_connections()` 可用，留待后续需要 `饱和度` 告警时另立规范）。
 6. `Pool::size()` 为 0（例如尚未建立任何连接的 lazy 池）时输出 `active=0, idle=0`，这是"当前没有任何打开连接"的真实表达，不是采集失败。
@@ -546,8 +555,8 @@ Prometheus 官方命名约定把 `_total` 后缀留给 counter。本设计的 `r
 
 - **Pull 模式**：只在请求到达时采集，MUST NOT 启动后台定时采集任务、MUST NOT 缓存上一次响应（同一路径上的两次抓取允许得到不同取值，这是 gauge 的正常语义）。
 - **取值装配**：`collect.rs` 把 `MetricsSnapshot`（两条 DB 聚合）+ `MetricsRuntime`（构建常量与单调 uptime）+ 连接池内存读数（`PoolCounts`）合成 `model::ScrapeValues`，再交 `render::render`；`ScrapeValues` 是渲染层唯一的输入形态（§7.4 的 golden 测试直接构造它，不需要 DB）。
-- **并发闸**：`Arc<tokio::sync::Semaphore>`，容量 `pub const MAX_CONCURRENT_SCRAPE: usize = 4`（定义在 `metrics/collect.rs`，`http.rs` 与 `production.rs` 统一按 `metrics::collect::MAX_CONCURRENT_SCRAPE` 引用，不重复声明字面量），handler 用 `try_acquire_owned`；已满 → 立即 503（不排队、不占连接），防止 Prometheus 抓取风暴把业务连接池挤占。`tokio` 的 `sync`/`time` feature 已由工作区声明，无需新增 feature。
-- **超时**：两条聚合查询整体包在 `tokio::time::timeout(SCRAPE_TIMEOUT, ...)` 内，`pub const SCRAPE_TIMEOUT: Duration = Duration::from_secs(2)`（同处 `collect.rs` 定义）；超时 → 503。该上限小于常见 Prometheus `scrape_timeout`（10s），使失败由本进程先判定，而不是让抓取端观察到悬挂连接。单次抓取的最坏墙钟耗时是 `POOL_ACQUIRE_TIMEOUT + SCRAPE_TIMEOUT = 2.5s`（§5.5.1），仍在 10s 之内，因此 handler 外层 MUST NOT 再叠加第三层超时（叠了只会产生第二种失败形态而无法定性）。**该超时只是必要条件，不是充分的池保护**，见 §5.5.1。
+- **并发闸**：`Arc<tokio::sync::Semaphore>`，容量 `pub const MAX_CONCURRENT_SCRAPE: usize = 4`（定义在 `metrics/collect.rs`，`http.rs` 与 `production.rs` 统一按 `metrics::collect::MAX_CONCURRENT_SCRAPE` 引用，不重复声明字面量），handler 用 `try_acquire_owned`；已满 → 立即 503（不排队、不占连接），防止 Prometheus 抓取风暴把业务连接池挤占。**许可持有周期与底层连接的完整生命周期绑定（I7）**：handler 把取得的 `OwnedPermit` 随采集调用移交给 `tokio::spawn` 的独立采集任务持有，只有该任务返回（= 底层连接已完全关闭，§5.5.1）后才释放许可；MUST NOT 随查询超时的 503 响应提前释放，客户端断线也 MUST NOT 使其提前释放。`tokio` 的 `sync`/`time` feature 已由工作区声明，无需新增 feature。
+- **超时**：两条聚合查询整体包在 `tokio::time::timeout(SCRAPE_TIMEOUT, ...)` 内，`pub const SCRAPE_TIMEOUT: Duration = Duration::from_secs(2)`（同处 `collect.rs` 定义）；超时 → 503。该上限小于常见 Prometheus `scrape_timeout`（10s），使失败由本进程先判定，而不是让抓取端观察到悬挂连接。正常路径（含健康连接的快速关闭）的最坏墙钟耗时是 `POOL_ACQUIRE_TIMEOUT + SCRAPE_TIMEOUT = 2.5s`（§5.5.1），仍在 10s 之内；仅当数据库严重异常时其后的连接关闭阶段（§5.5.1 第 2 条）会拉长墙钟，此时允许响应被 Prometheus 的 `scrape_timeout` 先行截断、采集任务自行收尾。handler 与关闭调用都 MUST NOT 再叠加第三层超时——给关闭设超时会使其提前放行许可，等于重开多波累积后门（§5.5.1 第 2 条）。**该超时只是必要条件，不是充分的池保护**，见 §5.5.1。
 - **失败语义（G4）**：任一聚合查询报错或超时、映射遇到未知取值、`u64` 转换失败、渲染超上限 → **整次抓取 503、空响应体**。MUST NOT 输出"部分成功 + 缺失族记 0"或 `unknown` 占位：把取不到写成 0 会让 `devices_total` 假装设备消失、让告警静默，是伪造 PASS。
 
 - **数据源可注入**：DB 汇总经 dyn-safe trait 注入，与 `http_device_status::DeviceStatusSnapshotSource` 同一形态，便于进程内 HTTP 测试不连真实库：
@@ -568,7 +577,8 @@ Prometheus 官方命名约定把 `_total` 后缀留给 counter。本设计的 `r
 
   pub struct SqlxMetricsSnapshotSource { /* db: DbPool */ }
   impl SqlxMetricsSnapshotSource {
-      /// 只接受**既有**池的 Clone；实现内部按 §5.5.1 执行 acquire 超时 + close_on_drop。
+      /// 只接受**既有**池的 Clone；实现内部按 §5.5.1 执行 acquire 超时、close_on_drop 兜底，
+      /// 并在本调用内 await 连接关闭完毕后才返回——池槽位与并发闸许可随返回一并释放。
       /// 生产装配只能由 `production.rs` 以 `inputs.auth.db` 调用（§6.3），
       /// `main.rs` 与任何业务线 MUST NOT 自行构造它再作为入参传入。
       pub fn new(db: DbPool) -> Self;
@@ -591,10 +601,10 @@ Prometheus 官方命名约定把 `_total` 后缀留给 counter。本设计的 `r
 
 指标线与 auth/tasks 共用同一个 `DbPool`（I2），因此指标慢查询**首先**是业务可用性问题，其次才是观测成本问题。`sqlx` 与 `sqlx-core 0.8.6` 的以下事实是本节规则的根据，实现与评审 MUST 逐条对照：
 
-1. **`tokio::time::timeout` 只取消外层 Future**。被取消的只是"等待查询完成"的那段 await；池连接由 `PoolConnection` 持有，其 `Drop`（`sqlx-core-0.8.6/src/pool/connection.rs`）会 `rt::spawn(...)` 一个后台任务去做归还或关闭，该任务**不受**已返回的 `timeout` 影响。默认路径 `return_to_pool()` 会先 `raw.ping()` 以"测试连接并 flush 掉因取消而残留的结果"（源码注释明确写了这是取消后状态不一致的 band-aid），**成功后**才 `PoolInner::release()` 释放池槽位的 semaphore permit。也就是说：外层已经 503 了，池槽位仍被这条慢/脏连接占着，直到数据库把余下结果吐完或 ping 失败。慢查询连续发生时，指标线就会持续吃掉共享池的连接。
+1. **`tokio::time::timeout` 只取消外层 Future**。被取消的只是"等待查询完成"的那段 await；池连接由 `PoolConnection` 持有，其 `Drop`（`sqlx-core-0.8.6/src/pool/connection.rs`）会 `rt::spawn(...)` 一个后台任务去做归还或关闭，该任务**不受**已返回的 `timeout` 影响。默认路径 `return_to_pool()` 会先 `raw.ping()` 以"测试连接并 flush 掉因取消而残留的结果"（源码注释明确写了这是取消后状态不一致的 band-aid），**成功后**才 `PoolInner::release()` 释放池槽位的 semaphore permit；即使设置了 `close_on_drop()`，`Drop` 走的 `take_and_close()` 同样是 `rt::spawn` 出去的后台关闭（外包 `CLOSE_ON_DROP_TIMEOUT = 5s`），池 permit 也要到它完成才释放。**结论：池槽位的释放与 handler 的返回天然是解耦的——外层已经 503，池槽位可能仍被这条慢/脏连接占用，且占多久由服务端行为决定、handler 不可见。**只要并发闸的许可随 handler 返回立即释放，"新一波再次借出新连接"就会与"上一波仍在后台关闭的连接"逐波叠加，总占用**不受并发闸封顶**，可耗尽共享池默认 `max_connections = 10` 而饿死业务线（二轮复审 R1 的根因；v2 的 `close_on_drop()` + 立即释放许可方案正是因此在多波连续慢抓取下不成立，予以否决）。
 2. **`acquire()` 默认超时是 30 秒**（`sqlx-core-0.8.6/src/pool/options.rs` 的 `PoolOptions::default().acquire_timeout`，而 `DbPool::connect` 使用 `MySqlPool::connect` 的默认参数，本期不改其池参数以免牵动业务线）。指标线若直接 `acquire()`，在池被打满时会排队 30 秒，与 2 秒抓取上限完全脱节。
 
-据此，`SqlxMetricsSnapshotSource::snapshot()` MUST 按以下顺序实现（三条都是硬门禁）：
+据此，`SqlxMetricsSnapshotSource::snapshot()` 与 handler 侧装配 MUST 共同满足以下六条硬规则（I7 生命周期对齐的硬门禁）：
 
 ```rust
 // metrics/collect.rs
@@ -603,29 +613,58 @@ pub const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(500);
 /// 两条聚合的整体执行上限（§5.5）。
 pub const SCRAPE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// 采集内核：acquire → 聚合 → **关闭** 全部在调用方任务内顺序完成。
+/// 调用方 MUST 把并发闸许可移交本任务持有、直到本函数返回才释放——
+/// 本函数的返回点就是"底层连接已完全关闭"的时点（I7）。
 pub async fn snapshot_via(pool: &DbPool) -> Result<MetricsSnapshot, ControllerError> {
     // 1) 显式 acquire 超时：500ms 借不到连接 → 立即失败（映射 503）。
+    //    此时没有任何连接产生，许可可立即释放。
     let mut conn = tokio::time::timeout(POOL_ACQUIRE_TIMEOUT, pool.0.acquire())
         .await
         .map_err(|_| ControllerError::Config("metrics snapshot: pool acquire timeout"))?
         .map_err(|_| ControllerError::Config("metrics snapshot: pool acquire failed"))?;
 
-    // 2) 借到即标记为"用后即弃"：任何取消/出错路径都走 take_and_close()
-    //    （sqlx-core 0.8.6 的 CLOSE_ON_DROP_TIMEOUT = 5s 有界关闭），
-    //    而不是 return_to_pool() 的 ping-drain-再归还。
+    // 2) 借到即标记"用后即弃"（兜底）：若本 future 整体被取消（正常流程不可达，
+    //    仅 runtime 关停/任务 abort），Drop 走 take_and_close() 的 ≤5s 有界关闭、
+    //    绝不 return_to_pool() 的 ping-drain-再回池，脏连接永不交还业务线。
     conn.close_on_drop();
 
-    // 3) 两条聚合在上限内顺序执行；超时/错误都让 conn 在此处离开作用域。
-    tokio::time::timeout(SCRAPE_TIMEOUT, run_aggregates(&mut conn)).await
-        .map_err(|_| ControllerError::Config("metrics snapshot: query timeout"))?
+    // 3) 两条聚合在上限内顺序执行；超时/错误都不提前 return，
+    //    一律继续走到第 4 步的关闭收尾。
+    let outcome = tokio::time::timeout(SCRAPE_TIMEOUT, run_aggregates(&mut conn))
+        .await
+        .map_err(|_| ControllerError::Config("metrics snapshot: query timeout"))?;
+
+    // 4) 池槽位释放点 = 本函数返回点：在当前任务内 await
+    //    PoolConnection::close()（其文档明确：关闭期间持续持有池 permit，
+    //    池不会超出 max_connections——不是 detach），并**不为其设第三层超时**：
+    //    提前放行许可等于重开多波累积后门。返回 Err 仅表示关闭握手未正常完成，
+    //    套接字同样被丢弃、池槽位同样释放。
+    let _ = conn.close().await;
+
+    outcome
 }
 ```
 
-1. **显式 `acquire` 超时**：`POOL_ACQUIRE_TIMEOUT = 500ms`（MUST NOT 大于 1s，且 MUST 明显小于 `SCRAPE_TIMEOUT`），超时映射 503。这让"池紧张"在 0.5 秒内就是可见的 503，而不是 2 秒后仍无法定性的超时。
-2. **借到连接立即 `close_on_drop()`**：取消发生在查询中途时，这条连接的会话状态已不可信，`close_on_drop` 让 `Drop` 走 `take_and_close()`（`Floating::close()` 外包 `rt::timeout(CLOSE_ON_DROP_TIMEOUT = 5s, ...)`），**销毁**该连接而不是 ping-drain 后放回空闲队列。效果上：超时/取消绝不把"还在为上一条慢查询吐结果"的连接重新交给业务线使用，池槽位也随关闭尽快释放回补。MUST NOT 依赖 `Pool::disconnect_idle()`（只处理空闲连接，对借出中的连接无效），也 MUST NOT 用 `PoolConnection::detach()`（detach 会让进程实际超出 `max_connections`）。
-3. **诚实登记残余占用**：`Drop` 派生出的后台关闭任务在 `timeout` 之后仍会运行至多 `CLOSE_ON_DROP_TIMEOUT`（5 秒）才释放 permit，`tokio` 层无法把它提前。占用面由并发闸封顶：至多 `MAX_CONCURRENT_SCRAPE = 4` 条抓取各自持有一条待销毁连接，而池的默认 `max_connections = 10`，因此最坏情况下业务线仍有 ≥ 6 个可用槽位；该项登记为 §8 的 R11。若压测出现实测排队，处置方向是"降低抓取频率/另立规范引入指标缓存或独立只读副本"，MUST NOT 改为"指标线自建第二个池"（违反 I2）。
-4. **服务端兜底（SHOULD）**：两条聚合 SHALL 附带 `/*+ MAX_EXECUTION_TIME(...) */` 优化器提示（取值 `SCRAPE_TIMEOUT` 的毫秒数）作为服务端侧的兜底，让数据库主动终止慢聚合、缩短待关闭连接的 drain 时间；该提示 MUST 在 §7.7 双引擎实测确认"被接受且生效"后方可保留，任一引擎拒绝或无效时删除提示而不改变其余语义（客户端 `close_on_drop` 才是硬保证）。
-5. 超时与取消路径 MUST NOT 记录原始 SQL 参数以外的任何数据（本查询无参数），MUST NOT 重试：一次抓取失败就是 503，重试只会把同一个慢数据库压得更慢。
+1. **显式 `acquire` 超时**：`POOL_ACQUIRE_TIMEOUT = 500ms`（MUST NOT 大于 1s，且 MUST 明显小于 `SCRAPE_TIMEOUT`），超时映射 503。这让"池紧张"在 0.5 秒内就是可见的 503，而不是 2 秒后仍无法定性的超时。借连接失败时许可可立即释放（没有连接产生）。
+2. **池槽位释放与许可同域：关闭完毕才允许返回**：聚合完成（成功、出错或超时）后，`snapshot()` MUST 在**当前任务内 await `PoolConnection::close()` 完毕**才返回——`close()` 全程持有池 permit（`sqlx-core-0.8.6` 文档注释："the connection permit is retained for the duration so that the pool may not exceed `max_connections`"），完成即释放池槽位；**许可只有在 `snapshot()` 返回（连接完全关闭）后才释放**。MUST NOT 依赖"`Drop` 派生后台关闭、许可先行放行"的路径；MUST NOT 为该关闭 await 设一个会提前放行许可的超时——健康连接的关闭是毫秒级；服务端卡住时关闭时长由服务端行为决定，此时许可继续被占用、新抓取拿不到许可立即 503，**业务线的 ≥ 6 槽位额度不受任何影响**，这是刻意的 fail-closed 取舍。MUST NOT 依赖 `Pool::disconnect_idle()`（只处理空闲连接，对借出中的连接无效），也 MUST NOT 用 `PoolConnection::detach()`（detach 会让进程实际超出 `max_connections`）。
+3. **handler 侧装配：许可由独立采集任务持有、不随客户端断线释放**：handler `try_acquire_owned` 取得 `OwnedPermit` 后，MUST 把许可与采集调用一起移交给 `tokio::spawn` 出的独立任务，用 `tokio::sync::oneshot` 等待结果；许可只在任务返回（= 连接已完全关闭）时释放。客户端断线、Prometheus `scrape_timeout` 掐线只取消 handler，MUST NOT 取消采集任务、MUST NOT 提前释放许可。由此 I7 无条件成立：指标线"在途 + 关闭中"连接总数任何时刻 ≤ `MAX_CONCURRENT_SCRAPE = 4`——每条连接自借出到关闭始终被恰好一个在手持的许可覆盖，每个许可同时至多覆盖一条连接；共享池默认 `max_connections = 10`，业务线恒有 ≥ 6 个空闲槽位额度，**连续多波慢抓取不可能累积连接占用**。handler 侧示意：
+
+   ```rust
+   // metrics/http.rs（HEAD 短路之后的采集路径示意）
+   let permit = state.guard.clone().try_acquire_owned().map_err(...)?; // 闸满 → 503
+   let (tx, rx) = tokio::sync::oneshot::channel();
+   let source = Arc::clone(&state.snapshot);
+   tokio::spawn(async move {
+       let _permit = permit; // 任务结束（连接已完全关闭）才随 Drop 释放（I7）
+       let _ = tx.send(source.snapshot().await); // handler 已断线时发送失败，取值直接丢弃
+   });
+   rx.await.map_err(...)? // 结果照旧映射 200 / 503（§4.5）
+   ```
+
+4. **诚实登记残余占用**：本设计下唯一"许可已释放而连接未关闭完毕"的窗口是采集任务被**整体 abort**（仅 runtime 关停、显式 `abort`——正常请求断线不 abort，第 3 条），此时 `close_on_drop()` 的 `Drop` 兜底（`take_and_close`，≤ `CLOSE_ON_DROP_TIMEOUT = 5s`）接管关闭；该窗口只发生在进程关停阶段，业务线彼时已不存在，不构成饥饿。许可的持有时长上界是服务端完成关闭握手（或套接字被 OS 判定断开）的时刻，若数据库长时间卡住会表现为指标端点连续 503——仍然正确（fail-closed），业务槽位不受影响；该项登记为 §8 的 R11。若压测出现实测排队，处置方向是"降低抓取频率/另立规范引入指标缓存或独立只读副本"，MUST NOT 改为"指标线自建第二个池"（违反 I2）。
+5. **服务端兜底（SHOULD）**：两条聚合 SHALL 附带 `/*+ MAX_EXECUTION_TIME(...) */` 优化器提示（取值 `SCRAPE_TIMEOUT` 的毫秒数）作为服务端侧的兜底，让数据库主动终止慢聚合、**缩短服务端卡住的时间**，从而让随后的 `close()` 立即可完成、压缩许可持有时长；该提示 MUST 在 §7.7 双引擎实测确认"被接受且生效"后方可保留，任一引擎拒绝或无效时删除提示而不改变其余语义（许可与关闭生命周期的对齐才是硬保证，提示只压缩墙钟与许可占用时长）。
+6. 超时与取消路径 MUST NOT 记录原始 SQL 参数以外的任何数据（本查询无参数），MUST NOT 重试：一次抓取失败就是 503，重试只会把同一个慢数据库压得更慢。
 
 ### 5.6 完整响应示例（golden）
 
@@ -703,10 +742,10 @@ async fn scrape(
 ```
 
 1. 路由注册 `state.config.endpoint` 上的 `get(scrape)`，MUST 始终注册（含 `enabled = false` 时），由 handler 依 §4.5 顺序返回 404；不采用"禁用即不注册"的方式，这样禁用态响应与路径配置项完全无关，也不受后续合并顺序或前端 SPA 白名单演变影响。
-2. **Axum 0.8 的 HEAD 事实（先厘清再定策略）**：`MethodRouter::get(handler)` 注册的 `MethodFilter::GET` 同时把 `HEAD` 也指向该 handler（`axum-0.8.9/src/routing/method_routing.rs` 中 GET 端点登记的允许方法是 `["GET", "HEAD"]`，其自带测试 `get_accepts_head` 断言 HEAD 得 200 且 body 为空；显式 `.head()` 优先于 GET）。命中后 handler **完整执行**，响应离开顶层路由时由 axum 先按 `size_hint` 写入 `Content-Length`、再把 body 替换为空（`axum-0.8.9/src/routing/route.rs`）。响应还会带 `Allow: GET, HEAD`。结论：**只写 `get()` 绝不等于"HEAD 返回 405"**——HEAD 会走到 handler，若不特殊处理就会为一次探测执行两条聚合查询（body 被丢弃，但数据库开销全额发生）。
+2. **Axum 0.8 的 HEAD 与 `Allow` 事实（先厘清再定策略）**：`MethodRouter::get(handler)` 注册的 `MethodFilter::GET` 同时把 `HEAD` 也指向该 handler（`axum-0.8.9/src/routing/method_routing.rs` 中 GET 端点登记的允许方法是 `["GET", "HEAD"]`，其自带测试 `get_accepts_head` 断言 HEAD 得 200 且 body 为空；显式 `.head()` 优先于 GET）。命中后 handler **完整执行**，响应离开顶层路由时由 axum 先按 `size_hint` 写入 `Content-Length`、再把 body 替换为空（`axum-0.8.9/src/routing/route.rs`）。**`Allow` 头只出现在 405 fallback，且值为无空格的 `GET,HEAD`**：`method_routing.rs` 的 `append_allow_header` 以 `","` 连接方法名（`AllowHeader::Bytes`，不追加空格），而 `RouteFuture::allow_header(...)` 只在 `call_with_state` 走到 fallback（未命中任何已注册方法）这一条路径上挂载；命中 GET/HEAD 的请求经 `call!` 宏提前 return，**永不经过该挂载路径，因此成功的 200 响应（GET 与 HEAD 皆然）不携带 `Allow` 头**。结论：**只写 `get()` 绝不等于"HEAD 返回 405"**——HEAD 会走到 handler，若不特殊处理就会为一次探测执行两条聚合查询（body 被丢弃，但数据库开销全额发生）。
 3. **本端点对 HEAD 的策略（显式选择，不靠框架默认）**：允许 HEAD，且
    - HEAD 与 GET 共用**同一条认证与门禁路径**（先 `enabled`、后 Basic 认证），凭据缺失/不匹配一律 401，形状与 GET 完全一致；禁用态一律 404。
-   - 认证通过后 HEAD **短路返回 200 空体** + §5.1 的三个响应头，MUST NOT 获取并发闸、MUST NOT 调用 `snapshot()`/连接池/数据库：HEAD 的用途是"探活 + 检查认证配置"，为一个被丢弃的 body 支付两次 `GROUP BY` 是纯粹的可用性风险。
+   - 认证通过后 HEAD **短路返回 200 空体** + §5.1 的三个响应头，MUST NOT 获取并发闸、MUST NOT 调用 `snapshot()`/连接池/数据库：HEAD 的用途是"探活 + 检查认证配置"，为一个被丢弃的 body 支付两次 `GROUP BY` 是纯粹的可用性风险。200 响应 MUST NOT 携带 `Allow` 头（源码字节事实见上条：`Allow` 仅由 405 fallback 设置）。
    - 短路只可能发生在认证之后，因此不存在"未鉴权即触达数据源"的窗口；`Content-Length: 0` 是可观察行为（axum 先设长度后置空 body）。
    - MUST NOT 用独立的 `.head(handler)` 注册第二条 handler 实现：单 handler + `Method` 分支才能保证两个方法的认证与门禁不会各自漂移。
 4. handler 不接收任何业务 extractor：入参固定 `(State<MetricsState>, Method, HeaderMap)`，MUST NOT 使用 `Path`/`Query`/`Json`，从而不存在"提取器先于门禁短路"的历史问题（`http_device_status` 已为此改用 `Result<Path<_>, PathRejection>`，本端点直接不引入路径参数）。
@@ -733,7 +772,8 @@ pub struct ProductionInputs {
 /// 指标线的装配输入：**只有配置与运行时量两项**。
 /// 刻意不包含 `snapshot`、`DbPool` 与 `Arc<HttpAuthState>`：生产汇总源只能在
 /// `build_production_router` 内部由 `inputs.auth.db` 构造（§6.3 末尾），顶层入参
-/// 里没有"把一个外部自建的池塞进指标线"的入口，I2 由类型结构而非运行期检查保证。
+/// 里没有"把一个外部自建的池塞进指标线"的入口，I2 由结构约束 + 装配契约共同保证
+/// （保证强度的边界见下方"设计取舍"段）。
 pub struct MetricsLineInputs {
     pub config: Arc<MetricsConfig>,
     pub runtime: Arc<MetricsRuntime>,
@@ -791,7 +831,7 @@ fn build_router(
 }
 ```
 
-设计取舍：**不新增第四条指针校验**，而是让指标线的类型里根本没有第二个 `DbPool` 入口——配置之外的指标线装配项（汇总源、池读数）都在 `build_production_router` 内部由 `inputs.auth.db` 派生，违规在编译期不可表达，比运行期 `ptr_eq` 检查更强（这是既有"指针一致性硬门禁"在新线上的结构性替代）。
+设计取舍：**不新增第四条指针校验**，而是让指标线的类型里根本没有第二个 `DbPool` 入口——配置之外的指标线装配项（汇总源、池读数）都在 `build_production_router` 内部由 `inputs.auth.db` 派生。对这一保证的强度做诚实界定：顶层入参的类型**大幅收缩**了违规面（外部既递不进池、也递不进外部自建的汇总源），但"生产汇总源只在装配函数内部基于 `inputs.auth.db` 构造"本身是一条**架构契约**——由装配约定 + §7.6 第 9 条的结构性与源码级回归测试 + §7.8 grep 静态门禁 + 评审共同执法；测试注入缝（`build_production_router_with_metrics_source`）同样是公开 API，MUST NOT 把该保证宣传为"编译期不可能违反"这类绝对化结论（这是既有"指针一致性硬门禁"在新线上的结构性替代，只是其强度是契约 + 测试门禁，而非编译期不可表达）。
 
 **测试注入缝（唯一的第二个入口，且无法用它引入第二个池）**：装配测试需要假汇总源（不连真库也要断言六线合并与响应形状），因此暴露
 
@@ -878,7 +918,7 @@ fn production_inputs(
 | L1 纯逻辑单测 | `metrics/config.rs`、`auth.rs`、`model.rs`、`render.rs` 的 `#[cfg(test)]` | 三阶段配置解析与门禁、Basic 头解析（owned `ParsedBasic`）、常量时间映射、渲染确定性 | 路由、HTTP 语义 |
 | L2 进程内 HTTP | `metrics/http.rs` 的 `#[cfg(test)]`（`tower::ServiceExt::oneshot` + fake source） | 状态码与响应头（含 GET/HEAD 分派）、认证与禁用门禁、失败语义 | 真实 SQL、真实库数据、真实连接池回收 |
 | L3 装配测试 | `tests/production_composition.rs` 扩展 | 六线合并可达、单一端口、隔离与**单一池的结构性装配**、路径不冲突 | 认证语义、真实指标取值、真实慢查询下的池行为 |
-| L4 真库验收 | `tests/mysql_identity.rs` 风格（`#[ignore]`，需授权开发库） | 两条聚合 SQL 在 MySQL/TiDB 上的真实分布与求和不变量、二进制分组语义、**慢查询/超时后业务仍可借到连接** | — |
+| L4 真库验收 | `tests/mysql_identity.rs` 风格（`#[ignore]`，需授权开发库） | 两条聚合 SQL 在 MySQL/TiDB 上的真实分布与求和不变量、字节级分组（`CAST(... AS BINARY)`）语义、**多波连续超时抓取期间业务 `pool.acquire()` 的耗时与可用性（证明业务绝不发生连接饥饿）** | — |
 
 L1 的关键签名以本规范为准（改动签名即改契约，需同步改本表）：`parse_authorization(&HeaderMap) -> Option<ParsedBasic>`（owned，§4.2）、`verify(&str, &str, &BasicCredentials) -> bool`、`MetricsConfig::from_parts_with(&dyn Fn(&str) -> EnvRead, &dyn Fn(&Path) -> Result<String, io::Error>) -> Result<MetricsConfig, ControllerError>`（§3.3）。
 
@@ -896,8 +936,10 @@ L1 的关键签名以本规范为准（改动签名即改契约，需同步改�
 | `rejects_unknown_key_in_auth` | `[metrics.auth]` 内 `passwaerd = "x"` | `Err`（未知字段） |
 | `accepts_incomplete_auth_section_shape` | `[metrics.auth]` 只写 `username = "u"`（阶段一 Raw DTO 全 `Option`） | `parse_file` **Ok**（形状合法，必填性由门禁裁决） |
 | `rejects_invalid_toml_without_leaking_values` | 语法错误且错误行含 `password = "secret-value"` | `Err`，且 `err.message()` 不含 `secret-value` |
-| `rejects_non_basic_auth_type` | `enabled=true` + `type = "bearer"` / `"none"` / `""` | `Err("metrics.auth.type must be \"basic\"")` |
-| `rejects_missing_auth_type_when_enabled_without_env` | `enabled=true`、`[metrics.auth]` 写了完整 username/password 但缺 `type` | `Err("metrics.auth.type must be \"basic\"")`（§3.5 第 2 条） |
+| `rejects_non_basic_auth_type` | `enabled=true`、完整 username/password + `type = "bearer"` / `"none"` / `""` | `Err("metrics.auth.type must be \"basic\"")`（凭据齐备才到达 §3.6 分支 3） |
+| `rejects_missing_auth_type_when_enabled_without_env` | `enabled=true`、`[metrics.auth]` 写了完整 username/password 但缺 `type` | `Err("metrics.auth.type must be \"basic\"")`（§3.6 分支 3；存在性已满足，kind 缺失只在凭据齐备时可达） |
+| `missing_credentials_precede_type_error` | `enabled=true`、`[metrics.auth]` 只写 `type = "bearer"`（无 username/password） | `Err("metrics.auth is required when metrics.enabled is true")`——存在性检查先于 kind，MUST NOT 报 type 错误（§3.6 判定顺序，分支 2） |
+| `missing_credentials_precede_field_error` | `enabled=true`、`[metrics.auth]` 只写 `username = "a:b"`（含非法字符、缺 password、缺 type） | `Err("metrics.auth is required when metrics.enabled is true")`——存在性检查先于字段合法性（§3.6 分支 2） |
 | `accepts_password_containing_colons` | `enabled=true`、`password = "a:b:c"` | `Ok`，终态密码逐字节 `"a:b:c"`（§3.4 规则 2） |
 | `rejects_endpoint_without_leading_slash` | `endpoint = "metrics"` | `Err("metrics.endpoint is invalid")` |
 | `rejects_endpoint_with_trailing_slash_query_or_space` | `"/metrics/"`、`"/metrics?x=1"`、`"/met rics"`、`"/a//b"`、`"/METRICS"` | 同上 |
@@ -905,9 +947,9 @@ L1 的关键签名以本规范为准（改动签名即改契约，需同步改�
 | `reserved_root_path_is_exact_match_only` | `"/metrics"`、`"/metrics/deep"` 与保留集合 | 均**不**冲突（`/` 只精确匹配、前缀匹配需 `/` 边界，§6.5） |
 | `rejects_username_with_colon_or_control_char` | `"a:b"`、`"a\u{7}"` | `Err("metrics.auth.username is invalid")` |
 | `rejects_password_with_control_char` | `password = "a\u{7}b"` | `Err("metrics.auth.password is invalid")` |
-| `fail_closed_when_enabled_without_auth` | `enabled=true` 且无 `[metrics.auth]`、无环境变量 | `Err("metrics.auth is required when metrics.enabled is true")` |
-| `rejects_blank_username_when_enabled` | `enabled=true`、`[metrics.auth]` 内 `username = ""` | `Err("metrics.auth.username is invalid")` |
-| `rejects_blank_password_when_enabled` | `enabled=true`、`[metrics.auth]` 内 `password = ""` | `Err("metrics.auth.password is invalid")` |
+| `fail_closed_when_enabled_without_auth` | `enabled=true` 且无 `[metrics.auth]`、无环境变量 | `Err("metrics.auth is required when metrics.enabled is true")`（§3.6 分支 2："段完全缺失"即凭据缺失） |
+| `rejects_blank_username_when_enabled` | `enabled=true`、`[metrics.auth]` 写 `username = ""` 且 password 齐备、`type = "basic"` | `Err("metrics.auth.username is invalid")`——空串是"已提供但非法"（`Some("")`），命中分支 4 而非分支 2（§3.6 边界裁决） |
+| `rejects_blank_password_when_enabled` | `enabled=true`、`[metrics.auth]` 写 `password = ""` 且 username 齐备合法、`type = "basic"` | `Err("metrics.auth.password is invalid")`（同上，§3.6 分支 4） |
 | `disabled_drops_credentials_without_error` | `enabled=false` + 完整 `[metrics.auth]` | `Ok`，`credentials=None`，终态不保留密码副本 |
 | `disabled_tolerates_incomplete_auth` | `enabled=false` + `[metrics.auth]` 只写 `username`（或 `type = "basc"`） | `Ok`，`credentials=None`，**不阻断启动**（§3.6 分支 1；P1 的核心回归网） |
 | `env_pair_overrides_file_credentials` | 文件示例值 + 环境变量对 | 终态为环境变量值 |
@@ -951,10 +993,11 @@ L1 的关键签名以本规范为准（改动签名即改契约，需同步改�
 
 | 测试名 | 断言 |
 | --- | --- |
-| `admission_label_maps_persisted_vocabulary` | `APPROVED→APPROVED`、`PENDING→PENDING`、`REVOKED→REJECTED`；`"approved"`（小写）、`""`、`"UNKNOWN"`、`"APPROVED "` → `None`（§5.2.2 未知值 fail-closed；数据库侧已无 CHECK 约束，见同节事实修正） |
-| `task_bucket_covers_documented_matrix` | §5.2.2 全表逐条，含 `("completed", None)→failed` 与非终态 `outcome` 取任意已知值仍归该桶 |
-| `task_bucket_fails_closed_on_unknown_state` | `("queued ", _)`、`"DONE"`、`""` → `None` |
-| `task_bucket_fails_closed_on_unknown_outcome` | `("completed", Some("Success"))`、`("completed", Some(""))`、`("completed", Some("succeded"))` → `None`（未知 outcome 与未知 state 同等 fail-closed） |
+| `admission_label_maps_persisted_vocabulary` | `b"APPROVED"→APPROVED`、`b"PENDING"→PENDING`、`b"REVOKED"→REJECTED`；`b"approved"`（小写）、`b""`、`b"UNKNOWN"`、`b"APPROVED "`（尾部空格）→ `None`（`&[u8]` 逐字节比较，§5.2.2 未知值 fail-closed；数据库侧已无 CHECK 约束，见同节事实修正） |
+| `task_bucket_covers_documented_matrix` | §5.2.2 全表逐条，含 `(b"completed", None)→failed` 与非终态 `outcome` 取任意已知值仍归该桶（非终态不校验 outcome，统计口径见 §5.2.2） |
+| `task_bucket_fails_closed_on_unknown_state` | `(b"queued ", _)`（尾部空格）、`b"DONE"`、`b""` → `None` |
+| `task_bucket_fails_closed_on_unknown_outcome` | `(b"completed", Some(b"Success"))`、`(b"completed", Some(b""))`、`(b"completed", Some(b"succeded"))`、`(b"completed", Some(b"success "))`（尾部空格）→ `None`（未知 outcome 与未知 state 同等 fail-closed；大小写与尾部空格变体不得被任何折叠语义吞并） |
+| `unknown_bucket_values_need_not_be_valid_utf8` | state 或 outcome 传入非 UTF-8 字节（如 `&[0xFF, 0xFE]`）→ `None`（字节级映射不要求 UTF-8 合法性，§5.3 约束 3） |
 | `unknown_state_and_outcome_messages_are_distinct` | 两条采集错误分别为 `"metrics task aggregate: unknown task state"` 与 `"…unknown task outcome"`，且都不含原始取值 |
 | `render_matches_golden_exposition` | §5.6 fixture 逐字节相等（含末尾单个 `\n`） |
 | `render_emits_zero_valued_series` | 全 0 fixture 仍输出全部 11 条序列 |
@@ -972,9 +1015,9 @@ L1 的关键签名以本规范为准（改动签名即改契约，需同步改�
 
 | 测试名 | 请求 | 期望 |
 | --- | --- | --- |
-| `scrape_with_valid_credentials_returns_200` | `GET /metrics` + 正确 Basic | `200`；`Content-Type` 逐字节等于常量；体与 golden 一致；`Cache-Control: no-store`；无 `Set-Cookie` |
+| `scrape_with_valid_credentials_returns_200` | `GET /metrics` + 正确 Basic | `200`；`Content-Type` 逐字节等于常量；体与 golden 一致；`Cache-Control: no-store`；无 `Set-Cookie`；**无 `Allow` 头**（200 不携带，§6.2） |
 | `scrape_with_password_containing_colons_returns_200` | 配置密码为 `a:b:c`，提交 `base64("prom_admin:a:b:c")` | `200` 且体与 golden 一致（P1 的端到端回归网：RFC 7617 合法密码不得被解析或配置层拒绝） |
-| `head_with_valid_credentials_returns_200_without_collection` | `HEAD /metrics` + 正确 Basic | `200`；体为空；`Content-Type`/`Cache-Control`/`X-Content-Type-Options` 三头齐全；**source 调用次数 0**、并发闸 permit 未减少（§6.2 HEAD 短路） |
+| `head_with_valid_credentials_returns_200_without_collection` | `HEAD /metrics` + 正确 Basic | `200`；体为空；`Content-Type`/`Cache-Control`/`X-Content-Type-Options` 三头齐全；**无 `Allow` 头**（`Allow` 仅出现在 405 fallback，§6.2）；**source 调用次数 0**、并发闸 permit 未减少（§6.2 HEAD 短路） |
 | `head_without_credentials_returns_401_like_get` | `HEAD /metrics`，无 `Authorization` | `401`；`WWW-Authenticate` 与 GET 逐字节相同；source 0 次（HEAD 不绕过认证） |
 | `head_when_disabled_returns_404` | `enabled=false` + `HEAD /metrics`（带/不带凭据） | 均 `404`；无 `WWW-Authenticate`；source 0 次 |
 | `scrape_without_credentials_returns_401` | 无 `Authorization` | `401`；`WWW-Authenticate` 逐字节等于 `Basic realm="rsetup-controller-metrics"`；体为空；**source 调用次数 0** |
@@ -982,7 +1025,7 @@ L1 的关键签名以本规范为准（改动签名即改契约，需同步改�
 | `scrape_with_wrong_username_returns_401` | 错用户名 + 正确密码 | `401`（source 0 次） |
 | `scrape_with_malformed_header_returns_401` | `Bearer …`、非法 base64、无冒号、`":pw"`、两个 `Authorization` 头 | 均 `401`（source 0 次） |
 | `disabled_endpoint_returns_404_regardless_of_credentials` | `enabled=false`，分别带/不带凭据 | 均 `404`；无 `WWW-Authenticate`；无 `Content-Type`；source 0 次 |
-| `other_methods_are_rejected_with_allow_header` | `POST`/`PUT`/`PATCH`/`DELETE`/`OPTIONS` `/metrics` | 均 `405` 且 `Allow` 头为 `GET, HEAD`（Axum 依注册方法生成，§4.5）；source 0 次 |
+| `other_methods_are_rejected_with_allow_header` | `POST`/`PUT`/`PATCH`/`DELETE`/`OPTIONS` `/metrics` | 均 `405` 且 `Allow` 头**逐字节等于无空格形态 `GET,HEAD`**（Axum 0.8.9 `append_allow_header` 以 `","` 连接，§6.2 源码字节事实；断言 MUST NOT 写成含空格的 `GET, HEAD`；如需格式韧性可另加一条"解析后的方法集合恰为 `{GET, HEAD}`"的等价断言）；source 0 次 |
 | `other_paths_are_not_registered_by_metrics_line` | `GET /`、`/healthz`、`/metrics.txt` | 404 / 404 / 404（本线只注册配置路径一条） |
 | `metrics_ignores_session_cookie` | 携带格式合法的 `rsc_session=…` 而无 Basic | `401`（§4.1 隔离的行为证明） |
 | `metrics_success_does_not_create_session` | 成功抓取 200 | 响应无 `Set-Cookie`；`HttpAuthState` 相关结构（若断言）零变化 |
@@ -1003,25 +1046,26 @@ L1 的关键签名以本规范为准（改动签名即改契约，需同步改�
 6. `metrics_gauges_read_the_shared_pool_only`：用 lazy 池 + `build_production_router_with_metrics_source(… SyntheticMetricsSnapshotSource)`（两条聚合走合成源，池 gauge 仍走真实内存读数）断言 `db_pool_connections{state="active"} 0` 与 `{state="idle"} 0`（lazy 池未建立任何连接），且抓取前后 `lazy_db()` 未产生连接——证明指标线读的是 `auth.db` 那个池且不发查询。
 7. `metrics_line_never_touches_session_boundary`：在全量顶层 router 上，用完整合法会话 Cookie（L2 的 `LiveSessionAuth` 桩形态）请求 `/metrics` 得 401；随后请求 `/api/v1/auth/me` 仍按会话语义工作，证明指标抓取未污染会话/CSRF/限速状态。
 8. `reserved_paths_stay_registered`：对 `/healthz`、`/readyz`、`/`、`/login`、`/assets` 前缀逐一探测，断言它们仍由所属条线应答（而不是被指标线抢占或退化为 404），并且 `RESERVED_PATHS` 覆盖 `web.rs` 的 `SPA_EXACT_ROUTES`/`SPA_PARAM_ROUTES`/`ASSET_DIR` 全部条目，使保留集合不与代码漂移。
-9. `production_inputs_exposes_no_second_pool`（结构性、编译期即成立）：断言 `MetricsLineInputs` 的字段集合只有 `config` 与 `runtime`（构造点写全字段、不允许 `..Default::default()` 兜底），并用源码级断言（`include_str!("../src/main.rs")`）钉住 `main.rs` 只调用 `build_production_router`、`src/` 下 `SqlxMetricsSnapshotSource::new` 与 `build_production_router_with_metrics_source` 只出现在 `production.rs`（§6.3、§7.8）。这条测试是"生产装配内部基于 `auth.db` 构造汇总源"的回归网：一旦有人把汇总源或 `DbPool` 重新加回顶层入参，编译或该测试立刻失败。
+9. `production_inputs_exposes_no_second_pool`（结构性断言 + 源码级静态门禁；对装配唯一性的契约性质见 §6.3 设计取舍段）：断言 `MetricsLineInputs` 的字段集合只有 `config` 与 `runtime`（构造点写全字段、不允许 `..Default::default()` 兜底），并用源码级断言（`include_str!("../src/main.rs")`）钉住 `main.rs` 只调用 `build_production_router`、`src/` 下 `SqlxMetricsSnapshotSource::new` 与 `build_production_router_with_metrics_source` 只出现在 `production.rs`（§6.3、§7.8）。这条测试是"生产装配内部基于 `auth.db` 构造汇总源"这一架构契约的回归网：一旦有人把汇总源或 `DbPool` 重新加回顶层入参，编译或该测试立刻失败。
 10. `metrics_timeout_does_not_starve_business_routes`（L3 侧的**结构**部分）：注入一个"永久挂起"的合成汇总源，占满并发闸后，断言 `/healthz` 仍 200、`/api/v1/auth/me` 仍按会话语义 401（不经指标线）、且业务线借用连接的调用点数未被指标线改变（无新增池构造、无 `detach`）。**真实慢查询下的池可用性不在此证明范围**，见 §7.7 的 L4 用例。
 
 ### 7.7 真实数据库验收（L4）与边界
 
-两条聚合 SQL 的真实行为（`GROUP BY` 分布、`CAST(... AS CHAR)` 类型、TiDB 兼容性、求和不变量、空表 → 全 0 序列）按 `tests/mysql_identity.rs`/`tests/tidb_identity.rs` 的做法在专用 `#[ignore]` 测试中验收，连接**已获授权的隔离开发库**、凭据仅进程内载入、测试报告只出去敏结果（`AGENTS.md` 凭据保护规则）。该层只读，不建表、不迁移、不写入（表数据准备亦限定在已获授权的隔离开发库内，并按同规则只出去敏结果）。L2 的 fake source 通过 MUST NOT 被表述为真库聚合已验收；反之 L4 未运行时，交付报告必须写明"两条聚合 SQL 的真实引擎验收仍待执行"。
+两条聚合 SQL 的真实行为（`GROUP BY` 分布、`CAST(... AS BINARY)` 字节返回类型、TiDB 兼容性、求和不变量、空表 → 全 0 序列）按 `tests/mysql_identity.rs`/`tests/tidb_identity.rs` 的做法在专用 `#[ignore]` 测试中验收，连接**已获授权的隔离开发库**、凭据仅进程内载入、测试报告只出去敏结果（`AGENTS.md` 凭据保护规则）。该层只读，不建表、不迁移、不写入（表数据准备亦限定在已获授权的隔离开发库内，并按同规则只出去敏结果）。L2 的 fake source 通过 MUST NOT 被表述为真库聚合已验收；反之 L4 未运行时，交付报告必须写明"两条聚合 SQL 的真实引擎验收仍待执行"。
 
 L4 必须覆盖以下三组、缺一即该层未完成：
 
 1. `aggregates_match_table_distribution_and_sum_invariant`：既有数据下三桶/四桶逐桶与独立 `COUNT(*)` 对账，且求和恒等于表行数（§5.1 第 4 条）。
-2. `grouping_is_binary_collated_on_both_engines`：**构造**只差大小写（`APPROVED` 与 `approved`）或只差尾部空格（`PENDING` 与 `'PENDING '`）的分组键，断言两条聚合把它们返回为**各自独立的分组**（证明 §5.3 的 `COLLATE utf8mb4_bin` 生效、默认排序规则没有折叠差异），并断言此时经 `metrics` 采集路径得到 **503 fail-closed**（映射函数拒绝未知值），而不是把异常值算进合法桶。同时断言该 SQL 在 MySQL 与 TiDB 上都不因 `ONLY_FULL_GROUP_BY` 报错。
-3. `metrics_slow_query_does_not_exhaust_shared_business_pool`：在**同一个 `DbPool`** 上执行本用例（不新建池），步骤固定为
-   1. 通过指标采集路径（`SqlxMetricsSnapshotSource` 的实现骨架 + 把两条聚合替换为 `SELECT SLEEP(...)` 慢查询的测试变体，保留 `POOL_ACQUIRE_TIMEOUT` 与 `close_on_drop()` 语义）并发发起 `MAX_CONCURRENT_SCRAPE + 1` 次抓取；
-   2. 断言全部抓取在 `POOL_ACQUIRE_TIMEOUT + SCRAPE_TIMEOUT` 之内以 503 结束（不是悬挂到 30s `acquire_timeout`）；
-   3. 在抓取进行中与结束后各测一次业务侧 `pool.acquire()`：均须在 **500 ms** 内成功（业务未被指标慢查询饿死）；
-   4. 慢查询超时后再连续借还 10 次连接，断言每次都在 500 ms 内成功、`pool.size()` 回落到 `max_connections` 以内、且**没有**超时期间归还的空闲连接被业务再次取到（`close_on_drop()` 生效：脏连接被销毁而非回到空闲队列）；
-   5. 报告只出去敏数值（耗时、permit/size/idle 计数），不回显 DSN。
+2. `grouping_is_byte_exact_on_both_engines`：**构造**只差大小写（`APPROVED` 与 `approved`）或只差尾部空格（`PENDING` 与 `'PENDING '`）的分组键，断言两条聚合把它们返回为**各自独立的分组**（证明 §5.3 的 `CAST(... AS BINARY)` 逐字节语义生效），并断言此时经 `metrics` 采集路径得到 **503 fail-closed**——**尾部空格与大小写异常值都必须作为独立未知桶让映射函数返回 `None`**，而不是被算进合法桶。**本用例同时是 PAD SPACE 陷阱的回归网**：对同一份数据构造跑对照查询 `SELECT ... GROUP BY CAST(<列> AS CHAR) COLLATE utf8mb4_bin`，确认它会把 `'PENDING'` 与 `'PENDING '` **折叠**为同一组（证明 `utf8mb4_bin` 确为 `PAD SPACE`、该陷阱真实存在、只有字节级分组才堵得住；若对照不折叠，说明引擎行为与官方文档事实不符，本规范拼法评审不通过、必须重新评审）。同时断言该 SQL 在 MySQL 与 TiDB 上都不因 `ONLY_FULL_GROUP_BY` 报错，且 `SHOW WARNINGS` 无针对 `CAST(... AS BINARY)` 的 deprecation 告警。
+3. `metrics_slow_query_does_not_exhaust_shared_business_pool`：在**同一个 `DbPool`** 上执行本用例（不新建池）。本用例是**多波连续超时测试**（§5.5.1 第 2/3 条"许可与连接完整生命周期绑定"的直接回归网），步骤固定为
+   1. 通过指标采集路径（`SqlxMetricsSnapshotSource` 的实现骨架 + 把两条聚合替换为 `SELECT SLEEP(...)` 慢查询的测试变体，`SLEEP` 取值大于 `SCRAPE_TIMEOUT`，保留 `POOL_ACQUIRE_TIMEOUT`、`close_on_drop()`、任务内 `close()` await 与许可持有任务的全部语义）连续发起 **3 波**抓取，每波 `MAX_CONCURRENT_SCRAPE + 1` 路并发；**波间背靠背发起**（上一波收到 503 立即发起下一波，或按远小于 5 秒的固定间隔），刻意构造"上一波连接可能仍在关闭中、下一波已再次借出连接"的累积场景；
+   2. 业务哨兵任务从第 1 波开始前起、直至第 3 波结束后 5 秒，每 100 ms 持续执行一次 `pool.acquire()` + `SELECT 1` + 归还，记录每次 acquire 的耗时与成败；
+   3. 断言：每波抓取全部以 503 结束（前 `MAX_CONCURRENT_SCRAPE` 路因查询/采集失败、其余因闸满被立即拒绝——**第 2、3 波中"闸满即拒"的比例不得低于第 1 波，证明许可没有随超时被提前放行**）；业务哨兵**零失败**、每次 `pool.acquire()` 均在 **500 ms** 内成功，且 p99 耗时不随波次单调上升（证明无累积型饥饿，业务绝不发生连接饥饿）；
+   4. 断言：3 波全程对池的持续采样（`pool.size()` 与哨兵视图）显示指标线占用（在途 + 关闭中）**任何时刻 ≤ `MAX_CONCURRENT_SCRAPE = 4`**、业务恒有 ≥ 6 个槽位额度可用；末波结束 5 秒内 `pool.size()` 回落到基线、`pool.num_idle()` 未因超时而增长（脏连接被销毁而非回到空闲队列），且哨兵随后的 `SELECT 1` 始终成功（业务从未拿到仍在为上一条慢查询吐结果的连接）；
+   5. 取消变体（SHOULD）：发起 4 路抓取后立即掐断客户端连接（模拟 handler 被取消），再连发 2 波——业务哨兵 acquire 耗时仍 < 500 ms、指标占用仍 ≤ 4，证明许可绑定在独立采集任务上、不随客户端断线提前释放（§5.5.1 第 3 条）；
+   6. 报告只出去敏数值（耗时、permit/size/idle 计数），不回显 DSN。
 
-   该用例是 §5.5.1 三条防护（acquire 超时、`close_on_drop`、并发闸封顶）在真实驱动行为上的唯一验收点：L2/L3 的合成源证明不了 `PoolConnection::Drop` 的后台 drain 语义。
+   该用例是 §5.5.1 四条防护（`POOL_ACQUIRE_TIMEOUT`、任务内 `close()` 完毕才返回、许可由采集任务持有、并发闸封顶）在真实驱动行为上的唯一验收点：L2/L3 的合成源证明不了 `PoolConnection::close()` 的池 permit 语义与 `Drop` 的后台 drain 语义。
 
 ### 7.8 命令与静态门禁
 
@@ -1049,13 +1093,13 @@ grep -rn 'subtle::ConstantTimeEq\|use subtle::ConstantTimeEq' crates/rsetup-cont
 | R3 | 哈希前耗时与 base64 解析失败提前返回（§4.3 第 4 条） | 弱时序旁证（不含凭据内容） | 明确留档为可接受残余；比较本身用 `subtle::ConstantTimeEq`（§4.3 第 2 条），不宣称全 handler 常量时间 |
 | R4 | `401` 携带 `WWW-Authenticate` 会宣告端点存在 | 信息暴露有限 | 对齐设计的显式要求（抓取方排障需要）；禁用态 404 刻意不带该头，保持与"路径不存在"不可区分 |
 | R5 | 禁用态下 `POST` 等未注册方法返回 405（§4.5） | 可探测配置路径存在 | 与业务路由既有语义一致，不特殊化；如需完全隐藏须改为"不注册路由"，同时放弃 §6.2 的确定性 404，本期不做。HEAD 在禁用态与本行同属 404，不额外暴露信息 |
-| R6 | 每次抓取两条聚合查询 | 高频抓取压库 | 两条聚合都按表达式分组（`CAST(...) COLLATE utf8mb4_bin`），**既有 `ix_devices_admission` 与 `ix_main_tasks_state` 都无法用于该分组**（表达式使索引不可用），代价是表行数级的扫描 + 临时分组；唯一护栏是并发闸 4 + 2s 超时 + `scrape_interval` 由部署控制（建议 ≥ 30s）+ §5.5.1 的 `MAX_EXECUTION_TIME` 兜底提示。出现实测压力时另立规范引入覆盖索引、表达式索引或指标缓存 |
+| R6 | 每次抓取两条聚合查询 | 高频抓取压库 | 两条聚合都按表达式分组（`CAST(... AS BINARY)`），**既有 `ix_devices_admission` 与 `ix_main_tasks_state` 都无法用于该分组**（表达式使索引不可用），代价是表行数级的扫描 + 临时分组；唯一护栏是并发闸 4 + 2s 超时 + `scrape_interval` 由部署控制（建议 ≥ 30s）+ §5.5.1 的 `MAX_EXECUTION_TIME` 兜底提示。出现实测压力时另立规范引入覆盖索引、表达式索引或指标缓存 |
 | R7 | 跨两条聚合的非事务读 | 两族之间毫秒级偏差 | §5.3 第 4 条显式声明为近似瞬时 gauge；对账走 SQL |
 | R8 | `_total` 后缀用作 gauge 违反命名习惯 | 误用 `rate()` | §5.4：`# TYPE gauge` 必发 + `HELP` 说明求和语义 |
 | R9 | `REVOKED → REJECTED` 词汇映射（§5.2.2） | 阅读者误认为存在第四种准入态 | 映射表在指标 `HELP`、本文与单元测试三处留档；未知值 fail-closed 503，绝不静默归类 |
 | R10 | `toml` 为工作区新增依赖、`subtle` 提升为直接依赖 | 供应链与离线构建 | 均按最小用途使用、不启用额外 feature（§3.1）；`subtle 2.6.1` 已在 `Cargo.lock` 不构成新树，`toml 0.8` 首次进入需更新 `Cargo.lock` 并在交付说明中登记新增 crate |
-| R11 | 抓取超时/取消后，池槽位的实际释放由 `PoolConnection::Drop` 派生的后台任务完成，最坏受 `CLOSE_ON_DROP_TIMEOUT`（5s）约束（§5.5.1 第 3 条） | 数据库持续极慢时，最多多占 4 条连接、最长约 5s | 并发闸 4 ≪ 池默认 `max_connections = 10`，业务恒有 ≥ 6 个槽位；`acquire` 侧 500ms 快速失败使紧张状态立刻可见为 503；§7.7 第 3 组 L4 用例实测业务借连接仍 < 500ms |
-| R12 | 单个脏枚举值（未知 `admission_state`/`state`/`outcome`）使整次抓取 503 | 一条异常历史数据即让该实例指标全黑（`up` 抖动） | 刻意的 fail-closed 取舍（I4/G4）：宁可指标缺失，不输出可求和但错误的数据；数据库侧已无 CHECK 约束（§5.2.2 事实修正），因此同时用 503 的去敏消息与 §7.7 的二进制分组用例把"哪个桶对不上"变成可排障事件；后续如需容错须另立规范定义显式的 `unknown` 桶语义 |
+| R11 | 抓取超时**不等于**底层连接关闭完毕：v2 的"503 立即释放并发闸许可 + `close_on_drop()` 后台关闭（≤ `CLOSE_ON_DROP_TIMEOUT` 5s）"允许许可先于连接释放，连续多波慢抓取下"后台关闭中的连接"与"新一波借出的连接"**逐波叠加**，并发闸封顶不了总占用，可耗尽共享池 `max_connections = 10` 饿死业务线（二轮复审 R1） | 多波慢抓取导致连接累积耗尽——业务线连接饥饿，属可用性事故而非观测成本问题 | v3 改为**许可与连接生命周期绑定（I7）**：许可由独立采集任务持有，任务内 `PoolConnection::close()` 完毕（池槽位释放）后任务才返回、许可才释放，客户端断线不取消任务；**指标线在途 + 关闭中连接无条件 ≤ 4，业务恒有 ≥ 6 空闲槽位额度**。残余：服务端卡住关闭握手时许可可被长期占用（表现为指标端点连续 503 的 fail-closed，业务槽位不受影响；`MAX_EXECUTION_TIME` 提示压缩卡住时长）；采集任务仅在进程关停时被 abort，彼时 `Drop` 的 ≤5s 兜底关闭不构成饥饿（§5.5.1 第 4 条）。§7.7 第 3 组已升级为**连续 3 波超时抓取 + 业务哨兵持续 `pool.acquire()` 耗时/可用性 + 占用上限**的实测用例 |
+| R12 | 单个脏枚举值（未知 `admission_state`/`state`/`outcome`）使整次抓取 503 | 一条异常历史数据即让该实例指标全黑（`up` 抖动） | 刻意的 fail-closed 取舍（I4/G4）：宁可指标缺失，不输出可求和但错误的数据；数据库侧已无 CHECK 约束（§5.2.2 事实修正），因此同时用 503 的去敏消息与 §7.7 的字节级分组用例把"哪个桶对不上"变成可排障事件；后续如需容错须另立规范定义显式的 `unknown` 桶语义 |
 
 ---
 
@@ -1064,16 +1108,16 @@ grep -rn 'subtle::ConstantTimeEq\|use subtle::ConstantTimeEq' crates/rsetup-cont
 1. §7.2–§7.6 的全部测试存在且通过，并各自先有对应 RED 记录（实现提交按 RED→GREEN 分步）。
 2. 端点在默认（禁用）配置下不改变现有任何响应；启用后 `/metrics` 在同一端口 200，`Content-Type` 与 golden 文本逐字节符合 §5.1/§5.6；`HEAD /metrics` 认证后 200 空体且不触达数据源（§6.2）。
 3. 配置按 §3.3 三阶段生效：`enabled = false` 且 auth 不完整时启动成功并丢弃该段；`enabled = true` 且凭据不完整/非法时进程拒绝启动，错误文案与 §3.6 完全一致，且没有产生监听套接字或数据库连接；环境变量非 Unicode 值是启动错误而非"未设置"。
-4. §4.5 矩阵每一行都有对应自动化断言；401 头逐字节符合 §4.4；未注册方法的 405 带 `Allow: GET, HEAD`。
-5. §4.1 隔离不变量与 I1–I6 均有代码结构或测试证据；未新增 `EndpointId` 变体、permission、审计写入、数据库对象或第二个连接池构造点；`MetricsLineInputs` 无汇总源/池字段，生产汇总源只在 `build_production_router` 内部由 `inputs.auth.db` 构造（§6.3、§7.6 第 9 条）。
-6. §5.5.1 三条连接防护（`POOL_ACQUIRE_TIMEOUT`、`close_on_drop()`、并发闸封顶）在代码中可指认，且 §7.7 第 3 组的池可用性用例已在授权开发库执行；若未执行，交付报告显式标注。
-7. 两条聚合 SQL 使用 §5.3 的二进制分组写法，并在 MySQL 与 TiDB 上均通过 §7.7 第 2 组（大小写/尾部空格不折叠 + 未知枚举 503）。
+4. §4.5 矩阵每一行都有对应自动化断言；401 头逐字节符合 §4.4；未注册方法的 405 带**无空格**的 `Allow: GET,HEAD`（Axum 0.8.9 字节事实，§6.2）；成功 200（GET 与 HEAD）均**不**携带 `Allow` 头。
+5. §4.1 隔离不变量与 I1–I7 均有代码结构或测试证据；未新增 `EndpointId` 变体、permission、审计写入、数据库对象或第二个连接池构造点；`MetricsLineInputs` 无汇总源/池字段，生产汇总源只在 `build_production_router` 内部由 `inputs.auth.db` 构造（架构契约，§6.3、§7.6 第 9 条）。
+6. §5.5.1 四条连接防护（`POOL_ACQUIRE_TIMEOUT`、任务内 `PoolConnection::close()` 完毕才返回、并发闸许可由采集任务持有并覆盖连接全生命周期（I7）、并发闸封顶 ≤ 4）在代码中可指认，且 §7.7 第 3 组的**多波（3 波）连续超时测试**（业务哨兵持续 `pool.acquire()` 的耗时与可用性 + 指标占用上限采样）已在授权开发库执行；若未执行，交付报告显式标注。
+7. 两条聚合 SQL 使用 §5.3 的字节级分组写法（`CAST(... AS BINARY)`，MUST NOT 使用 `COLLATE utf8mb4_bin`——`PAD SPACE` 陷阱），并在 MySQL 与 TiDB 上均通过 §7.7 第 2 组（大小写/尾部空格不折叠 + 两类异常值都确实触发 503 + `utf8mb4_bin` 折叠对照断言）。
 8. §7.8 的 fmt/clippy/test 全绿，四条 grep 门禁符合预期（第 5/6/7 条无输出、第 8 条有输出），提交内不含凭据。
 9. 若 L4 真库聚合验收尚未执行，交付报告必须显式标注该项未完成，不以 L2 fake 通过替代（G4/§7.7）。
 
 ### 9.1 交付边界
 
-本规范文档本身不改动源码。实现应拆为可独立审查的增量：①`config`（三阶段 + Raw DTO + `EnvRead`）+ 单测；②`auth`（`ParsedBasic` + `subtle`）+ 单测；③`model`/`render` + 单测；④`collect`（含 §5.3 二进制分组 SQL 与 §5.5.1 三条连接防护）+ L1/L4；⑤`http`（含 HEAD 短路）+ L2；⑥`production`/`main` 装配（含 uptime 零点前移）+ L3；⑦文档与部署说明。提交信息遵循仓库规则（简体中文，Conventional Commits 描述亦为中文），例如 `feat(controller): 增加普罗米修斯指标端点与配置文件认证`。
+本规范文档本身不改动源码。实现应拆为可独立审查的增量：①`config`（三阶段 + Raw DTO + `EnvRead`）+ 单测；②`auth`（`ParsedBasic` + `subtle`）+ 单测；③`model`/`render` + 单测；④`collect`（含 §5.3 字节级分组 SQL 与 §5.5.1 连接防护六规则，其中 I7 许可绑定为核心）+ L1/L4；⑤`http`（含 HEAD 短路）+ L2；⑥`production`/`main` 装配（含 uptime 零点前移）+ L3；⑦文档与部署说明。提交信息遵循仓库规则（简体中文，Conventional Commits 描述亦为中文），例如 `feat(controller): 增加普罗米修斯指标端点与配置文件认证`。
 
 ---
 
@@ -1157,7 +1201,7 @@ curl -fsS -u 'prom_admin:secure_password' http://127.0.0.1:8080/metrics -D -
 # 密码含冒号同样 200（curl 亦按首个冒号切分 -u 参数；服务端 split_once 一致）
 curl -fsS -o /dev/null -w '%{http_code}\n' -u 'prom_admin:a:b:c' http://127.0.0.1:8080/metrics
 
-# 期望 200 且无响应体：HEAD 走同一认证，但不采集（不产生数据库开销）
+# 期望 200 且无响应体：HEAD 走同一认证，但不采集（不产生数据库开销）；无 Allow 头（200 不携带 Allow，§6.2）
 curl -sS -o /dev/null -D - -I -u 'prom_admin:secure_password' http://127.0.0.1:8080/metrics
 
 # 期望 401 且带 WWW-Authenticate: Basic realm="rsetup-controller-metrics"
@@ -1169,7 +1213,7 @@ curl -sS -o /dev/null -D - -I http://127.0.0.1:8080/metrics
 # 期望 401
 curl -sS -o /dev/null -D - -u 'prom_admin:wrong-password' http://127.0.0.1:8080/metrics
 
-# 期望 405 且 Allow: GET, HEAD
+# 期望 405 且 Allow: GET,HEAD（无空格，Axum 0.8.9 逐字节事实，§6.2）
 curl -sS -o /dev/null -D - -X POST -u 'prom_admin:secure_password' http://127.0.0.1:8080/metrics
 
 # 期望 404（enabled = false 配置）
@@ -1193,9 +1237,9 @@ curl -sS -o /dev/null -D - http://127.0.0.1:8080/metrics
 | HEAD 认证后短路 200 空体 | 沿用框架默认会让 HEAD 付出一条被丢弃 body 的全部数据库开销；短路既不绕认证也不产生采集（§6.2） |
 | 不引入指标 SDK | 11 条固定序列无需注册中心；避免隐式指标与新的全局状态 |
 | 采集失败整次 503 | 拒绝部分降级为 0：伪 0 会让告警静默，比"抓取失败"更危险；未知枚举同样 503（§5.2.2、R12） |
-| 分组用二进制校对（`COLLATE utf8mb4_bin`） | 默认排序规则会折叠大小写与尾部空格，把未知枚举吞进合法桶，使 fail-closed 链路失效；`BINARY` 运算符已弃用且有 1055 风险（§5.3） |
-| 单一池由装配内部保证 | 顶层入参不接受汇总源/池：第二个池无法表达；测试注入缝的类型里没有 `DbPool`，无法借此引入第二池（§6.3） |
-| 超时连接 `close_on_drop()` 销毁 | 外层 `timeout` 管不到 `PoolConnection::Drop` 的后台 drain；销毁脏连接而非归还空闲队列，才真正保护业务线（§5.5.1） |
+| 分组用 `CAST(... AS BINARY)` 字节语义 | 默认排序规则会折叠大小写与尾部空格；`utf8mb4_bin` 亦为 `PAD SPACE` 校对（`'PENDING' = 'PENDING '` 恒真），v2 的 `COLLATE utf8mb4_bin` 拼法堵不住尾部空格脏数据逃逸——只有字节级分组能闭环 fail-closed 链路，且 MySQL/TiDB 语义确定一致；`BINARY` 运算符已弃用但 `CAST(... AS BINARY)` 恰是官方替代、不受影响（§5.3） |
+| 单一池由装配契约保证 | 顶层入参不接受汇总源/池，类型上大幅收缩违规面；"汇总源只在装配函数内部基于 `auth.db` 构造"是架构契约，由 §7.6 结构/源码级测试与 §7.8 grep 门禁执法，不宣传为编译期不可能（§6.3） |
+| 许可绑定连接全生命周期（I7） | 外层 `timeout` 管不到 `PoolConnection::Drop` 的后台关闭；v2 用 `close_on_drop()` 销毁脏连接但许可随 503 立即释放——多波连续慢抓取逐波叠加会耗尽共享池。v3 任务内 `PoolConnection::close()` 完毕才释放许可、许可由独立任务持有不随断线取消：指标占用（在途+关闭中）无条件 ≤ 4，业务恒有 ≥ 6 槽位（§5.5.1） |
 | `held` 并入 `pending`、`REVOKED` 映射 `REJECTED` | 保持对齐设计固定的标签域与求和不变量；映射在 `HELP`、本文与测试三处留档 |
 
 ---
@@ -1206,3 +1250,4 @@ curl -sS -o /dev/null -D - http://127.0.0.1:8080/metrics
 | --- | --- | --- |
 | v1 | 2026-10-19 | 初版：架构与契约方向逐节对齐后落档。 |
 | v2 | 2026-10-19 | 按架构与代码复审意见修订（4 项 P1 阻断 + 7 项 P2 缺陷），全部为文档变更，未改动任何源码：<br>**P1** ①`parse_authorization` 改为返回 owned `ParsedBasic`，同步 §4.2/§7.1/§7.3；②密码冒号兼容 RFC 7617 §2（删除"password 不得含冒号"，改 `split_once(':')`，§3.4/§4.2/§7.2/§7.3/§7.5）；③Raw serde DTO 字段全 `Option<String>` + 三阶段生命周期（反序列化 → 环境变量原子覆盖与 `type` 推导 → 统一门禁；禁用态容忍不完整 auth，§3.2/§3.3/§3.5/§3.6）；④SQLx 连接池回收与超时强化（`POOL_ACQUIRE_TIMEOUT`、`close_on_drop()`、后台 `return_to_pool`/`ping` drain 事实与残余占用登记、L4 池可用性用例，新增 §5.5.1）。<br>**P2** ⑤Axum 0.8 HEAD 派发事实与 HEAD 策略（认证后 200 空体、不采集；未注册方法 405 + `Allow: GET, HEAD`，§4.5/§6.2/§7.5）；⑥SQL 二进制分组 `COLLATE utf8mb4_bin` 与未知 `outcome` fail-closed（§5.2.2/§5.3/§7.4/§7.7）；⑦生产连接池单一性由装配内部保证，`MetricsLineInputs` 去掉 `snapshot` 字段 + 测试注入缝与 grep 门禁（§6.3/§6.4/§7.6/§7.8）；⑧改用 `subtle::ConstantTimeEq`（§3.1/§4.3/§7.3/§7.8）；⑨标签转义只保留 `\\`、`\"`、`\n`（§5.1/§7.4）；⑩环境变量 `NotUnicode` 显式失败（§3.3/§3.4/§7.2/§10.2）；⑪事实与描述自洽：`chk_devices_state` 已被 v3 移除、`sub_tasks` 表名、`MetricsConfig` 手写脱敏 `Debug`、uptime 零点提前到 `main()` 首行、`/` 保留路径完全精确匹配（§3.2/§5.2.2/§6.4/§6.5）。风险表新增 R11（池 permit 有界延迟释放）与 R12（脏枚举值致整次 503），§9 验收标准同步扩写。 |
+| v3 | 2026-10-19 | 按**二轮架构复审**报告修订（1 项 P1 + 3 项 P2 + 非阻断小建议），全部为文档变更，未改动任何源码：<br>**P1 R1** 并发闸许可与底层连接**完全关闭**生命周期绑定（新增全局不变量 I7）：v2 "503 立即释放许可 + `close_on_drop()` 后台关闭"在连续多波慢抓取下会逐波叠加"后台关闭中 + 新借出"的连接直至耗尽共享池——v3 改为采集任务内 `PoolConnection::close()` 完毕（池槽位释放）才返回、许可由 `tokio::spawn` 独立任务持有且客户端断线不取消，指标线"在途 + 关闭中"占用无条件 ≤ 4、业务恒有 ≥ 6 空闲槽位；§5.5/§5.5.1 重写（六条硬规则），R11 更新，§7.7 第 3 组升级为**连续 3 波超时抓取 + 业务哨兵持续 `pool.acquire()` 耗时/可用性 + 占用上限采样**的多波测试（含断线取消变体）。<br>**P2 R2** SQL 分组由 `COLLATE utf8mb4_bin` 改为 `CAST(... AS BINARY)` 字节级分组：MySQL 8.0 文档证实 `utf8mb4_bin` 属 `PAD SPACE` 校对（`'PENDING' = 'PENDING '` 恒真），v2 拼法下尾部空格脏数据被折叠进合法分组、逃逸 fail-closed；Rust 侧映射改为 `&[u8]` 逐字节比较（非 UTF-8 字节天然落入未知桶，`'PENDING '`/`'approved'` 等异常值稳定 503）；§5.2.2 明确 `completed` 严格校验 5 种 outcome 与 `queued`/`running`/`held` 非终态统计口径；§7.4/§7.7 新增尾部空格、大小写异常触发 503 与 `utf8mb4_bin` 折叠对照的回归断言。<br>**P2 R3** 按 Axum 0.8.9 源码修正 `Allow` 字节事实：405 携带**无空格** `Allow: GET,HEAD`（`append_allow_header` 以 `","` 连接），成功 200（GET/HEAD）**不**携带 `Allow`（`Allow` 仅由 405 fallback 设置），§4.5/§6.2/§7.5/§9/§10.5 同步。<br>**P2 R4** §3.6 给出唯一短路判定顺序（禁用放行 → 凭据存在性 → `kind` → 字段合法性 → 装配），凭据缺失统一优先报 `"metrics.auth is required when metrics.enabled is true"`，§3.3/§3.4/§3.5 表述随之收敛到 §3.6 权威顺序，§7.2 新增两条优先级钉桩用例。<br>**小建议** §4.3 `sha256` 示例改传 `expected.username.as_bytes()`/`expected.password.as_bytes()`；§6.3/§7.6/§10.6 弱化装配唯一性的"编译期不可表达"绝对化修辞，明确"生产汇总源只在装配函数内部基于 `auth.db` 构造"是架构契约、由装配约定 + §7.6 测试 + §7.8 grep 门禁执法。 |
