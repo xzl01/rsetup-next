@@ -26,16 +26,16 @@ Spec: 06 §6
 
 | ID | status | executed_at | layer | command_or_steps | evidence |
 | --- | --- | --- | --- | --- | --- |
-| T4-01 | 未验证 | | | | |
-| T4-02 | 未验证 | | | | |
-| T4-03 | 未验证 | | | | |
-| T4-04 | 未验证 | | | | |
-| T4-05 | 未验证 | | | | |
+| T4-01 | PASS | 2026-10-18T16:40:00+08:00 | cargo-test | cargo test -p rsetup-controller --test production_composition | tests/production_composition.rs |
+| T4-02 | PASS | 2026-10-18T16:40:00+08:00 | cargo-test | cargo test -p rsetup-controller --lib tasks::http | src/tasks/http.rs |
+| T4-03 | PASS | 2026-10-18T16:40:00+08:00 | cargo-test | cargo test -p rsetup-controller --test management_gateway_http | tests/management_gateway_http.rs |
+| T4-04 | PASS | 2026-10-18T16:40:00+08:00 | cargo-test | cargo test -p rsetup-controller --lib tasks::adapter | src/tasks/adapter.rs |
+| T4-05 | PASS | 2026-10-18T16:40:00+08:00 | cargo-test | cargo test -p rsetup-controller --lib tasks::http::decision_tests | src/tasks/http.rs |
 | T4-06 | 未验证 | | | | |
-| T4-07 | 未验证 | | | | |
+| T4-07 | PASS | 2026-10-18T16:40:00+08:00 | cargo-test | cargo test -p rsetup-controller --lib tasks::recovery | src/tasks/recovery.rs |
 | T4-08 | 未验证 | | | | |
 | T4-09 | BLOCKED | | | | |
-| T4-10 | 未验证 | | | | |
+| T4-10 | PASS | 2026-10-18T16:40:00+08:00 | vitest | npm --prefix apps/controller-web test -- --run | apps/controller-web/tests/browser/README.md |
 | T4-11 | PASS | 2026-10-18T16:30:00+08:00 | cargo-test | cargo test -p rsetup-controller --test web_assets | tests/web_assets.rs |
 | T4-12 | PASS | 2026-10-18T16:35:00+08:00 | real-db | cargo test -p rsetup-controller --test migration_v4 | tests/migration_v4.rs (MySQL 8.0 & TiDB v7.5) |
 | AT-01 | 未验证 | | | | |
