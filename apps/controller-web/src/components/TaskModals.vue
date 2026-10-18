@@ -36,6 +36,21 @@ const reason = ref('')
 const acknowledged = ref(false)
 const batchConfirmed = ref(false)
 let restoreTarget: HTMLElement | null = null
+// 在途恢复目标：本轮打开记录的触发器，跨“关闭 → 立刻重开”的微任务间隙存活。
+// restoreTarget 会在 restoreFocus() 里被立即消费（置 null），而真正的 .focus() 要等
+// nextTick 之后；父组件在 post-flush 阶段重开时，旧对话框已从 DOM 移除、焦点掉回
+// document.body，新一代 openDialog 只能观察到 body。没有这一份在途记录，最初有效的
+// 触发按钮就会在这一刻永久遗失。
+let pendingRestoreTarget: HTMLElement | null = null
+
+function usableRestoreTarget(el: HTMLElement | null | undefined): el is HTMLElement {
+  if (!el || typeof el.focus !== 'function' || el.isConnected !== true) return false
+  // body / documentElement 是焦点“无人认领”的哨兵值，记下来等于放弃恢复
+  if (el === document.body || el === document.documentElement) return false
+  // 焦点还在本组件（旧或新）对话框内部：那是对话框自己的焦点，不是打开前的触发器
+  if (dialogRef.value?.contains(el) === true) return false
+  return true
+}
 
 const releaseConfirmed = computed(() => reason.value.trim().length > 0 && acknowledged.value && !props.busy)
 const releaseButtonDisabled = computed(() => !releaseConfirmed.value)
@@ -72,8 +87,11 @@ function restoreFocus() {
   const openGeneration = lastOpenGeneration
   void nextTick().then(() => {
     // 代际守卫：等待期间模态框被重新打开（openDialog 会推进代际）时，焦点归属
-    // 已重新交给对话框，这一轮过期的恢复必须放弃，不得抢占焦点
+    // 已重新交给对话框，这一轮过期的恢复必须放弃，不得抢占焦点。
+    // 注意此时 in-flight 的触发器要留给新一代继承，不能在这里清理。
     if (openGeneration !== lastOpenGeneration) return
+    // 本轮继承链到此结束：焦点真正交还触发器（或目标确已不可用）后不再对后续重开生效
+    if (pendingRestoreTarget === target) pendingRestoreTarget = null
     if (!document.contains(target)) return
     // 触发按钮仍然禁用（例如 CSPRNG 不可用时的永久禁用）：浏览器本就无法聚焦，
     // 显式跳过，不把焦点从当前归属处无谓移走
@@ -117,9 +135,24 @@ function onKeydown(event: KeyboardEvent) {
 
 async function openDialog() {
   const generation = ++focusGeneration
-  // 记录本轮打开的代际：任何更早的、仍在等待中的焦点恢复都会因快照不再匹配而作废
+  // 记录本轮打开的代际：任何更早的、仍在等待中的焦点恢复都会因快照不再匹配而作废，
+  // 上一代排在 nextTick 上的异步聚焦因此被正确取消，不会抢占本对话框的焦点
   lastOpenGeneration = generation
-  restoreTarget = (document.activeElement as HTMLElement | null) ?? null
+  const active = document.activeElement as HTMLElement | null
+  if (usableRestoreTarget(active)) {
+    restoreTarget = active
+    pendingRestoreTarget = active
+  } else {
+    // 触发器焦点继承：关闭与重开发生在同一轮 flush 的微任务交错里时，activeElement 只是
+    // 刚失去焦点子树的 document.body（或仍在对话框内部）。此时继承上一代仍然有效的触发器，
+    // 而不是把无人认领的 body 记成新的恢复目标，否则触发器永久遗失、关闭后焦点掉到 body。
+    if (usableRestoreTarget(pendingRestoreTarget)) {
+      restoreTarget = pendingRestoreTarget
+    } else {
+      pendingRestoreTarget = null
+      restoreTarget = null
+    }
+  }
   reason.value = ''
   acknowledged.value = false
   batchConfirmed.value = false

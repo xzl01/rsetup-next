@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/vue'
-import { defineComponent, ref } from 'vue'
+import { defineComponent, ref, watch } from 'vue'
 import type { PropType } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 import TaskModals from './TaskModals.vue'
@@ -293,5 +293,102 @@ describe('TaskModals 焦点恢复与禁用触发按钮的时序合同', () => {
     const secondDialog = await screen.findByRole('dialog')
     await waitFor(() => expect(secondDialog.contains(document.activeElement)).toBe(true))
     expect(document.activeElement).not.toBe(trigger())
+  })
+})
+
+// ── P2 回归：模态框在微任务/post-flush 阶段被父组件立刻重开时的触发器焦点继承 ────────────
+// TasksView 一类父组件可能在 `watch(open, …, { flush: 'post' })` 里于关闭后立刻重开
+// （确认失败重试、连开两个确认框等）。重开发生在旧对话框已从 DOM 移除、上一轮
+// restoreFocus 的 nextTick 回调尚未落地的那一刻：此刻 document.activeElement 只是
+// 刚失去焦点子树的 document.body。若新一代 openDialog 把这个 body 记成 restoreTarget，
+// 最初有效的触发按钮就永久遗失，第 2 个对话框关闭后焦点只能掉到 body。
+const ReopenHarness = defineComponent({
+  components: { TaskModals },
+  props: {
+    mode: { type: String as PropType<'batch-risk' | 'release-lock'>, default: 'batch-risk' },
+    subtask: { type: Object as PropType<SubTaskItem | null>, default: null },
+  },
+  setup() {
+    const open = ref(false)
+    const reopenOnce = ref(false)
+    const reopens = ref(0)
+    // flush: 'post' 保证重开排在本轮渲染之后：对话框已卸载、焦点已掉回 body，
+    // 而 restoreFocus 调度的 nextTick 恢复还要更早落地（会被代际守卫作废）
+    watch(open, (value) => {
+      if (!value && reopenOnce.value) {
+        reopenOnce.value = false
+        reopens.value += 1
+        open.value = true
+      }
+    }, { flush: 'post' })
+    function openAndArm(): void {
+      reopenOnce.value = true
+      open.value = true
+    }
+    return { open, reopens, openAndArm }
+  },
+  template: `
+    <div>
+      <button data-testid="trigger" :disabled="open" @click="openAndArm">打开模态框</button>
+      <button data-testid="parent-close" @click="open = false">父组件直接关闭</button>
+      <span data-testid="reopen-count">{{ reopens }}</span>
+      <TaskModals :mode="mode" :open="open" :subtask="subtask" @close="open = false" />
+    </div>
+  `,
+})
+
+function mountReopenHarness(props: { mode: 'batch-risk' | 'release-lock'; subtask?: SubTaskItem | null } = { mode: 'batch-risk' }) {
+  return render(ReopenHarness, { props, global: { provide: { i18n } } })
+}
+
+function reopenCount(): number {
+  return Number(screen.getByTestId('reopen-count').textContent ?? '0')
+}
+
+describe('TaskModals 微任务重开竞态下的触发器焦点继承', () => {
+  it('父组件 post-flush 立刻重开时继承最初的触发器，第 2 个对话框关闭后焦点回到触发按钮', async () => {
+    mountReopenHarness({ mode: 'batch-risk' })
+    await openByTrigger()
+    const firstDialog = await screen.findByRole('dialog')
+    await waitFor(() => expect(firstDialog.contains(document.activeElement)).toBe(true))
+    expect(reopenCount()).toBe(0)
+
+    // 关闭 → 父组件在 post-flush 立刻重开：这一轮不发生任何额外的 await，
+    // 第 1 代排在 nextTick 上的焦点恢复被代际守卫作废
+    await fireEvent.keyDown(firstDialog, { key: 'Escape', code: 'Escape' })
+
+    // 重开确实发生了，且焦点归属新的对话框
+    await waitFor(() => expect(reopenCount()).toBe(1))
+    const secondDialog = await screen.findByRole('dialog')
+    expect(secondDialog).not.toBe(firstDialog)
+    await waitFor(() => expect(secondDialog.contains(document.activeElement)).toBe(true))
+
+    // 关闭第 2 个对话框：焦点必须精确回到最初的触发按钮，而不是 document.body
+    await fireEvent.keyDown(secondDialog, { key: 'Escape', code: 'Escape' })
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(trigger().disabled).toBe(false)
+    await waitFor(() => expect(document.activeElement).toBe(trigger()))
+  })
+
+  it('重开后焦点不被上一代过期的恢复抢走，父组件驱动关闭同样回到继承的触发按钮', async () => {
+    mountReopenHarness({ mode: 'release-lock', subtask })
+    const triggerButton = trigger()
+    await openByTrigger()
+    const firstDialog = await screen.findByRole('dialog')
+    await waitFor(() => expect(firstDialog.contains(document.activeElement)).toBe(true))
+
+    await fireEvent.keyDown(firstDialog, { key: 'Escape', code: 'Escape' })
+    await waitFor(() => expect(reopenCount()).toBe(1))
+    const secondDialog = await screen.findByRole('dialog')
+    await waitFor(() => expect(secondDialog.contains(document.activeElement)).toBe(true))
+    // 第 1 代排在 nextTick 上的恢复必须被作废，不能把焦点从新对话框抢回触发按钮
+    await new Promise<void>((resolve) => { queueMicrotask(resolve) })
+    expect(document.activeElement).not.toBe(triggerButton)
+
+    // 第 2 代由父组件直接置 open=false 关闭（提交成功路径，不经过 close()）：
+    // 继承来的触发按钮同样要接得住这一轮恢复
+    await fireEvent.click(screen.getByTestId('parent-close'))
+    expect(screen.queryByRole('dialog')).toBeNull()
+    await waitFor(() => expect(document.activeElement).toBe(triggerButton))
   })
 })
