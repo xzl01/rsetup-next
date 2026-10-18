@@ -36,8 +36,8 @@ Spec: 06 §6
 | T4-08 | 未验证 | | | | |
 | T4-09 | BLOCKED | | | | |
 | T4-10 | 未验证 | | | | |
-| T4-11 | 未验证 | | | | |
-| T4-12 | BLOCKED | | | | |
+| T4-11 | PASS | 2026-10-18T16:30:00+08:00 | cargo-test | cargo test -p rsetup-controller --test web_assets | tests/web_assets.rs |
+| T4-12 | PASS | 2026-10-18T16:35:00+08:00 | real-db | cargo test -p rsetup-controller --test migration_v4 | tests/migration_v4.rs (MySQL 8.0 & TiDB v7.5) |
 | AT-01 | 未验证 | | | | |
 | AT-02 | 未验证 | | | | |
 | AT-03 | 未验证 | | | | |
