@@ -13,6 +13,7 @@ axum.workspace = true
 chrono.workspace = true
 hex.workspace = true
 rand.workspace = true
+rsetup-protocol = { path = "../rsetup-protocol" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
