@@ -50,18 +50,41 @@ function focusableElements(): HTMLElement[] {
 }
 
 let focusGeneration = 0
+// 最近一次 openDialog 观察到的代际。焦点恢复用它判断“等待期间模态框是否又被打开”：
+// 关闭路径自身也会推进 focusGeneration，所以不能直接拿 focusGeneration 比较，
+// 否则同一次关闭被 close() 与 props.open 监听二次进入时会把刚安排的恢复作废掉。
+let lastOpenGeneration = 0
 
-// 焦点恢复的唯一出口：先清空记录，仅当记录的目标仍在文档中且可聚焦时才聚焦；
-// 记录为空（无触发元素或触发元素已断开）时静默跳过，不抛错。
+// 焦点恢复的唯一出口：先消费（读取并清空）记录的目标，因此同一次关闭无论从
+// close() 还是 props.open 监听进入，第二次都取不到目标而静默跳过，不会重复恢复。
+// 时序：必须排在 nextTick 之后。emit('close') 或父组件置 open=false 只是把重渲染排进
+// 微任务队列，此刻触发按钮上的 `:disabled="... || batchModalOpen"` 仍是 true；浏览器
+// （与 jsdom 一致）对 disabled 元素调用 .focus() 会静默忽略，同步聚焦等于把焦点丢给
+// document.body，破坏 A11y 键盘导航合同。nextTick 解析时本轮 flush 已经结束
+// （flushJobs 会把 flush 期间新排入的任务一并处理完才 resolve），解禁后的 DOM 已 patch 完成，
+// 因此无需额外轮询或定时器。
 function restoreFocus() {
   const target = restoreTarget
   restoreTarget = null
-  if (target && typeof target.focus === 'function' && document.contains(target)) target.focus()
+  // 关闭即作废尚未落地的 openDialog 迟到聚焦
+  focusGeneration += 1
+  if (!target || typeof target.focus !== 'function') return
+  const openGeneration = lastOpenGeneration
+  void nextTick().then(() => {
+    // 代际守卫：等待期间模态框被重新打开（openDialog 会推进代际）时，焦点归属
+    // 已重新交给对话框，这一轮过期的恢复必须放弃，不得抢占焦点
+    if (openGeneration !== lastOpenGeneration) return
+    if (!document.contains(target)) return
+    // 触发按钮仍然禁用（例如 CSPRNG 不可用时的永久禁用）：浏览器本就无法聚焦，
+    // 显式跳过，不把焦点从当前归属处无谓移走
+    if ('disabled' in target && (target as HTMLButtonElement).disabled === true) return
+    target.focus()
+  })
 }
 
 function close() {
-  // 关闭即作废尚未落地的 openDialog 迟到聚焦
-  focusGeneration += 1
+  // 先通知父组件解禁触发按钮，再安排焦点恢复：恢复落在 nextTick 之后，
+  // 拿到的是解禁并 patch 完成的真实 DOM
   emit('close')
   restoreFocus()
 }
@@ -94,6 +117,8 @@ function onKeydown(event: KeyboardEvent) {
 
 async function openDialog() {
   const generation = ++focusGeneration
+  // 记录本轮打开的代际：任何更早的、仍在等待中的焦点恢复都会因快照不再匹配而作废
+  lastOpenGeneration = generation
   restoreTarget = (document.activeElement as HTMLElement | null) ?? null
   reason.value = ''
   acknowledged.value = false
@@ -113,13 +138,14 @@ onMounted(() => {
 
 // 父组件成功提交后直接把 open 置为 false 是合法关闭路径：组件常驻，close() 与
 // onBeforeUnmount 都不会执行，必须由 watch 兜底恢复焦点；该路径只恢复焦点、不
-// emit('close')，否则父组件的 open=false 会回授成第二次 close，形成回授循环
+// emit('close')，否则父组件的 open=false 会回授成第二次 close，形成回授循环。
+// 与 close() 共用 restoreFocus：目标已被消费时第二次进入静默跳过，推进的代际
+// 也只作废迟到聚焦，不会作废另一轮已排在 nextTick 上的恢复
 watch(() => props.open, (open) => {
   if (open) {
     openDialog()
     return
   }
-  focusGeneration += 1
   restoreFocus()
 })
 
@@ -138,9 +164,9 @@ function confirmBatch() {
   emit('confirmBatchRisk')
 }
 
-// 卸载与父驱动关闭共用同一 restoreFocus helper；推进代际让任何迟到的 openDialog 失效
+// 卸载与父驱动关闭共用同一 restoreFocus helper：恢复同样排在 nextTick 之后，
+// 由代际守卫保证迟到的这一轮不会抢占之后重新打开的对话框焦点
 onBeforeUnmount(() => {
-  focusGeneration += 1
   restoreFocus()
 })
 </script>

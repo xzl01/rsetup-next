@@ -1,4 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/vue'
+import { defineComponent, ref } from 'vue'
+import type { PropType } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 import TaskModals from './TaskModals.vue'
 import { createI18n } from '../i18n'
@@ -193,5 +195,103 @@ describe('TaskModals batch risk confirmation', () => {
     expect(confirmBatchRisk).not.toHaveBeenCalled()
     expect(fetcher).not.toHaveBeenCalled()
     vi.unstubAllGlobals()
+  })
+})
+
+// ── P2 回归：触发按钮在模态框打开期间被 :disabled 禁用时的焦点恢复时序 ──────────────
+// TasksView 的真实形态是 `:disabled="!csprngAvailable || batchModalOpen"`：模态框打开期间
+// 背景触发器禁用，关闭后才解禁。浏览器（与 jsdom）对 disabled 元素调用 .focus() 会静默忽略，
+// 因此 close() 里同步聚焦必然失败：此刻父组件的 open=false 与解禁还没 patch 到真实 DOM。
+// 下面这套父组件 harness 就是该时序的最小复现，任何把 restoreFocus 提前到 emit('close')
+// 之前/同帧同步执行的实现都会让焦点掉到 document.body。
+const ParentHarness = defineComponent({
+  components: { TaskModals },
+  props: {
+    mode: { type: String as PropType<'batch-risk' | 'release-lock'>, default: 'batch-risk' },
+    subtask: { type: Object as PropType<SubTaskItem | null>, default: null },
+  },
+  setup() {
+    // 与 TasksView 一致：open 同时驱动模态框显隐与触发按钮的禁用态
+    const open = ref(false)
+    return { open }
+  },
+  template: `
+    <div>
+      <button data-testid="trigger" :disabled="open" @click="open = true">打开模态框</button>
+      <button data-testid="parent-close" @click="open = false">父组件直接关闭</button>
+      <TaskModals :mode="mode" :open="open" :subtask="subtask" @close="open = false" />
+    </div>
+  `,
+})
+
+function mountHarness(props: { mode: 'batch-risk' | 'release-lock'; subtask?: SubTaskItem | null } = { mode: 'batch-risk' }) {
+  return render(ParentHarness, { props, global: { provide: { i18n } } })
+}
+
+function trigger(): HTMLButtonElement {
+  return screen.getByTestId('trigger') as HTMLButtonElement
+}
+
+// 真实浏览器里点击可聚焦按钮会先让它获得焦点（mousedown 阶段），jsdom 不实现这一行为。
+// 先显式 focus 再 click，还原“打开前焦点就在触发按钮上”这一 A11y 键盘导航前提。
+async function openByTrigger(): Promise<void> {
+  const button = trigger()
+  button.focus()
+  expect(document.activeElement).toBe(button)
+  await fireEvent.click(button)
+}
+
+describe('TaskModals 焦点恢复与禁用触发按钮的时序合同', () => {
+  it('点击取消按钮关闭后把焦点还给打开期间被禁用的触发按钮', async () => {
+    mountHarness({ mode: 'batch-risk' })
+    await openByTrigger()
+    expect(trigger().disabled).toBe(true) // 模态框打开期间触发按钮处于禁用态
+    const dialog = await screen.findByRole('dialog')
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true))
+
+    await fireEvent.click(screen.getByRole('button', { name: new RegExp(i18n.t('common.cancel'), 'i') }))
+    expect(screen.queryByRole('dialog')).toBeNull()
+    // nextTick 之后父组件已解禁触发按钮，焦点必须落回它而不是 document.body
+    await waitFor(() => expect(document.activeElement).toBe(trigger()))
+  })
+
+  it('按下 Escape 关闭后把焦点还给打开期间被禁用的触发按钮', async () => {
+    mountHarness({ mode: 'release-lock', subtask })
+    await openByTrigger()
+    expect(trigger().disabled).toBe(true)
+    const dialog = await screen.findByRole('dialog')
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true))
+
+    await fireEvent.keyDown(dialog, { key: 'Escape', code: 'Escape' })
+    expect(screen.queryByRole('dialog')).toBeNull()
+    await waitFor(() => expect(document.activeElement).toBe(trigger()))
+  })
+
+  it('父组件直接把 open 置为 false 关闭时同样把焦点还给被禁用的触发按钮', async () => {
+    mountHarness({ mode: 'batch-risk' })
+    await openByTrigger()
+    const dialog = await screen.findByRole('dialog')
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true))
+
+    // 提交成功路径：父组件不接收 close 事件，只把 open 置为 false，触发按钮随之解禁
+    await fireEvent.click(screen.getByTestId('parent-close'))
+    expect(screen.queryByRole('dialog')).toBeNull()
+    await waitFor(() => expect(document.activeElement).toBe(trigger()))
+  })
+
+  it('关闭后再次打开时焦点落在新对话框内，过期的焦点恢复不回弹到触发按钮', async () => {
+    mountHarness({ mode: 'batch-risk' })
+    await openByTrigger()
+    const firstDialog = await screen.findByRole('dialog')
+    await waitFor(() => expect(firstDialog.contains(document.activeElement)).toBe(true))
+
+    await fireEvent.keyDown(firstDialog, { key: 'Escape', code: 'Escape' })
+    await waitFor(() => expect(document.activeElement).toBe(trigger()))
+
+    // 同一触发按钮再次打开：焦点归属重新交给对话框，不得被上一轮的迟到恢复抢回触发按钮
+    await fireEvent.click(trigger())
+    const secondDialog = await screen.findByRole('dialog')
+    await waitFor(() => expect(secondDialog.contains(document.activeElement)).toBe(true))
+    expect(document.activeElement).not.toBe(trigger())
   })
 })

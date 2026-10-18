@@ -458,6 +458,52 @@ describe('TasksView list, onMounted initial loading and error states', () => {
   })
 })
 
+// 真实父组件形态的焦点归属回归（P2）：TasksView 的提交按钮带
+// `:disabled="!csprngAvailable || batchModalOpen"`，模态框打开期间该按钮处于禁用态。
+// 浏览器对 disabled 元素调用 .focus() 会被静默忽略，因此模态框关闭时若在
+// emit('close')/open=false 的同一同步时机恢复焦点，按钮还是禁用的，焦点会掉到 body。
+describe('TasksView 批量重启模态框的焦点归属', () => {
+  it('Esc 关闭模态框后把焦点还给打开期间被禁用的提交按钮', async () => {
+    const onPreview = vi.fn(async () => preview)
+    mount({ devices, pendingDeviceId: DEV_A, onPreview })
+    await fireEvent.click(screen.getByRole('button', { name: name('task.preview.submit') }))
+    await waitFor(() => expect(screen.getByText(i18n.t('task.preview.eligible'))).toBeTruthy())
+
+    // 模态框打开前该名称唯一；打开后模态内同名确认按钮也会出现，故先固定触发按钮引用
+    const trigger = screen.getByRole('button', { name: name('task.submitReboot') }) as HTMLButtonElement
+    trigger.focus() // 真实浏览器点击可聚焦按钮即聚焦，jsdom 需显式还原该前提
+    await fireEvent.click(trigger)
+    expect(trigger.disabled).toBe(true)
+    const dialog = await screen.findByRole('dialog')
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true))
+
+    await fireEvent.keyDown(dialog, { key: 'Escape', code: 'Escape' })
+    expect(screen.queryByRole('dialog')).toBeNull()
+    await waitFor(() => expect(document.activeElement).toBe(trigger))
+  })
+
+  it('提交成功由父组件关闭模态框后同样把焦点还给提交按钮', async () => {
+    const onPreview = vi.fn(async () => preview)
+    const onSubmit = vi.fn(async () => ({ task_id: TASK_ID, accepted: true }))
+    mount({ devices, pendingDeviceId: DEV_A, onPreview, onSubmit })
+    await fireEvent.click(screen.getByRole('button', { name: name('task.preview.submit') }))
+    await waitFor(() => expect(screen.getByText(i18n.t('task.preview.eligible'))).toBeTruthy())
+
+    const trigger = screen.getByRole('button', { name: name('task.submitReboot') }) as HTMLButtonElement
+    trigger.focus()
+    await fireEvent.click(trigger)
+    const dialog = await screen.findByRole('dialog')
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true))
+
+    await fireEvent.click(screen.getByRole('checkbox', { name: name('task.risk.confirmBatchReboot') }))
+    await fireEvent.click(screen.getByTestId('confirm-batch-risk'))
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    // 提交成功路径不经过 close() 事件，只由父组件把 open 置为 false：焦点同样必须回到触发按钮
+    await waitFor(() => expect(document.activeElement).toBe(trigger))
+  })
+})
+
 // 静态注明：后端尚未注册任务路由，本用例只是 Vitest stub fetch 的错误态单测，
 // 不构成"真实 404 证据"，也不代表任何真实端到端验收结论。
 it('renders error state truthfully when request fails with 404', async () => {
