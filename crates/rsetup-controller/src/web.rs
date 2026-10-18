@@ -46,14 +46,14 @@ struct EmbeddedAsset {
 /// - MIME 与扩展名不符，或嵌入的产物为空文件。
 const ASSETS: &[EmbeddedAsset] = &[
     EmbeddedAsset {
-        path: "/assets/index-CRpQSRGu.js",
+        path: "/assets/index-BPj7dGBJ.js",
         mime: MIME_JS,
-        bytes: include_bytes!("../../../apps/controller-web/dist/assets/index-CRpQSRGu.js"),
+        bytes: include_bytes!("../../../apps/controller-web/dist/assets/index-BPj7dGBJ.js"),
     },
     EmbeddedAsset {
-        path: "/assets/index-D4kiGYQ8.css",
+        path: "/assets/index-BCZGT6CR.css",
         mime: MIME_CSS,
-        bytes: include_bytes!("../../../apps/controller-web/dist/assets/index-D4kiGYQ8.css"),
+        bytes: include_bytes!("../../../apps/controller-web/dist/assets/index-BCZGT6CR.css"),
     },
 ];
 
