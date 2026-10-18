@@ -31,7 +31,7 @@ Spec: 06 §6
 | T4-03 | PASS | 2026-10-18T16:40:00+08:00 | cargo-test | cargo test -p rsetup-controller --test management_gateway_http | tests/management_gateway_http.rs |
 | T4-04 | PASS | 2026-10-18T16:40:00+08:00 | cargo-test | cargo test -p rsetup-controller --lib tasks::adapter | src/tasks/adapter.rs |
 | T4-05 | PASS | 2026-10-18T16:40:00+08:00 | cargo-test | cargo test -p rsetup-controller --lib tasks::http::decision_tests | src/tasks/http.rs |
-| T4-06 | 未验证 | | | | |
+| T4-06 | PASS | 2026-10-18T16:50:00+08:00 | cargo-test | cargo test -p rsetup-controller --lib http_device_status | src/http_device_status.rs |
 | T4-07 | PASS | 2026-10-18T16:40:00+08:00 | cargo-test | cargo test -p rsetup-controller --lib tasks::recovery | src/tasks/recovery.rs |
 | T4-08 | 未验证 | | | | |
 | T4-09 | BLOCKED | | | | |
