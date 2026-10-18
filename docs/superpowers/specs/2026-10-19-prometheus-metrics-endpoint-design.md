@@ -52,7 +52,7 @@
 - **I4 失败关闭**：配置非法、凭据缺失、采集失败一律 fail-closed（启动失败或 5xx），不得降级为"看起来正常"的空指标或常量 0。
 - **I5 去敏**：所有错误消息、日志、指标文本与测试报告都不得回显密码、base64 凭据原文或配置文件的行原文。
 - **I6 不污染业务契约**：不新增 `EndpointId` 变体、不新增 permission、不写 `audit_events`（抓取是高频只读行为，写审计会造成写入放大并污染安全审计的可读性）。
-- **I7 生命周期对齐**：指标线每一条连接从借出、查询到关闭的整个生命周期都被**恰好一个**并发闸许可（permit）持有，许可只有在底层连接**完全关闭完毕**后才释放（指标连接一律销毁、不回空闲池，§5.5.1）。由此无条件成立：任何时刻指标线"在途 + 关闭中"的连接总数 ≤ `MAX_CONCURRENT_SCRAPE = 4`，共享池默认 `max_connections = 10`，业务线恒保有 ≥ 6 个空闲槽位额度——连续多波慢抓取**不得**发生连接累积饥饿。
+- **I7 生命周期对齐**：指标线每一条连接从借出、查询到关闭的整个生命周期都被**恰好一个**并发闸许可（permit）持有，许可只有在底层连接**完全关闭完毕**后才释放（指标连接一律销毁、不回空闲池，§5.5.1）。由此无条件成立：任何时刻指标线"在途 + 关闭中"的连接总数 ≤ `MAX_CONCURRENT_SCRAPE = 4`，共享池默认 `max_connections = 10`——**指标线任何时刻在途与关闭中的连接数至多占 4 槽，连接池中至少 6 槽容量属于主业务、绝对不被指标线占用或挤占**（该结论只封顶指标线侧占用，不对业务自身用量作任何假设）——连续多波慢抓取**不得**发生连接累积饥饿。
 
 ---
 
@@ -629,26 +629,38 @@ pub async fn snapshot_via(pool: &DbPool) -> Result<MetricsSnapshot, ControllerEr
     //    绝不 return_to_pool() 的 ping-drain-再回池，脏连接永不交还业务线。
     conn.close_on_drop();
 
-    // 3) 两条聚合在上限内顺序执行；超时/错误都不提前 return，
-    //    一律继续走到第 4 步的关闭收尾。
-    let outcome = tokio::time::timeout(SCRAPE_TIMEOUT, run_aggregates(&mut conn))
-        .await
-        .map_err(|_| ControllerError::Config("metrics snapshot: query timeout"))?;
+    // 3) 两条聚合在上限内顺序执行。自本步起直到第 4 步 close() 完成之前，
+    //    **彻底禁止 `?`（或任何等价的提前 return / 提前 drop 分岔）**：查询报错
+    //    与超时一律只把错误折进 scrape_outcome，继续走到第 4 步的关闭收尾。
+    //    反例（三轮复审 F1，MUST NOT 复活）：`timeout(..).await.map_err(..)?`
+    //    ——`?` 会在超时/报错时提前返回、跳过第 4 步 close()，conn 的 Drop 因
+    //    close_on_drop() 改由后台任务异步关闭，而持有 OwnedPermit 的独立采集
+    //    任务却在此刻退出并归还许可，重新引入"许可提前归还与后台关闭重叠"
+    //    导致连接池累积耗尽的漏洞。
+    let scrape_outcome = match tokio::time::timeout(SCRAPE_TIMEOUT, run_aggregates(&mut conn)).await {
+        Ok(Ok(metrics)) => Ok(metrics),
+        // 查询报错：沿用 run_aggregates 已映射的去敏错误，绝不提前返回。
+        Ok(Err(db_err)) => Err(db_err),
+        // 超时：固定去敏文案，绝不提前返回。
+        Err(_) => Err(ControllerError::Config("metrics snapshot: query timeout")),
+    };
 
-    // 4) 池槽位释放点 = 本函数返回点：在当前任务内 await
-    //    PoolConnection::close()（其文档明确：关闭期间持续持有池 permit，
-    //    池不会超出 max_connections——不是 detach），并**不为其设第三层超时**：
-    //    提前放行许可等于重开多波累积后门。返回 Err 仅表示关闭握手未正常完成，
-    //    套接字同样被丢弃、池槽位同样释放。
+    // 4) 池槽位释放点 = 本函数返回点：无论查询成功、失败还是超时，都必须在当前
+    //    任务内**无条件** await PoolConnection::close()，彻底释放连接池槽位
+    //    （其文档明确：关闭期间持续持有池 permit，池不会超出 max_connections——
+    //    不是 detach），并**不为其设第三层超时**：提前放行许可等于重开多波累积
+    //    后门。返回 Err 仅表示关闭握手未正常完成，套接字同样被丢弃、池槽位同样释放。
     let _ = conn.close().await;
 
-    outcome
+    // close().await 执行完成后才返回采集结果；持有 OwnedPermit 的独立采集任务
+    // 随本函数返回而退出，随后 OwnedPermit 随任务退出释放（I7）。
+    scrape_outcome
 }
 ```
 
 1. **显式 `acquire` 超时**：`POOL_ACQUIRE_TIMEOUT = 500ms`（MUST NOT 大于 1s，且 MUST 明显小于 `SCRAPE_TIMEOUT`），超时映射 503。这让"池紧张"在 0.5 秒内就是可见的 503，而不是 2 秒后仍无法定性的超时。借连接失败时许可可立即释放（没有连接产生）。
-2. **池槽位释放与许可同域：关闭完毕才允许返回**：聚合完成（成功、出错或超时）后，`snapshot()` MUST 在**当前任务内 await `PoolConnection::close()` 完毕**才返回——`close()` 全程持有池 permit（`sqlx-core-0.8.6` 文档注释："the connection permit is retained for the duration so that the pool may not exceed `max_connections`"），完成即释放池槽位；**许可只有在 `snapshot()` 返回（连接完全关闭）后才释放**。MUST NOT 依赖"`Drop` 派生后台关闭、许可先行放行"的路径；MUST NOT 为该关闭 await 设一个会提前放行许可的超时——健康连接的关闭是毫秒级；服务端卡住时关闭时长由服务端行为决定，此时许可继续被占用、新抓取拿不到许可立即 503，**业务线的 ≥ 6 槽位额度不受任何影响**，这是刻意的 fail-closed 取舍。MUST NOT 依赖 `Pool::disconnect_idle()`（只处理空闲连接，对借出中的连接无效），也 MUST NOT 用 `PoolConnection::detach()`（detach 会让进程实际超出 `max_connections`）。
-3. **handler 侧装配：许可由独立采集任务持有、不随客户端断线释放**：handler `try_acquire_owned` 取得 `OwnedPermit` 后，MUST 把许可与采集调用一起移交给 `tokio::spawn` 出的独立任务，用 `tokio::sync::oneshot` 等待结果；许可只在任务返回（= 连接已完全关闭）时释放。客户端断线、Prometheus `scrape_timeout` 掐线只取消 handler，MUST NOT 取消采集任务、MUST NOT 提前释放许可。由此 I7 无条件成立：指标线"在途 + 关闭中"连接总数任何时刻 ≤ `MAX_CONCURRENT_SCRAPE = 4`——每条连接自借出到关闭始终被恰好一个在手持的许可覆盖，每个许可同时至多覆盖一条连接；共享池默认 `max_connections = 10`，业务线恒有 ≥ 6 个空闲槽位额度，**连续多波慢抓取不可能累积连接占用**。handler 侧示意：
+2. **池槽位释放与许可同域：关闭完毕才允许返回**：聚合完成（成功、出错或超时）后，`snapshot()` MUST 在**当前任务内 await `PoolConnection::close()` 完毕**才返回——`close()` 全程持有池 permit（`sqlx-core-0.8.6` 文档注释："the connection permit is retained for the duration so that the pool may not exceed `max_connections`"），完成即释放池槽位；**许可只有在 `snapshot()` 返回（连接完全关闭）后才释放**。自连接借出成功（第 1 步之后）起至 `close().await` 执行完毕为止，代码路径上 MUST NOT 出现任何 `?`、`return` 或提前 drop 分岔——查询报错与超时都只折入结果变量，close 之后统一返回（三轮复审 F1：`timeout(...).await.map_err(...)?` 式早退会让 `close_on_drop()` 的后台关闭与许可释放重叠，等于退回 v2 漏洞；评审以本节代码骨架逐行对照，§7.8 另设 grep 门禁拦截 `timeout(SCRAPE_TIMEOUT, ...)` 之后直接 `?` 的写法）。MUST NOT 依赖"`Drop` 派生后台关闭、许可先行放行"的路径；MUST NOT 为该关闭 await 设一个会提前放行许可的超时——健康连接的关闭是毫秒级；服务端卡住时关闭时长由服务端行为决定，此时许可继续被占用、新抓取拿不到许可立即 503，**指标线任何时刻在途与关闭中的连接数至多占 4 槽，连接池中至少 6 槽容量属于主业务、绝对不被指标线占用或挤占**，这是刻意的 fail-closed 取舍。MUST NOT 依赖 `Pool::disconnect_idle()`（只处理空闲连接，对借出中的连接无效），也 MUST NOT 用 `PoolConnection::detach()`（detach 会让进程实际超出 `max_connections`）。
+3. **handler 侧装配：许可由独立采集任务持有、不随客户端断线释放**：handler `try_acquire_owned` 取得 `OwnedPermit` 后，MUST 把许可与采集调用一起移交给 `tokio::spawn` 出的独立任务，用 `tokio::sync::oneshot` 等待结果；许可只在任务返回（= 连接已完全关闭）时释放。客户端断线、Prometheus `scrape_timeout` 掐线只取消 handler，MUST NOT 取消采集任务、MUST NOT 提前释放许可。**任务退出的唯一合法时点是 `conn.close().await` 成功执行完成之后**——持有 `OwnedPermit` 的独立采集任务必须等 close 收尾完毕才退出并释放 Permit（§5.5.1 代码骨架第 3/4 步：close 之前不存在任何 `?` 早退路径）。由此 I7 无条件成立：指标线"在途 + 关闭中"连接总数任何时刻 ≤ `MAX_CONCURRENT_SCRAPE = 4`——每条连接自借出到关闭始终被恰好一个在手持的许可覆盖，每个许可同时至多覆盖一条连接；共享池默认 `max_connections = 10`，**指标线任何时刻在途与关闭中的连接数至多占 4 槽，连接池中至少 6 槽容量属于主业务、绝对不被指标线占用或挤占**（该结论只封顶指标线侧占用，不对业务自身用量作任何假设），**连续多波慢抓取不可能累积连接占用**。handler 侧示意：
 
    ```rust
    // metrics/http.rs（HEAD 短路之后的采集路径示意）
@@ -831,16 +843,18 @@ fn build_router(
 }
 ```
 
-设计取舍：**不新增第四条指针校验**，而是让指标线的类型里根本没有第二个 `DbPool` 入口——配置之外的指标线装配项（汇总源、池读数）都在 `build_production_router` 内部由 `inputs.auth.db` 派生。对这一保证的强度做诚实界定：顶层入参的类型**大幅收缩**了违规面（外部既递不进池、也递不进外部自建的汇总源），但"生产汇总源只在装配函数内部基于 `inputs.auth.db` 构造"本身是一条**架构契约**——由装配约定 + §7.6 第 9 条的结构性与源码级回归测试 + §7.8 grep 静态门禁 + 评审共同执法；测试注入缝（`build_production_router_with_metrics_source`）同样是公开 API，MUST NOT 把该保证宣传为"编译期不可能违反"这类绝对化结论（这是既有"指针一致性硬门禁"在新线上的结构性替代，只是其强度是契约 + 测试门禁，而非编译期不可表达）。
+设计取舍：**不新增第四条指针校验**，而是让指标线的类型里根本没有第二个 `DbPool` 入口——配置之外的指标线装配项（汇总源、池读数）都在 `build_production_router` 内部由 `inputs.auth.db` 派生。对这一保证的强度做诚实界定，统一规范表述为：**生产装配在内部强制由 `auth.db` 构造汇总源作为架构契约，辅以 §7.6 测试与 §7.8 grep 门禁静态审查，严防意外引入第二连接池**。顶层入参的类型**大幅收缩**了违规面（外部既递不进池、也递不进外部自建的汇总源），但"生产汇总源只在装配函数内部基于 `inputs.auth.db` 构造"本身是一条**架构契约**——由装配约定 + §7.6 第 9 条的结构性与源码级回归测试 + §7.8 grep 静态门禁 + 评审共同执法；测试注入缝（`build_production_router_with_metrics_source`）同样是公开 API，MUST NOT 把该保证宣传为"编译期不可能违反"这类绝对化结论（这是既有"指针一致性硬门禁"在新线上的结构性替代，只是其强度是契约 + 测试门禁，而非编译期不可表达）。
 
-**测试注入缝（唯一的第二个入口，且无法用它引入第二个池）**：装配测试需要假汇总源（不连真库也要断言六线合并与响应形状），因此暴露
+**测试注入缝（唯一的第二个入口）**：装配测试需要假汇总源（不连真库也要断言六线合并与响应形状），因此暴露
 
 ```rust
 /// 仅供 `crates/rsetup-controller/tests/` 的装配测试注入合成汇总源。
-/// `#[doc(hidden)]` 且 MUST NOT 被 `main.rs` 或任何生产路径调用：它接收的是
-/// `Arc<dyn MetricsSnapshotSource>`（类型里没有 `DbPool`），因此即使被误用也
-/// 只是替换取值来源，不会新增连接池构造点；`MetricsState.pool` 仍恒为
-/// `inputs.auth.db.clone()`。
+/// `#[doc(hidden)]` 且 MUST NOT 被 `main.rs` 或任何生产路径调用。它接收的是
+/// `Arc<dyn MetricsSnapshotSource>`，对本缝防第二连接池的表述统一规范为：
+/// **生产装配在内部强制由 `auth.db` 构造汇总源作为架构契约，辅以 §7.6 测试与
+/// §7.8 grep 门禁静态审查，严防意外引入第二连接池**。类型参数里没有 `DbPool`
+/// 只是收缩违规面（误用通常只是替换取值来源），MUST NOT 夸大为"该缝在类型上
+/// 绝不可能引入第二池"；`MetricsState.pool` 仍恒为 `inputs.auth.db.clone()`。
 #[doc(hidden)]
 pub fn build_production_router_with_metrics_source(
     inputs: ProductionInputs,
@@ -918,7 +932,7 @@ fn production_inputs(
 | L1 纯逻辑单测 | `metrics/config.rs`、`auth.rs`、`model.rs`、`render.rs` 的 `#[cfg(test)]` | 三阶段配置解析与门禁、Basic 头解析（owned `ParsedBasic`）、常量时间映射、渲染确定性 | 路由、HTTP 语义 |
 | L2 进程内 HTTP | `metrics/http.rs` 的 `#[cfg(test)]`（`tower::ServiceExt::oneshot` + fake source） | 状态码与响应头（含 GET/HEAD 分派）、认证与禁用门禁、失败语义 | 真实 SQL、真实库数据、真实连接池回收 |
 | L3 装配测试 | `tests/production_composition.rs` 扩展 | 六线合并可达、单一端口、隔离与**单一池的结构性装配**、路径不冲突 | 认证语义、真实指标取值、真实慢查询下的池行为 |
-| L4 真库验收 | `tests/mysql_identity.rs` 风格（`#[ignore]`，需授权开发库） | 两条聚合 SQL 在 MySQL/TiDB 上的真实分布与求和不变量、字节级分组（`CAST(... AS BINARY)`）语义、**多波连续超时抓取期间业务 `pool.acquire()` 的耗时与可用性（证明业务绝不发生连接饥饿）** | — |
+| L4 真库验收 | `tests/mysql_identity.rs` 风格（`#[ignore]`，需授权开发库） | 两条聚合 SQL 在 MySQL/TiDB 上的真实分布与求和不变量、字节级分组（`CAST(... AS BINARY)`）语义、**多波连续超时抓取期间业务 `pool.acquire()` 的耗时与可用性（证明业务绝不发生连接饥饿）**、**受控关闭屏障下"close 完成前 permit 绝不回落"的确定性断言（§7.7 第 3 组第 4 步）** | — |
 
 L1 的关键签名以本规范为准（改动签名即改契约，需同步改本表）：`parse_authorization(&HeaderMap) -> Option<ParsedBasic>`（owned，§4.2）、`verify(&str, &str, &BasicCredentials) -> bool`、`MetricsConfig::from_parts_with(&dyn Fn(&str) -> EnvRead, &dyn Fn(&Path) -> Result<String, io::Error>) -> Result<MetricsConfig, ControllerError>`（§3.3）。
 
@@ -997,7 +1011,7 @@ L1 的关键签名以本规范为准（改动签名即改契约，需同步改�
 | `task_bucket_covers_documented_matrix` | §5.2.2 全表逐条，含 `(b"completed", None)→failed` 与非终态 `outcome` 取任意已知值仍归该桶（非终态不校验 outcome，统计口径见 §5.2.2） |
 | `task_bucket_fails_closed_on_unknown_state` | `(b"queued ", _)`（尾部空格）、`b"DONE"`、`b""` → `None` |
 | `task_bucket_fails_closed_on_unknown_outcome` | `(b"completed", Some(b"Success"))`、`(b"completed", Some(b""))`、`(b"completed", Some(b"succeded"))`、`(b"completed", Some(b"success "))`（尾部空格）→ `None`（未知 outcome 与未知 state 同等 fail-closed；大小写与尾部空格变体不得被任何折叠语义吞并） |
-| `unknown_bucket_values_need_not_be_valid_utf8` | state 或 outcome 传入非 UTF-8 字节（如 `&[0xFF, 0xFE]`）→ `None`（字节级映射不要求 UTF-8 合法性，§5.3 约束 3） |
+| `unknown_bucket_values_need_not_be_valid_utf8` | 分两个方向断言（§5.2.2 统计口径）：① `state` 传入非 UTF-8 字节（如 `&[0xFF, 0xFE]`）→ `None`（state 恒须落在四值域内，与 outcome 无关）；② 非 UTF-8 `outcome` 触发 `None`/503 的案例**仅针对 `state = completed` 终态**——`(b"completed", Some(&[0xFF, 0xFE]))→None`；对 `queued`/`running`/`held` 非终态，其统计口径为**忽略 outcome**（既不校验也不参与），`(b"queued", Some(&[0xFF, 0xFE]))`、`(b"held", Some(&[0xFF, 0xFE]))→pending` 桶、`(b"running", Some(&[0xFF, 0xFE]))→running` 桶（字节级映射不要求 UTF-8 合法性，§5.3 约束 3） |
 | `unknown_state_and_outcome_messages_are_distinct` | 两条采集错误分别为 `"metrics task aggregate: unknown task state"` 与 `"…unknown task outcome"`，且都不含原始取值 |
 | `render_matches_golden_exposition` | §5.6 fixture 逐字节相等（含末尾单个 `\n`） |
 | `render_emits_zero_valued_series` | 全 0 fixture 仍输出全部 11 条序列 |
@@ -1046,7 +1060,7 @@ L1 的关键签名以本规范为准（改动签名即改契约，需同步改�
 6. `metrics_gauges_read_the_shared_pool_only`：用 lazy 池 + `build_production_router_with_metrics_source(… SyntheticMetricsSnapshotSource)`（两条聚合走合成源，池 gauge 仍走真实内存读数）断言 `db_pool_connections{state="active"} 0` 与 `{state="idle"} 0`（lazy 池未建立任何连接），且抓取前后 `lazy_db()` 未产生连接——证明指标线读的是 `auth.db` 那个池且不发查询。
 7. `metrics_line_never_touches_session_boundary`：在全量顶层 router 上，用完整合法会话 Cookie（L2 的 `LiveSessionAuth` 桩形态）请求 `/metrics` 得 401；随后请求 `/api/v1/auth/me` 仍按会话语义工作，证明指标抓取未污染会话/CSRF/限速状态。
 8. `reserved_paths_stay_registered`：对 `/healthz`、`/readyz`、`/`、`/login`、`/assets` 前缀逐一探测，断言它们仍由所属条线应答（而不是被指标线抢占或退化为 404），并且 `RESERVED_PATHS` 覆盖 `web.rs` 的 `SPA_EXACT_ROUTES`/`SPA_PARAM_ROUTES`/`ASSET_DIR` 全部条目，使保留集合不与代码漂移。
-9. `production_inputs_exposes_no_second_pool`（结构性断言 + 源码级静态门禁；对装配唯一性的契约性质见 §6.3 设计取舍段）：断言 `MetricsLineInputs` 的字段集合只有 `config` 与 `runtime`（构造点写全字段、不允许 `..Default::default()` 兜底），并用源码级断言（`include_str!("../src/main.rs")`）钉住 `main.rs` 只调用 `build_production_router`、`src/` 下 `SqlxMetricsSnapshotSource::new` 与 `build_production_router_with_metrics_source` 只出现在 `production.rs`（§6.3、§7.8）。这条测试是"生产装配内部基于 `auth.db` 构造汇总源"这一架构契约的回归网：一旦有人把汇总源或 `DbPool` 重新加回顶层入参，编译或该测试立刻失败。
+9. `production_inputs_exposes_no_second_pool`（结构性断言 + 源码级静态门禁；对装配唯一性的契约性质见 §6.3 设计取舍段）：断言 `MetricsLineInputs` 的字段集合只有 `config` 与 `runtime`（构造点写全字段、不允许 `..Default::default()` 兜底），并用源码级断言（`include_str!("../src/main.rs")`）钉住 `main.rs` 只调用 `build_production_router`、`src/` 下 `SqlxMetricsSnapshotSource::new` 与 `build_production_router_with_metrics_source` 只出现在 `production.rs`（§6.3、§7.8）。这条测试是"生产装配在内部强制由 `auth.db` 构造汇总源"这一架构契约的回归网（与 §7.8 grep 门禁同属静态审查，严防意外引入第二连接池）：一旦有人把汇总源或 `DbPool` 重新加回顶层入参，编译或该测试立刻失败。
 10. `metrics_timeout_does_not_starve_business_routes`（L3 侧的**结构**部分）：注入一个"永久挂起"的合成汇总源，占满并发闸后，断言 `/healthz` 仍 200、`/api/v1/auth/me` 仍按会话语义 401（不经指标线）、且业务线借用连接的调用点数未被指标线改变（无新增池构造、无 `detach`）。**真实慢查询下的池可用性不在此证明范围**，见 §7.7 的 L4 用例。
 
 ### 7.7 真实数据库验收（L4）与边界
@@ -1058,14 +1072,19 @@ L4 必须覆盖以下三组、缺一即该层未完成：
 1. `aggregates_match_table_distribution_and_sum_invariant`：既有数据下三桶/四桶逐桶与独立 `COUNT(*)` 对账，且求和恒等于表行数（§5.1 第 4 条）。
 2. `grouping_is_byte_exact_on_both_engines`：**构造**只差大小写（`APPROVED` 与 `approved`）或只差尾部空格（`PENDING` 与 `'PENDING '`）的分组键，断言两条聚合把它们返回为**各自独立的分组**（证明 §5.3 的 `CAST(... AS BINARY)` 逐字节语义生效），并断言此时经 `metrics` 采集路径得到 **503 fail-closed**——**尾部空格与大小写异常值都必须作为独立未知桶让映射函数返回 `None`**，而不是被算进合法桶。**本用例同时是 PAD SPACE 陷阱的回归网**：对同一份数据构造跑对照查询 `SELECT ... GROUP BY CAST(<列> AS CHAR) COLLATE utf8mb4_bin`，确认它会把 `'PENDING'` 与 `'PENDING '` **折叠**为同一组（证明 `utf8mb4_bin` 确为 `PAD SPACE`、该陷阱真实存在、只有字节级分组才堵得住；若对照不折叠，说明引擎行为与官方文档事实不符，本规范拼法评审不通过、必须重新评审）。同时断言该 SQL 在 MySQL 与 TiDB 上都不因 `ONLY_FULL_GROUP_BY` 报错，且 `SHOW WARNINGS` 无针对 `CAST(... AS BINARY)` 的 deprecation 告警。
 3. `metrics_slow_query_does_not_exhaust_shared_business_pool`：在**同一个 `DbPool`** 上执行本用例（不新建池）。本用例是**多波连续超时测试**（§5.5.1 第 2/3 条"许可与连接完整生命周期绑定"的直接回归网），步骤固定为
-   1. 通过指标采集路径（`SqlxMetricsSnapshotSource` 的实现骨架 + 把两条聚合替换为 `SELECT SLEEP(...)` 慢查询的测试变体，`SLEEP` 取值大于 `SCRAPE_TIMEOUT`，保留 `POOL_ACQUIRE_TIMEOUT`、`close_on_drop()`、任务内 `close()` await 与许可持有任务的全部语义）连续发起 **3 波**抓取，每波 `MAX_CONCURRENT_SCRAPE + 1` 路并发；**波间背靠背发起**（上一波收到 503 立即发起下一波，或按远小于 5 秒的固定间隔），刻意构造"上一波连接可能仍在关闭中、下一波已再次借出连接"的累积场景；
+   1. 通过指标采集路径（`SqlxMetricsSnapshotSource` 的实现骨架 + 把两条聚合替换为 `SELECT SLEEP(...)` 慢查询的测试变体，`SLEEP` 取值大于 `SCRAPE_TIMEOUT`，保留 `POOL_ACQUIRE_TIMEOUT`、`close_on_drop()`、任务内 `close()` await 与许可持有任务的全部语义）连续发起 **3 波**抓取，每波 `MAX_CONCURRENT_SCRAPE + 1` 路并发；**波间背靠背发起**（上一波收到 503 立即发起下一波，或按远小于 5 秒的固定间隔），刻意构造"上一波连接可能仍在关闭中、下一波已再次借出连接"的累积场景。**须诚实界定本步的证明边界**：普通 `SELECT SLEEP` 只拖慢**服务端查询**，而 `MySqlConnection::close()` 只是发送一个 Quit 报文、即便查询曾被超时也通常毫秒级完成，"close 中"与"下一波借出"的真实重叠窗口因此极短且依赖时序——本步只能证明宏观不饥饿，**单独不足以确定性地证明"permit 未提前释放"**；确定性证明由下述第 4 步的**受控关闭屏障**完成；
    2. 业务哨兵任务从第 1 波开始前起、直至第 3 波结束后 5 秒，每 100 ms 持续执行一次 `pool.acquire()` + `SELECT 1` + 归还，记录每次 acquire 的耗时与成败；
-   3. 断言：每波抓取全部以 503 结束（前 `MAX_CONCURRENT_SCRAPE` 路因查询/采集失败、其余因闸满被立即拒绝——**第 2、3 波中"闸满即拒"的比例不得低于第 1 波，证明许可没有随超时被提前放行**）；业务哨兵**零失败**、每次 `pool.acquire()` 均在 **500 ms** 内成功，且 p99 耗时不随波次单调上升（证明无累积型饥饿，业务绝不发生连接饥饿）；
-   4. 断言：3 波全程对池的持续采样（`pool.size()` 与哨兵视图）显示指标线占用（在途 + 关闭中）**任何时刻 ≤ `MAX_CONCURRENT_SCRAPE = 4`**、业务恒有 ≥ 6 个槽位额度可用；末波结束 5 秒内 `pool.size()` 回落到基线、`pool.num_idle()` 未因超时而增长（脏连接被销毁而非回到空闲队列），且哨兵随后的 `SELECT 1` 始终成功（业务从未拿到仍在为上一条慢查询吐结果的连接）；
-   5. 取消变体（SHOULD）：发起 4 路抓取后立即掐断客户端连接（模拟 handler 被取消），再连发 2 波——业务哨兵 acquire 耗时仍 < 500 ms、指标占用仍 ≤ 4，证明许可绑定在独立采集任务上、不随客户端断线提前释放（§5.5.1 第 3 条）；
-   6. 报告只出去敏数值（耗时、permit/size/idle 计数），不回显 DSN。
+   3. 断言：每波抓取全部以 503 结束（前 `MAX_CONCURRENT_SCRAPE` 路因查询/采集失败、其余因闸满被立即拒绝——**第 2、3 波中"闸满即拒"的比例不得低于第 1 波，证明许可没有随超时被提前放行**；该比例断言只是辅助证据，"close 完成前许可绝不回落"的确定性证明以第 4 步受控关闭屏障为准）；业务哨兵**零失败**、每次 `pool.acquire()` 均在 **500 ms** 内成功，且 p99 耗时不随波次单调上升（证明无累积型饥饿，业务绝不发生连接饥饿）；
+   4. **受控关闭屏障（Controlled Close Barrier / Probe，MUST，本用例红/绿确定性的来源）**：为了稳定证明"permit 未提前释放"，测试变体必须在采集内核的关闭阶段注入**人为可控的延迟屏障**——仍在真实 `DbPool` 上借出真实 `PoolConnection`，但让 `close()` 的完成时刻处于测试控制之下：屏障置于 §5.5.1 代码骨架第 4 步的 close await 处（测试侧以可控 await 点——如 `tokio::sync::Notify` / 手动 `oneshot` 门——替换或包裹该次关闭的完成信号），使 `close()` 进入延迟阻塞状态、保持至测试显式放行；屏障只控制 close 的完成时刻，MUST NOT 改变 acquire 超时、`close_on_drop()` 兜底、许可持有任务等其余语义，且该注入缝仅存在于 `#[ignore]` L4 测试变体、MUST NOT 进入生产代码路径。步骤与断言：
+      1. 发起 4 路抓取占满 `MAX_CONCURRENT_SCRAPE`，查询超时后 4 路全部进入 close 并被屏障挂住——此时对调用方已可回 503，但采集任务尚未退出；
+      2. 屏障未放行期间立即发起第 5 路请求：断言其**立即返回 503（闸满）**，且并发闸 `available_permits() == 0`（等价断言：第 5 路始终拿不到许可）——**在 `close()` 尚未完成前，Permit 计数绝不回落**；
+      3. 放行屏障，等待 4 路 `close().await` 完成：断言 Permit 随任务退出恢复、随后新发起的抓取可正常通过并发闸进入采集；
+      4. 屏障挂起/放行的时机完全由测试控制，断言窗口不依赖真实网络往返或 MySQL 关闭时序，因此对"旧版本在 `close()` 完成前提前释放 permit"的缺陷实现**稳定必红（RED）**（第 2 步中第 5 路会拿到许可通过闸口，或 `available_permits() > 0`），对正确实现**稳定绿（GREEN）**——门禁不靠时序侥幸；
+   5. 断言：3 波全程对池的持续采样（`pool.size()` 与哨兵视图）显示指标线占用（在途 + 关闭中）**任何时刻 ≤ `MAX_CONCURRENT_SCRAPE = 4`**——即**指标线任何时刻在途与关闭中的连接数至多占 4 槽，连接池中至少 6 槽容量属于主业务、绝对不被指标线占用或挤占**（采样断言只封顶指标线侧占用，不假设业务自身用量）；末波结束 5 秒内 `pool.size()` 回落到基线、`pool.num_idle()` 未因超时而增长（脏连接被销毁而非回到空闲队列），且哨兵随后的 `SELECT 1` 始终成功（业务从未拿到仍在为上一条慢查询吐结果的连接）；
+   6. 取消变体（SHOULD）：发起 4 路抓取后立即掐断客户端连接（模拟 handler 被取消），再连发 2 波——业务哨兵 acquire 耗时仍 < 500 ms、指标占用仍 ≤ 4，证明许可绑定在独立采集任务上、不随客户端断线提前释放（§5.5.1 第 3 条）；
+   7. 报告只出去敏数值（耗时、permit/size/idle 计数），不回显 DSN。
 
-   该用例是 §5.5.1 四条防护（`POOL_ACQUIRE_TIMEOUT`、任务内 `close()` 完毕才返回、许可由采集任务持有、并发闸封顶）在真实驱动行为上的唯一验收点：L2/L3 的合成源证明不了 `PoolConnection::close()` 的池 permit 语义与 `Drop` 的后台 drain 语义。
+   该用例是 §5.5.1 四条防护（`POOL_ACQUIRE_TIMEOUT`、任务内 `close()` 完毕才返回、许可由采集任务持有、并发闸封顶）在真实驱动行为上的唯一验收点：L2/L3 的合成源证明不了 `PoolConnection::close()` 的池 permit 语义与 `Drop` 的后台 drain 语义；其中第 4 步受控关闭屏障是"close 完成前 permit 绝不回落"（I7 判据、F1 修复的回归网）的唯一确定性验收点。
 
 ### 7.8 命令与静态门禁
 
@@ -1078,9 +1097,10 @@ grep -rnE 'TO''DO|T-B-D|FIXME' crates/rsetup-controller/src/metrics
 grep -rn 'build_production_router_with_metrics_source\|SqlxMetricsSnapshotSource::new' crates/rsetup-controller/src/main.rs
 grep -rn 'diff |= a\[i\]' crates/rsetup-controller/src/metrics
 grep -rn 'subtle::ConstantTimeEq\|use subtle::ConstantTimeEq' crates/rsetup-controller/src/metrics/auth.rs
+grep -nE 'SCRAPE_TIMEOUT.*\?' crates/rsetup-controller/src/metrics/collect.rs
 ```
 
-第 5 条 grep MUST 无输出；模式串刻意写成 `'TO''DO|T-B-D|FIXME'` 的 shell 拆分形式，这样 `TODO` 不会因把命令原文写进文档而自指命中（`FIXME` 无法用同样手法拆开——拆开就不再是那个模式串，因此对本文件执行同一条检查时，MUST 只命中本节这条命令自身所在的代码块，除此之外零命中）。第 6、7 条 MUST 无输出（生产入口不得触碰测试注入缝；指标线不得手写常量时间折叠）。第 8 条 MUST **有**输出（常量时间比较确实落在 `subtle` 上）。提交前另需检查 `git diff --cached` 不含真实凭据、不含 `controller.toml` 实体（§3.7）。
+第 5 条 grep MUST 无输出；模式串刻意写成 `'TO''DO|T-B-D|FIXME'` 的 shell 拆分形式，这样 `TODO` 不会因把命令原文写进文档而自指命中（`FIXME` 无法用同样手法拆开——拆开就不再是那个模式串，因此对本文件执行同一条检查时，MUST 只命中本节这条命令自身所在的代码块，除此之外零命中）。第 6、7 条 MUST 无输出（生产入口不得触碰测试注入缝；指标线不得手写常量时间折叠）。第 8 条 MUST **有**输出（常量时间比较确实落在 `subtle` 上）。第 9 条 MUST 无输出——拦截 `timeout(SCRAPE_TIMEOUT, ...)` 同一行直接 `?` 的写法（F1：`?` 早退会跳过任务内 `close()`，使许可随任务退出提前释放、与 `close_on_drop()` 的后台关闭重叠，§5.5.1 规则 2/3）；该 grep 是同行启发式拦截，跨行规避变体由评审对照 §5.5.1 代码骨架逐行消除。提交前另需检查 `git diff --cached` 不含真实凭据、不含 `controller.toml` 实体（§3.7）。
 
 ---
 
@@ -1098,7 +1118,7 @@ grep -rn 'subtle::ConstantTimeEq\|use subtle::ConstantTimeEq' crates/rsetup-cont
 | R8 | `_total` 后缀用作 gauge 违反命名习惯 | 误用 `rate()` | §5.4：`# TYPE gauge` 必发 + `HELP` 说明求和语义 |
 | R9 | `REVOKED → REJECTED` 词汇映射（§5.2.2） | 阅读者误认为存在第四种准入态 | 映射表在指标 `HELP`、本文与单元测试三处留档；未知值 fail-closed 503，绝不静默归类 |
 | R10 | `toml` 为工作区新增依赖、`subtle` 提升为直接依赖 | 供应链与离线构建 | 均按最小用途使用、不启用额外 feature（§3.1）；`subtle 2.6.1` 已在 `Cargo.lock` 不构成新树，`toml 0.8` 首次进入需更新 `Cargo.lock` 并在交付说明中登记新增 crate |
-| R11 | 抓取超时**不等于**底层连接关闭完毕：v2 的"503 立即释放并发闸许可 + `close_on_drop()` 后台关闭（≤ `CLOSE_ON_DROP_TIMEOUT` 5s）"允许许可先于连接释放，连续多波慢抓取下"后台关闭中的连接"与"新一波借出的连接"**逐波叠加**，并发闸封顶不了总占用，可耗尽共享池 `max_connections = 10` 饿死业务线（二轮复审 R1） | 多波慢抓取导致连接累积耗尽——业务线连接饥饿，属可用性事故而非观测成本问题 | v3 改为**许可与连接生命周期绑定（I7）**：许可由独立采集任务持有，任务内 `PoolConnection::close()` 完毕（池槽位释放）后任务才返回、许可才释放，客户端断线不取消任务；**指标线在途 + 关闭中连接无条件 ≤ 4，业务恒有 ≥ 6 空闲槽位额度**。残余：服务端卡住关闭握手时许可可被长期占用（表现为指标端点连续 503 的 fail-closed，业务槽位不受影响；`MAX_EXECUTION_TIME` 提示压缩卡住时长）；采集任务仅在进程关停时被 abort，彼时 `Drop` 的 ≤5s 兜底关闭不构成饥饿（§5.5.1 第 4 条）。§7.7 第 3 组已升级为**连续 3 波超时抓取 + 业务哨兵持续 `pool.acquire()` 耗时/可用性 + 占用上限**的实测用例 |
+| R11 | 抓取超时**不等于**底层连接关闭完毕：v2 的"503 立即释放并发闸许可 + `close_on_drop()` 后台关闭（≤ `CLOSE_ON_DROP_TIMEOUT` 5s）"允许许可先于连接释放，连续多波慢抓取下"后台关闭中的连接"与"新一波借出的连接"**逐波叠加**，并发闸封顶不了总占用，可耗尽共享池 `max_connections = 10` 饿死业务线（二轮复审 R1） | 多波慢抓取导致连接累积耗尽——业务线连接饥饿，属可用性事故而非观测成本问题 | v3 改为**许可与连接生命周期绑定（I7）**：许可由独立采集任务持有，任务内 `PoolConnection::close()` 完毕（池槽位释放）后任务才返回、许可才释放，客户端断线不取消任务；**指标线任何时刻在途与关闭中的连接数至多占 4 槽，连接池中至少 6 槽容量属于主业务、绝对不被指标线占用或挤占**（v4 进一步钉死"close 之前禁止 `?` 早退"，见 §5.5.1 规则 2 与 F1）。残余：服务端卡住关闭握手时许可可被长期占用（表现为指标端点连续 503 的 fail-closed，业务槽位不受影响；`MAX_EXECUTION_TIME` 提示压缩卡住时长）；采集任务仅在进程关停时被 abort，彼时 `Drop` 的 ≤5s 兜底关闭不构成饥饿（§5.5.1 第 4 条）。§7.7 第 3 组已升级为**连续 3 波超时抓取 + 业务哨兵持续 `pool.acquire()` 耗时/可用性 + 占用上限采样 + 受控关闭屏障（close 完成前 permit 绝不回落的确定性断言）**的实测用例 |
 | R12 | 单个脏枚举值（未知 `admission_state`/`state`/`outcome`）使整次抓取 503 | 一条异常历史数据即让该实例指标全黑（`up` 抖动） | 刻意的 fail-closed 取舍（I4/G4）：宁可指标缺失，不输出可求和但错误的数据；数据库侧已无 CHECK 约束（§5.2.2 事实修正），因此同时用 503 的去敏消息与 §7.7 的字节级分组用例把"哪个桶对不上"变成可排障事件；后续如需容错须另立规范定义显式的 `unknown` 桶语义 |
 
 ---
@@ -1109,10 +1129,10 @@ grep -rn 'subtle::ConstantTimeEq\|use subtle::ConstantTimeEq' crates/rsetup-cont
 2. 端点在默认（禁用）配置下不改变现有任何响应；启用后 `/metrics` 在同一端口 200，`Content-Type` 与 golden 文本逐字节符合 §5.1/§5.6；`HEAD /metrics` 认证后 200 空体且不触达数据源（§6.2）。
 3. 配置按 §3.3 三阶段生效：`enabled = false` 且 auth 不完整时启动成功并丢弃该段；`enabled = true` 且凭据不完整/非法时进程拒绝启动，错误文案与 §3.6 完全一致，且没有产生监听套接字或数据库连接；环境变量非 Unicode 值是启动错误而非"未设置"。
 4. §4.5 矩阵每一行都有对应自动化断言；401 头逐字节符合 §4.4；未注册方法的 405 带**无空格**的 `Allow: GET,HEAD`（Axum 0.8.9 字节事实，§6.2）；成功 200（GET 与 HEAD）均**不**携带 `Allow` 头。
-5. §4.1 隔离不变量与 I1–I7 均有代码结构或测试证据；未新增 `EndpointId` 变体、permission、审计写入、数据库对象或第二个连接池构造点；`MetricsLineInputs` 无汇总源/池字段，生产汇总源只在 `build_production_router` 内部由 `inputs.auth.db` 构造（架构契约，§6.3、§7.6 第 9 条）。
-6. §5.5.1 四条连接防护（`POOL_ACQUIRE_TIMEOUT`、任务内 `PoolConnection::close()` 完毕才返回、并发闸许可由采集任务持有并覆盖连接全生命周期（I7）、并发闸封顶 ≤ 4）在代码中可指认，且 §7.7 第 3 组的**多波（3 波）连续超时测试**（业务哨兵持续 `pool.acquire()` 的耗时与可用性 + 指标占用上限采样）已在授权开发库执行；若未执行，交付报告显式标注。
+5. §4.1 隔离不变量与 I1–I7 均有代码结构或测试证据；未新增 `EndpointId` 变体、permission、审计写入、数据库对象或第二个连接池构造点；`MetricsLineInputs` 无汇总源/池字段，生产装配在内部强制由 `inputs.auth.db` 构造汇总源作为架构契约，辅以 §7.6 测试与 §7.8 grep 门禁静态审查，严防意外引入第二连接池（§6.3、§7.6 第 9 条）。
+6. §5.5.1 四条连接防护（`POOL_ACQUIRE_TIMEOUT`、任务内 `PoolConnection::close()` 完毕才返回、并发闸许可由采集任务持有并覆盖连接全生命周期（I7）、并发闸封顶 ≤ 4）在代码中可指认——其中"许可随任务退出释放"以"`conn.close().await` 成功执行完成、close 之前无任何 `?` 早退"为前提（F1，§5.5.1 代码骨架第 3/4 步），且 §7.7 第 3 组的**多波（3 波）连续超时测试**（业务哨兵持续 `pool.acquire()` 的耗时与可用性 + 指标占用上限采样）**与受控关闭屏障用例**（close 完成前 permit 绝不回落、第 5 路立即 503 的确定性断言）已在授权开发库执行；若未执行，交付报告显式标注。
 7. 两条聚合 SQL 使用 §5.3 的字节级分组写法（`CAST(... AS BINARY)`，MUST NOT 使用 `COLLATE utf8mb4_bin`——`PAD SPACE` 陷阱），并在 MySQL 与 TiDB 上均通过 §7.7 第 2 组（大小写/尾部空格不折叠 + 两类异常值都确实触发 503 + `utf8mb4_bin` 折叠对照断言）。
-8. §7.8 的 fmt/clippy/test 全绿，四条 grep 门禁符合预期（第 5/6/7 条无输出、第 8 条有输出），提交内不含凭据。
+8. §7.8 的 fmt/clippy/test 全绿，五条 grep 门禁符合预期（第 5/6/7/9 条无输出、第 8 条有输出），提交内不含凭据。
 9. 若 L4 真库聚合验收尚未执行，交付报告必须显式标注该项未完成，不以 L2 fake 通过替代（G4/§7.7）。
 
 ### 9.1 交付边界
@@ -1238,8 +1258,8 @@ curl -sS -o /dev/null -D - http://127.0.0.1:8080/metrics
 | 不引入指标 SDK | 11 条固定序列无需注册中心；避免隐式指标与新的全局状态 |
 | 采集失败整次 503 | 拒绝部分降级为 0：伪 0 会让告警静默，比"抓取失败"更危险；未知枚举同样 503（§5.2.2、R12） |
 | 分组用 `CAST(... AS BINARY)` 字节语义 | 默认排序规则会折叠大小写与尾部空格；`utf8mb4_bin` 亦为 `PAD SPACE` 校对（`'PENDING' = 'PENDING '` 恒真），v2 的 `COLLATE utf8mb4_bin` 拼法堵不住尾部空格脏数据逃逸——只有字节级分组能闭环 fail-closed 链路，且 MySQL/TiDB 语义确定一致；`BINARY` 运算符已弃用但 `CAST(... AS BINARY)` 恰是官方替代、不受影响（§5.3） |
-| 单一池由装配契约保证 | 顶层入参不接受汇总源/池，类型上大幅收缩违规面；"汇总源只在装配函数内部基于 `auth.db` 构造"是架构契约，由 §7.6 结构/源码级测试与 §7.8 grep 门禁执法，不宣传为编译期不可能（§6.3） |
-| 许可绑定连接全生命周期（I7） | 外层 `timeout` 管不到 `PoolConnection::Drop` 的后台关闭；v2 用 `close_on_drop()` 销毁脏连接但许可随 503 立即释放——多波连续慢抓取逐波叠加会耗尽共享池。v3 任务内 `PoolConnection::close()` 完毕才释放许可、许可由独立任务持有不随断线取消：指标占用（在途+关闭中）无条件 ≤ 4，业务恒有 ≥ 6 槽位（§5.5.1） |
+| 单一池由装配契约保证 | 顶层入参不接受汇总源/池，类型上大幅收缩违规面；生产装配在内部强制由 `auth.db` 构造汇总源作为架构契约，辅以 §7.6 测试与 §7.8 grep 门禁静态审查，严防意外引入第二连接池，不宣传为编译期不可能（§6.3） |
+| 许可绑定连接全生命周期（I7） | 外层 `timeout` 管不到 `PoolConnection::Drop` 的后台关闭；v2 用 `close_on_drop()` 销毁脏连接但许可随 503 立即释放——多波连续慢抓取逐波叠加会耗尽共享池。v3 任务内 `PoolConnection::close()` 完毕才释放许可、许可由独立任务持有不随断线取消（v4 钉死 close 之前禁止 `?` 早退，F1）：指标占用（在途+关闭中）无条件 ≤ 4——指标线任何时刻在途与关闭中的连接数至多占 4 槽，连接池中至少 6 槽容量属于主业务、绝对不被指标线占用或挤占（§5.5.1） |
 | `held` 并入 `pending`、`REVOKED` 映射 `REJECTED` | 保持对齐设计固定的标签域与求和不变量；映射在 `HELP`、本文与测试三处留档 |
 
 ---
@@ -1251,3 +1271,4 @@ curl -sS -o /dev/null -D - http://127.0.0.1:8080/metrics
 | v1 | 2026-10-19 | 初版：架构与契约方向逐节对齐后落档。 |
 | v2 | 2026-10-19 | 按架构与代码复审意见修订（4 项 P1 阻断 + 7 项 P2 缺陷），全部为文档变更，未改动任何源码：<br>**P1** ①`parse_authorization` 改为返回 owned `ParsedBasic`，同步 §4.2/§7.1/§7.3；②密码冒号兼容 RFC 7617 §2（删除"password 不得含冒号"，改 `split_once(':')`，§3.4/§4.2/§7.2/§7.3/§7.5）；③Raw serde DTO 字段全 `Option<String>` + 三阶段生命周期（反序列化 → 环境变量原子覆盖与 `type` 推导 → 统一门禁；禁用态容忍不完整 auth，§3.2/§3.3/§3.5/§3.6）；④SQLx 连接池回收与超时强化（`POOL_ACQUIRE_TIMEOUT`、`close_on_drop()`、后台 `return_to_pool`/`ping` drain 事实与残余占用登记、L4 池可用性用例，新增 §5.5.1）。<br>**P2** ⑤Axum 0.8 HEAD 派发事实与 HEAD 策略（认证后 200 空体、不采集；未注册方法 405 + `Allow: GET, HEAD`，§4.5/§6.2/§7.5）；⑥SQL 二进制分组 `COLLATE utf8mb4_bin` 与未知 `outcome` fail-closed（§5.2.2/§5.3/§7.4/§7.7）；⑦生产连接池单一性由装配内部保证，`MetricsLineInputs` 去掉 `snapshot` 字段 + 测试注入缝与 grep 门禁（§6.3/§6.4/§7.6/§7.8）；⑧改用 `subtle::ConstantTimeEq`（§3.1/§4.3/§7.3/§7.8）；⑨标签转义只保留 `\\`、`\"`、`\n`（§5.1/§7.4）；⑩环境变量 `NotUnicode` 显式失败（§3.3/§3.4/§7.2/§10.2）；⑪事实与描述自洽：`chk_devices_state` 已被 v3 移除、`sub_tasks` 表名、`MetricsConfig` 手写脱敏 `Debug`、uptime 零点提前到 `main()` 首行、`/` 保留路径完全精确匹配（§3.2/§5.2.2/§6.4/§6.5）。风险表新增 R11（池 permit 有界延迟释放）与 R12（脏枚举值致整次 503），§9 验收标准同步扩写。 |
 | v3 | 2026-10-19 | 按**二轮架构复审**报告修订（1 项 P1 + 3 项 P2 + 非阻断小建议），全部为文档变更，未改动任何源码：<br>**P1 R1** 并发闸许可与底层连接**完全关闭**生命周期绑定（新增全局不变量 I7）：v2 "503 立即释放许可 + `close_on_drop()` 后台关闭"在连续多波慢抓取下会逐波叠加"后台关闭中 + 新借出"的连接直至耗尽共享池——v3 改为采集任务内 `PoolConnection::close()` 完毕（池槽位释放）才返回、许可由 `tokio::spawn` 独立任务持有且客户端断线不取消，指标线"在途 + 关闭中"占用无条件 ≤ 4、业务恒有 ≥ 6 空闲槽位；§5.5/§5.5.1 重写（六条硬规则），R11 更新，§7.7 第 3 组升级为**连续 3 波超时抓取 + 业务哨兵持续 `pool.acquire()` 耗时/可用性 + 占用上限采样**的多波测试（含断线取消变体）。<br>**P2 R2** SQL 分组由 `COLLATE utf8mb4_bin` 改为 `CAST(... AS BINARY)` 字节级分组：MySQL 8.0 文档证实 `utf8mb4_bin` 属 `PAD SPACE` 校对（`'PENDING' = 'PENDING '` 恒真），v2 拼法下尾部空格脏数据被折叠进合法分组、逃逸 fail-closed；Rust 侧映射改为 `&[u8]` 逐字节比较（非 UTF-8 字节天然落入未知桶，`'PENDING '`/`'approved'` 等异常值稳定 503）；§5.2.2 明确 `completed` 严格校验 5 种 outcome 与 `queued`/`running`/`held` 非终态统计口径；§7.4/§7.7 新增尾部空格、大小写异常触发 503 与 `utf8mb4_bin` 折叠对照的回归断言。<br>**P2 R3** 按 Axum 0.8.9 源码修正 `Allow` 字节事实：405 携带**无空格** `Allow: GET,HEAD`（`append_allow_header` 以 `","` 连接），成功 200（GET/HEAD）**不**携带 `Allow`（`Allow` 仅由 405 fallback 设置），§4.5/§6.2/§7.5/§9/§10.5 同步。<br>**P2 R4** §3.6 给出唯一短路判定顺序（禁用放行 → 凭据存在性 → `kind` → 字段合法性 → 装配），凭据缺失统一优先报 `"metrics.auth is required when metrics.enabled is true"`，§3.3/§3.4/§3.5 表述随之收敛到 §3.6 权威顺序，§7.2 新增两条优先级钉桩用例。<br>**小建议** §4.3 `sha256` 示例改传 `expected.username.as_bytes()`/`expected.password.as_bytes()`；§6.3/§7.6/§10.6 弱化装配唯一性的"编译期不可表达"绝对化修辞，明确"生产汇总源只在装配函数内部基于 `auth.db` 构造"是架构契约、由装配约定 + §7.6 测试 + §7.8 grep 门禁执法。 |
+| v4 | 2026-10-19 | 按**三轮复审**报告修订（1 项 P1 + 1 项 P2 + 3 项非阻断小项），全部为文档变更，未改动任何源码：<br>**P1 F1** §5.5.1 代码骨架第 3 步示例的 `timeout(SCRAPE_TIMEOUT, run_aggregates(&mut conn)).await.map_err(...)?` 使用 `?` 早退——查询超时或报错即提前返回、跳过第 4 步 `conn.close().await`；`close_on_drop()` 使 `conn` 的 Drop 改由后台任务异步关闭，而持有 `OwnedPermit` 的独立采集任务此刻退出并归还许可，重新引入"许可提前归还与后台关闭重叠"导致连接池累积耗尽的漏洞。重写为 `match` 三分支（成功/查询报错/超时）折入 `scrape_outcome` 后**无条件** `let _ = conn.close().await;` 再返回，持有许可的采集任务必须在 `close().await` 成功执行完成后才退出并释放 Permit；规则 2 增补"借出连接至 close 完成之间 MUST NOT 出现任何 `?`/`return`/提前 drop 分岔"，§7.8 新增第 9 条 grep 门禁拦截同行 `SCRAPE_TIMEOUT ... ?` 写法（§9 第 6/8 条同步）。<br>**P2 F2** §7.7 第 3 组新增**受控关闭屏障（Controlled Close Barrier / Probe）MUST 子用例**：测试变体在 close await 点人为保持延迟阻塞，屏障未放行期间发起第 5 路请求，直接断言"`close()` 尚未完成前 Permit 计数绝不回落"（闸满立即 503、`available_permits() == 0`），`close().await` 完成后 Permit 才放行新请求——对"旧版本过早释放 permit"缺陷**稳定必红（RED）**、不依赖时序侥幸；并显式界定 `SELECT SLEEP` 只拖慢服务端查询、`MySqlConnection::close()` 发送 Quit 报文极快的证明边界（多波测试单独不足以确定性证明 permit 未提前释放），§7.1 层次表与 R11 同步。容量表述在 §2 I7、§5.5.1 规则 2/3、§7.7、R11、§10.6 统一修正为"**指标线任何时刻在途与关闭中的连接数至多占 4 槽，连接池中至少 6 槽容量属于主业务、绝对不被指标线占用或挤占**"，替换"业务恒有 ≥ 6 空闲/idle 槽位"的歧义说法，并明示该结论只封顶指标线侧占用、不对业务自身用量作假设。<br>**非阻断小项** §7.4 `unknown_bucket_values_need_not_be_valid_utf8` 拆为两个方向：非 UTF-8 `outcome` 触发 `None`/503 仅针对 `state = completed` 终态，`queued`/`running`/`held` 非终态按 §5.2.2 统计口径**忽略 outcome**（非 UTF-8 outcome 归对应桶）；§6.3/§7.6/§10.6 对 `Arc<dyn MetricsSnapshotSource>` 测试注入缝规避第二池的修辞统一规范为"生产装配在内部强制由 `auth.db` 构造汇总源作为架构契约，辅以 §7.6 测试与 §7.8 grep 门禁静态审查，严防意外引入第二连接池"，删除 §6.3 注入缝标题中"无法用它引入第二个池"的绝对化表述。 |
