@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   rust-and-ui:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
@@ -29,7 +29,7 @@ jobs:
       # dist 缺失时 cargo 直接失败（fail-closed），web_assets 还要读同一份磁盘字节
       # 作为独立预期源。顺序固定「锁定安装 → 测试 → 类型检查 → 构建」，与
       # make controller-test-offline 一致。
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: npm
@@ -73,7 +73,7 @@ jobs:
         run: node --test scripts/tests/*.test.mjs
 
   rust-multi-arch-check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         target:
@@ -92,7 +92,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
       # 交叉 --check 也要编译 rsetup-controller，编译期嵌入的前端产物必须先构建。
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: npm
@@ -105,7 +105,7 @@ jobs:
         run: cargo check --workspace --all-targets --locked --target ${{ matrix.target }}
 
   rust-msrv:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
@@ -138,7 +138,7 @@ jobs:
           done
       # msrv-check 跑 cargo test --workspace，其中 rsetup-controller 编译期嵌入
       # 前端产物，因此先构建 dist。Node 22 只是构建产物的宿主，被测版本仍是 1.85.0。
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: npm
