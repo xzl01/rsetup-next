@@ -25,7 +25,7 @@ pub use bootstrap::{BootstrapSecretSink, bootstrap_admin};
 pub use config::ControllerConfig;
 pub use db::{
     AdmissionStore, DbPool, TestMigrationConfig, TestMigrationMode, check_identity_schema,
-    run_identity_test_migration,
+    check_v3_ready, run_identity_test_migration,
 };
 pub use error::ControllerError;
 pub use http_auth::{AppState, HttpAuthState, build_http_router};

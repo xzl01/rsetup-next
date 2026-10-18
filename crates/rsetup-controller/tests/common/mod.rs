@@ -66,7 +66,7 @@ pub async fn assert_fresh_v3_is_check_and_fk_free(db: &DbPool) {
     .await
     .unwrap_or_else(|_| panic!("task4_fixture_operation_failed"));
     assert_eq!(tables, 11);
-    rsetup_controller::check_identity_schema(db)
+    rsetup_controller::check_v3_ready(db)
         .await
         .unwrap_or_else(|_| panic!("task4_fixture_operation_failed"));
 }
@@ -81,7 +81,7 @@ pub async fn assert_actor_fixture_v3_without_check_or_fk(db: &DbPool) {
     let constraints: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.table_constraints WHERE table_schema = DATABASE() AND constraint_type IN ('CHECK', 'FOREIGN KEY')")
         .fetch_one(&db.0).await.unwrap_or_else(|_| panic!("task4_fixture_operation_failed"));
     assert_eq!(constraints, 0, "actor fixture must have no CHECK or FK");
-    rsetup_controller::check_identity_schema(db)
+    rsetup_controller::check_v3_ready(db)
         .await
         .unwrap_or_else(|_| panic!("task4_fixture_operation_failed"));
 }

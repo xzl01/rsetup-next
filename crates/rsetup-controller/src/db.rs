@@ -1715,6 +1715,10 @@ pub async fn check_identity_schema(db: &DbPool) -> Result<(), ControllerError> {
     check_identity_schema_with_probe(db).await
 }
 
+pub async fn check_v3_ready(db: &DbPool) -> Result<(), ControllerError> {
+    check_v3_ready_with_probe(db).await
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum TestMigrationMode {
     Upgrade,
