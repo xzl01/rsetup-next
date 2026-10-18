@@ -329,7 +329,8 @@ mod typed {
         assert_eq!(body["error"]["code"], json!("AUTH_REQUIRED"));
 
         // management / tasks / status 三线：路由已注册（否则 404），且都在共享
-        // gate 处严格 401，未触达任何仓储。
+        // gate 处严格 401，未触达任何仓储。含 percent-decode 非法 UTF-8 的状态
+        // 路径：路径提取失败绝不先于认证门禁短路（修复轮 1 · F2）。
         for path in [
             "/api/v1/users",
             "/api/v1/roles",
@@ -338,6 +339,7 @@ mod typed {
             "/api/v1/tasks",
             "/api/v1/tasks/00000000-0000-4000-8000-000000000001",
             DEVICE_STATUS_PATH,
+            "/api/v1/devices/%FF/status",
         ] {
             let (status, body) = request_get(&router, path).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "业务路径 {path} 必须 401");
@@ -358,10 +360,14 @@ mod typed {
     }
 
     #[tokio::test]
-    async fn composed_router_serves_status_component_from_real_source() {
-        // 设备状态线在装配后必须真的走 EmptyDeviceStatusSnapshotSource 的语义：
-        // 无样本 → snapshot=null / freshness=unknown / age_ms=null，不伪造 PASS。
-        // 这里通过未认证 401 证明路由归属，再由 lib 单测覆盖投影本身。
+    async fn composed_router_registers_status_route_behind_shared_gate() {
+        // 设备状态线在装配后归属顶层生产 router：未认证请求（含合法 ID 与
+        // percent-decode 非法的路径段）都在共享 gate 处严格 401，绝不 404、
+        // 也绝不先于认证返回提取器 400。本测试只证明路由归属与 gate 优先，
+        // **不**读取状态源；空样本投影与已认证响应由 lib 单测
+        // `live_session_empty_source_returns_unknown_with_time_evidence_object`
+        // 覆盖（EmptyDeviceStatusSnapshotSource 语义：snapshot=null/unknown/
+        // age_ms=null，received_time 为 TimeEvidence 对象，不伪造 PASS）。
         let shared = auth_state();
         let router = build_production_router(inputs(
             Arc::clone(&shared),
@@ -370,15 +376,18 @@ mod typed {
             Arc::clone(&shared),
         ))
         .expect("装配必须成功");
-        let (status, _) = request_get(
-            &router,
+        for path in [
             "/api/v1/devices/0000000000000000000000000000000000000000000000000000000000000001",
-        )
-        .await;
-        assert_eq!(
-            status,
-            StatusCode::UNAUTHORIZED,
-            "设备详情属 management 线，也必须 401 而非 404"
-        );
+            DEVICE_STATUS_PATH,
+            "/api/v1/devices/%FF/status",
+        ] {
+            let (status, body) = request_get(&router, path).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "路径 {path} 必须 401 而非 404/400"
+            );
+            assert_eq!(body["error"]["code"], json!("AUTH_REQUIRED"), "{path}");
+        }
     }
 }
