@@ -18,6 +18,7 @@ pub mod polling;
 pub mod production;
 pub mod tasks;
 pub mod time;
+pub mod web;
 
 pub use bootstrap::{BootstrapSecretSink, bootstrap_admin};
 pub use config::ControllerConfig;
@@ -29,6 +30,7 @@ pub use error::ControllerError;
 pub use http_auth::{AppState, HttpAuthState, build_http_router};
 pub use integrity::{validate_device_fields, validate_grant_fields, validate_singleton_ids};
 pub use model::{AdmissionSnapshot, AdmissionState, ReviewDecision};
+pub use web::web_router;
 
 pub fn parse_device_id(s: &str) -> Result<[u8; 32], ControllerError> {
     if s.len() != 64
