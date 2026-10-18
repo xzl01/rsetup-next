@@ -9,14 +9,13 @@ mod fixture;
 
 use axum::body::to_bytes;
 use axum::http::StatusCode;
-use std::sync::atomic::Ordering;
 use tower::ServiceExt;
 
 #[tokio::test]
 async fn all_26_missing_sessions_return_401_and_zero_business_calls() {
     assert_eq!(fixture::cases().len(), 26);
     for case in fixture::cases() {
-        let (router, calls) = fixture::fixture(false);
+        let (router, counters) = fixture::fixture(false);
         let response = router
             .oneshot(fixture::request(&case, false, true, true))
             .await
@@ -31,14 +30,14 @@ async fn all_26_missing_sessions_return_401_and_zero_business_calls() {
         let bytes = to_bytes(response.into_body(), 1_048_576).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["error"]["code"], "AUTH_REQUIRED");
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(counters.total(), 0, "拒绝路径所有网关调用必须恒零");
     }
 }
 
 #[tokio::test]
 async fn all_26_allowed_requests_really_reach_their_business_gateway() {
     for case in fixture::cases() {
-        let (router, calls) = fixture::fixture(false);
+        let (router, counters) = fixture::fixture(false);
         let response = router
             .oneshot(fixture::request(&case, true, true, true))
             .await
@@ -50,9 +49,17 @@ async fn all_26_allowed_requests_really_reach_their_business_gateway() {
             case.path,
             response.status()
         );
-        assert!(
-            calls.load(Ordering::SeqCst) > 0,
-            "方法spy必须增长，不得恒零：{} {}",
+        assert_eq!(
+            counters.count(case.gateway),
+            1,
+            "目标网关计数必须恰好递增 1：{} {}",
+            case.method,
+            case.path
+        );
+        assert_eq!(
+            counters.total(),
+            1,
+            "非目标网关必须零调用：{} {}",
             case.method,
             case.path
         );
@@ -66,7 +73,7 @@ async fn host_and_temporary_password_and_write_csrf_reject_before_gateway() {
             if mode == 2 && case.method == "GET" {
                 continue;
             }
-            let (router, calls) = fixture::fixture(mode == 1);
+            let (router, counters) = fixture::fixture(mode == 1);
             let response = router
                 .oneshot(fixture::request(&case, true, mode != 0, mode != 2))
                 .await
@@ -91,7 +98,7 @@ async fn host_and_temporary_password_and_write_csrf_reject_before_gateway() {
                 case.method,
                 case.path
             );
-            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(counters.total(), 0, "拒绝路径所有网关调用必须恒零");
         }
     }
 }

@@ -179,8 +179,21 @@ fn audit_page_shape_error() -> ControllerError {
     ControllerError::Config("audit cursor page shape".into())
 }
 
-/// 网关内部 raw 80 hex（epoch ‖ seq BE ‖ id）→ typed 复合键；任何形状不符都是
-/// 同一个去敏 `Config` → 503，不把裸 key 写进响应也不截断。
+/// 网关内部 raw 复合键（Task 12 布局）的唯一编码定义：epoch 16B ‖ event_seq 8B BE
+/// ‖ id 16B，恰 80 小写 hex。生产 adapter（`api::adapters`）返回 `next_cursor` 与
+/// 本模块 `parse_audit_raw_key` 解码共用此单一定义，编解码永不双写漂移；只在内部
+/// 传递，绝不直接外传。
+pub(crate) fn format_audit_raw_cursor(next: &AuditCursor) -> String {
+    format!(
+        "{}{:016x}{}",
+        hex::encode(next.process_epoch.as_bytes()),
+        next.event_seq,
+        hex::encode(next.id.as_bytes()),
+    )
+}
+
+/// 网关内部 raw 80 hex（epoch ‖ seq BE ‖ id）→ typed 复合键，`format_audit_raw_cursor`
+/// 的逆；任何形状不符都是同一个去敏 `Config` → 503，不把裸 key 写进响应也不截断。
 fn parse_audit_raw_key(raw: &str) -> Result<AuditCursor, ControllerError> {
     if raw.len() != AUDIT_RAW_KEY_HEX || !is_lower_hex(raw) {
         return Err(audit_page_shape_error());
@@ -381,6 +394,38 @@ mod tests {
         let mut raw = RAW_NEXT.to_string();
         raw.replace_range(hex_index..hex_index + 1, &nibble.to_string());
         raw
+    }
+
+    /// 唯一编码定义 `format_audit_raw_cursor` 与 `parse_audit_raw_key` 必须严格互逆，
+    /// 且逐字等于 fixture raw 键；seq 段固定 16 位小写 hex 大端（u64::MAX 钉住宽度）。
+    #[test]
+    fn format_audit_raw_cursor_is_inverse_of_parse_and_pins_layout() {
+        let cursor = AuditCursor {
+            process_epoch: Uuid::parse_str(EPOCH_V4).expect("fixture epoch"),
+            event_seq: 7,
+            id: Uuid::parse_str(ID_V4).expect("fixture id"),
+        };
+        let raw = format_audit_raw_cursor(&cursor);
+        assert_eq!(raw, RAW_NEXT, "编码必须逐字等于 fixture raw 键");
+        assert_eq!(raw.len(), AUDIT_RAW_KEY_HEX);
+        assert_eq!(
+            parse_audit_raw_key(&raw).expect("round-trip 必须解码成功"),
+            cursor
+        );
+        let max_seq = AuditCursor {
+            event_seq: u64::MAX,
+            ..cursor
+        };
+        let raw = format_audit_raw_cursor(&max_seq);
+        assert_eq!(
+            &raw[32..48],
+            "ffffffffffffffff",
+            "seq 段必须 16 位小写 hex 大端"
+        );
+        assert_eq!(
+            parse_audit_raw_key(&raw).expect("u64::MAX seq 必须可解回"),
+            max_seq
+        );
     }
 
     fn audit_page(next_cursor: serde_json::Value) -> serde_json::Value {

@@ -1,9 +1,10 @@
 //! 26 管理路由动态网关 fixture（Identity Task 13b，05 子计划 Step 1）。
 //!
-//! 只证明「router → 业务 Gateway 方法」的动态接线：`SpyGateway` 以
-//! `Arc<AtomicUsize>` 计数八个 Gateway 的全部方法调用；认证/Host/CSRF/临时密码
-//! 拒绝路径必须计数恒零。**不**证明生产 SQLx、真实数据源、真实 probe 或真库
-//! 验收（那归 Task 14 受控门禁）。
+//! 只证明「router → 业务 Gateway 方法」的动态接线：`SpyGateway` 为八个 Gateway
+//! trait 各持一个**独立** `Arc<AtomicUsize>` 计数器（`SpyCounters`），每个方法只
+//! 递增所属网关的计数；认证/Host/CSRF/临时密码拒绝路径必须八个计数恒零，阳性
+//! 路径必须只有目标网关计数增长、其余七个恒零。**不**证明生产 SQLx、真实数据源、
+//! 真实 probe 或真库验收（那归 Task 14 受控门禁）。
 //!
 //! 真实 Cookie 名称 `rsc_session` 已按 `src/http_auth.rs` 核对；fixture 值全部
 //! synthetic，无任何凭据内容。
@@ -108,17 +109,86 @@ impl AuthServiceApi for TestAuth {
     }
 }
 
-/// 业务网关 spy：八个 Gateway 的每个方法调用都递增同一计数，证明
-/// router→方法接线与拒绝路径零业务调用。
+/// 八个 Gateway 类别，与 `ManagementState` 的八个 Gateway trait 一一对应；
+/// 用例经 `Case.gateway` 声明预期被调用的网关。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayKind {
+    Users,
+    Roles,
+    Grants,
+    Groups,
+    Devices,
+    Approvals,
+    Audit,
+    System,
+}
+
+/// 断言遍历全集：八个类别一个不漏。
+pub const ALL_GATEWAYS: [GatewayKind; 8] = [
+    GatewayKind::Users,
+    GatewayKind::Roles,
+    GatewayKind::Grants,
+    GatewayKind::Groups,
+    GatewayKind::Devices,
+    GatewayKind::Approvals,
+    GatewayKind::Audit,
+    GatewayKind::System,
+];
+
+/// 八个 Gateway 的独立调用计数：每个方法只递增所属网关的计数器，使断言能精确
+/// 到「仅目标网关被调用、其余七个恒零」，消除粗粒度单计数器的串扰。
+#[derive(Clone, Default)]
+pub struct SpyCounters {
+    users: Arc<AtomicUsize>,
+    roles: Arc<AtomicUsize>,
+    grants: Arc<AtomicUsize>,
+    groups: Arc<AtomicUsize>,
+    devices: Arc<AtomicUsize>,
+    approvals: Arc<AtomicUsize>,
+    audit: Arc<AtomicUsize>,
+    system: Arc<AtomicUsize>,
+}
+
+impl SpyCounters {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn field(&self, kind: GatewayKind) -> &AtomicUsize {
+        match kind {
+            GatewayKind::Users => &self.users,
+            GatewayKind::Roles => &self.roles,
+            GatewayKind::Grants => &self.grants,
+            GatewayKind::Groups => &self.groups,
+            GatewayKind::Devices => &self.devices,
+            GatewayKind::Approvals => &self.approvals,
+            GatewayKind::Audit => &self.audit,
+            GatewayKind::System => &self.system,
+        }
+    }
+
+    /// 指定网关的当前调用计数。
+    pub fn count(&self, kind: GatewayKind) -> usize {
+        self.field(kind).load(Ordering::SeqCst)
+    }
+
+    /// 八个计数之和：拒绝路径断言「无任何网关被调用」。
+    pub fn total(&self) -> usize {
+        ALL_GATEWAYS.iter().map(|kind| self.count(*kind)).sum()
+    }
+}
+
+/// 业务网关 spy：八个 Gateway 的每个方法调用只递增所属网关的独立计数，证明
+/// router→方法接线归属与拒绝路径零业务调用。
 pub struct SpyGateway {
-    pub calls: Arc<AtomicUsize>,
+    counters: SpyCounters,
 }
 
 macro_rules! value_method {
-    ($name:ident($($arg:ident: $ty:ty),*) => $result:expr) => {
+    ($counter:ident $name:ident($($arg:ident: $ty:ty),*) => $result:expr) => {
         fn $name<'a>(&'a self, actor: &'a Session, $($arg: $ty),*) -> ManagementFuture<'a, Value> {
             let _ = (actor, $(&$arg),*);
-            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.counters.$counter.fetch_add(1, Ordering::SeqCst);
             let result = $result;
             Box::pin(async move { Ok(result) })
         }
@@ -136,24 +206,24 @@ fn group() -> Value {
 }
 
 impl UsersGateway for SpyGateway {
-    value_method!(list(cursor: Option<[u8; 16]>, limit: usize) => page());
-    value_method!(create(username: &'a str, display_name: &'a str, is_admin: bool) =>
+    value_method!(users list(cursor: Option<[u8; 16]>, limit: usize) => page());
+    value_method!(users create(username: &'a str, display_name: &'a str, is_admin: bool) =>
         json!({"user":user(),"temporary_password":"synthetic-only-not-real"}));
-    value_method!(patch(id: [u8; 16], revision: u64, active: Option<bool>, is_admin: Option<bool>, display_name: Option<&'a str>) => user());
-    value_method!(reset_password(id: [u8; 16], revision: u64) =>
+    value_method!(users patch(id: [u8; 16], revision: u64, active: Option<bool>, is_admin: Option<bool>, display_name: Option<&'a str>) => user());
+    value_method!(users reset_password(id: [u8; 16], revision: u64) =>
         json!({"user":user(),"temporary_password":"synthetic-only-not-real"}));
-    value_method!(effective_permissions(target: [u8; 16], device_id: Option<[u8; 32]>, cursor: Option<[u8; 32]>, limit: usize) => page());
+    value_method!(users effective_permissions(target: [u8; 16], device_id: Option<[u8; 32]>, cursor: Option<[u8; 32]>, limit: usize) => page());
 }
 impl RolesGateway for SpyGateway {
-    value_method!(list(cursor: Option<Uuid>, limit: usize) => page());
-    value_method!(create(name: &'a str, permissions: &'a [Permission]) =>
+    value_method!(roles list(cursor: Option<Uuid>, limit: usize) => page());
+    value_method!(roles create(name: &'a str, permissions: &'a [Permission]) =>
         json!({"id":"00000000-0000-4000-8000-000000000001","name":"fixture","builtin":false,"archived":false,"revision":"1","permissions":["device.read"]}));
-    value_method!(patch(id: Uuid, revision: u64, name: Option<&'a str>, permissions: Option<&'a [Permission]>, archived: Option<bool>) =>
+    value_method!(roles patch(id: Uuid, revision: u64, name: Option<&'a str>, permissions: Option<&'a [Permission]>, archived: Option<bool>) =>
         json!({"id":id.to_string(),"revision":"2","name":"fixture","builtin":false,"archived":false,"permissions":["device.read"]}));
 }
 impl GrantsGateway for SpyGateway {
-    value_method!(list(user_id: Option<[u8; 16]>, cursor: Option<Uuid>, limit: usize) => page());
-    value_method!(create(user_id: [u8; 16], source: GrantSource, scope: GrantScope) =>
+    value_method!(grants list(user_id: Option<[u8; 16]>, cursor: Option<Uuid>, limit: usize) => page());
+    value_method!(grants create(user_id: [u8; 16], source: GrantSource, scope: GrantScope) =>
         json!({"id":"00000000-0000-4000-8000-000000000001","revision":"1","user_id":"00000000-0000-4000-8000-000000000001","source":{"kind":"direct","permissions":["device.read"]},"scope":{"kind":"all"}}));
     fn delete<'a>(
         &'a self,
@@ -161,25 +231,25 @@ impl GrantsGateway for SpyGateway {
         _id: Uuid,
         _revision: u64,
     ) -> ManagementFuture<'a, ()> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.counters.grants.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Ok(()) })
     }
 }
 impl GroupsGateway for SpyGateway {
-    value_method!(list(cursor: Option<Uuid>, limit: usize) => page());
-    value_method!(create(name: &'a str) => group());
-    value_method!(patch(id: Uuid, revision: u64, name: Option<&'a str>, archived: Option<bool>) => group());
-    value_method!(replace_members(id: Uuid, revision: u64, devices: &'a [[u8; 32]]) => group());
+    value_method!(groups list(cursor: Option<Uuid>, limit: usize) => page());
+    value_method!(groups create(name: &'a str) => group());
+    value_method!(groups patch(id: Uuid, revision: u64, name: Option<&'a str>, archived: Option<bool>) => group());
+    value_method!(groups replace_members(id: Uuid, revision: u64, devices: &'a [[u8; 32]]) => group());
 }
 impl DevicesGateway for SpyGateway {
-    value_method!(list_devices_visible(cursor: Option<[u8; 32]>, limit: usize, group_id: Option<Uuid>, search: Option<&'a str>) => page());
+    value_method!(devices list_devices_visible(cursor: Option<[u8; 32]>, limit: usize, group_id: Option<Uuid>, search: Option<&'a str>) => page());
     fn find_device<'a>(
         &'a self,
         _actor: &'a Session,
         id: [u8; 32],
     ) -> ManagementFuture<'a, Option<(DeviceAdminView, std::collections::HashSet<Permission>)>>
     {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.counters.devices.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             Ok(Some((
                 DeviceAdminView {
@@ -195,25 +265,25 @@ impl DevicesGateway for SpyGateway {
             )))
         })
     }
-    value_method!(patch(id: [u8; 32], revision: u64, display_name: &'a str) =>
+    value_method!(devices patch(id: [u8; 32], revision: u64, display_name: &'a str) =>
         json!({"device_id":hex::encode(id),"display_name":display_name,"revision":"2"}));
 }
 impl ApprovalsGateway for SpyGateway {
-    value_method!(list(decision: Option<ReviewDecision>, cursor: Option<[u8; 32]>, limit: usize) => page());
-    value_method!(approve(targets: &'a [ApprovalTarget]) => json!({"results":[]}));
-    value_method!(reject(targets: &'a [ApprovalTarget], reason: &'a str) => json!({"results":[]}));
-    value_method!(reopen(id: [u8; 32], revision: u64) =>
+    value_method!(approvals list(decision: Option<ReviewDecision>, cursor: Option<[u8; 32]>, limit: usize) => page());
+    value_method!(approvals approve(targets: &'a [ApprovalTarget]) => json!({"results":[]}));
+    value_method!(approvals reject(targets: &'a [ApprovalTarget], reason: &'a str) => json!({"results":[]}));
+    value_method!(approvals reopen(id: [u8; 32], revision: u64) =>
         json!({"decision":"none","requires_device_reset":true}));
-    value_method!(revoke(id: [u8; 32], revision: u64, reason: &'a str) =>
+    value_method!(approvals revoke(id: [u8; 32], revision: u64, reason: &'a str) =>
         json!({"state":"REVOKED","requires_device_reset":true}));
-    value_method!(reauthorize(id: [u8; 32], revision: u64) =>
+    value_method!(approvals reauthorize(id: [u8; 32], revision: u64) =>
         json!({"state":"APPROVED","requires_device_reset":true}));
 }
 impl AuditGateway for SpyGateway {
-    value_method!(list(filter: AuditFilter, cursor: Option<AuditCursor>, limit: usize) => page());
+    value_method!(audit list(filter: AuditFilter, cursor: Option<AuditCursor>, limit: usize) => page());
 }
 impl SystemGateway for SpyGateway {
-    value_method!(status() =>
+    value_method!(system status() =>
         json!({"ready":false,"version":"synthetic","schema_version":4,"users":"1","devices":"1","roles":"1","grants":"1","groups":"1","recovery_mode":"normal"}));
 }
 
@@ -247,7 +317,7 @@ impl ManagementNotificationSink for TestProbe {
     }
 }
 
-pub fn fixture(must_change: bool) -> (Router<()>, Arc<AtomicUsize>) {
+pub fn fixture(must_change: bool) -> (Router<()>, SpyCounters) {
     // 测试进程内一次性注入合成 cursor 密钥 `SYNTHETIC_SECRET = [7u8; 32]`：仅测试
     // fixture 允许，保证 6 个 list 端点在测试进程内不因全局 OnceLock 未装返回 503，
     // 使 26 路由阳性测试正常通过并签发合法游标。生产 handler 严禁硬编码默认密钥
@@ -257,9 +327,9 @@ pub fn fixture(must_change: bool) -> (Router<()>, Arc<AtomicUsize>) {
         rsetup_controller::api::install_management_cursor_secret(&[7u8; 32])
             .expect("synthetic cursor key installation must succeed");
     });
-    let calls = Arc::new(AtomicUsize::new(0));
+    let counters = SpyCounters::new();
     let spy = Arc::new(SpyGateway {
-        calls: calls.clone(),
+        counters: counters.clone(),
     });
     let auth = Arc::new(HttpAuthState::new(
         Arc::new(TestAuth { must_change }),
@@ -290,16 +360,18 @@ pub fn fixture(must_change: bool) -> (Router<()>, Arc<AtomicUsize>) {
         recovery_probe: Arc::new(TestProbe),
         notification_sink: Arc::new(TestProbe),
     };
-    (build_management_router(state), calls)
+    (build_management_router(state), counters)
 }
 
 pub struct Case {
     pub method: &'static str,
     pub path: String,
     pub body: Value,
+    /// 该路由阳性路径预期且唯一预期被调用的业务网关。
+    pub gateway: GatewayKind,
 }
 
-/// 恰 26 条管理路由矩阵（spec 02 §4 路由表全集）。
+/// 恰 26 条管理路由矩阵（spec 02 §4 路由表全集），逐条声明预期网关。
 pub fn cases() -> Vec<Case> {
     let id = "00000000-0000-4000-8000-000000000001";
     let device = format!("{:064x}", 1);
@@ -312,131 +384,157 @@ pub fn cases() -> Vec<Case> {
             method: "GET",
             path: "/api/v1/users".into(),
             body: json!({}),
+            gateway: GatewayKind::Users,
         },
         Case {
             method: "POST",
             path: "/api/v1/users".into(),
             body: json!({"username":"fixture_user","display_name":"fixture","is_admin":false}),
+            gateway: GatewayKind::Users,
         },
         Case {
             method: "PATCH",
             path: format!("/api/v1/users/{id}"),
             body: json!({"expected_revision":"1","display_name":"updated"}),
+            gateway: GatewayKind::Users,
         },
         Case {
             method: "POST",
             path: format!("/api/v1/users/{id}/reset-password"),
             body: json!({"expected_revision":"1"}),
+            gateway: GatewayKind::Users,
         },
         Case {
             method: "GET",
             path: format!("/api/v1/users/{id}/effective-permissions"),
             body: json!({}),
+            gateway: GatewayKind::Users,
         },
         Case {
             method: "GET",
             path: "/api/v1/roles".into(),
             body: json!({}),
+            gateway: GatewayKind::Roles,
         },
         Case {
             method: "POST",
             path: "/api/v1/roles".into(),
             body: json!({"name":"fixture","permissions":["device.read"]}),
+            gateway: GatewayKind::Roles,
         },
         Case {
             method: "PATCH",
             path: format!("/api/v1/roles/{id}"),
             body: json!({"expected_revision":"1","name":"updated"}),
+            gateway: GatewayKind::Roles,
         },
         Case {
             method: "GET",
             path: "/api/v1/grants".into(),
             body: json!({}),
+            gateway: GatewayKind::Grants,
         },
         Case {
             method: "POST",
             path: "/api/v1/grants".into(),
             body: json!({"user_id":id,"source":{"kind":"direct","permissions":["device.read"]},"scope":{"kind":"all"}}),
+            gateway: GatewayKind::Grants,
         },
         Case {
             method: "DELETE",
             path: format!("/api/v1/grants/{id}"),
             body: json!({"expected_revision":"1"}),
+            gateway: GatewayKind::Grants,
         },
         Case {
             method: "GET",
             path: "/api/v1/groups".into(),
             body: json!({}),
+            gateway: GatewayKind::Groups,
         },
         Case {
             method: "POST",
             path: "/api/v1/groups".into(),
             body: json!({"name":"fixture"}),
+            gateway: GatewayKind::Groups,
         },
         Case {
             method: "PATCH",
             path: format!("/api/v1/groups/{id}"),
             body: json!({"expected_revision":"1","name":"updated"}),
+            gateway: GatewayKind::Groups,
         },
         Case {
             method: "PUT",
             path: format!("/api/v1/groups/{id}/members"),
             body: json!({"expected_revision":"1","device_ids":[device.clone()]}),
+            gateway: GatewayKind::Groups,
         },
         Case {
             method: "GET",
             path: "/api/v1/devices".into(),
             body: json!({}),
+            gateway: GatewayKind::Devices,
         },
         Case {
             method: "GET",
             path: format!("/api/v1/devices/{device}"),
             body: json!({}),
+            gateway: GatewayKind::Devices,
         },
         Case {
             method: "PATCH",
             path: format!("/api/v1/devices/{device}"),
             body: json!({"expected_revision":"1","display_name":"updated"}),
+            gateway: GatewayKind::Devices,
         },
         Case {
             method: "GET",
             path: "/api/v1/approvals".into(),
             body: json!({}),
+            gateway: GatewayKind::Approvals,
         },
         Case {
             method: "POST",
             path: "/api/v1/approvals/approve".into(),
             body: target,
+            gateway: GatewayKind::Approvals,
         },
         Case {
             method: "POST",
             path: "/api/v1/approvals/reject".into(),
             body: reject,
+            gateway: GatewayKind::Approvals,
         },
         Case {
             method: "POST",
             path: format!("/api/v1/approvals/{device}/reopen"),
             body: json!({"expected_revision":"1","confirm":true}),
+            gateway: GatewayKind::Approvals,
         },
         Case {
             method: "POST",
             path: format!("/api/v1/devices/{device}/revoke"),
             body: json!({"expected_revision":"1","reason":"synthetic reason","confirm":true}),
+            gateway: GatewayKind::Approvals,
         },
         Case {
             method: "POST",
             path: format!("/api/v1/devices/{device}/reauthorize"),
             body: json!({"expected_revision":"1","confirm":true}),
+            gateway: GatewayKind::Approvals,
         },
         Case {
             method: "GET",
             path: "/api/v1/audit".into(),
             body: json!({}),
+            gateway: GatewayKind::Audit,
         },
         Case {
             method: "GET",
             path: "/api/v1/system/status".into(),
             body: json!({}),
+            gateway: GatewayKind::System,
         },
     ]
 }

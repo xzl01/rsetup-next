@@ -5,7 +5,8 @@
 //!
 //! cursor 边界纪律（05 子计划）：各 list 方法返回的 `next_cursor` 一律是**内部
 //! raw key 的 hex**（UUID 32hex / 设备公钥 64hex；audit 为 Task 12 复合键
-//! 80hex = epoch32hex ‖ seq16hex ‖ id32hex），本模块绝不签发或解码签名 token；
+//! 80hex = epoch32hex ‖ seq16hex ‖ id32hex，唯一编码定义见
+//! `audit::format_audit_raw_cursor`），本模块绝不签发或解码签名 token；
 //! 外部 signed 游标（64/96hex）只由 handler 的 HTTP 边界 helper
 //! `decode_management_list_cursor` / `sign_management_list_page` 负责。
 
@@ -28,6 +29,7 @@ use crate::devices::repository::{
 };
 use crate::devices::service::{
     AdmissionChangeEvent, AdmissionChangeSink, DecisionResult, DeviceService,
+    MAX_ADMISSION_REASON_BYTES,
 };
 use crate::http_auth::HttpAuthState;
 use crate::model::{AdmissionState, ReviewDecision};
@@ -157,9 +159,15 @@ fn decision_value(result: DecisionResult, reopen: bool) -> Value {
     }
 }
 
+/// 批量目标上限（spec 02 §3：单请求 1..=1024），与 HTTP 入口门禁
+/// `api::approvals::MAX_BATCH_TARGETS` 同值同源；后者是 approvals 模块私有常量
+/// 无法跨模块引用，此处为同值命名定义，任何一侧调整上限必须同步另一侧。
+const MAX_BATCH_TARGETS: usize = 1024;
+
 /// 审批批量项结果：单项失败收集为 `ok:false` + 去敏错误码，不中断其余项。
-/// 错误码与 `api::map_error` 的 02 信封逐一对齐；`LastAdmin`/任务类冲突在准入
-/// 状态机上不可达，落入 fail-closed 的 `NOT_READY` 兜底（见报告偏差说明）。
+/// 错误码与 `api::map_error` 的 02 信封逐变体一一对齐（显式穷尽匹配，新增
+/// `ControllerError` 变体将编译失败，强制在此补映射）；`LastAdmin` 与任务类
+/// 冲突在准入状态机上不可达，映射仅保持与 `map_error` 的强一致（见报告偏差说明）。
 fn batch_item(id: [u8; 32], result: Result<DecisionResult, ControllerError>) -> Value {
     match result {
         Ok(result) => json!({
@@ -169,29 +177,21 @@ fn batch_item(id: [u8; 32], result: Result<DecisionResult, ControllerError>) -> 
         }),
         Err(error) => {
             let code = match error {
-                ControllerError::RevisionConflict => "REVISION_CONFLICT",
-                ControllerError::InvalidState => "INVALID_STATE",
+                ControllerError::InvalidArgument => "INVALID_ARGUMENT",
                 ControllerError::PermissionDenied => "PERMISSION_DENIED",
                 ControllerError::NotFound => "NOT_FOUND",
-                ControllerError::InvalidArgument => "INVALID_ARGUMENT",
+                ControllerError::RevisionConflict => "REVISION_CONFLICT",
+                ControllerError::LastAdmin => "LAST_ADMIN",
+                ControllerError::InvalidState => "INVALID_STATE",
+                ControllerError::TaskIdempotencyConflict => "IDEMPOTENCY_CONFLICT",
+                ControllerError::TaskPreviewInvalidState => "INVALID_STATE",
                 ControllerError::ResourceExhausted => "RESOURCE_EXHAUSTED",
                 ControllerError::Database(_) | ControllerError::Config(_) => "STORAGE_UNAVAILABLE",
-                _ => "NOT_READY",
+                ControllerError::SchemaNotReady { .. } | ControllerError::Crypto => "NOT_READY",
             };
             json!({"device_id": hex::encode(id), "ok": false, "error": {"code": code}})
         }
     }
-}
-
-/// audit 内部 raw 复合键（Task 12 布局）：epoch 16B ‖ event_seq 8B BE ‖ id 16B，
-/// 恰 80 小写 hex；只在 adapter 与 audit handler 之间内部传递，绝不直接外传。
-fn audit_raw_cursor(next: &AuditCursor) -> String {
-    format!(
-        "{}{:016x}{}",
-        hex::encode(next.process_epoch.as_bytes()),
-        next.event_seq,
-        hex::encode(next.id.as_bytes()),
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -365,7 +365,7 @@ impl approvals::ApprovalsGateway for SqlxManagementGateway {
         g.devices.approval_page(actor, decision, cursor, limit).await
     });
     method!(approve(actor: &'a Session, targets: &'a [ApprovalTarget]); g; {
-        if targets.is_empty() || targets.len() > 1024 {
+        if targets.is_empty() || targets.len() > MAX_BATCH_TARGETS {
             return Err(ControllerError::InvalidArgument);
         }
         let mut results = Vec::with_capacity(targets.len());
@@ -381,9 +381,9 @@ impl approvals::ApprovalsGateway for SqlxManagementGateway {
     });
     method!(reject(actor: &'a Session, targets: &'a [ApprovalTarget], reason: &'a str); g; {
         if targets.is_empty()
-            || targets.len() > 1024
+            || targets.len() > MAX_BATCH_TARGETS
             || reason.trim().is_empty()
-            || reason.len() > 1024
+            || reason.len() > MAX_ADMISSION_REASON_BYTES
             || reason.chars().any(char::is_control)
         {
             return Err(ControllerError::InvalidArgument);
@@ -440,8 +440,9 @@ impl audit::AuditGateway for SqlxManagementGateway {
                 })
             })
             .collect();
-        // audit handler 使用自己的复合 cursor 签名（Task 12）；raw 三元键编码只在内部传递。
-        let raw = next.as_ref().map(audit_raw_cursor);
+        // audit handler 使用自己的复合 cursor 签名（Task 12）；raw 三元键编码复用
+        // `audit::format_audit_raw_cursor` 唯一编码定义，只在内部传递。
+        let raw = next.as_ref().map(audit::format_audit_raw_cursor);
         Ok(page(items, raw))
     });
 }
@@ -703,12 +704,20 @@ mod tests {
 
     #[tokio::test]
     async fn batch_item_error_codes_agree_with_map_error_envelope() {
+        // 显式穷尽：`ControllerError` 全部 13 个变体逐一断言与 `map_error` 同码，
+        // 新增变体未补映射时上方穷尽匹配先编译失败，此处兜底逐变体语义一致。
         let cases: Vec<(fn() -> ControllerError, &str)> = vec![
             (|| ControllerError::InvalidArgument, "INVALID_ARGUMENT"),
             (|| ControllerError::PermissionDenied, "PERMISSION_DENIED"),
             (|| ControllerError::NotFound, "NOT_FOUND"),
             (|| ControllerError::RevisionConflict, "REVISION_CONFLICT"),
+            (|| ControllerError::LastAdmin, "LAST_ADMIN"),
             (|| ControllerError::InvalidState, "INVALID_STATE"),
+            (
+                || ControllerError::TaskIdempotencyConflict,
+                "IDEMPOTENCY_CONFLICT",
+            ),
+            (|| ControllerError::TaskPreviewInvalidState, "INVALID_STATE"),
             (|| ControllerError::ResourceExhausted, "RESOURCE_EXHAUSTED"),
             (
                 || ControllerError::Config("synthetic".into()),
@@ -727,6 +736,7 @@ mod tests {
             ),
             (|| ControllerError::Crypto, "NOT_READY"),
         ];
+        assert_eq!(cases.len(), 13, "必须逐变体覆盖 ControllerError 全集");
         for (make, code) in cases {
             let item = batch_item([0x22; 32], Err(make()));
             assert_eq!(item["ok"], false, "case {code}");
@@ -739,21 +749,6 @@ mod tests {
             let envelope: Value = serde_json::from_slice(&bytes).expect("error envelope");
             assert_eq!(envelope["error"]["code"], code, "map_error {code}");
         }
-    }
-
-    #[test]
-    fn audit_raw_cursor_encodes_epoch_seq_id_composite_80_hex() {
-        let epoch = v4_uuid(0x99);
-        let id = v4_uuid(0xaa);
-        let raw = audit_raw_cursor(&AuditCursor {
-            process_epoch: epoch,
-            event_seq: 7,
-            id,
-        });
-        assert_eq!(raw.len(), 80);
-        assert_eq!(&raw[0..32], hex::encode(epoch.as_bytes()));
-        assert_eq!(&raw[32..48], "0000000000000007");
-        assert_eq!(&raw[48..80], hex::encode(id.as_bytes()));
     }
 
     struct OkSink;
