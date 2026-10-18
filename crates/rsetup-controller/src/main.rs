@@ -181,7 +181,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 唯一生产装配点：五线共享同一 Arc<HttpAuthState>，指针不一致即失败关闭。
         let router = build_production_router(production_inputs(&db)?)?;
         let listener = tokio::net::TcpListener::bind(&config.listen_address).await?;
-        axum::serve(listener, router).await?;
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await?;
         Ok::<(), Box<dyn std::error::Error>>(())
     })
     .await
