@@ -2,8 +2,10 @@
 //!
 //! 两轨严格分轨（计划 §Task 2 Step 2）：
 //! - [`gate_blocks_business_before_readiness`]：普通离线环境运行的门禁纯测试。
-//!   只证明「时间 / DB / 恢复门禁未放行前 `/readyz` 与业务路由不可用、全部放行后可用」
-//!   的装配契约；不连接真实数据库、不访问网络、不做真实 NTP 采样。
+//!   以 `(time_ready, db_ready, recovery_ready)` 五组状态矩阵，逐个证明「任一单项门禁
+//!   关闭都独立阻断 `/readyz` 与两条业务路由、业务网关零调用」，以及三门禁全放行后
+//!   真正放行且业务调用计数如实递增的装配契约；不连接真实数据库、不访问网络、
+//!   不做真实 NTP 采样。
 //! - [`two_process_real_db_smoke`]：完整真实 DB 双进程 smoke 骨架，恒 `#[ignore]`，
 //!   仅在操作员核验物理隔离、真实备份与授权隔离库后，经显式
 //!   `--ignored --exact --test-threads=1` 单 case 串行命令执行；生产接线未就绪时
@@ -200,6 +202,33 @@ fn assemble_runtime() -> RuntimeAssembly {
     }
 }
 
+impl RuntimeAssembly {
+    /// 放行受控时间采样，并有界等待生产 driver 真正置 ready（超时即失败）。
+    async fn release_time_gate(&self) {
+        self.release.send(true).expect("时间门禁放行信号必须可送达");
+        wait_until_time_gate_ready(&self.state.time_gate).await;
+    }
+}
+
+/// 两条受就绪门禁保护的业务路由（任务列表 / 设备状态）。
+const BUSINESS_PATHS: [&str; 2] = [
+    "/api/v1/tasks",
+    "/api/v1/devices/0123456789abcdef0123456789abcdef/status",
+];
+
+/// 按指定 DB / 恢复门禁开关装配一份全新实例；时间门禁默认未 ready，
+/// 需要放行时由调用方显式 [`RuntimeAssembly::release_time_gate`]。
+fn assemble_with(db_ready: bool, recovery_ready: bool) -> RuntimeAssembly {
+    let assembly = assemble_runtime();
+    if db_ready {
+        assembly.state.db_ready.open();
+    }
+    if recovery_ready {
+        assembly.state.recovery_ready.open();
+    }
+    assembly
+}
+
 async fn get_response(app: &Router, uri: &str) -> (StatusCode, String) {
     let response = app
         .clone()
@@ -222,6 +251,20 @@ async fn assert_not_ready(app: &Router, uri: &str, context: &str) {
     );
 }
 
+/// 断言该门禁状态下 `/readyz` 与两条业务路由全部受控不可用（固定 503 `NOT_READY`），
+/// 且业务网关调用恒零：每个负例都用独立装配实例断言，互不借用彼此的放行进度。
+async fn assert_all_business_blocked(assembly: &RuntimeAssembly, context: &str) {
+    assert_not_ready(&assembly.app, "/readyz", context).await;
+    for uri in BUSINESS_PATHS {
+        assert_not_ready(&assembly.app, uri, context).await;
+    }
+    assert_eq!(
+        assembly.state.business_calls.load(Ordering::SeqCst),
+        0,
+        "{context}：门禁关闭期间业务网关调用必须恒零"
+    );
+}
+
 /// 有界等待时间门禁 ready；超时即失败，绝不把超时兜底误当放行。
 async fn wait_until_time_gate_ready(handle: &TimeGateHandle) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -234,69 +277,83 @@ async fn wait_until_time_gate_ready(handle: &TimeGateHandle) {
     }
 }
 
+/// 三门禁状态矩阵：状态记为 `(time_ready, db_ready, recovery_ready)`。
+/// 4 个负例各用独立装配实例，逐个证明「仅该门禁关闭」也足以阻断 `/readyz` 与
+/// 两条业务路由且业务网关零调用；正例证明全放行后真正可达且计数如实递增。
 #[tokio::test]
 async fn gate_blocks_business_before_readiness() {
-    let assembly = assemble_runtime();
-    let app = assembly.app.clone();
-    let device_path = "/api/v1/devices/0123456789abcdef0123456789abcdef/status";
-
-    // 1. 三门禁全关：/readyz 必须非 200；/healthz 存活探活不受就绪门禁阻断。
+    // 负例 1（000 全关）：/healthz 存活探活不受就绪门禁阻断，其余全部 503。
+    let closed_all = assemble_with(false, false);
     assert!(
-        !assembly.state.time_gate.is_ready(),
+        !closed_all.state.time_gate.is_ready(),
         "刚装配的时间门禁必须未 ready"
     );
-    let (status, _) = get_response(&app, "/healthz").await;
+    let (status, _) = get_response(&closed_all.app, "/healthz").await;
     assert_eq!(
         status,
         StatusCode::OK,
         "存活探活不得被就绪门禁阻断（与生产 /healthz 语义一致）"
     );
-    assert_not_ready(&app, "/readyz", "三门禁全关").await;
+    assert_all_business_blocked(&closed_all, "负例 1（000 三门禁全关）").await;
 
-    // 2. 业务路由受控不可用：固定 503 且业务网关零调用。
-    assert_not_ready(&app, "/api/v1/tasks", "三门禁全关").await;
-    assert_not_ready(&app, device_path, "三门禁全关").await;
-    assert_eq!(
-        assembly.state.business_calls.load(Ordering::SeqCst),
-        0,
-        "门禁关闭期间业务网关调用必须恒零"
+    // 负例 2（011 仅时间门禁关闭）：DB 与恢复均已放行，时间门禁仍关 → 必须仍全阻断。
+    // 若装配漏接 time_gate.is_ready()，本负例立即失败。
+    let time_only_closed = assemble_with(true, true);
+    assert!(
+        !time_only_closed.state.time_gate.is_ready(),
+        "未放行的时间门禁必须未 ready"
     );
-
-    // 3. 仅放行 DB 门禁：时间与恢复仍关，/readyz 与业务仍必须非 200。
-    assembly.state.db_ready.open();
-    assert_not_ready(&app, "/readyz", "仅 DB 门禁放行").await;
-    assert_not_ready(&app, "/api/v1/tasks", "仅 DB 门禁放行").await;
-
-    // 4. 再放行时间门禁（生产 driver 转 ready）：恢复门禁仍关，仍不得放行。
-    assembly
-        .release
-        .send(true)
-        .expect("时间门禁放行信号必须可送达");
-    wait_until_time_gate_ready(&assembly.state.time_gate).await;
-    assert_not_ready(&app, "/readyz", "恢复门禁仍关").await;
-    assert_not_ready(&app, "/api/v1/tasks", "恢复门禁仍关").await;
-    assert_eq!(
-        assembly.state.business_calls.load(Ordering::SeqCst),
-        0,
-        "恢复门禁关闭期间业务网关调用必须恒零"
+    assert!(
+        time_only_closed.state.db_ready.is_open()
+            && time_only_closed.state.recovery_ready.is_open(),
+        "负例 2 前置：DB 与恢复门禁必须已放行"
     );
+    assert_all_business_blocked(&time_only_closed, "负例 2（011 仅时间门禁关闭）").await;
 
-    // 5. 放行恢复门禁：/readyz 返回 200，业务真正可达且计数如实递增。
-    assembly.state.recovery_ready.open();
-    let (status, _) = get_response(&app, "/readyz").await;
+    // 负例 3（101 仅 DB 门禁关闭）：时间已 ready、恢复已放行，DB 仍关 → 必须仍全阻断。
+    // 若装配漏接 db_ready.is_open()，本负例立即失败。
+    let db_only_closed = assemble_with(false, true);
+    db_only_closed.release_time_gate().await;
+    assert!(
+        !db_only_closed.state.db_ready.is_open() && db_only_closed.state.recovery_ready.is_open(),
+        "负例 3 前置：时间已 ready、恢复已放行、DB 仍关"
+    );
+    assert_all_business_blocked(&db_only_closed, "负例 3（101 仅 DB 门禁关闭）").await;
+
+    // 负例 4（110 仅恢复门禁关闭）：时间已 ready、DB 已放行，恢复仍关 → 必须仍全阻断。
+    // 保留原有「仅恢复未放行」的独立阻断证明。
+    let recovery_only_closed = assemble_with(true, false);
+    recovery_only_closed.release_time_gate().await;
+    assert!(
+        recovery_only_closed.state.db_ready.is_open()
+            && !recovery_only_closed.state.recovery_ready.is_open(),
+        "负例 4 前置：时间已 ready、DB 已放行、恢复仍关"
+    );
+    assert_all_business_blocked(&recovery_only_closed, "负例 4（110 仅恢复门禁关闭）").await;
+
+    // 正例（111 全放行）：/readyz 200，两条业务真正可达且计数精确递增到 2。
+    let all_open = assemble_with(true, true);
+    all_open.release_time_gate().await;
+    assert!(
+        all_open.state.time_gate.is_ready()
+            && all_open.state.db_ready.is_open()
+            && all_open.state.recovery_ready.is_open(),
+        "正例前置：三门禁必须全部放行"
+    );
+    let (status, _) = get_response(&all_open.app, "/readyz").await;
     assert_eq!(
         status,
         StatusCode::OK,
         "全部门禁放行后 /readyz 必须返回 200"
     );
-    let (status, _) = get_response(&app, "/api/v1/tasks").await;
-    assert_eq!(status, StatusCode::OK, "全部门禁放行后任务业务必须可达");
-    let (status, _) = get_response(&app, device_path).await;
-    assert_eq!(status, StatusCode::OK, "全部门禁放行后设备业务必须可达");
+    for uri in BUSINESS_PATHS {
+        let (status, _) = get_response(&all_open.app, uri).await;
+        assert_eq!(status, StatusCode::OK, "全部门禁放行后 {uri} 必须可达");
+    }
     assert_eq!(
-        assembly.state.business_calls.load(Ordering::SeqCst),
-        2,
-        "放行后业务调用必须恰好两次到达网关"
+        all_open.state.business_calls.load(Ordering::SeqCst),
+        BUSINESS_PATHS.len(),
+        "放行后业务调用必须恰好两条到达网关"
     );
 }
 
