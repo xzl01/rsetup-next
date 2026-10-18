@@ -60,3 +60,51 @@ const rows = computed(() => props.subtasks.map((subtask) => ({
     </ul>
   </div>
 </template>
+
+<style scoped>
+.task-state-list {
+  min-width: 0;
+}
+.task-state-list__empty {
+  margin: 0;
+}
+/* 子任务状态行：一行一子任务的紧凑卡片，取消默认列表缩进与项目符号，
+   使十态子任务清单不再被主任务信息整段推出首屏 */
+.task-state-list__items {
+  display: grid;
+  gap: var(--space-1, 0.25rem);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.task-state-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1, 0.25rem) var(--space-3, 0.75rem);
+  min-width: 0;
+  padding: var(--space-1, 0.25rem) var(--space-3, 0.75rem);
+  background: var(--color-surface, #fff);
+  border: 1px solid var(--color-border, #69788b);
+  border-radius: var(--radius, 0.375rem);
+}
+.task-state-row__device {
+  font-family: monospace;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.task-state-row__state {
+  font-weight: 600;
+}
+.task-state-row__reason {
+  color: var(--color-muted, #41536a);
+  overflow-wrap: anywhere;
+}
+.task-state-row__revision,
+.task-state-row__evidence {
+  font-family: monospace;
+  font-size: 0.875rem;
+  color: var(--color-muted, #41536a);
+  overflow-wrap: anywhere;
+}
+</style>

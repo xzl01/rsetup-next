@@ -472,10 +472,24 @@ onUnmounted(() => {
   min-width: 0;
   overflow-wrap: anywhere;
 }
-.app-header { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-4); }
-.app-header h1 { margin: 0; flex-basis: 100%; }
+.app-header { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-2) var(--space-4); }
+/* 标题与语言选择同行，标题不再独占一行抬高整页首屏基线 */
+.app-header h1 { margin: 0; margin-inline-end: auto; }
 .app-header select { max-width: 100%; min-height: 2.75rem; font: inherit; }
-.auth-signed-in { display: grid; gap: var(--space-4); min-width: 0; }
+.auth-signed-in {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-3) var(--space-4);
+  min-width: 0;
+}
+/* 已登录身份条：标题、显示名、导航与登出按钮收拢为一行，登出不再被栅格拉伸成整行，
+   视图正文从第二行整行铺开，避免主内容被挤到折叠线下 */
+.auth-signed-in > h2 { grid-column: 1; margin: 0; }
+.auth-signed-in > p[role="status"] { grid-column: 2; margin: 0; }
+.auth-signed-in > .auth-nav { grid-column: 3; justify-self: start; }
+.auth-signed-in > button { grid-column: 4; justify-self: end; }
+.auth-signed-in > :nth-child(n + 5) { grid-column: 1 / -1; }
 .auth-nav { display: flex; gap: var(--space-2); }
 .auth-retry { margin-inline-start: auto; }
 .app-placeholder { display: grid; gap: var(--space-2); padding: var(--space-4); border: 1px dashed var(--color-border, #ccc); border-radius: 4px; }

@@ -216,3 +216,85 @@ onBeforeUnmount(() => {
     </div>
   </div>
 </template>
+
+<style scoped>
+/* 模态浮层：全屏半透明遮罩 + 居中浮层。此前模板已有 task-modal-overlay/task-modal
+   两个类名但无任何样式，对话框以普通文档流混排在页面中，既无遮罩隔离也无焦点聚焦 */
+.task-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  padding: var(--space-4, 1rem);
+}
+.task-modal {
+  display: grid;
+  gap: var(--space-4, 1rem);
+  background: var(--color-surface, #fff);
+  color: var(--color-text, #182235);
+  border-radius: var(--radius, 0.375rem);
+  padding: var(--space-6, 1.5rem);
+  max-width: 36rem;
+  width: 100%;
+  min-width: 0;
+  box-shadow: 0 10px 25px rgba(0, 0, 0, 0.2);
+  max-height: 90vh;
+  overflow-y: auto;
+  text-align: start;
+}
+.task-modal h3 {
+  margin: 0;
+  font-size: 1.25rem;
+  line-height: 1.3;
+}
+.task-modal p {
+  margin: 0;
+}
+.task-modal__warning {
+  color: var(--color-danger, #a12333);
+  font-weight: 600;
+}
+.task-modal__field {
+  display: grid;
+  gap: var(--space-1, 0.25rem);
+  min-width: 0;
+  font-weight: 600;
+}
+.task-modal__field input {
+  width: 100%;
+  min-width: 0;
+  min-height: 2.75rem;
+  padding: var(--space-2, 0.5rem) var(--space-3, 0.75rem);
+  border: 2px solid var(--color-border, #69788b);
+  border-radius: var(--radius, 0.375rem);
+  background: var(--color-surface, #fff);
+  color: var(--color-text, #182235);
+  font: inherit;
+  font-weight: 400;
+}
+.task-modal__ack {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2, 0.5rem);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.task-modal__ack input {
+  flex: none;
+  width: 1.125rem;
+  height: 1.125rem;
+  margin-block-start: 0.2rem;
+}
+.task-modal__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2, 0.5rem);
+}
+@media (max-width: 320px) {
+  .task-modal { padding: var(--space-4, 1rem); }
+  .task-modal__actions > * { flex: 1 1 100%; }
+}
+</style>

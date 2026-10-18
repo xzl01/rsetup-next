@@ -241,14 +241,17 @@ watch(
       <span>{{ displayError }}</span>
     </AppNotice>
     <template v-if="task">
-      <p data-testid="task-id">{{ task.id }}</p>
-      <!-- 字段标签与值渲染为同一文本节点：主任务四态文案与子任务十态文案存在同词（如"排队中"），
-           带标签可避免两处文本产生歧义匹配；值本身仍是 mainTaskStateLabel 专用文案 -->
-      <p data-testid="task-state">{{ t('task.list.columns.state') }}: {{ mainTaskStateLabel(task.state, t) }}</p>
-      <p data-testid="task-revision">{{ task.revision }}</p>
-      <!-- 时间证据只消费原始值，绝不把 created_time 对象整体渲染进模板 -->
-      <p data-testid="task-created">{{ task.created_time.reference_utc }} {{ task.created_time.quality }}</p>
-      <p data-testid="task-scope">{{ t(describeAuthorizedSubset(task.view_scope).key) }}</p>
+      <!-- 主任务基本信息：紧凑栅格卡片，避免逐项纵向堆叠把下方子任务列表完全推出首屏 -->
+      <div class="task-detail-view__meta">
+        <p data-testid="task-id">{{ task.id }}</p>
+        <!-- 字段标签与值渲染为同一文本节点：主任务四态文案与子任务十态文案存在同词（如"排队中"），
+             带标签可避免两处文本产生歧义匹配；值本身仍是 mainTaskStateLabel 专用文案 -->
+        <p data-testid="task-state">{{ t('task.list.columns.state') }}: {{ mainTaskStateLabel(task.state, t) }}</p>
+        <p data-testid="task-revision">{{ t('task.list.columns.revision') }}: {{ task.revision }}</p>
+        <!-- 时间证据只消费原始值，绝不把 created_time 对象整体渲染进模板 -->
+        <p data-testid="task-created">{{ task.created_time.reference_utc }} {{ task.created_time.quality }}</p>
+        <p data-testid="task-scope">{{ t(describeAuthorizedSubset(task.view_scope).key) }}</p>
+      </div>
 
       <p v-if="!cancellable">{{ t('task.cancel.notCancellable') }}</p>
       <BaseButton
@@ -320,6 +323,41 @@ watch(
   display: flex;
   flex-direction: column;
   gap: var(--space-2, 0.5rem);
+}
+/* 视图内的裸文本节点段落不承担纵向间距职责：由 flex gap 统一控制，去掉浏览器默认
+   上下 margin，避免主任务信息把下方子任务列表整段推出首屏 */
+.task-detail-view > p,
+.task-detail-view h2,
+.task-detail-view h3 {
+  margin-block: 0;
+}
+.task-detail-view h2,
+.task-detail-view h3 {
+  margin-block: var(--space-3, 0.75rem) 0;
+}
+/* 危险动作按钮按内容宽度呈现，不被 flex 列拉伸成整行红色色块 */
+.task-detail-view > button {
+  align-self: flex-start;
+}
+.task-detail-view__meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: var(--space-1, 0.25rem) var(--space-4, 1rem);
+  min-width: 0;
+  margin-block-end: var(--space-2, 0.5rem);
+  padding: var(--space-3, 0.75rem) var(--space-4, 1rem);
+  background: var(--color-surface, #fff);
+  border: 1px solid var(--color-border, #69788b);
+  border-radius: var(--radius, 0.375rem);
+}
+.task-detail-view__meta > p {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.task-detail-view__meta > [data-testid="task-id"] {
+  grid-column: 1 / -1;
+  font-family: monospace;
 }
 .task-detail-view__evidence {
   display: flex;

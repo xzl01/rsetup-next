@@ -238,7 +238,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="tasks-view">
+  <div class="tasks-view" :class="{ 'tasks-view--modal-open': batchModalOpen }">
     <section class="tasks-view__preview">
       <h2>{{ t('task.preview.title') }}</h2>
       <fieldset>
@@ -255,14 +255,17 @@ onBeforeUnmount(() => {
           {{ device.display_name }}
         </label>
       </fieldset>
-      <BaseButton
-        :disabled="selected.length === 0 || previewBusy"
-        :loading="previewBusy"
-        :loading-label="t('button.loading')"
-        @click="loadPreview"
-      >
-        {{ t('task.preview.submit') }}
-      </BaseButton>
+      <div class="tasks-view__actions">
+        <BaseButton
+          variant="secondary"
+          :disabled="selected.length === 0 || previewBusy"
+          :loading="previewBusy"
+          :loading-label="t('button.loading')"
+          @click="loadPreview"
+        >
+          {{ t('task.preview.submit') }}
+        </BaseButton>
+      </div>
       <AppNotice
         v-if="previewError"
         tone="error"
@@ -287,10 +290,11 @@ onBeforeUnmount(() => {
       >
         <span>{{ t('task.security.csprngUnavailable') }}</span>
       </AppNotice>
+      <!-- 风险确认的唯一入口：模态框打开即禁用背景触发器，同屏不同时存在两个同名提交按钮 -->
       <BaseButton
         v-if="preview && eligibleDeviceIds(preview).length > 0"
         variant="danger"
-        :disabled="!csprngAvailable"
+        :disabled="!csprngAvailable || batchModalOpen"
         @click="batchModalOpen = true"
       >
         {{ t('task.submitReboot') }}
@@ -361,6 +365,18 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: var(--space-4, 1rem);
+}
+/* 模态框打开时：背景内容退出交互，同屏唯一的操作聚焦点是遮罩内的确认主按钮 */
+.tasks-view--modal-open .tasks-view__preview,
+.tasks-view--modal-open .tasks-view__list {
+  pointer-events: none;
+  user-select: none;
+}
+.tasks-view__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2, 0.5rem);
 }
 .tasks-view__device {
   display: flex;

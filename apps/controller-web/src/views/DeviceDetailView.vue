@@ -203,10 +203,29 @@ onUnmounted(() => {
   border: 1px solid var(--color-border, #ccc);
   border-radius: 4px;
   padding: var(--space-4, 1rem);
+  min-width: 0;
 }
-.dimension-grid {
+.profile-card h2 {
+  margin: 0 var(--space-1) var(--space-3);
+  font-size: 1.25rem;
+  overflow-wrap: anywhere;
+}
+/* 五维状态同屏并列：档案卡三维 + 遥测卡两维各自成栅格，避免纵向堆叠把后两维推出首屏 */
+.dimension-grid,
+.status-card {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
   gap: var(--space-3, 0.75rem);
+}
+.status-card > section {
+  min-width: 0;
+}
+.device-detail h3 {
+  margin: 0 0 var(--space-1);
+  font-size: 1rem;
+}
+.device-detail p {
+  margin: 0;
+  overflow-wrap: anywhere;
 }
 </style>
