@@ -2,11 +2,15 @@
 //!
 //! 纯函数切片（`classify_recovery`/`success_evidence_satisfied`/
 //! `calculate_main_task_outcome`）不依赖 `rsetup_protocol`、不连数据库、不调用
-//! 板端。[`recover_process`] 为 wire DTO 门禁通过后的 typed 编排切片：经
-//! [`TaskRepository::begin`] 的短事务全量重建非终态未决集，对可能已发送的状态**只**
-//! 调用 [`BoardClient::task_record`]，将核验去敏记录落库至 `recovery_checks`；
-//! 对 `queued` 按不可信期限保守分类为 `MarkHeld` 并更新为 `held` 状态；
-//! 事务统一提交。
+//! 板端。[`recover_process`] 为 wire DTO 门禁通过后的 typed 编排切片，严格三阶段
+//! 执行，任何板端 `.await` 前后都不存在未提交的数据库事务：
+//! 1. **只读短事务**：经 [`TaskRepository::begin`] 全量重建非终态未决集后立即提交，
+//!    释放连接与锁；
+//! 2. **事务外零锁网络核验**：对可能已发送的状态**只**调用
+//!    [`BoardClient::task_record`]，在纯内存中收集 `recovery_checks` 待插入项与
+//!    `queued → held` 待更新项（对 `queued` 按不可信期限保守分类为 `MarkHeld`）；
+//! 3. **写入短事务**：批量插入 `recovery_checks` 并条件更新 `held` 后立即提交，
+//!    事务内零网络调用。
 //!
 //! 恢复路径**永不**产生发送动作：实现中不存在任何 `prepare`/`execute` 调用点，
 //! `RecoverySummary::execute_calls` 恒为 0。
@@ -258,27 +262,37 @@ macro_rules! recovery_params {
     }};
 }
 
-/// 进程重启后的只读恢复编排（04 §5.2、04 Task 5 Step 3.6，F1-F3 修复）：
+/// 进程重启后的只读恢复编排（04 §5.2、04 Task 5 Step 3.6，F1-F3 修复 +
+/// 修复轮 2 读写短事务拆分）：
 ///
-/// 1. 经 [`TaskRepository::begin`] 开启事务，使用全量非终态 SQL (`RECOVERY_PENDING_SQL`)
-///    重建未决集（涵盖旧代际意图与 NULL epoch 的 queued 任务）；
-/// 2. 网络在事务外 / 事务短平快：在获取未决集行后，对于可能已发送状态
-///    `Dispatching | Accepted | Verifying | Unknown` **只**调用 [`BoardClient::task_record`]
-///    取得去敏核验结果；
-/// 3. 在事务中持久化落库：
-///    - 将 `task_record` 的去敏结果插入 `recovery_checks` 表（`id, process_epoch, subtask_id, outcome, detail_redacted, checked_at`）；
-///    - 对 `Queued` 状态按 [`classify_recovery`] 分类，若是 `MarkHeld`，执行更新
-///      `UPDATE sub_tasks SET state = 'held', updated_at = NOW(6) WHERE id = ? AND state = 'queued'`；
-/// 4. 事务统一提交；
-/// 5. 硬约束：恢复流程**永不**产生发送动作，`RecoverySummary::execute_calls` 恒为 0。
+/// 1. **阶段 1 只读短事务**：经 [`TaskRepository::begin`] 开启事务，使用全量非终态
+///    SQL (`RECOVERY_PENDING_SQL`) 重建未决集（涵盖旧代际意图与 NULL epoch 的 queued
+///    任务）后立即提交，释放连接与锁；
+/// 2. **阶段 2 事务外零锁网络核验**：对可能已发送状态
+///    `Dispatching | Accepted | Verifying | Unknown` **只**调用
+///    [`BoardClient::task_record`] 取得去敏核验结果，在纯内存中收集
+///    `recovery_checks` 待插入项与 `queued → held` 待更新项；此期间不存在任何
+///    打开的数据库事务，网络等待不持有任何行锁；
+/// 3. **阶段 3 写入短事务**：仅当存在待写入项时重新开启事务，纯内存批量把去敏核验
+///    结果 `INSERT INTO recovery_checks`（`id, process_epoch, subtask_id, outcome,
+///    detail_redacted, checked_at`），并对 [`classify_recovery`] 分类为 `MarkHeld`
+///    的 `Queued` 执行
+///    `UPDATE sub_tasks SET state = 'held', updated_at = NOW(6) WHERE id = ? AND state = 'queued'`，
+///    随后立即提交，事务内零网络调用；
+/// 4. 硬约束：恢复流程**永不**产生发送动作，`RecoverySummary::execute_calls` 恒为 0。
 pub async fn recover_process<R: TaskRepository, C: BoardClient>(
     repo: &R,
     board_client: &C,
     process_epoch: Uuid,
 ) -> Result<RecoverySummary, ControllerError> {
-    let mut tx = repo.begin().await?;
-
-    let rows = tx_rows(&mut tx, RECOVERY_PENDING_SQL, MySqlArguments::default()).await?;
+    // 阶段 1：只读短事务——读取未决集后立即提交，释放连接与锁。
+    let mut read_tx = repo.begin().await?;
+    let rows = tx_rows(
+        &mut read_tx,
+        RECOVERY_PENDING_SQL,
+        MySqlArguments::default(),
+    )
+    .await?;
     let mut pending = Vec::with_capacity(rows.len());
     for row in &rows {
         pending.push(RecoveryPendingRow {
@@ -288,8 +302,13 @@ pub async fn recover_process<R: TaskRepository, C: BoardClient>(
                 .ok_or_else(task_row_decode_error)?,
         });
     }
+    read_tx.commit().await?;
 
+    // 阶段 2：事务外零锁网络核验——此刻不存在任何打开的数据库事务，
+    // 板端 `.await` 只等待网络，不持有数据库连接或行锁。
     let mut summary = RecoverySummary::default();
+    let mut checks_to_insert: Vec<(Uuid, [u8; 16], &'static str, String)> = Vec::new();
+    let mut held_to_update: Vec<Uuid> = Vec::new();
 
     for row in &pending {
         match row.state {
@@ -302,29 +321,17 @@ pub async fn recover_process<R: TaskRepository, C: BoardClient>(
                 if check.verified {
                     summary.read_only_verified += 1;
                 }
-                let check_id = Uuid::new_v4();
-                tx_execute(
-                    &mut tx,
-                    INSERT_RECOVERY_CHECK_SQL,
-                    recovery_params![
-                        check_id.as_bytes().as_slice(),
-                        process_epoch.as_bytes().as_slice(),
-                        row.subtask_id.as_bytes().as_slice(),
-                        check.outcome,
-                        &check.detail_redacted,
-                    ],
-                )
-                .await?;
+                checks_to_insert.push((
+                    Uuid::new_v4(),
+                    *row.subtask_id.as_bytes(),
+                    check.outcome,
+                    check.detail_redacted,
+                ));
             }
             SubTaskState::Queued => match classify_recovery(row.state, false, false) {
                 RecoveryAction::MarkHeld { .. } => {
                     summary.marked_held += 1;
-                    tx_execute(
-                        &mut tx,
-                        UPDATE_QUEUED_HELD_SQL,
-                        recovery_params![row.subtask_id.as_bytes().as_slice()],
-                    )
-                    .await?;
+                    held_to_update.push(row.subtask_id);
                 }
                 RecoveryAction::MarkExpired { .. } => summary.marked_expired += 1,
                 RecoveryAction::ReadOnlyVerify { .. } => summary.read_only_verified += 1,
@@ -334,7 +341,33 @@ pub async fn recover_process<R: TaskRepository, C: BoardClient>(
         }
     }
 
-    tx.commit().await?;
+    // 阶段 3：写入短事务——纯内存批量写，事务内零网络调用；无待写入项则不开事务。
+    if !checks_to_insert.is_empty() || !held_to_update.is_empty() {
+        let mut write_tx = repo.begin().await?;
+        for (check_id, subtask_id, outcome, detail_redacted) in checks_to_insert {
+            tx_execute(
+                &mut write_tx,
+                INSERT_RECOVERY_CHECK_SQL,
+                recovery_params![
+                    check_id.as_bytes().as_slice(),
+                    process_epoch.as_bytes().as_slice(),
+                    subtask_id.as_slice(),
+                    outcome,
+                    detail_redacted,
+                ],
+            )
+            .await?;
+        }
+        for subtask_id in held_to_update {
+            tx_execute(
+                &mut write_tx,
+                UPDATE_QUEUED_HELD_SQL,
+                recovery_params![subtask_id.as_bytes().as_slice()],
+            )
+            .await?;
+        }
+        write_tx.commit().await?;
+    }
 
     Ok(summary)
 }
@@ -595,6 +628,11 @@ mod tests {
         prepare_calls: AtomicUsize,
         execute_calls: AtomicUsize,
         records: Mutex<HashMap<Uuid, FakeRecord>>,
+        /// 每次 `task_record` 调用时刻数据库已发生的 COMMIT 次数：
+        /// 修复轮 2 用于断言网络核验发生在读、写两次短事务之间。
+        commits_at_board_calls: Mutex<Vec<usize>>,
+        /// 测试注入的数据库事件记录器；未注入时不记账。
+        db_recorded: Mutex<Option<Arc<Mutex<MockRecordedDb>>>>,
     }
 
     impl FakeBoardClient {
@@ -603,6 +641,14 @@ mod tests {
                 .get_mut()
                 .expect("未中毒")
                 .insert(subtask_id, record);
+        }
+        /// 注入 MockDbServer 的事件记录器，使 `task_record` 能记录调用时刻已提交的
+        /// 短事务数（验证网络在两次事务之间）。
+        fn attach_db_recorded(&mut self, recorded: Arc<Mutex<MockRecordedDb>>) {
+            *self.db_recorded.lock().expect("未中毒") = Some(recorded);
+        }
+        fn commits_at_board_calls(&self) -> Vec<usize> {
+            self.commits_at_board_calls.lock().expect("未中毒").clone()
         }
         fn task_record_calls(&self) -> Vec<([u8; 32], Uuid)> {
             self.task_record_calls.lock().expect("未中毒").clone()
@@ -653,6 +699,13 @@ mod tests {
                 .lock()
                 .expect("未中毒")
                 .push((*device, sub_task_id));
+            if let Some(recorded) = self.db_recorded.lock().expect("未中毒").as_ref() {
+                let commits = recorded.lock().expect("未中毒").commit_count;
+                self.commits_at_board_calls
+                    .lock()
+                    .expect("未中毒")
+                    .push(commits);
+            }
             let record = self
                 .records
                 .lock()
@@ -757,6 +810,9 @@ mod tests {
         insert_checks_count: usize,
         update_held_count: usize,
         commit_count: usize,
+        /// 有序事件轨迹（select/insert/update/commit）：用于断言读、写两个短事务
+        /// 的边界，验证板端网络核验确实发生在两次事务之间。
+        events: Vec<String>,
     }
 
     struct MockDbServer {
@@ -830,7 +886,9 @@ mod tests {
                                     0x0002u16
                                 };
                                 if q.contains("COMMIT") {
-                                    rec.lock().unwrap().commit_count += 1;
+                                    let mut rec = rec.lock().unwrap();
+                                    rec.commit_count += 1;
+                                    rec.events.push("commit".to_owned());
                                 }
                                 let ok = [
                                     0x00,
@@ -916,7 +974,11 @@ mod tests {
                                     .unwrap_or((false, false, false));
                                 let mut cur_seq = seq.wrapping_add(1);
                                 if is_select {
-                                    rec.lock().unwrap().select_count += 1;
+                                    {
+                                        let mut rec = rec.lock().unwrap();
+                                        rec.select_count += 1;
+                                        rec.events.push("select".to_owned());
+                                    }
                                     send_packet(&mut stream, cur_seq, &lenenc_int(3));
                                     cur_seq = cur_seq.wrapping_add(1);
                                     send_packet(&mut stream, cur_seq, &make_col_def("id", 0xfc));
@@ -943,10 +1005,15 @@ mod tests {
                                     cur_seq = cur_seq.wrapping_add(1);
                                     send_packet(&mut stream, cur_seq, &eof);
                                 } else {
-                                    if is_insert {
-                                        rec.lock().unwrap().insert_checks_count += 1;
-                                    } else if is_update {
-                                        rec.lock().unwrap().update_held_count += 1;
+                                    {
+                                        let mut rec = rec.lock().unwrap();
+                                        if is_insert {
+                                            rec.insert_checks_count += 1;
+                                            rec.events.push("insert".to_owned());
+                                        } else if is_update {
+                                            rec.update_held_count += 1;
+                                            rec.events.push("update".to_owned());
+                                        }
                                     }
                                     send_packet(
                                         &mut stream,
@@ -1008,6 +1075,7 @@ mod tests {
         let repo = SqlxTaskRepository::new(pool);
 
         let mut client = FakeBoardClient::default();
+        client.attach_db_recorded(server.recorded.clone());
         client.with_record(
             dispatching_id,
             FakeRecord::Found(board_task_record(dispatching_id)),
@@ -1042,13 +1110,32 @@ mod tests {
         assert_eq!(client.send_calls(), 0);
         assert_eq!(client.read_calls.load(Ordering::Relaxed), 0);
 
-        // 持久化与事务断言 (F2):
-        // 4 个可能已发送态插入 recovery_checks，1 个 queued 状态更新为 held，且统一 commit
+        // 持久化与事务断言 (F2 + 修复轮 2)：
+        // 4 个可能已发送态插入 recovery_checks，1 个 queued 状态更新为 held；
+        // 读、写两个独立短事务各自提交（commit_count == 2），网络核验发生在两者之间。
         let rec = server.recorded.lock().unwrap();
         assert_eq!(rec.select_count, 1);
         assert_eq!(rec.insert_checks_count, 4);
         assert_eq!(rec.update_held_count, 1);
-        assert_eq!(rec.commit_count, 1);
+        assert_eq!(rec.commit_count, 2);
+        // 4 次 task_record 调用时刻数据库均只完成了第 1 次 COMMIT（读事务已提交、
+        // 写事务尚未开始）：板端网络等待完全发生在两次短事务之间，零持锁。
+        assert_eq!(client.commits_at_board_calls(), vec![1, 1, 1, 1]);
+        // 有序轨迹：读事务（SELECT→COMMIT）→（事务外板端核验）→
+        // 写事务（INSERT×4→UPDATE→COMMIT）。
+        assert_eq!(
+            rec.events,
+            vec![
+                "select".to_owned(),
+                "commit".to_owned(),
+                "insert".to_owned(),
+                "insert".to_owned(),
+                "insert".to_owned(),
+                "insert".to_owned(),
+                "update".to_owned(),
+                "commit".to_owned(),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1079,7 +1166,9 @@ mod tests {
         assert_eq!(rec.select_count, 1);
         assert_eq!(rec.insert_checks_count, 0);
         assert_eq!(rec.update_held_count, 0);
+        // 空未决集：仅经历一次只读短事务，不开启写事务。
         assert_eq!(rec.commit_count, 1);
+        assert_eq!(rec.events, vec!["select".to_owned(), "commit".to_owned()]);
     }
 
     #[tokio::test]
