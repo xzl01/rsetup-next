@@ -438,7 +438,7 @@ mod tests {
                         "revision": revision,
                         "device_ids": devices
                             .iter()
-                            .map(|id| hex::encode(id))
+                            .map(hex::encode)
                             .collect::<Vec<_>>(),
                     },
                     "member_count": devices.len(),

@@ -706,7 +706,9 @@ mod tests {
     async fn batch_item_error_codes_agree_with_map_error_envelope() {
         // 显式穷尽：`ControllerError` 全部 13 个变体逐一断言与 `map_error` 同码，
         // 新增变体未补映射时上方穷尽匹配先编译失败，此处兜底逐变体语义一致。
-        let cases: Vec<(fn() -> ControllerError, &str)> = vec![
+        type ErrorProbe = fn() -> ControllerError;
+
+        let cases: Vec<(ErrorProbe, &str)> = vec![
             (|| ControllerError::InvalidArgument, "INVALID_ARGUMENT"),
             (|| ControllerError::PermissionDenied, "PERMISSION_DENIED"),
             (|| ControllerError::NotFound, "NOT_FOUND"),

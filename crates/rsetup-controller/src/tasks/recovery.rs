@@ -836,14 +836,8 @@ mod tests {
                         let server_ver = b"8.0.46\0";
                         let auth_data_1 = b"12345678";
                         let auth_data_2 = b"123456789012\0";
-                        let cap: u32 = 0x0000
-                            | 0x0200
-                            | 0x8000
-                            | 0x0004
-                            | 0x020000
-                            | 0x0008
-                            | 0x00800000
-                            | 0x00000001;
+                        let cap: u32 =
+                            0x0200 | 0x8000 | 0x0004 | 0x020000 | 0x0008 | 0x00800000 | 0x00000001;
                         let mut payload = Vec::new();
                         payload.push(10);
                         payload.extend(server_ver);

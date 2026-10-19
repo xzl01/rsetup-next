@@ -1,3 +1,9 @@
+// 本模块是被多个集成测试引入的共享测试辅助库：migration_v4.rs 用显式
+// `#[path = "common/mod.rs"] mod common;`，mysql_identity.rs 与 tidb_identity.rs
+// 走目录约定 `mod common;`；
+// 每个集成测试是独立编译的二进制，只会调用自身需要的辅助函数，
+// 因此其余辅助条目必然在部分测试目标中呈现为未使用，此处统一豁免 dead_code。
+#![allow(dead_code)]
 use rsetup_controller::{ControllerConfig, DbPool, TestMigrationConfig};
 use std::sync::Mutex;
 

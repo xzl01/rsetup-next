@@ -3010,9 +3010,9 @@ mod tests {
             u64::MAX,
         )
         .expect("valid row must decode");
-        assert_eq!(ok.active, true);
-        assert_eq!(ok.is_admin, false);
-        assert_eq!(ok.must_change_password, true);
+        assert!(ok.active);
+        assert!(!ok.is_admin);
+        assert!(ok.must_change_password);
         assert_eq!(ok.revision, u64::MAX);
     }
 

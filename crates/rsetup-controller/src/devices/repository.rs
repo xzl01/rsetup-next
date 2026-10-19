@@ -875,7 +875,7 @@ mod tests {
 
     #[test]
     fn audit_keys_keep_namespaces_distinct_and_sql_has_exact_bindings() {
-        let mut keys = vec![
+        let mut keys = [
             AuditCursor {
                 process_epoch: Uuid::from_u128(0x00000000000040008000000000000003),
                 event_seq: 7,
