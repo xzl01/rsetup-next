@@ -7,6 +7,8 @@
 
 pub mod auth;
 pub mod config;
+pub mod model;
+pub mod render;
 
 /// Rust edition 标签值。Cargo 不暴露 `CARGO_PKG_EDITION`，故显式声明，
 /// 由 `metrics_edition_matches_workspace_manifest` 与根清单 `[workspace.package]` 对齐。
@@ -18,6 +20,11 @@ pub use config::{
     DEFAULT_ENDPOINT, EnvRead, MetricsAuthRaw, MetricsConfig, MetricsFile, MetricsSection, REALM,
     RESERVED_PATHS, is_reserved,
 };
+pub use model::{
+    AdmissionBucket, DeviceCounts, PoolCounts, ScrapeValues, TaskBucket, TaskCounts,
+    admission_label, task_bucket,
+};
+pub use render::{CONTENT_TYPE, MAX_BODY_BYTES, render};
 
 #[cfg(test)]
 mod tests {
