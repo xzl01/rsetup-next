@@ -89,7 +89,7 @@
   - `MetricsConfig::from_env() -> Result<Self, ControllerError>`
   - `metrics::config::EnvRead::{Unset, NotUnicode, Value(String)}`（`Debug + Clone + PartialEq + Eq`）+ `EnvRead::from_std(name: &str) -> Self`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 先建模块骨架与测试，让「测试先存在」。`crates/rsetup-controller/src/lib.rs` 追加一行（第 16 行 `pub mod integrity;` 之后）：
 
@@ -879,7 +879,7 @@ password = "secure_password"
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 ```bash
 cargo test -p rsetup-controller --lib metrics
@@ -896,7 +896,7 @@ error: could not compile `rsetup-controller` (lib test) due to N previous errors
 
 同时确认 `cargo test -p rsetup-controller --lib metrics` **没有**任何 `test result: ok` 行——测试从未跑起来才是本 Step 的通过判据。若本机 `Cargo.lock` 还没有 `toml`，此时仍不应报依赖错误（本 Step 的测试代码不 `use toml`）；出现 `no matching package named 'toml'` 说明 Step 3 的清单改动被提前做了，回退到本 Step 的骨架。
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 3.1 工作区根 `Cargo.toml` 的 `[workspace.dependencies]` 内、`thiserror = "2.0"` 之前追加三行（键名字母序无强制要求，保持与相邻块风格一致）：
 
@@ -1361,7 +1361,7 @@ cargo update -p rsetup-controller --workspace
 grep -n -A1 '^name = "toml"' Cargo.lock
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 ```bash
 cargo fmt --package rsetup-controller
@@ -1389,7 +1389,7 @@ cargo clippy --package rsetup-controller --all-targets -- -D warnings
 
 > 计数容差说明：`38 passed` 是本 Task Step 1 写下的测试函数条数（执行时以实际数量为准）；**判据是 `0 failed` 且 `metrics::config::tests` 下每个测试都出现在输出里**，不得用 `--skip` 掩盖任何一条。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add Cargo.toml Cargo.lock crates/rsetup-controller/Cargo.toml \
@@ -1422,7 +1422,7 @@ git commit -m "feat(controller): 增加指标配置三阶段解析与启动安�
   - `metrics::auth::www_authenticate() -> String`（恒 `Basic realm="rsetup-controller-metrics"`）
   - 私有 `fn sha256(bytes: &[u8]) -> [u8; 32]`、`fn ct_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `crates/rsetup-controller/src/metrics/auth.rs` 先只写测试模块（实现属 Step 3）：
 
@@ -1729,7 +1729,7 @@ mod tests {
 pub mod auth;
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 ```bash
 cargo test -p rsetup-controller --lib metrics::auth
@@ -1746,7 +1746,7 @@ error: could not compile `rsetup-controller` (lib test) due to N previous errors
 
 不得出现 `test result: ok`。若出现 `metrics::auth` 相关以外的编译错误（例如 `single_header` 不可见），说明越过了 §4.2 的复用约束，先修依赖面再继续。
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 `crates/rsetup-controller/src/metrics/auth.rs` 的实现部分（写在 Step 1 的测试模块之前）：
 
@@ -1879,7 +1879,7 @@ fn reset_ct_eq_calls() {
 pub use auth::{ParsedBasic, parse_authorization, verify, www_authenticate};
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 ```bash
 cargo fmt --package rsetup-controller
@@ -1905,7 +1905,7 @@ grep -rn 'diff |= a\[i\]' crates/rsetup-controller/src/metrics
 
 预期：clippy 无 warning；第二条 grep **有**输出（§7.8 第 8 条）；第三条 grep **无**输出（§7.8 第 7 条）。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/rsetup-controller/src/metrics/mod.rs crates/rsetup-controller/src/metrics/auth.rs
@@ -1937,7 +1937,7 @@ git commit -m "feat(controller): 增加 Basic 凭据解析与常量时间认证"
   - `metrics::render::render(values: &ScrapeValues) -> Result<String, ControllerError>`
   - `metrics::render::escape_label_value(value: &str) -> String`（三项转义，本模块唯一一处）
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `crates/rsetup-controller/src/metrics/model.rs`（仅测试模块）：
 
@@ -2360,7 +2360,7 @@ rsetup_controller_db_pool_connections{state="idle"} 3
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 ```bash
 cargo test -p rsetup-controller --lib metrics::model metrics::render
@@ -2377,7 +2377,7 @@ error[E0432]: unresolved imports `super::CONTENT_TYPE`, `super::MAX_BODY_BYTES`,
 error: could not compile `rsetup-controller` (lib test) due to N previous errors
 ```
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 `crates/rsetup-controller/src/metrics/model.rs` 的实现部分：
 
@@ -2680,7 +2680,7 @@ pub use model::{
 pub use render::{CONTENT_TYPE, MAX_BODY_BYTES, render};
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 ```bash
 cargo fmt --package rsetup-controller
@@ -2697,7 +2697,7 @@ test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; N filtered out
 
 判据：`0 failed`，且 `render_matches_golden_exposition` 与 `render_does_not_escape_carriage_return_or_tab` 都在输出中。若 golden 比对失败，输出会给出逐字节 diff——**改实现，不改 golden 常量**（golden 是规范 §5.6 的定本）。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/rsetup-controller/src/metrics/mod.rs crates/rsetup-controller/src/metrics/model.rs \
@@ -2731,7 +2731,7 @@ git commit -m "feat(controller): 增加指标数据模型与普罗米修斯文�
   - 私有 `async fn run_aggregates(conn: &mut PoolConnection<MySqlConnection>) -> Result<MetricsSnapshot, ControllerError>`
   - `#[cfg(test)] metrics::collect::FakeMetricsSnapshotSource`（§7.5 的三种行为 + 调用计数）
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `crates/rsetup-controller/src/metrics/collect.rs`（仅测试模块；`FakeMetricsSnapshotSource` 的类型本体属 Step 3，因为它被 Task 5 的 L2 测试复用）：
 
@@ -2999,7 +2999,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 ```bash
 cargo test -p rsetup-controller --lib metrics::collect
@@ -3015,7 +3015,7 @@ error: could not compile `rsetup-controller` (lib test) due to N previous errors
 
 注意：`snapshot_kernel_has_no_early_exit_between_acquire_and_close` 也必须在 Step 2 失败（`include_str!` 指向的文件此刻没有 `pub async fn snapshot_via`）——它就是 F1 回归网的红灯侧。
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 `crates/rsetup-controller/src/metrics/collect.rs` 的实现部分（写在 Step 1 的测试模块之前）：
 
@@ -3360,7 +3360,7 @@ impl std::fmt::Debug for FakeMetricsSnapshotSource {
 }
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 ```bash
 cargo fmt --package rsetup-controller
@@ -3387,7 +3387,7 @@ grep -nE 'SCRAPE_TIMEOUT.*\?' crates/rsetup-controller/src/metrics/collect.rs
 
 > 若 `snapshot_kernel_has_no_early_exit_between_acquire_and_close` 因第 1 步的两个 `map_err(...)?` 报错：那是断言范围写错，不是实现错——早退禁令的区间是"连接借出成功之后到 `close().await`"，第 1 步的两个 `?` 发生在**没有连接产生**时（许可可立即释放），必须保留。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/rsetup-controller/src/metrics/mod.rs crates/rsetup-controller/src/metrics/collect.rs
@@ -3409,7 +3409,7 @@ git commit -m "feat(controller): 增加指标采集内核与连接生命周期�
   - `metrics::http::build_metrics_router(state: MetricsState) -> Router<()>`
   - 私有 `async fn scrape(State<MetricsState>, Method, HeaderMap) -> Response`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `crates/rsetup-controller/src/metrics/http.rs`（仅测试模块）：
 
@@ -4071,7 +4071,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 ```bash
 cargo test -p rsetup-controller --lib metrics::http
@@ -4087,7 +4087,7 @@ error: could not compile `rsetup-controller` (lib test) due to N previous errors
 
 不得出现 `test result: ok`。
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 `crates/rsetup-controller/src/metrics/http.rs` 的实现部分（写在 Step 1 的测试模块之前）：
 
@@ -4248,7 +4248,7 @@ async fn scrape(
 pub use http::{build_metrics_router, MetricsState};
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 ```bash
 cargo fmt --package rsetup-controller
@@ -4277,7 +4277,7 @@ cargo test -p rsetup-controller --lib
 > 2. **`metrics_success_does_not_create_session` 的"零变化"用结构门禁 + 无 `Set-Cookie` 证明**：`MetricsState` 与 handler 源码（`#[cfg(test)]` 之前的实现部分）不含 `HttpAuthState`/`Session`/`EndpointId`/`Csrf`/`RateLimit`/`audit`/`axum_extra`/日志调用；跨线行为（抓取不污染会话）由 Task 6 的 `metrics_line_never_touches_session_boundary` 在顶层 router 上证明。
 > 3. **新增 `permit_stays_held_after_client_disconnects`**（规范表未列，属 I7 的进程内可指认部分）：`multi_thread` runtime + 两处 80ms 观察窗口，只断言"许可不回落"，不声称证明 `close()` 语义（那是 Task 7 §7.7 第 4 步受控关闭屏障的职责）。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/rsetup-controller/src/metrics/mod.rs crates/rsetup-controller/src/metrics/http.rs
@@ -4303,7 +4303,7 @@ git commit -m "feat(controller): 增加指标端点处理链与 HEAD 短路门�
   - `#[doc(hidden)] production::build_production_router_with_metrics_source(ProductionInputs, Arc<dyn MetricsSnapshotSource>) -> Result<Router<()>, ControllerError>`
   - `production::compose_component_routers(auth, management, tasks, status, metrics, web) -> Router<()>`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `crates/rsetup-controller/tests/production_composition.rs`。**先改既有断言的 arity**（不改断言内容），再追加 §7.6 的 10 条新用例。
 
@@ -4762,7 +4762,7 @@ fn composed() -> Router<()> {
 
 既有 `mismatched_auth_context_is_rejected_on_every_line` 与 `composed_router_registers_status_route_behind_shared_gate` **保持原样**（§7.6 第 4 条：三条负例不变，证明新增线未削弱原门禁）。
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 ```bash
 cargo test -p rsetup-controller --test production_composition
@@ -4777,7 +4777,7 @@ error[E0432]: unresolved import `rsetup_controller::production::build_production
 error: could not compile `rsetup-controller` (test "production_composition") due to N previous errors
 ```
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 `crates/rsetup-controller/src/production.rs` 全文替换为：
 
@@ -4996,7 +4996,7 @@ fn production_inputs(
 }
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 ```bash
 cargo fmt --package rsetup-controller
@@ -5028,7 +5028,7 @@ cargo test -p rsetup-controller
 
 > §7.6 第 9 条的实现取舍：该条要求"断言字段集合只有 `config` 与 `runtime`"。Rust 没有"恰好两个字段"的运行时反射，因此用**写全字段的构造点**（多字段即编译失败）+ 两次显式取字段 + 源码级断言（`include_str!`）实现；对 `RESERVED_PATHS` 与 `web.rs` 三张表的一致性同理用集合包含断言，不引入序列化反射。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/rsetup-controller/src/production.rs crates/rsetup-controller/src/web.rs \
@@ -5048,7 +5048,7 @@ git commit -m "feat(controller): 生产装配接入普罗米修斯指标第六�
 - Consumes：`metrics::collect::{MAX_CONCURRENT_SCRAPE, SCRAPE_TIMEOUT, POOL_ACQUIRE_TIMEOUT, DEVICE_AGGREGATE_SQL, MetricsSnapshotSource, SqlxMetricsSnapshotSource}`（Task 4，常量与两条 SQL 均为 `pub`）、`common::required_test_db()`（`tests/common/mod.rs`）。
 - Produces：无生产 API（本 Task 只加测试与门禁）。
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `crates/rsetup-controller/tests/metrics_real_db.rs`（整文件）：
 
@@ -5267,7 +5267,7 @@ async fn aggregates_match_table_distribution_and_sum_invariant() {
     for (label, expected) in [
         ("APPROVED", snapshot.devices.approved),
         ("PENDING", snapshot.devices.pending),
-        ("REJECTED", snapshot.devices.rejected),
+        ("REVOKED", snapshot.devices.rejected), // 持久层 REVOKED → 指标侧 rejected 桶（§5.2.2 留档映射）
     ] {
         let rows: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM devices WHERE CAST(admission_state AS BINARY) = CAST(? AS BINARY)",
@@ -5609,7 +5609,7 @@ metrics-gates: fmt-check
 	@echo "metrics-gates：九条门禁全部符合预期（第 8 条已确认有输出）"
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 ```bash
 make metrics-gates
@@ -5639,7 +5639,7 @@ git checkout -- crates/rsetup-controller/src/metrics/collect.rs                 
 git status --short                                                               # 确认已还原
 ```
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 本 Task 不改生产代码，"实现"即让门禁与 L4 文件成立：
 
@@ -5651,7 +5651,7 @@ git status --short                                                              
 6. 受控关闭屏障的确定性来自"抵达数可观测"（`await_waiting` 轮询到 4 才断言），不依赖网络往返或 MySQL 关闭时序；对"提前释放许可"的缺陷实现，第 4 步的第 2 小步稳定必红。
 7. `tests/metrics_real_db.rs` 顶部用 `#![allow(dead_code)]`：本文件只用 `common::required_test_db`，其余 `pub` 辅助函数在该测试目标内未使用属预期，与既有 `tests/mysql_identity.rs` 的形态一致但更严格（不产生 clippy `-D warnings` 噪声）。
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 离线全量门禁（不含真库）：
 
@@ -5691,7 +5691,7 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
 判据：三组全绿，报告只含去敏数值（`L4 对账：…`、`L4 池回落：…`、`L4 取消变体：…`）。**若本轮未执行 L4，交付报告必须显式标注"两条聚合 SQL 的真实引擎验收仍待执行"，不得以 L2/L3 fake 通过替代（§9 第 9 条、G4）。**
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add Makefile crates/rsetup-controller/tests/metrics_real_db.rs
@@ -5703,7 +5703,7 @@ git commit -m "test(controller): 增加指标线受控关闭屏障与静态门�
 
 严禁 `git push`；严禁 `git add -f`。
 
-- [ ] **Step 6: 交付报告要素（§9 Definition of Done 自检表）**
+- [x] **Step 6: 交付报告要素（§9 Definition of Done 自检表）**
 
 报告须逐条给出证据（测试名 + 命令 + 关键输出行）：
 
