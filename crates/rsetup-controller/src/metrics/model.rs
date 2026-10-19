@@ -133,7 +133,7 @@ pub fn task_aggregate_error(state: &[u8]) -> ControllerError {
 }
 
 /// 设备准入分布（三桶恒定输出，计数为 0 也输出该序列）。
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DeviceCounts {
     pub approved: u64,
     pub pending: u64,
@@ -141,7 +141,7 @@ pub struct DeviceCounts {
 }
 
 /// 主任务状态分布（四桶）。
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TaskCounts {
     pub pending: u64,
     pub running: u64,

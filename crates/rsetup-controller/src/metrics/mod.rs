@@ -6,6 +6,7 @@
 //! 不写审计（I3/I6），因此这里 MUST NOT 出现 `Arc<HttpAuthState>`、`Session` 或 `EndpointId`。
 
 pub mod auth;
+pub mod collect;
 pub mod config;
 pub mod model;
 pub mod render;
@@ -15,6 +16,11 @@ pub mod render;
 pub const EDITION: &str = "2024";
 
 pub use auth::{ParsedBasic, parse_authorization, verify, www_authenticate};
+pub use collect::{
+    DEVICE_AGGREGATE_SQL, MAX_CONCURRENT_SCRAPE, MetricsFuture, MetricsRuntime, MetricsSnapshot,
+    MetricsSnapshotSource, POOL_ACQUIRE_TIMEOUT, SCRAPE_TIMEOUT, SqlxMetricsSnapshotSource,
+    TASK_AGGREGATE_SQL, pool_counts, snapshot_via,
+};
 pub use config::{
     AUTH_PASSWORD_ENV, AUTH_USER_ENV, BasicCredentials, CONFIG_PATH_ENV, DEFAULT_CONFIG_PATH,
     DEFAULT_ENDPOINT, EnvRead, MetricsAuthRaw, MetricsConfig, MetricsFile, MetricsSection, REALM,
