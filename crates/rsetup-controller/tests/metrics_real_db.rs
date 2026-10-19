@@ -541,7 +541,9 @@ async fn grouping_is_byte_exact_on_both_engines() {
             .await
             .unwrap_or_else(|error| panic!("{name} 在 ONLY_FULL_GROUP_BY 下必须可执行：{error}"));
         // **同一连接**上紧接着执行：上一条语句的告警只存在于这条连接的会话里。
-        let warnings = sqlx::query("SHOW WARNINGS")
+        // MySQL 8.0/8.4 的 `SHOW WARNINGS` 不支持 Prepared Statement 协议
+        // （HY000/1295），必须走 `raw_sql` 文本协议。
+        let warnings = sqlx::raw_sql("SHOW WARNINGS")
             .fetch_all(&mut *conn)
             .await
             .expect("SHOW WARNINGS 必须与聚合 SQL 同连接执行");
