@@ -138,6 +138,8 @@ cargo run -p rsetup-next -- --demo serve
 
 启动服务器后，打开 `http://127.0.0.1:8788`。
 
+Rust 格式检查请使用 `make fmt-check`，不要使用 `cargo fmt --all`，因为后者会把第三方 submodule `externals/devicesinfo` 一并纳入检查范围；详见 [AGENTS.md](AGENTS.md) 的「Rust 格式检查口径」。
+
 常用 CLI 操作：
 
 ```bash

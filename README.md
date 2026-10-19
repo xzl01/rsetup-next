@@ -194,6 +194,11 @@ cargo run -p rsetup-next -- --demo serve
 
 Open `http://127.0.0.1:8788` after starting the server.
 
+For Rust format checks run `make fmt-check` rather than `cargo fmt --all`,
+because the latter also pulls the third-party `externals/devicesinfo` submodule
+into the checked scope; see the "Rust 格式检查口径" section of
+[AGENTS.md](AGENTS.md).
+
 Common CLI operations:
 
 ```bash
