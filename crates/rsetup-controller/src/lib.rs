@@ -14,6 +14,7 @@ pub mod http_gate;
 pub mod http_live;
 pub mod http_security;
 pub mod integrity;
+pub mod metrics;
 pub mod model;
 pub mod polling;
 pub mod production;
