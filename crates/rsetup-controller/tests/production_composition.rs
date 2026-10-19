@@ -93,7 +93,8 @@ mod typed {
         DeviceConnectionState, DeviceLiveProbe, DeviceLiveView, DeviceStreamHealth,
     };
     use rsetup_controller::api::system::{RecoveryModeProbe, RecoveryView};
-    use rsetup_controller::auth::service::{Login, Session, SessionPage};
+    use rsetup_controller::auth::service::{IdentityUser, Login, Session, SessionPage};
+    use rsetup_controller::auth::session::token_digest;
     use rsetup_controller::authz::sqlx_repo::SqlxAuthorizationSnapshotRepository;
     use rsetup_controller::devices::service::AdmissionChangeEvent;
     use rsetup_controller::http_auth::{AuthFuture, AuthServiceApi};
@@ -119,7 +120,10 @@ mod typed {
     use rsetup_controller::web_router;
     use serde_json::{Value, json};
     use sqlx::mysql::MySqlPoolOptions;
+    use std::future::Future;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+    use tokio::sync::Semaphore;
 
     const HOST: &str = "controller.test";
     /// 合法设备 ID 形状（64 位小写 hex）。
@@ -127,6 +131,19 @@ mod typed {
         "/api/v1/devices/0000000000000000000000000000000000000000000000000000000000000001/status";
     /// synthetic 游标密钥：仅用于把生产 `SqlxTaskApi` 立起来，本文件不签发任何游标。
     const SYNTHETIC_CURSOR_SECRET: [u8; 32] = [7u8; 32];
+    /// 合法 live session 的会话令牌：64 位**小写 hex**，是 `session_cookie_value`
+    /// 严格 cookie 门禁唯一放行的形状（§7.6 第 7 条要求"完整合法会话 Cookie"——
+    /// 非 hex 占位符只能证明匿名请求被拒，证明不了合法会话不被抓取污染）。
+    const LIVE_SESSION_TOKEN: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const LIVE_SESSION_USERNAME: &str = "alice-metrics-isolation";
+    const LIVE_SESSION_USER_ID: [u8; 16] = [7u8; 16];
+    /// `user_public` 期望投影的 canonical UUID：取值**独立于桩对象**写出（不从
+    /// `LIVE_SESSION_USER_ID` 现场派生），避免"用实现验证实现"。
+    const LIVE_SESSION_USER_UUID: &str = "07070707-0707-0707-0707-070707070707";
+    /// 业务侧单次调用的超时护栏：并发闸占满期间业务请求必须**快速**返回；一旦超时
+    /// 直接失败，绝不让测试永久挂起。
+    const BUSINESS_CALL_BUDGET: Duration = Duration::from_secs(5);
 
     /// 认证桩：`is_live_session` 恒 false，因此共享 gate 在触达仓储前严格 401。
     /// 本文件只用它把 router 立起来并断言「路由已注册」，不认证任何真实会话。
@@ -155,6 +172,86 @@ mod typed {
         }
         fn is_live_session(&self, _digest: &[u8; 32]) -> bool {
             false
+        }
+        fn list_sessions<'a>(
+            &'a self,
+            _s: &'a Session,
+            _c: Option<&'a str>,
+            _l: usize,
+        ) -> AuthFuture<'a, SessionPage> {
+            Box::pin(async { Err(ControllerError::InvalidArgument) })
+        }
+        fn revoke_by_alias<'a>(&'a self, _s: &'a Session, _id: &'a str) -> AuthFuture<'a, bool> {
+            Box::pin(async { Err(ControllerError::InvalidArgument) })
+        }
+        fn revoke_others<'a>(&'a self, _s: &'a Session) -> AuthFuture<'a, u64> {
+            Box::pin(async { Err(ControllerError::InvalidArgument) })
+        }
+    }
+
+    /// 合法 live session 认证桩（§7.6 第 7 条要求的 `LiveSessionAuth` 形态）：
+    /// `is_live_session` 只对 `LIVE_SESSION_TOKEN` 的 digest 返回 true，
+    /// `authenticate` 只认同同一枚令牌并返回有效 `Session`，`authz_epoch` 返回固定
+    /// epoch——三者合起来让 `/api/v1/auth/me` 真正走到 200，从而**先证明会话合法**，
+    /// 再证明指标抓取对它零影响。它只在内存里持有"这条会话有效"这一个事实，不连
+    /// 任何仓储，也**不**代表真实认证语义。
+    struct LiveSessionAuth {
+        digest: [u8; 32],
+    }
+
+    impl LiveSessionAuth {
+        fn new() -> Self {
+            Self {
+                digest: token_digest(LIVE_SESSION_TOKEN.as_bytes()),
+            }
+        }
+
+        fn session(&self) -> Session {
+            Session {
+                user: IdentityUser {
+                    id: LIVE_SESSION_USER_ID,
+                    username: LIVE_SESSION_USERNAME.into(),
+                    password_hash: "$argon2id$=synthetic-test-only=".into(),
+                    active: true,
+                    is_admin: false,
+                    must_change_password: false,
+                    revision: 1,
+                },
+                digest: self.digest,
+            }
+        }
+    }
+
+    impl AuthServiceApi for LiveSessionAuth {
+        fn login<'a>(&'a self, _u: &'a str, _p: &'a str) -> AuthFuture<'a, Login> {
+            Box::pin(async { Err(ControllerError::InvalidArgument) })
+        }
+        fn authenticate<'a>(&'a self, raw: &'a str) -> AuthFuture<'a, Session> {
+            let session = self.session();
+            Box::pin(async move {
+                if raw == LIVE_SESSION_TOKEN {
+                    Ok(session)
+                } else {
+                    Err(ControllerError::InvalidArgument)
+                }
+            })
+        }
+        fn change_password<'a>(
+            &'a self,
+            _s: &'a Session,
+            _c: &'a str,
+            _n: &'a str,
+        ) -> AuthFuture<'a, ()> {
+            Box::pin(async { Err(ControllerError::InvalidArgument) })
+        }
+        fn logout<'a>(&'a self, _s: &'a Session) -> AuthFuture<'a, ()> {
+            Box::pin(async { Err(ControllerError::InvalidArgument) })
+        }
+        fn authz_epoch(&self) -> AuthFuture<'_, u64> {
+            Box::pin(async { Ok(7) })
+        }
+        fn is_live_session(&self, digest: &[u8; 32]) -> bool {
+            digest == &self.digest
         }
         fn list_sessions<'a>(
             &'a self,
@@ -216,14 +313,27 @@ mod typed {
         )
     }
 
+    fn security_config() -> HttpSecurityConfig {
+        HttpSecurityConfig {
+            allowed_hosts: vec![HOST.into()],
+            allowed_origin: Some("http://controller.test".into()),
+            trust_tls: false,
+        }
+    }
+
     fn auth_state() -> Arc<HttpAuthState> {
         Arc::new(HttpAuthState::new(
             Arc::new(NoSessionAuth),
-            HttpSecurityConfig {
-                allowed_hosts: vec![HOST.into()],
-                allowed_origin: Some("http://controller.test".into()),
-                trust_tls: false,
-            },
+            security_config(),
+        ))
+    }
+
+    /// 带**合法 live session** 的共享认证上下文：`/api/v1/auth/me` 携
+    /// `LIVE_SESSION_TOKEN` 能拿到 200，用于 §7.6 第 7 条的会话隔离闭环。
+    fn live_auth_state() -> Arc<HttpAuthState> {
+        Arc::new(HttpAuthState::new(
+            Arc::new(LiveSessionAuth::new()),
+            security_config(),
         ))
     }
 
@@ -482,12 +592,66 @@ mod typed {
         }
     }
 
-    /// 永久挂起的合成源（§7.6 第 10 条）。
-    struct HangingMetricsSnapshotSource;
+    /// 永久挂起的合成源（§7.6 第 10 条）+ **确定性同步面**，让"并发闸已占满"成为
+    /// 可等待、可断言的前置条件，而不是 `sleep` 猜出来的时序：
+    ///
+    /// - `entered`：真正进入 `snapshot()` 的请求数——"闸被占满"的唯一直接证据；
+    /// - `all_entered`：0 许可信号量，第 `MAX_CONCURRENT_SCRAPE` 路进入时发放恰好 1 枚
+    ///   许可；测试 `acquire()` 成功即证明 4 路全部落在采集内部、许可已全部耗尽；
+    /// - `release`：0 许可信号量。测试 `add_permits` 放行后，已挂起与其后进入的调用都
+    ///   立即返回——许可是**持久状态**，不存在 `Notify::notify_waiters` 那种"先通知后
+    ///   等待"的丢唤醒竞态。
+    ///
+    /// 刻意不用 `tokio::sync::Barrier`：其 `wait()` 明确**不是** cancel-safe，测试加
+    /// 超时兜底后可能在超时留下不确定状态；`Semaphore::acquire()` 是 cancel-safe 的，
+    /// 因此等待既能在"实现退化为进不满 4 路"时**直接失败**（而非永久挂起），又不引入
+    /// 取消后的状态污染。
+    struct HangingMetricsSnapshotSource {
+        entered: AtomicUsize,
+        all_entered: Semaphore,
+        release: Semaphore,
+    }
+
+    impl HangingMetricsSnapshotSource {
+        fn new() -> Self {
+            Self {
+                entered: AtomicUsize::new(0),
+                all_entered: Semaphore::new(0),
+                release: Semaphore::new(0),
+            }
+        }
+
+        /// 已进入 `snapshot()` 的请求数。
+        fn entered(&self) -> usize {
+            self.entered.load(Ordering::SeqCst)
+        }
+
+        /// 等待"并发闸已被 `MAX_CONCURRENT_SCRAPE` 路在途抓取完全占满"。
+        async fn wait_until_full(&self) {
+            let _ = tokio::time::timeout(BUSINESS_CALL_BUDGET, self.all_entered.acquire())
+                .await
+                .expect("并发闸必须在预算内被 MAX_CONCURRENT_SCRAPE 路抓取完全占满")
+                .expect("同步信号量不会关闭");
+        }
+
+        /// 放行全部挂起的采集：多给 1 枚许可，供测试收尾时再发一次抓取验证闸位恢复。
+        fn release_all(&self) {
+            self.release.add_permits(MAX_CONCURRENT_SCRAPE + 1);
+        }
+    }
 
     impl MetricsSnapshotSource for HangingMetricsSnapshotSource {
         fn snapshot(&self) -> MetricsFuture<'_, MetricsSnapshot> {
-            Box::pin(std::future::pending())
+            let entered = self.entered.fetch_add(1, Ordering::SeqCst) + 1;
+            if entered == MAX_CONCURRENT_SCRAPE {
+                self.all_entered.add_permits(1);
+            }
+            Box::pin(async move {
+                let _ = self.release.acquire().await;
+                Err(ControllerError::Config(
+                    "synthetic hanging source released".into(),
+                ))
+            })
         }
     }
 
@@ -511,6 +675,18 @@ mod typed {
         uri: &str,
         headers: &HeaderMap,
     ) -> (StatusCode, Vec<u8>) {
+        let (status, _, bytes) = request_returning_headers(router, method, uri, headers).await;
+        (status, bytes)
+    }
+
+    /// 与 [`request_with_headers`] 同源，但把**响应头**一并交出：§7.6 第 7 条的隔离
+    /// 断言必须能观察 `Set-Cookie` 是否出现，且不做任何 JSON 解析（指标体不是 JSON）。
+    async fn request_returning_headers(
+        router: &Router<()>,
+        method: &str,
+        uri: &str,
+        headers: &HeaderMap,
+    ) -> (StatusCode, HeaderMap, Vec<u8>) {
         let mut builder = Request::builder().method(method).uri(uri);
         for (name, value) in headers {
             builder = builder.header(name, value);
@@ -521,8 +697,17 @@ mod typed {
             .await
             .unwrap();
         let status = response.status();
+        let response_headers = response.headers().clone();
         let bytes = to_bytes(response.into_body(), 262_144).await.unwrap();
-        (status, bytes.to_vec())
+        (status, response_headers, bytes.to_vec())
+    }
+
+    /// 给业务侧调用套统一超时护栏：并发闸占满期间，业务请求一旦被拖住就直接失败，
+    /// 而不是让整个测试套件挂到 CI 超时。
+    async fn within_business_budget<T>(what: &str, fut: impl Future<Output = T>) -> T {
+        tokio::time::timeout(BUSINESS_CALL_BUDGET, fut)
+            .await
+            .unwrap_or_else(|_| panic!("业务调用 {what} 在 {BUSINESS_CALL_BUDGET:?} 内未返回"))
     }
 
     /// 从编译期嵌入的 `index.html` 取第一个真实资产路径（与 `web.rs` 同源，不
@@ -594,11 +779,19 @@ mod typed {
 
     #[tokio::test]
     async fn metrics_line_never_touches_session_boundary() {
-        // 完整合法会话 Cookie 打 /metrics → 仍 401（会话不是指标线的凭据）；
-        // 随后打 /api/v1/auth/me 仍按会话语义工作 → 抓取未污染会话/CSRF/限速。
+        // §7.6 第 7 条：在全量顶层 router 上用**一条真正合法的 live session** 走完
+        // 四步闭环，缺一即伪阳性：
+        // 1. 携合法 `rsc_session` 打业务线 → 200 且拿到合法用户（先证明这条会话真的
+        //    有效：Cookie 形状与语义都合法，不是"匿名被拒"的替身）；
+        // 2. 同一 Cookie 打 `/metrics`（不带 Basic）→ 401 且无 `Set-Cookie`（会话不是
+        //    指标线的凭据，指标线也不下发 Cookie）；
+        // 3. Basic 凭据 + 同一 Cookie 抓取成功 → 200 且响应头**绝不**含 `Set-Cookie`
+        //    （抓取不建会话、不轮换 Cookie）；
+        // 4. 原有 Cookie 再打业务线 → 仍 200 且身份与 CSRF 逐字段不变（抓取对活跃
+        //    会话零副作用，没有污染会话/CSRF/限速状态）。
         // 注意：401 只在**启用态**成立（禁用态按 §4.5 恒 404、与路径不存在不可
         // 区分），因此本用例显式传入 metrics_inputs(true)，不套薄壳 inputs()。
-        let shared = auth_state();
+        let shared = live_auth_state();
         let db = lazy_db();
         let router = build_production_router_with_metrics_source(
             inputs_with_db(
@@ -612,20 +805,104 @@ mod typed {
             Arc::new(SyntheticMetricsSnapshotSource),
         )
         .expect("装配必须成功");
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::COOKIE,
-            HeaderValue::from_static("rsc_session=composition-fixture-session"),
+
+        // 同一份请求头既打业务线（`/api/v1/auth/me` 要求唯一且在允许名单内的 Host），
+        // 也打指标线（指标线不读 Cookie、也不看 Host）。
+        let cookie = HeaderValue::from_str(&format!("rsc_session={LIVE_SESSION_TOKEN}"))
+            .expect("64 位 hex 必成合法头值");
+        let mut session_headers = HeaderMap::new();
+        session_headers.insert(header::HOST, HeaderValue::from_static(HOST));
+        session_headers.insert(header::COOKIE, cookie.clone());
+
+        // 1. 合法会话在业务线必须是 200，且投影出完整用户信息。
+        let (status, _, body) =
+            request_returning_headers(&router, "GET", "/api/v1/auth/me", &session_headers).await;
+        let first_text = String::from_utf8_lossy(&body).into_owned();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "合法 live session 在业务线必须 200（否则后续 401 只是匿名被拒）：{first_text}"
         );
-        let (status, _) = request_with_headers(&router, "GET", "/metrics", &headers).await;
+        let before: Value = serde_json::from_slice(&body).expect("业务线必须返回 JSON 信封");
+        assert_eq!(
+            before["data"]["user"],
+            json!({
+                "id": LIVE_SESSION_USER_UUID,
+                "username": LIVE_SESSION_USERNAME,
+                "active": true,
+                "is_admin": false,
+                "must_change_password": false,
+                "revision": "1",
+            }),
+            "合法会话必须投影出完整用户信息：{first_text}"
+        );
+        assert!(
+            before["data"]["csrf_token"]
+                .as_str()
+                .is_some_and(|token| token.len() == 64),
+            "合法会话必须拿到 64 位 hex CSRF 绑定：{first_text}"
+        );
+        assert!(
+            !first_text.contains("argon2"),
+            "响应绝不回显口令哈希材料：{first_text}"
+        );
+
+        // 2. 同一 Cookie 打指标线：会话不是凭据 → 401，且不下发任何 Cookie。
+        let (status, headers, body) =
+            request_returning_headers(&router, "GET", "/metrics", &session_headers).await;
         assert_eq!(
             status,
             StatusCode::UNAUTHORIZED,
-            "会话 Cookie 不是指标线凭据"
+            "合法会话 Cookie 不是指标线凭据，必须 401"
         );
-        let (status, body) = request_get(&router, "/api/v1/auth/me").await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "会话线路语义不变");
-        assert_eq!(body["error"]["code"], json!("AUTH_REQUIRED"));
+        assert!(body.is_empty(), "指标线 401 响应体必须为空");
+        assert!(
+            !headers.contains_key(header::SET_COOKIE),
+            "指标线 401 绝不下发 Set-Cookie"
+        );
+
+        // 3. Basic 凭据 + 同一合法会话 Cookie：按指标线语义 200，且不建会话。
+        let mut scrape_headers = authorized_metrics_headers();
+        scrape_headers.insert(header::COOKIE, cookie);
+        let (status, headers, body) =
+            request_returning_headers(&router, "GET", "/metrics", &scrape_headers).await;
+        let scrape_text = String::from_utf8_lossy(&body).into_owned();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "携带合法会话 Cookie 不影响 Basic 抓取：{scrape_text}"
+        );
+        assert!(
+            scrape_text.contains("rsetup_controller_devices_total{admission=\"APPROVED\"} 3"),
+            "抓取的读数必须来自注入的合成源：{scrape_text}"
+        );
+        assert!(
+            !headers.contains_key(header::SET_COOKIE),
+            "成功抓取绝不下发 Set-Cookie（指标线不建会话）"
+        );
+
+        // 4. 抓取之后原会话仍然有效，且身份/CSRF/epoch 逐字段不变。
+        let (status, _, body) =
+            request_returning_headers(&router, "GET", "/api/v1/auth/me", &session_headers).await;
+        let after_text = String::from_utf8_lossy(&body).into_owned();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "指标抓取必须对现有活跃会话零副作用：{after_text}"
+        );
+        let after: Value = serde_json::from_slice(&body).expect("业务线必须返回 JSON 信封");
+        assert_eq!(
+            after["data"]["user"], before["data"]["user"],
+            "身份投影必须逐字段一致"
+        );
+        assert_eq!(
+            after["data"]["csrf_token"], before["data"]["csrf_token"],
+            "同一 digest 的 CSRF 绑定必须被复用：抓取既不得清除它，也不得轮换它"
+        );
+        assert_eq!(
+            after["data"]["authz_epoch"], before["data"]["authz_epoch"],
+            "授权 epoch 读数不随抓取变化"
+        );
     }
 
     #[tokio::test]
@@ -739,11 +1016,25 @@ mod typed {
         assert!(!http_impl.contains("SqlxMetricsSnapshotSource::new"));
     }
 
+    /// 闸位恢复的**有限重试**次数：许可随采集任务结束才 Drop，`join` 与 Drop 之间
+    /// 存在调度窗口，因此放行后的首次抓取可能仍撞上"上一路许可尚未归还"。这里用
+    /// cancel-safe 的 `yield_now` 让出调度权，而不是 `sleep` 猜时序。
+    const GATE_RECOVERY_ATTEMPTS: usize = 1_000;
+
     #[tokio::test]
     async fn metrics_timeout_does_not_starve_business_routes() {
-        // L3 侧的**结构**部分：合成源永久挂起 + 并发闸占满，业务线路由形状不受影响。
-        // 真实慢查询下的池可用性不在此证明范围（§7.7 L4，Task 7）。
-        let shared = auth_state();
+        // L3 侧的**结构**部分：合成源永久挂起把并发闸**确定性占满**，业务线仍必须
+        // 快速返回。真实慢查询下的池可用性不在此证明范围（§7.7 L4，Task 7）。
+        // 四步闭环，缺一即伪阳性：
+        // 1. 4 路带凭据抓取进入挂起源 → `wait_until_full()` 等到"闸已被 4 路完全
+        //    占满"这一事实成立（`sleep` 猜不出这个前置条件）；
+        // 2. 第 5 路带凭据抓取 → 立即 503，证明闸真的满了（否则后面三条业务断言
+        //    什么都没证明）；
+        // 3. 闸满期间 `/healthz`、合法会话的 `/api/v1/auth/me`、无凭据 `/metrics`
+        //    都在业务预算内返回，且无凭据仍是 401 而不是 503——认证门禁先于并发闸；
+        // 4. `release_all()` 放行 4 路并 join，杜绝任务泄漏，再证明闸位恢复。
+        let shared = live_auth_state();
+        let hanging = Arc::new(HangingMetricsSnapshotSource::new());
         let router = build_production_router_with_metrics_source(
             inputs_with_db(
                 &lazy_db(),
@@ -753,37 +1044,127 @@ mod typed {
                 Arc::clone(&shared),
                 metrics_inputs(true),
             ),
-            Arc::new(HangingMetricsSnapshotSource),
+            hanging.clone(),
         )
         .expect("装配必须成功");
+
+        // 1. 恰好 `MAX_CONCURRENT_SCRAPE` 路带有效凭据的抓取：闸满前全部进入采集。
         let pending: Vec<_> = (0..MAX_CONCURRENT_SCRAPE)
             .map(|_| {
                 let router = router.clone();
                 let headers = authorized_metrics_headers();
                 tokio::spawn(async move {
-                    let _ = request_with_headers(&router, "GET", "/metrics", &headers).await;
+                    request_with_headers(&router, "GET", "/metrics", &headers).await
                 })
             })
             .collect();
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        let (status, _) = request_get(&router, "/healthz").await;
+        hanging.wait_until_full().await;
+        assert_eq!(
+            hanging.entered(),
+            MAX_CONCURRENT_SCRAPE,
+            "并发闸必须由且仅由 {MAX_CONCURRENT_SCRAPE} 路在途抓取占满"
+        );
+
+        // 2. 第 5 路：认证通过后取不到许可 → 立即 503（不排队），闸满这一前置条件
+        //    由此成为被断言的事实，而不是测试自己的假设。
+        let (status, _) = within_business_budget(
+            "GET /metrics（第 5 路带凭据）",
+            request_with_headers(&router, "GET", "/metrics", &authorized_metrics_headers()),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "闸被 {MAX_CONCURRENT_SCRAPE} 路占满后第 5 路必须立即 503"
+        );
+
+        // 3. 业务线未被饥饿：全部套超时护栏，一旦被拖住直接失败而非挂到 CI 超时。
+        let (status, _) =
+            within_business_budget("GET /healthz", request_get(&router, "/healthz")).await;
         assert_eq!(status, StatusCode::OK, "指标线挂起不得拖住探活");
-        let (status, body) = request_get(&router, "/api/v1/auth/me").await;
+
+        // 合法 live session 仍走通业务认证线并拿到 200：闸满期间业务线不只是"有响应
+        // 形状"，而是**真的服务完成**。
+        let cookie = HeaderValue::from_str(&format!("rsc_session={LIVE_SESSION_TOKEN}"))
+            .expect("64 位 hex 必成合法头值");
+        let mut session_headers = HeaderMap::new();
+        session_headers.insert(header::HOST, HeaderValue::from_static(HOST));
+        session_headers.insert(header::COOKIE, cookie);
+        let (status, _, body) = within_business_budget(
+            "GET /api/v1/auth/me",
+            request_returning_headers(&router, "GET", "/api/v1/auth/me", &session_headers),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "闸满期间合法会话必须正常进入并完成业务认证线：{text}"
+        );
+        let me: Value = serde_json::from_slice(&body).expect("业务认证线必须返回 JSON 信封");
+        assert_eq!(
+            me["data"]["user"]["username"],
+            json!(LIVE_SESSION_USERNAME),
+            "业务认证线必须投影出该会话的用户：{text}"
+        );
+
+        // 无凭据抓取仍是 401：认证门禁（②）先于并发闸（④），挂起的采集改变不了顺序。
+        let (status, _) = within_business_budget(
+            "GET /metrics（无凭据）",
+            request_with_headers(&router, "GET", "/metrics", &HeaderMap::new()),
+        )
+        .await;
         assert_eq!(
             status,
             StatusCode::UNAUTHORIZED,
-            "指标线挂起不得改变会话语义"
+            "认证门禁先于并发闸，闸满也不得把无凭据请求变成 503"
         );
-        assert_eq!(body["error"]["code"], json!("AUTH_REQUIRED"));
-        let (status, _) = request_with_headers(&router, "GET", "/metrics", &HeaderMap::new()).await;
-        assert_eq!(
-            status,
-            StatusCode::UNAUTHORIZED,
-            "认证门禁先于并发闸，不受挂起影响"
-        );
-        for task in pending {
-            task.abort();
+
+        // 4. 放行全部挂起采集并 join：绝不用 `abort()` 掩盖任务泄漏。
+        hanging.release_all();
+        for handle in pending {
+            let (status, _) = within_business_budget("在途抓取收尾", handle)
+                .await
+                .unwrap();
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "合成源放行后返回 Err，按 §4.5 映射 503"
+            );
         }
+
+        // 闸位恢复：再发一次有效抓取必须能**重新进入采集**。放行后源立即返回 Err，
+        // 采集失败与闸满都是 503，唯一可靠证据是 `entered()` 是否增长。
+        let entered_before = hanging.entered();
+        let mut recovered = false;
+        for _ in 0..GATE_RECOVERY_ATTEMPTS {
+            let (status, _) = within_business_budget(
+                "GET /metrics（放行后复抓）",
+                request_with_headers(&router, "GET", "/metrics", &authorized_metrics_headers()),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "放行后源返回 Err → 503"
+            );
+            if hanging.entered() > entered_before {
+                recovered = true;
+                break;
+            }
+            // 上一路的许可随其采集任务结束才 Drop：让出调度权后重试，不 sleep 猜时序。
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            recovered,
+            "放行后并发闸必须恢复可用（{GATE_RECOVERY_ATTEMPTS} 次尝试内没有一路重新进入采集）"
+        );
+        assert_eq!(
+            hanging.entered(),
+            entered_before + 1,
+            "闸位恢复后恰好一路重新进入采集"
+        );
+
         // 无新增池构造、无 detach：源码级复核。
         let production = include_str!("../src/production.rs");
         assert!(!production.contains("detach"), "指标线不得把关闭甩到后台");
