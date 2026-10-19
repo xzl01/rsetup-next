@@ -24,7 +24,9 @@ use rsetup_controller::http_auth::{AppState, HttpAuthState};
 use rsetup_controller::http_device_status::{DeviceStatusState, EmptyDeviceStatusSnapshotSource};
 use rsetup_controller::http_live::LiveAuth;
 use rsetup_controller::http_security::HttpSecurityConfig;
-use rsetup_controller::production::{ProductionInputs, build_production_router};
+use rsetup_controller::metrics::collect::MetricsRuntime;
+use rsetup_controller::metrics::config::MetricsConfig;
+use rsetup_controller::production::{MetricsLineInputs, ProductionInputs, build_production_router};
 use rsetup_controller::tasks::SqlxTaskApi;
 use rsetup_controller::tasks::http::HttpTasksState;
 use rsetup_controller::tasks::repository::SqlxTaskRepository;
@@ -93,9 +95,15 @@ impl ManagementNotificationSink for UnwiredTransportSources {
 
 /// 生产装配唯一构造点。
 ///
-/// 顺序即门禁：管理 cursor 密钥（唯一来源是环境变量，缺失/非法即 `Err`，绝不以
-/// 「无 cursor 密钥」降级启动）→ 共享认证上下文 → 五线状态各自 `auth.clone()`。
-fn production_inputs(db: &DbPool) -> Result<ProductionInputs, ControllerError> {
+/// 顺序即门禁：运行时间零点由 `main` 第一条语句提供（**不在**本函数里构造，否则
+/// uptime 会系统性低估"进程已经活多久"）→ 管理 cursor 密钥（唯一来源是环境变量，
+/// 缺失/非法即 `Err`，绝不以「无 cursor 密钥」降级启动）→ 共享认证上下文 →
+/// 六线状态各自 `auth.clone()`。
+fn production_inputs(
+    db: &DbPool,
+    metrics_config: Arc<MetricsConfig>,
+    metrics_runtime: Arc<MetricsRuntime>,
+) -> Result<ProductionInputs, ControllerError> {
     let cursor_secret = load_management_cursor_secret_from_env()?;
     install_management_cursor_secret(&cursor_secret)?;
 
@@ -139,6 +147,10 @@ fn production_inputs(db: &DbPool) -> Result<ProductionInputs, ControllerError> {
             auth,
             snapshot: Arc::new(EmptyDeviceStatusSnapshotSource),
         },
+        metrics: MetricsLineInputs {
+            config: metrics_config,
+            runtime: metrics_runtime,
+        },
         web: web_router(),
     })
 }
@@ -171,15 +183,29 @@ where
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 运行时间零点：main 函数体第一条语句即记录（`MetricsRuntime::new` 内部取
+    // `Instant::now()` 作单调锚点），包含配置解析、建池、schema 检查与绑端口在
+    // 内的整个启动过程都计入 uptime（§5.2 语义「进程启动至今」）。
+    let metrics_runtime = Arc::new(MetricsRuntime::new());
     let config = ControllerConfig::from_env()?;
+    // 指标配置门禁：在连接数据库与绑定端口之前完成（§3.6 fail-closed 无副作用）。
+    let metrics_config = Arc::new(MetricsConfig::from_env()?);
     let db = DbPool::connect(&config).await?;
     let secret_path = std::env::var_os("CONTROLLER_BOOTSTRAP_SECRET_LOG")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| "controller-bootstrap-secret.log".into());
-    start_if_ready(check_identity_schema(&db), || async {
-        bootstrap_admin(&db, &LogSecretSink(secret_path)).await?;
-        // 唯一生产装配点：五线共享同一 Arc<HttpAuthState>，指针不一致即失败关闭。
-        let router = build_production_router(production_inputs(&db)?)?;
+    // DbPool 是 Arc 句柄：clone 只是把**同一个池**移交启动闭包（schema 检查仍借用
+    // 外层句柄），不新建池。
+    let db_handle = db.clone();
+    start_if_ready(check_identity_schema(&db), || async move {
+        bootstrap_admin(&db_handle, &LogSecretSink(secret_path)).await?;
+        // 唯一生产装配点：认证四线共享同一 Arc<HttpAuthState>（指标线是独立认证
+        // 边界），指针不一致即失败关闭。
+        let router = build_production_router(production_inputs(
+            &db_handle,
+            metrics_config,
+            metrics_runtime,
+        )?)?;
         let listener = tokio::net::TcpListener::bind(&config.listen_address).await?;
         axum::serve(
             listener,

@@ -31,6 +31,7 @@ fn composed() -> Router<()> {
         component("/api/v1/users", "management"),
         component("/api/v1/tasks", "tasks"),
         component("/api/v1/devices/test/status", "status"),
+        component("/metrics", "metrics"),
         component("/", "web"),
     )
 }
@@ -44,6 +45,7 @@ async fn every_component_is_reachable_without_duplicate_probes() {
         ("/api/v1/users", "management"),
         ("/api/v1/tasks", "tasks"),
         ("/api/v1/devices/test/status", "status"),
+        ("/metrics", "metrics"),
         ("/", "web"),
     ] {
         let response = router
@@ -67,6 +69,7 @@ fn duplicate_business_path_panics_instead_of_being_hidden_by_override() {
         component("/api/v1/users", "management"),
         component("/api/v1/users", "tasks"),
         component("/api/v1/devices/test/status", "status"),
+        component("/metrics", "metrics"),
         component("/", "web"),
     );
 }
@@ -78,6 +81,7 @@ fn duplicate_business_path_panics_instead_of_being_hidden_by_override() {
 mod typed {
     use super::*;
 
+    use axum::http::{HeaderMap, HeaderValue, header};
     use rsetup_controller::AppState;
     use rsetup_controller::ControllerError;
     use rsetup_controller::DbPool;
@@ -97,11 +101,21 @@ mod typed {
         DeviceStatusState, EmptyDeviceStatusSnapshotSource,
     };
     use rsetup_controller::http_security::HttpSecurityConfig;
-    use rsetup_controller::production::{ProductionInputs, build_production_router};
+    use rsetup_controller::metrics::collect::{
+        MAX_CONCURRENT_SCRAPE, MetricsFuture, MetricsRuntime, MetricsSnapshot,
+        MetricsSnapshotSource,
+    };
+    use rsetup_controller::metrics::config::{BasicCredentials, MetricsConfig, RESERVED_PATHS};
+    use rsetup_controller::metrics::model::{DeviceCounts, TaskCounts};
+    use rsetup_controller::production::{
+        MetricsLineInputs, ProductionInputs, build_production_router,
+        build_production_router_with_metrics_source,
+    };
     use rsetup_controller::tasks::SqlxTaskApi;
     use rsetup_controller::tasks::http::HttpTasksState;
     use rsetup_controller::tasks::repository::SqlxTaskRepository;
     use rsetup_controller::tasks::service::TaskService;
+    use rsetup_controller::web::{ASSET_DIR, SPA_EXACT_ROUTES, SPA_PARAM_ROUTES};
     use rsetup_controller::web_router;
     use serde_json::{Value, json};
     use sqlx::mysql::MySqlPoolOptions;
@@ -213,15 +227,30 @@ mod typed {
         ))
     }
 
-    /// 用**指定**的认证上下文实例装配五线输入：`management_auth`/`tasks_auth`/
-    /// `status_auth` 允许与 `auth` 不同，用来构造指针不一致的负例。
-    fn inputs(
+    /// 指标线装配项的 fixture：`enabled` 与端点可按用例指定。
+    fn metrics_inputs(enabled: bool) -> MetricsLineInputs {
+        MetricsLineInputs {
+            config: Arc::new(MetricsConfig {
+                enabled,
+                endpoint: "/metrics".to_string(),
+                credentials: enabled.then(|| BasicCredentials {
+                    username: "prom_admin".to_string(),
+                    password: "metrics-composition-fixture".to_string(),
+                }),
+            }),
+            runtime: Arc::new(MetricsRuntime::new()),
+        }
+    }
+
+    /// 用**指定**池装配六线输入（§7.6 第 6/10 条要观察同一个池的读数）。
+    fn inputs_with_db(
+        db: &DbPool,
         auth: Arc<HttpAuthState>,
         management_auth: Arc<HttpAuthState>,
         tasks_auth: Arc<HttpAuthState>,
         status_auth: Arc<HttpAuthState>,
+        metrics: MetricsLineInputs,
     ) -> ProductionInputs {
-        let db = lazy_db();
         let transport = Arc::new(SyntheticSources);
         ProductionInputs {
             auth: AppState {
@@ -248,8 +277,27 @@ mod typed {
                 auth: status_auth,
                 snapshot: Arc::new(EmptyDeviceStatusSnapshotSource),
             },
+            metrics,
             web: web_router(),
         }
+    }
+
+    /// 原四参数版本保留为薄壳，供既有 3 条负例复用；指标线取禁用态。
+    fn inputs(
+        auth: Arc<HttpAuthState>,
+        management_auth: Arc<HttpAuthState>,
+        tasks_auth: Arc<HttpAuthState>,
+        status_auth: Arc<HttpAuthState>,
+    ) -> ProductionInputs {
+        let db = lazy_db();
+        inputs_with_db(
+            &db,
+            auth,
+            management_auth,
+            tasks_auth,
+            status_auth,
+            metrics_inputs(false),
+        )
     }
 
     async fn request_get(router: &Router<()>, uri: &str) -> (StatusCode, Value) {
@@ -308,14 +356,21 @@ mod typed {
     }
 
     #[tokio::test]
-    async fn shared_auth_context_composes_all_five_lines() {
+    async fn shared_auth_context_composes_all_six_lines() {
+        // 原五线断言全部保留，另加指标线：四件事同时成立才是单端口六线合并。
         let shared = auth_state();
-        let router = build_production_router(inputs(
-            Arc::clone(&shared),
-            Arc::clone(&shared),
-            Arc::clone(&shared),
-            Arc::clone(&shared),
-        ))
+        let db = lazy_db();
+        let router = build_production_router_with_metrics_source(
+            inputs_with_db(
+                &db,
+                Arc::clone(&shared),
+                Arc::clone(&shared),
+                Arc::clone(&shared),
+                Arc::clone(&shared),
+                metrics_inputs(true),
+            ),
+            Arc::new(SyntheticMetricsSnapshotSource),
+        )
         .expect("同一 Arc<HttpAuthState> 必须装配成功");
 
         // auth 线：探活由 auth 线注册，且只有一个实现。
@@ -327,6 +382,15 @@ mod typed {
         let (status, body) = request_get(&router, "/api/v1/auth/me").await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "/api/v1/auth/me");
         assert_eq!(body["error"]["code"], json!("AUTH_REQUIRED"));
+
+        // metrics 线：无凭据 401；带 Basic 凭据 200，读数来自注入的合成源。
+        let (status, _) = request_with_headers(&router, "GET", "/metrics", &HeaderMap::new()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "/metrics 无凭据必须 401");
+        let (status, body) =
+            request_with_headers(&router, "GET", "/metrics", &authorized_metrics_headers()).await;
+        assert_eq!(status, StatusCode::OK, "/metrics 带凭据必须 200");
+        let text = String::from_utf8(body).expect("UTF-8 文本");
+        assert!(text.contains("rsetup_controller_devices_total{admission=\"APPROVED\"} 3"));
 
         // management / tasks / status 三线：路由已注册（否则 404），且都在共享
         // gate 处严格 401，未触达任何仓储。含 percent-decode 非法 UTF-8 的状态
@@ -389,5 +453,344 @@ mod typed {
             );
             assert_eq!(body["error"]["code"], json!("AUTH_REQUIRED"), "{path}");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Task 6：指标线六线装配与 §7.6 第 1–10 条
+    // -----------------------------------------------------------------
+
+    /// 合成汇总源：两条聚合的取值由测试给定，池 gauge 仍走真实内存读数。
+    struct SyntheticMetricsSnapshotSource;
+
+    impl MetricsSnapshotSource for SyntheticMetricsSnapshotSource {
+        fn snapshot(&self) -> MetricsFuture<'_, MetricsSnapshot> {
+            Box::pin(async {
+                Ok(MetricsSnapshot {
+                    devices: DeviceCounts {
+                        approved: 3,
+                        pending: 2,
+                        rejected: 1,
+                    },
+                    tasks: TaskCounts {
+                        pending: 1,
+                        running: 2,
+                        succeeded: 4,
+                        failed: 5,
+                    },
+                })
+            })
+        }
+    }
+
+    /// 永久挂起的合成源（§7.6 第 10 条）。
+    struct HangingMetricsSnapshotSource;
+
+    impl MetricsSnapshotSource for HangingMetricsSnapshotSource {
+        fn snapshot(&self) -> MetricsFuture<'_, MetricsSnapshot> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    fn authorized_metrics_headers() -> HeaderMap {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!(
+                "Basic {}",
+                STANDARD.encode("prom_admin:metrics-composition-fixture")
+            ))
+            .unwrap(),
+        );
+        headers
+    }
+
+    async fn request_with_headers(
+        router: &Router<()>,
+        method: &str,
+        uri: &str,
+        headers: &HeaderMap,
+    ) -> (StatusCode, Vec<u8>) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            builder = builder.header(name, value);
+        }
+        let response = router
+            .clone()
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 262_144).await.unwrap();
+        (status, bytes.to_vec())
+    }
+
+    /// 从编译期嵌入的 `index.html` 取第一个真实资产路径（与 `web.rs` 同源，不
+    /// 硬编码哈希名）：未嵌入的 `/assets/…` 按 web 线契约坚决 404（不回退 HTML），
+    /// 「资源前缀仍由 web 线应答」只能用真实嵌入资产证明。
+    fn embedded_asset_path() -> String {
+        let html = include_str!("../../../apps/controller-web/dist/index.html");
+        let at = html
+            .find(ASSET_DIR)
+            .expect("index.html 必须引用 /assets/ 资产");
+        let end = html[at..]
+            .find('"')
+            .map(|offset| at + offset)
+            .expect("资产引用必须以引号收尾");
+        html[at..end].to_string()
+    }
+
+    #[test]
+    #[should_panic(expected = "Overlapping method route")]
+    fn metrics_path_colliding_with_reserved_route_panics_on_merge() {
+        // 配置期拦截（§3.4）之外的第二道网：真把两条 /metrics 递进合并，仍必须 panic。
+        let _router = compose_component_routers(
+            component("/healthz", "auth-health"),
+            component("/api/v1/users", "management"),
+            component("/api/v1/tasks", "tasks"),
+            component("/api/v1/devices/test/status", "status"),
+            component("/metrics", "metrics"),
+            component("/metrics", "duplicate-metrics"),
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_gauges_read_the_shared_pool_only() {
+        // 两条聚合走合成源，池 gauge 仍是真实内存读数：lazy 池未建任何连接 → 全 0，
+        // 且抓取前后 lazy 池都不得产生连接（证明读的是 auth.db 那个池且不发查询）。
+        let shared = auth_state();
+        let db = lazy_db();
+        assert_eq!(db.0.size(), 0, "lazy 池构造不连接");
+        let router = build_production_router_with_metrics_source(
+            inputs_with_db(
+                &db,
+                Arc::clone(&shared),
+                Arc::clone(&shared),
+                Arc::clone(&shared),
+                Arc::clone(&shared),
+                metrics_inputs(true),
+            ),
+            Arc::new(SyntheticMetricsSnapshotSource),
+        )
+        .expect("装配必须成功");
+        let (status, body) =
+            request_with_headers(&router, "GET", "/metrics", &authorized_metrics_headers()).await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8(body).expect("UTF-8 文本");
+        assert!(
+            text.contains("rsetup_controller_db_pool_connections{state=\"active\"} 0"),
+            "lazy 池无活动连接：{text}"
+        );
+        assert!(
+            text.contains("rsetup_controller_db_pool_connections{state=\"idle\"} 0"),
+            "lazy 池无空闲连接：{text}"
+        );
+        assert_eq!(
+            db.0.size(),
+            0,
+            "抓取前后 lazy 池都不得建立连接（指标线不发查询）"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_line_never_touches_session_boundary() {
+        // 完整合法会话 Cookie 打 /metrics → 仍 401（会话不是指标线的凭据）；
+        // 随后打 /api/v1/auth/me 仍按会话语义工作 → 抓取未污染会话/CSRF/限速。
+        // 注意：401 只在**启用态**成立（禁用态按 §4.5 恒 404、与路径不存在不可
+        // 区分），因此本用例显式传入 metrics_inputs(true)，不套薄壳 inputs()。
+        let shared = auth_state();
+        let db = lazy_db();
+        let router = build_production_router_with_metrics_source(
+            inputs_with_db(
+                &db,
+                Arc::clone(&shared),
+                Arc::clone(&shared),
+                Arc::clone(&shared),
+                Arc::clone(&shared),
+                metrics_inputs(true),
+            ),
+            Arc::new(SyntheticMetricsSnapshotSource),
+        )
+        .expect("装配必须成功");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("rsc_session=composition-fixture-session"),
+        );
+        let (status, _) = request_with_headers(&router, "GET", "/metrics", &headers).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "会话 Cookie 不是指标线凭据"
+        );
+        let (status, body) = request_get(&router, "/api/v1/auth/me").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "会话线路语义不变");
+        assert_eq!(body["error"]["code"], json!("AUTH_REQUIRED"));
+    }
+
+    #[tokio::test]
+    async fn reserved_paths_stay_registered() {
+        // 保留集合内的路径必须仍由所属条线应答，不被指标线抢占或退化为 404。
+        let shared = auth_state();
+        let router = build_production_router_with_metrics_source(
+            inputs_with_db(
+                &lazy_db(),
+                Arc::clone(&shared),
+                Arc::clone(&shared),
+                Arc::clone(&shared),
+                Arc::clone(&shared),
+                metrics_inputs(true),
+            ),
+            Arc::new(SyntheticMetricsSnapshotSource),
+        )
+        .expect("装配必须成功");
+        for path in [
+            "/healthz",
+            "/readyz",
+            "/",
+            "/login",
+            "/password",
+            "/sessions",
+        ] {
+            let (status, _) = request_get(&router, path).await;
+            assert_ne!(
+                status,
+                StatusCode::NOT_FOUND,
+                "保留路径 {path} 不得退化为 404"
+            );
+        }
+        let asset = embedded_asset_path();
+        let (status, _) = request_with_headers(&router, "GET", &asset, &HeaderMap::new()).await;
+        assert_ne!(
+            status,
+            StatusCode::NOT_FOUND,
+            "资源前缀仍由 web 线应答（{asset}）"
+        );
+        // 保留集合不与代码漂移：web.rs 的三张表逐条被 RESERVED_PATHS 覆盖。
+        for path in SPA_EXACT_ROUTES {
+            assert!(
+                RESERVED_PATHS.contains(path),
+                "SPA 精确路由 {path} 未登记进 RESERVED_PATHS"
+            );
+        }
+        // ASSET_DIR 是 "/assets/"，登记形态是前缀段 "/assets"（§6.5）。
+        let asset_prefix = ASSET_DIR.trim_end_matches('/');
+        assert!(
+            RESERVED_PATHS.contains(&asset_prefix),
+            "资源目录前缀 {asset_prefix} 未登记（ASSET_DIR = {ASSET_DIR}）"
+        );
+        for template in SPA_PARAM_ROUTES {
+            // "/devices/{id}" → 字面段 "/devices"（§6.5 的前缀段）。
+            let literal = format!(
+                "/{}",
+                template
+                    .trim_start_matches('/')
+                    .split('/')
+                    .next()
+                    .unwrap_or_default()
+            );
+            assert!(
+                RESERVED_PATHS.contains(&literal.as_str()),
+                "SPA 参数路由字面段 {literal} 未登记（模板 {template}）"
+            );
+        }
+    }
+
+    #[test]
+    fn production_inputs_exposes_no_second_pool() {
+        // 结构性断言：装配项只有 config 与 runtime，写全字段，杜绝 ..Default 兜底。
+        let inputs = MetricsLineInputs {
+            config: Arc::new(MetricsConfig {
+                enabled: false,
+                endpoint: "/metrics".to_string(),
+                credentials: None,
+            }),
+            runtime: Arc::new(MetricsRuntime::new()),
+        };
+        // 下面两行是"字段集合恰为 {config, runtime}"的编译期证明：多一个字段就编译不过。
+        let _config: Arc<MetricsConfig> = Arc::clone(&inputs.config);
+        let _runtime: Arc<MetricsRuntime> = Arc::clone(&inputs.runtime);
+        // 源码级静态门禁（§6.3、§7.8）：main.rs 只调用 build_production_router，
+        // 真实源与测试注入缝只出现在 production.rs。
+        let main = include_str!("../src/main.rs");
+        assert!(
+            main.contains("build_production_router("),
+            "main.rs 必须经唯一入口装配"
+        );
+        assert!(
+            !main.contains("build_production_router_with_metrics_source"),
+            "测试注入缝绝不被生产路径调用"
+        );
+        assert!(
+            !main.contains("SqlxMetricsSnapshotSource"),
+            "真实汇总源只能在 production.rs 内构造"
+        );
+        let production = include_str!("../src/production.rs");
+        assert!(
+            production.contains("SqlxMetricsSnapshotSource::new(inputs.auth.db.clone())"),
+            "汇总源必须由 auth.db 派生（I2 架构契约）"
+        );
+        let api = include_str!("../src/lib.rs");
+        assert!(!api.contains("SqlxMetricsSnapshotSource::new"));
+        let http = include_str!("../src/metrics/http.rs");
+        // 只看 `#[cfg(test)]` 之前的实现段：Task 5 的单测用真实源（lazy 池、只读、
+        // 不建池）验证失败/超时映射，那是测试段而非生产路径。
+        let http_impl = http.split("#[cfg(test)]").next().unwrap_or(http);
+        assert!(!http_impl.contains("SqlxMetricsSnapshotSource::new"));
+    }
+
+    #[tokio::test]
+    async fn metrics_timeout_does_not_starve_business_routes() {
+        // L3 侧的**结构**部分：合成源永久挂起 + 并发闸占满，业务线路由形状不受影响。
+        // 真实慢查询下的池可用性不在此证明范围（§7.7 L4，Task 7）。
+        let shared = auth_state();
+        let router = build_production_router_with_metrics_source(
+            inputs_with_db(
+                &lazy_db(),
+                Arc::clone(&shared),
+                Arc::clone(&shared),
+                Arc::clone(&shared),
+                Arc::clone(&shared),
+                metrics_inputs(true),
+            ),
+            Arc::new(HangingMetricsSnapshotSource),
+        )
+        .expect("装配必须成功");
+        let pending: Vec<_> = (0..MAX_CONCURRENT_SCRAPE)
+            .map(|_| {
+                let router = router.clone();
+                let headers = authorized_metrics_headers();
+                tokio::spawn(async move {
+                    let _ = request_with_headers(&router, "GET", "/metrics", &headers).await;
+                })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let (status, _) = request_get(&router, "/healthz").await;
+        assert_eq!(status, StatusCode::OK, "指标线挂起不得拖住探活");
+        let (status, body) = request_get(&router, "/api/v1/auth/me").await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "指标线挂起不得改变会话语义"
+        );
+        assert_eq!(body["error"]["code"], json!("AUTH_REQUIRED"));
+        let (status, _) = request_with_headers(&router, "GET", "/metrics", &HeaderMap::new()).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "认证门禁先于并发闸，不受挂起影响"
+        );
+        for task in pending {
+            task.abort();
+        }
+        // 无新增池构造、无 detach：源码级复核。
+        let production = include_str!("../src/production.rs");
+        assert!(!production.contains("detach"), "指标线不得把关闭甩到后台");
+        assert_eq!(
+            production.matches("MySqlPoolOptions::new").count(),
+            0,
+            "production.rs 不得新建连接池"
+        );
     }
 }

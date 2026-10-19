@@ -17,8 +17,8 @@ use axum::routing::any;
 /// 编译期嵌入的 Vite 入口 HTML。缺失 `dist` 时 `include_str!` 直接编译失败（fail-closed）。
 const INDEX_HTML: &str = include_str!("../../../apps/controller-web/dist/index.html");
 
-/// 构建产物资产的 URL 前缀。
-const ASSET_DIR: &str = "/assets/";
+/// 静态资源目录前缀（改为 `pub` 只为 §7.6 第 8 条的一致性断言；值逐字不变）。
+pub const ASSET_DIR: &str = "/assets/";
 
 const MIME_HTML: &str = "text/html; charset=utf-8";
 const MIME_JS: &str = "text/javascript";
@@ -58,7 +58,7 @@ const ASSETS: &[EmbeddedAsset] = &[
 ];
 
 /// 已知 SPA 页面路由白名单（精确路径）。
-const SPA_EXACT_ROUTES: &[&str] = &[
+pub const SPA_EXACT_ROUTES: &[&str] = &[
     "/",
     "/login",
     "/password",
@@ -69,7 +69,7 @@ const SPA_EXACT_ROUTES: &[&str] = &[
 ];
 
 /// 已知 SPA 页面路由白名单（带路径参数，axum 0.8 语法）。
-const SPA_PARAM_ROUTES: &[&str] = &["/devices/{id}", "/tasks/{id}", "/admin/{*rest}"];
+pub const SPA_PARAM_ROUTES: &[&str] = &["/devices/{id}", "/tasks/{id}", "/admin/{*rest}"];
 
 // ---------------------------------------------------------------------------
 // 编译期资产表校验（const 断言）
