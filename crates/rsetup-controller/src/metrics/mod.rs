@@ -5,12 +5,14 @@
 //! 或 `sqlx`。本模块整体是**独立认证边界**：不读会话 Cookie、不建会话、不占 CSRF/限速桶、
 //! 不写审计（I3/I6），因此这里 MUST NOT 出现 `Arc<HttpAuthState>`、`Session` 或 `EndpointId`。
 
+pub mod auth;
 pub mod config;
 
 /// Rust edition 标签值。Cargo 不暴露 `CARGO_PKG_EDITION`，故显式声明，
 /// 由 `metrics_edition_matches_workspace_manifest` 与根清单 `[workspace.package]` 对齐。
 pub const EDITION: &str = "2024";
 
+pub use auth::{ParsedBasic, parse_authorization, verify, www_authenticate};
 pub use config::{
     AUTH_PASSWORD_ENV, AUTH_USER_ENV, BasicCredentials, CONFIG_PATH_ENV, DEFAULT_CONFIG_PATH,
     DEFAULT_ENDPOINT, EnvRead, MetricsAuthRaw, MetricsConfig, MetricsFile, MetricsSection, REALM,
