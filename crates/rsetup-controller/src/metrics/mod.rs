@@ -8,6 +8,7 @@
 pub mod auth;
 pub mod collect;
 pub mod config;
+pub mod http;
 pub mod model;
 pub mod render;
 
@@ -26,6 +27,7 @@ pub use config::{
     DEFAULT_ENDPOINT, EnvRead, MetricsAuthRaw, MetricsConfig, MetricsFile, MetricsSection, REALM,
     RESERVED_PATHS, is_reserved,
 };
+pub use http::{MetricsState, build_metrics_router};
 pub use model::{
     AdmissionBucket, DeviceCounts, PoolCounts, ScrapeValues, TaskBucket, TaskCounts,
     admission_label, task_bucket,
