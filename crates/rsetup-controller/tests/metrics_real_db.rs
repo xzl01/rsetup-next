@@ -268,21 +268,25 @@ async fn aggregates_match_table_distribution_and_sum_invariant() {
         .snapshot()
         .await
         .expect("既有数据上的两条聚合必须成功");
-    for (label, expected) in [
+    // 对账一律使用**持久层取值**：`admission_state` 的合法枚举是 APPROVED/PENDING/
+    // REVOKED，而指标模型（`src/metrics/model.rs`）把持久值 `REVOKED` 导出为指标标签
+    // `REJECTED`（§5.2.2 刻意留档的命名映射偏差）。用标签 `REJECTED` 去 COUNT(*) 恒为
+    // 0，与快照读数必然失配（P1）。
+    for (db_val, expected) in [
         ("APPROVED", snapshot.devices.approved),
         ("PENDING", snapshot.devices.pending),
-        ("REJECTED", snapshot.devices.rejected),
+        ("REVOKED", snapshot.devices.rejected), // 持久层 REVOKED → 指标侧 rejected 桶
     ] {
         let rows: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM devices WHERE CAST(admission_state AS BINARY) = CAST(? AS BINARY)",
         )
-        .bind(label)
+        .bind(db_val)
         .fetch_one(&db.0)
         .await
         .unwrap();
         assert_eq!(
             rows as u64, expected,
-            "admission={label} 的聚合取值必须与独立 COUNT(*) 对账"
+            "admission_state={db_val} 的聚合取值必须与独立 COUNT(*) 对账"
         );
     }
     let device_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM devices")
@@ -336,21 +340,23 @@ async fn grouping_is_byte_exact_on_both_engines() {
         .snapshot()
         .await
         .expect("只存在合法 admission_state 取值时 snapshot 必须成功");
-    for (label, got) in [
+    // 与第 1 组同源（P1）：插入的是持久值 `REVOKED`，对账 SQL 的过滤条件也必须是
+    // 持久值；指标标签 `REJECTED` 只存在于渲染层，用它 COUNT(*) 必为 0。
+    for (db_val, got) in [
         ("APPROVED", snapshot.devices.approved),
         ("PENDING", snapshot.devices.pending),
-        ("REJECTED", snapshot.devices.rejected),
+        ("REVOKED", snapshot.devices.rejected), // 持久层是 REVOKED，指标模型映射为 rejected
     ] {
         let want: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM devices WHERE CAST(admission_state AS BINARY) = CAST(? AS BINARY)",
         )
-        .bind(label)
+        .bind(db_val)
         .fetch_one(&db.0)
         .await
         .unwrap();
         assert_eq!(
             want as u64, got,
-            "合法取值下 admission={label} 必须与独立 COUNT(*) 对账"
+            "合法取值下 admission_state={db_val} 必须与独立 COUNT(*) 对账"
         );
     }
     cleanup_rows(&db, &valid).await;
@@ -442,11 +448,15 @@ async fn grouping_is_byte_exact_on_both_engines() {
     );
     cleanup_task_rows(&db, &valid_tasks).await;
 
-    // ---- B2（任务侧·字节级分组，F2）：`state` 与 `outcome` 两列都按字节分组：
-    // 四个分组键两两只差大小写或只差尾部空格，必须各自成组。
+    // ---- B2（任务侧·字节级分组，F2）：`state` 与 `outcome` 两列都按字节分组。
+    // 以合法基线 `('completed', 'success')` 为中心，四行变体各自**只有一列**与基线
+    // 不同（差大小写或差尾部空格），共 5 个分组键：任一列退化为 PAD SPACE 都只会
+    // 让**它自己那一列**的变体并回基线组，`task_groups.len() >= 5` + 逐组计数即可
+    // 独立证明"state 或 outcome 任一列折叠"都能被发现。
     let dirty_tasks = task_fixture_rows(
         &db,
         &[
+            ("completed", Some("success")),  // 合法基线
             ("Completed", Some("success")),  // state 差大小写
             ("completed ", Some("success")), // state 差尾部空格
             ("completed", Some("SUCCESS")),  // outcome 差大小写
@@ -455,7 +465,14 @@ async fn grouping_is_byte_exact_on_both_engines() {
     )
     .await;
     let task_groups = grouped_tasks(&db).await;
+    assert!(
+        task_groups.len() >= 5,
+        "5 个分组键必须各自成组（state/outcome 任一列退化为 PAD SPACE 都会让分组数掉到 5 以下）：\
+         实测 {} 组 {task_groups:?}",
+        task_groups.len()
+    );
     for (state, outcome) in [
+        ("completed", Some("success")),
         ("Completed", Some("success")),
         ("completed ", Some("success")),
         ("completed", Some("SUCCESS")),
@@ -469,23 +486,26 @@ async fn grouping_is_byte_exact_on_both_engines() {
     cleanup_task_rows(&db, &dirty_tasks).await;
 
     // ---- B3/B4（任务侧·单类异常隔离，F2）：
-    // B3：`state` 不在四值域（哪怕只差大小写）→ unknown task state；
-    // B4：`state` 合法而 `outcome` 不在枚举 → unknown task outcome。
+    // B3：`state` 不在四值域（大小写或尾空格任一形式的字节差异都算）→ unknown task state；
+    // B4：`state` 合法而 `outcome` 不在枚举（含尾空格）→ unknown task outcome。
+    // 每轮**只存在这一行异常**，排除"多类脏值混合才触发"的假阳性。
     for (row, marker) in [
         (("Completed", Some("success")), "unknown task state"),
+        (("completed ", Some("success")), "unknown task state"), // state 尾空格
         (("completed", Some("SUCCESS")), "unknown task outcome"),
+        (("completed", Some("success ")), "unknown task outcome"), // outcome 尾空格
     ] {
         let one = task_fixture_rows(&db, &[row]).await;
         let error = source
             .snapshot()
             .await
-            .expect_err("单个未知任务 state/outcome 必须让整次抓取失败（I4/G4）");
+            .expect_err("单个未知任务 state/outcome（含尾空格）必须让整次抓取失败（I4/G4）");
         let text = format!("{error:?}");
         assert!(
             text.contains(marker),
             "任务侧异常必须走 {marker} 去敏文案：{text}"
         );
-        for leak in ["Completed", "SUCCESS", "completed"] {
+        for leak in ["Completed", "SUCCESS", "completed", "success"] {
             assert!(!text.contains(leak), "去敏：错误不得回显取值原文：{text}");
         }
         cleanup_task_rows(&db, &one).await;
