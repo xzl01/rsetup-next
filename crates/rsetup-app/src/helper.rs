@@ -4,6 +4,7 @@ use rsetup_core::{
     SystemInstallManager, SystemInstallRequest,
 };
 use std::env;
+use std::ffi::{OsStr, OsString};
 
 #[derive(Debug, PartialEq)]
 enum HelperRequest {
@@ -71,7 +72,10 @@ impl From<anyhow::Error> for HelperFailure {
 }
 
 fn main() {
-    let arguments = env::args().skip(1).collect::<Vec<_>>();
+    // 必须使用 args_os()：args() 在非法 UTF-8 argv 上于标准库内部 unwrap() panic（退出码 101），
+    // 把携带原始字节的 panic 原文写入 stderr，既绕过下面的 JSON 错误信封，又回显操作员/上游输入。
+    // args_os() 永不 panic，非法字节的处理交给 parse_request 的无损解码统一折叠为固定错误。
+    let arguments = env::args_os().skip(1).collect::<Vec<_>>();
     match run(&arguments) {
         Ok(response) => match serde_json::to_string(&response) {
             Ok(encoded) => println!("{encoded}"),
@@ -102,7 +106,22 @@ fn emit_failure(failure: &HelperFailure) {
     std::process::exit(1);
 }
 
-fn run(arguments: &[String]) -> Result<serde_json::Value> {
+/// 参数非法时的固定错误文案（保持与原实现完全一致）：纯 ASCII，绝不含任何收到的 token。
+const INVALID_REQUEST: &str = "invalid helper request; expected a fixed native operation";
+
+/// 把一个业务参数从 `OsStr` 无损转成 `String`。
+///
+/// 只有当参数是合法 UTF-8 时才继续；任何非法 Unicode 一律返回同一条固定 ASCII 错误。绝不
+/// `Debug`/`Display` 原始 `OsStr`，也绝不 `to_string_lossy` 后带着替换符继续危险操作 —— 与命令词
+/// 精确比较不同，业务参数最终要落到底层动作，因此宁可拒绝也不能对字节做任何有损猜测。
+fn text(value: &OsStr) -> Result<String> {
+    value
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("{INVALID_REQUEST}"))
+}
+
+fn run(arguments: &[OsString]) -> Result<serde_json::Value> {
     if !cfg!(target_os = "linux") || effective_uid() != Some(0) {
         bail!("rsetup-next-helper must run as root through Polkit");
     }
@@ -176,25 +195,26 @@ fn run(arguments: &[String]) -> Result<serde_json::Value> {
     Ok(response)
 }
 
-fn parse_request(arguments: &[String]) -> Result<HelperRequest> {
+fn parse_request(arguments: &[OsString]) -> Result<HelperRequest> {
     match arguments {
         [command] if command == "overlays-inspect" => Ok(HelperRequest::OverlaysInspect),
         [command, action_id, confirmation]
             if command == "action" && confirmation == "--confirmed" =>
         {
-            Ok(HelperRequest::Action(action_id.clone()))
+            Ok(HelperRequest::Action(text(action_id)?))
         }
         [command, provider_id, plan_token, confirmation]
             if command == "sources-apply" && confirmation == "--confirmed" =>
         {
             Ok(HelperRequest::SourcesApply {
-                provider_id: provider_id.clone(),
-                plan_token: plan_token.clone(),
+                provider_id: text(provider_id)?,
+                plan_token: text(plan_token)?,
             })
         }
         [command, selected, plan_token, confirmation]
             if command == "overlays-apply" && confirmation == "--confirmed" =>
         {
+            let selected = text(selected)?;
             let selected_ids = selected
                 .split(',')
                 .filter(|id| !id.is_empty())
@@ -202,7 +222,7 @@ fn parse_request(arguments: &[String]) -> Result<HelperRequest> {
                 .collect();
             Ok(HelperRequest::OverlaysApply {
                 selected_ids,
-                plan_token: plan_token.clone(),
+                plan_token: text(plan_token)?,
             })
         }
         [
@@ -213,26 +233,33 @@ fn parse_request(arguments: &[String]) -> Result<HelperRequest> {
             plan_token,
             confirmation,
         ] if command == "spi-flash-apply" && confirmation == "--confirmed" => {
+            // "-" 是「无镜像」哨兵，只作 OsStr 精确比较；其余镜像 id 无损解码，非法字节直接拒绝。
+            let image_id = if image_id.as_os_str() == OsStr::new("-") {
+                None
+            } else {
+                Some(text(image_id)?)
+            };
             Ok(HelperRequest::SpiFlashApply {
                 request: SpiFlashRequest {
-                    operation: operation.clone(),
-                    target_id: target_id.clone(),
-                    image_id: (image_id != "-").then(|| image_id.clone()),
+                    operation: text(operation)?,
+                    target_id: text(target_id)?,
+                    image_id,
                 },
-                plan_token: plan_token.clone(),
+                plan_token: text(plan_token)?,
             })
         }
         [command, policy, confirmation]
             if command == "thermal-apply" && confirmation == "--confirmed" =>
         {
-            Ok(HelperRequest::ThermalApply(policy.clone()))
+            Ok(HelperRequest::ThermalApply(text(policy)?))
         }
         [command, request, plan_token, confirmation]
             if command == "fan-curve-apply" && confirmation == "--confirmed" =>
         {
+            let request = text(request)?;
             Ok(HelperRequest::FanCurveApply {
-                request: serde_json::from_str(request).context("invalid fan curve request")?,
-                plan_token: plan_token.clone(),
+                request: serde_json::from_str(&request).context("invalid fan curve request")?,
+                plan_token: text(plan_token)?,
             })
         }
         [command] if command == "thermal-restore" => Ok(HelperRequest::ThermalRestore),
@@ -240,8 +267,8 @@ fn parse_request(arguments: &[String]) -> Result<HelperRequest> {
             if command == "led-trigger" && confirmation == "--confirmed" =>
         {
             Ok(HelperRequest::LedTrigger {
-                led_id: led_id.clone(),
-                trigger: trigger.clone(),
+                led_id: text(led_id)?,
+                trigger: text(trigger)?,
             })
         }
         [
@@ -255,9 +282,14 @@ fn parse_request(arguments: &[String]) -> Result<HelperRequest> {
             cycle_ms,
             confirmation,
         ] if command == "led-rgb" && confirmation == "--confirmed" => {
+            let red = text(red)?;
+            let green = text(green)?;
+            let blue = text(blue)?;
+            let brightness = text(brightness)?;
+            let cycle_ms = text(cycle_ms)?;
             Ok(HelperRequest::LedRgb(RgbLedConfig {
-                group_id: group_id.clone(),
-                mode: mode.clone(),
+                group_id: text(group_id)?,
+                mode: text(mode)?,
                 red: red.parse().context("invalid red channel")?,
                 green: green.parse().context("invalid green channel")?,
                 blue: blue.parse().context("invalid blue channel")?,
@@ -274,14 +306,14 @@ fn parse_request(arguments: &[String]) -> Result<HelperRequest> {
             confirmation,
         ] if command == "system-install-apply" && confirmation == "--confirmed" => {
             Ok(HelperRequest::SystemInstallApply {
-                target_id: target_id.clone(),
-                image_path: image_path.clone(),
-                plan_token: plan_token.clone(),
-                acknowledgement: acknowledgement.clone(),
+                target_id: text(target_id)?,
+                image_path: text(image_path)?,
+                plan_token: text(plan_token)?,
+                acknowledgement: text(acknowledgement)?,
             })
         }
         [command] if command == "led-restore" => Ok(HelperRequest::LedRestore),
-        _ => bail!("invalid helper request; expected a fixed native operation"),
+        _ => bail!("{INVALID_REQUEST}"),
     }
 }
 
@@ -544,7 +576,7 @@ mod tests {
         .to_string();
         let request = parse_request(&[
             "fan-curve-apply".into(),
-            fan_curve_json.clone(),
+            fan_curve_json.clone().into(),
             "curve-plan-token".into(),
             "--confirmed".into(),
         ])
@@ -612,7 +644,7 @@ mod tests {
                 parse_request(
                     &rejected
                         .iter()
-                        .map(|value| value.to_string())
+                        .map(|value| OsString::from(*value))
                         .collect::<Vec<_>>()
                 )
                 .is_err(),
@@ -622,12 +654,87 @@ mod tests {
         assert!(
             parse_request(&[
                 "fan-curve-apply".into(),
-                fan_curve_json,
+                fan_curve_json.into(),
                 "curve-plan-token".into(),
                 "--confirmed".into(),
                 "extra".into(),
             ])
             .is_err()
         );
+    }
+
+    /// Unix argv 可以是任意非 NUL 字节。这里用 `from_vec` 构造真实含非法 UTF-8 的 OsString，
+    /// 直接驱动 `parse_request`（不读环境、不受 root 门禁影响），证明非法字节既不 panic 也不回显，
+    /// 并在任何真实特权动作之前被拒绝。
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_os_arguments_are_rejected_without_panic_or_echo() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let secret = OsString::from_vec(b"FAKE_CLI_SECRET_ONLY\xff".to_vec());
+        let cases: Vec<Vec<OsString>> = vec![
+            // 命令词位非法：不匹配任何固定动词。
+            vec![secret.clone()],
+            // 业务参数位非法：解码失败 → 同一条固定 ASCII 错误，绝不 lossy。
+            vec![
+                OsString::from("action"),
+                secret.clone(),
+                OsString::from("--confirmed"),
+            ],
+            vec![
+                OsString::from("overlays-apply"),
+                OsString::from("uart.dtbo"),
+                secret.clone(),
+                OsString::from("--confirmed"),
+            ],
+            vec![
+                OsString::from("led-trigger"),
+                OsString::from("status"),
+                secret.clone(),
+                OsString::from("--confirmed"),
+            ],
+            vec![
+                OsString::from("system-install-apply"),
+                OsString::from("sda"),
+                secret.clone(),
+                OsString::from("install-plan-0"),
+                OsString::from("sda"),
+                OsString::from("--confirmed"),
+            ],
+            // 纯非法字节混排。
+            vec![OsString::from_vec(vec![0xff, 0xfe, 0x80])],
+        ];
+        for argv in cases {
+            let error = parse_request(&argv).expect_err("非 UTF-8 参数必须被拒绝");
+            assert_failure_is_ascii_without_secret(&error);
+        }
+    }
+
+    /// `text()` 对纯非法字节直接返回固定错误，绝不返回带替换符的字符串；合法 UTF-8（含正常多字节
+    /// 明文）则无损通过。
+    #[cfg(unix)]
+    #[test]
+    fn text_never_lossy_decodes_non_utf8() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let raw = OsString::from_vec(b"FAKE_CLI_SECRET_ONLY\xff".to_vec());
+        let error = text(&raw).expect_err("非法 UTF-8 必须拒绝");
+        assert_failure_is_ascii_without_secret(&error);
+        assert_eq!(
+            text(OsStr::new("valid-\u{4e2d}\u{6587}")).unwrap(),
+            "valid-中文",
+            "合法多字节 UTF-8 必须无损保留"
+        );
+    }
+
+    #[track_caller]
+    fn assert_failure_is_ascii_without_secret(error: &anyhow::Error) {
+        let message = error.to_string();
+        assert_eq!(message, INVALID_REQUEST, "错误必须是纯 ASCII 固定文案");
+        assert!(message.is_ascii());
+        assert!(!message.contains("FAKE_CLI_SECRET_ONLY"), "参数不得回显");
+        assert!(!message.contains('\u{FFFD}'), "不得含 lossy 替换符");
+        // Debug 同样不得带出原始字节（token 未被保留）。
+        assert!(!format!("{error:?}").contains("FAKE_CLI_SECRET_ONLY"));
     }
 }
