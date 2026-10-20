@@ -17,7 +17,12 @@ import { isU64DecimalString } from './types'
  * 9. 快照落库只前进水位：对象 revision 低于已应用水位时保留更高水位，绝不逆序回退；
  * 10. 事件对象不在当前全量快照成员中时不凭提示直接打补丁，改为当前授权 GET 重取；
  * 11. 每次调用外部回调（`onSnapshot`/`onEntityUpdate`）之后与每条缓冲事件应用之前，都必须复核
- *     连接/同步代际，撤权或 reset 后绝不继续灌入数据。
+ *     连接/同步代际，撤权或 reset 后绝不继续灌入数据；
+ * 12. 缓冲提取按代际取子集：`drainBuffer` 入口先复核票据，且只移除并回放属于本轮票据代际的条目，
+ *     其他代际（含订阅方回调内部 reset/resync 后新产生的条目）原序留在共享缓冲，交给各自那一轮回放，
+ *     绝不被失效的旧同步流程抽空吞掉；
+ * 13. 未注册快照来源的 kind 没有任何已授权成员事实，其提示 fail-closed 静默忽略：不分发补丁，
+ *     也不建立或污染水位（06 §4）。
  */
 
 /** 统一命名事件；客户端对五个名称分别注册独立监听（不能只监听默认 `message`）。 */
@@ -223,7 +228,7 @@ export function createEventStreamClient(options: EventStreamClientOptions = {}):
    * 不在集合内的对象提示属于「列表成员变化/无法对应快照」，只能重取，不能当补丁分发。
    */
   const members = new Map<EntityKind, Set<string>>()
-  /** 已注册快照来源的 kind：未注册来源的 kind 没有成员事实，不做成员判定。 */
+  /** 已注册快照来源的 kind：未注册来源的 kind 没有成员事实，其提示一律 fail-closed 静默忽略。 */
   const sourceKinds = new Set<EntityKind>(sources.map((source) => source.kind))
   let inFlight: AbortController | null = null
 
@@ -306,8 +311,11 @@ export function createEventStreamClient(options: EventStreamClientOptions = {}):
    * 调用方必须立即中断后续流程，绝不继续灌入数据。
    */
   function applyUpdate(update: PendingUpdate, alive: () => boolean): boolean {
+    // 未注册快照来源的 kind：客户端对该 kind 没有任何已授权成员事实，06 §4 禁止把未知对象当作补丁
+    // 直接分发（也不能借分发建立/污染水位）。此类提示 fail-closed 静默忽略，不分发、不建水位。
+    if (!sourceKinds.has(update.kind)) return alive()
     // 未知成员：06 §4 明确「无法对应当前快照的对象」不得凭提示直接打补丁，必须当前授权 GET 重取。
-    if (sourceKinds.has(update.kind) && !isKnownMember(update.kind, update.id)) {
+    if (!isKnownMember(update.kind, update.id)) {
       fail('UNMAPPED_EVENT', { kind: update.kind, detail: 'event_object_not_in_snapshot' })
       startSync('unknown-member')
       return false
@@ -333,12 +341,22 @@ export function createEventStreamClient(options: EventStreamClientOptions = {}):
 
   /** 快照落库后回放缓冲：只回放同代际条目，且每条应用前后都复核代际与撤权。 */
   function drainBuffer(ticket: SyncTicket): void {
-    const pending = buffer.splice(0, buffer.length)
+    // 入口先复核票据：最后一次 onSnapshot 之后订阅方可能已 reset/撤权/重连，
+    // 此时本轮票据已失效，绝不能对共享缓冲做任何提取动作（提取即移除）。
+    if (!isCurrent(ticket)) return
+    // 只提取并移除属于本轮票据代际的条目：其他代际（外部回调内 reset/resync 后新产生的
+    // 条目）必须原序留在共享缓冲里，交给它自己那一轮同步回放，绝不因本轮抽空而被吞掉。
+    const pending: BufferedEvent[] = []
+    const retained: BufferedEvent[] = []
+    for (const entry of buffer) {
+      if (entry.epoch === ticket.epoch && entry.generation === ticket.generation) pending.push(entry)
+      else retained.push(entry)
+    }
+    buffer.length = 0
+    for (const entry of retained) buffer.push(entry)
     const alive = (): boolean => isCurrent(ticket)
     for (const entry of pending) {
       if (!isCurrent(ticket)) return
-      // 跨代际兜底：不属于本轮票据的缓冲条目一律安全丢弃，绝不回放到新连接/新同步代际。
-      if (entry.epoch !== ticket.epoch || entry.generation !== ticket.generation) continue
       const id = pickEntityId(entry.kind, entry.payload)
       const revision = entry.payload.revision
       if (id === null || !isU64DecimalString(revision)) {
@@ -467,7 +485,12 @@ export function createEventStreamClient(options: EventStreamClientOptions = {}):
       for (const entry of commit.entries) advanceWatermark(entry.key, entry.revision)
       members.set(commit.kind, new Set(commit.memberIds))
       options.onSnapshot?.(commit.kind, commit.items)
+      // 回调返回当刻立即复核：订阅方可能在回调内部 reset/resync 并让新代际开始缓冲事件，
+      // 本轮流程必须就地让位，绝不带着已失效的票据继续走缓冲回放。
+      if (!isCurrent(ticket)) return
     }
+    // 最后一次回调返回后到回放之间同样存在让位窗口：失效票据绝不触碰共享缓冲。
+    if (!isCurrent(ticket)) return
     drainBuffer(ticket)
     if (!isCurrent(ticket)) return
     syncState.value = 'synced'

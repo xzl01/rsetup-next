@@ -505,6 +505,50 @@ describe('代际守卫与 kind+id 水位丢弃', () => {
     expect(h.client.isRealtime.value).toBe(true)
   })
 
+  it('最后一次 onSnapshot 回调内 resync：旧同步流程不得抽走新代际缓冲，新事件在新轮完成后回放', async () => {
+    let c: EventStreamClient | null = null
+    let bus: FakeEventSource | null = null
+    const first = deferred<ReadonlyArray<Record<string, unknown>>>()
+    const second = deferred<ReadonlyArray<Record<string, unknown>>>()
+    let calls = 0
+    const h = createHarness({
+      snapshotsConfig: 'device-only',
+      deviceSnapshot: () => {
+        calls += 1
+        return calls === 1 ? first.promise : second.promise
+      },
+      onSnapshotHook: (kind) => {
+        // 订阅方在最后一次 onSnapshot 回调内部发起重同步，并在新代际下立刻收到提示：
+        // 旧同步流程必须在回调返回当刻让位，绝不把新代际刚缓冲的事件抽走丢弃。
+        if (kind !== 'device' || calls !== 1) return
+        c?.resync()
+        bus?.emitData('device.updated', { device_id: 'dev-1', revision: '9', display_name: '新代际提示' })
+      },
+    })
+    c = h.client
+    bus = h.es
+    client = h.client
+
+    h.es.emit('open')
+    const staleGenerationEvents = h.client.syncGeneration.value
+    // 旧代际缓冲：随 resync 触发的代际切换一起作废，绝不回灌（严禁跨代际回放）
+    h.es.emitData('device.updated', { device_id: 'dev-1', revision: '6', display_name: '旧代际提示' })
+    first.resolve([deviceItem('dev-1', '5')])
+    await flush()
+    expect(h.devices).toHaveBeenCalledTimes(2)
+    expect(h.client.lastSyncReason.value).toBe('manual')
+    expect(staleGenerationEvents).toBeLessThan(h.client.syncGeneration.value)
+    expect(h.updates).toHaveLength(0) // 新轮快照仍在途：任何代际的缓冲都不得提前回写
+
+    second.resolve([deviceItem('dev-1', '5')])
+    await flush()
+    // 新代际缓冲的 rev 9 必须在新轮快照落库后回放，而不是被上一轮同步流程抽空丢弃
+    expect(h.snapshots).toHaveLength(2)
+    expect(h.updates.map((u) => u.patch.revision)).toEqual(['9'])
+    expect(h.client.watermarkOf('device', 'dev-1')).toBe('9')
+    expect(h.client.isRealtime.value).toBe(true)
+  })
+
   it('非快照成员的未知对象不凭提示打补丁：拒绝分发并触发当前授权 GET 重取', async () => {
     const h = createHarness({
       snapshotsConfig: 'device-only',
@@ -557,6 +601,30 @@ describe('代际守卫与 kind+id 水位丢弃', () => {
     expect(h.client.lastSyncReason.value).toBe('unknown-member')
     expect(h.devices).toHaveBeenCalledTimes(2) // 安全重同步而非本地补一条未知对象
     expect(h.client.isRealtime.value).toBe(true)
+  })
+
+  it('未注册快照来源的 kind：没有成员事实就不作补丁分发，也不建立或污染水位', async () => {
+    const h = createHarness({
+      snapshotsConfig: 'device-only',
+      deviceSnapshot: async () => [deviceItem('dev-1', '5')],
+    })
+    client = h.client
+    h.es.emit('open')
+    await flush()
+    expect(h.snapshots).toEqual([{ kind: 'device', count: 1 }])
+
+    // 只订阅了 device 快照：task 没有任何已授权成员事实，其提示不得当作补丁直接分发（06 §4）
+    h.es.emitData('task.updated', { id: 'task-1', revision: '9', state: 'running' })
+    expect(h.updates).toHaveLength(0)
+    expect(h.client.watermarkOf('task', 'task-1')).toBeNull()
+    expect(h.client.lastError.value).toBeNull() // 未订阅的 kind 属于安全忽略，不谎报错误
+    expect(h.client.isRealtime.value).toBe(true) // 也不得因此打死实时或触发无意义重取
+    expect(h.devices).toHaveBeenCalledTimes(1)
+
+    // 已注册来源且属于已知成员的对象不受影响
+    h.es.emitData('device.updated', { device_id: 'dev-1', revision: '6' })
+    expect(h.updates).toHaveLength(1)
+    expect(h.client.watermarkOf('device', 'dev-1')).toBe('6')
   })
 
   it('快照 revision 低于已应用水位时不回退：迟到的中间事件仍被正确丢弃', async () => {
