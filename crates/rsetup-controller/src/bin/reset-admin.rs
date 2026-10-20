@@ -4,7 +4,9 @@
 //! 本 CLI **不**是 Web 端点、**不**接受用户名/密码参数、**不**读取任何声称权限的环境变量。
 //!
 //! fail-closed 顺序（任一步失败即以非 0 退出，且不触碰数据库）：
-//! 1. 参数：只接受 `reset-admin` 与 `-h`/`--help`，其余（含任意用户名/密码参数）一律拒绝；
+//! 1. 参数：只接受 `reset-admin` 与 `-h`/`--help`，其余（含任意用户名/密码参数、含非法 UTF-8
+//!    字节的参数）一律以固定脱敏文案拒绝；argv 经 `std::env::args_os()` 以 `OsStr` 精确比较，
+//!    绝不做 UTF-8 转换，因而绝不在标准库内部 `unwrap()` panic 并把原始字节打到 stderr；
 //! 2. 本机门禁：OS 实际 `real UID` 与 `effective UID` 双 0，且 `stdin`/`stdout`/`stderr`
 //!    各自均为交互 TTY（判定在 `admin_cli` 内于任何 DB 访问之前执行）；
 //! 3. 先打开并核验 `/dev/tty` 只写句柄（写库前的输出通道证明）；
@@ -12,6 +14,8 @@
 //!
 //! 秘密处理：一次性临时凭据只经 `/dev/tty` 写出一次；本 CLI 从不向 stdout/stderr/日志写入
 //! 凭据；错误信息经 [`describe_error`] 去敏，数据库驱动原文不外泄。
+
+use std::ffi::OsStr;
 
 use rsetup_controller::ControllerConfig;
 use rsetup_controller::admin_cli::{self, ControllingTty};
@@ -73,15 +77,27 @@ impl From<ControllerError> for CliError {
 
 /// 解析命令行：无参数 → 执行重置；仅 `-h`/`--help`（至多一次）→ 打印使用方式。
 ///
-/// 任何其他 token（用户名、密码、`--username`、重复参数、尾随参数）一律 fail-closed 拒绝：
-/// 内置管理员用户名固定为 `admin`，本 CLI 不提供覆盖入口。
-fn parse_request<I: IntoIterator<Item = String>>(args: I) -> Result<Request, CliError> {
-    let tokens: Vec<String> = args.into_iter().collect();
+/// 入参是 `OsStr` 而不是 `String`：Unix 下 argv 可以是任意非 NUL 字节，`std::env::args()`
+/// 会在标准库内部对非法 UTF-8 做 `unwrap()` 并 panic，panic 原文带着未脱敏的原始字节打到
+/// stderr（退出码 101），等于把操作员误传的密码回显出来。因此本 CLI 只使用永不 panic 的
+/// `std::env::args_os()`，并且只用 `OsStr` 做**字节级精确比较**，不做任何编码转换。
+///
+/// 任何其他 token（用户名、密码、`--username`、非法 UTF-8 字节串、重复参数、尾随参数）一律
+/// fail-closed 拒绝：内置管理员用户名固定为 `admin`，本 CLI 不提供覆盖入口；错误消息是固定
+/// 文案，绝不 `Debug`/`Display` 收到的 token，也绝不回显其任何部分。
+fn parse_request<I, T>(args: I) -> Result<Request, CliError>
+where
+    I: IntoIterator<Item = T>,
+    T: AsRef<OsStr>,
+{
+    let tokens: Vec<T> = args.into_iter().collect();
     match tokens.as_slice() {
         [] => Ok(Request::Reset),
-        [flag] if flag == "-h" || flag == "--help" => Ok(Request::Usage),
+        [flag] if flag.as_ref() == OsStr::new("-h") || flag.as_ref() == OsStr::new("--help") => {
+            Ok(Request::Usage)
+        }
         _ => {
-            // 绝不回显收到的 token：其中可能正是操作员误传的密码。
+            // 绝不回显收到的 token：其中可能正是操作员误传的密码，也可能是含非法字节的输入。
             Err(CliError {
                 message: "unexpected argument: reset-admin takes no arguments \
                           (the bootstrap administrator account is always 'admin')"
@@ -189,7 +205,9 @@ async fn run(request: Request) -> Result<(), CliError> {
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    let request = match parse_request(std::env::args().skip(1)) {
+    // 必须使用 `args_os()`：`args()` 在遇到非法 UTF-8 字节时于标准库内部 `unwrap()` panic，
+    // 并把携带原始字节的 panic 原文写入 stderr（退出码 101），构成凭据泄露。
+    let request = match parse_request(std::env::args_os().skip(1)) {
         Ok(request) => request,
         Err(error) => {
             note_stderr(&format!("reset-admin: {}\n", error.message));
@@ -213,10 +231,12 @@ async fn main() -> std::process::ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+
     use super::*;
 
-    fn argv(items: &[&str]) -> Vec<String> {
-        items.iter().map(|item| (*item).to_owned()).collect()
+    fn argv(items: &[&str]) -> Vec<OsString> {
+        items.iter().map(|item| (*item).into()).collect()
     }
 
     #[test]
@@ -238,6 +258,9 @@ mod tests {
             &["-h", "--help"][..],
             &["--help", "extra"][..],
             &[""][..],
+            &["-H"][..],
+            &["--HELP"][..],
+            &["管理员口令"][..],
         ] {
             let error = parse_request(argv(arguments)).expect_err("must reject");
             assert!(error.show_usage);
@@ -247,6 +270,57 @@ mod tests {
             );
             assert!(error.message.contains("takes no arguments"));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_arguments_fail_closed_without_panic_or_echo() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        // Unix argv 是字节串：非法 UTF-8 正是 `std::env::args()` 会在 std 内部 `unwrap()`
+        // panic 并把原始字节打进 stderr 的输入。这里必须走同一条 fail-closed 路径。
+        let cases: Vec<Vec<u8>> = vec![
+            b"FAKE_PASSWORD\xff".to_vec(),
+            b"--password\xff\xfe".to_vec(),
+            // 形状与合法 flag 相近，仅多出非法字节：绝不允许命中 Usage 分支。
+            b"-h\xff".to_vec(),
+            b"--help\xfe".to_vec(),
+            vec![0xff, 0xfe, 0x80, 0x41],
+        ];
+        for bytes in cases {
+            let rejected = OsString::from_vec(bytes.clone());
+            let error = parse_request([rejected]).expect_err("非 UTF-8 参数必须被拒绝");
+            assert!(error.show_usage);
+            assert!(error.message.contains("takes no arguments"));
+            // 固定脱敏文案：纯 ASCII，既不含凭据明文，也不含任何非法字节。
+            assert!(error.message.is_ascii(), "错误消息必须只含固定 ASCII 文案");
+            assert!(!error.message.contains("FAKE_PASSWORD"), "参数不得回显");
+            // `Debug`/`Display` 同样不得带出原始字节（token 未被保留）。
+            assert!(!format!("{error:?}").contains("FAKE_PASSWORD"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn help_flags_still_parse_when_arguments_are_os_bytes() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        // args_os 路径下合法 flag 仍精确匹配；非法字节仅存在于其他参数时同样拒绝。
+        assert_eq!(
+            parse_request([OsString::from_vec(b"-h".to_vec())]).unwrap(),
+            Request::Usage
+        );
+        assert_eq!(
+            parse_request([OsString::from_vec(b"--help".to_vec())]).unwrap(),
+            Request::Usage
+        );
+        assert!(
+            parse_request([
+                OsString::from_vec(b"-h".to_vec()),
+                OsString::from_vec(b"\xff".to_vec()),
+            ])
+            .is_err()
+        );
     }
 
     #[tokio::test]
