@@ -364,8 +364,10 @@ async fn grouping_is_byte_exact_on_both_engines() {
     // ---- A2（设备侧·字节级分组）：两对分组键：只差大小写、只差尾部空格。
     // 列名以 `DESCRIBE devices` 为准，本用例只依赖 admission_state 可写入任意
     // 字节串（§5.2.2：库侧已无 CHECK 约束）。
+    // `grouped_devices` 与生产映射同规则剥除尾部 `0x00` 哨兵（缺哨兵直接 panic），
+    // 因此这里的"各自成组"断言断的是**剥哨兵后的真实字节取值**。
     let dirty = fixture_rows(&db, &["CASE", "case", "PADX", "PADX "]).await;
-    let byte_rows = grouped_by(&db, DEVICE_AGGREGATE_SQL).await;
+    let byte_rows = grouped_devices(&db).await;
     assert!(
         byte_rows.iter().any(|(key, _)| key == "CASE")
             && byte_rows.iter().any(|(key, _)| key == "case"),
@@ -374,15 +376,14 @@ async fn grouping_is_byte_exact_on_both_engines() {
     assert!(
         byte_rows.iter().any(|(key, _)| key == "PADX")
             && byte_rows.iter().any(|(key, _)| key == "PADX "),
-        "尾部空格必须各自成组：{byte_rows:?}"
+        "尾部空格必须各自成组（TiDB v8.5.8 预编译线路的折叠缺陷已由哨兵挡住）：{byte_rows:?}"
     );
     assert!(
         count_of(&byte_rows, "CASE") >= 1 && count_of(&byte_rows, "case") >= 1,
         "两行必须落在两个不同分组：{byte_rows:?}"
     );
-
     // PAD SPACE 陷阱对照：同一份数据用 utf8mb4_bin 分组会**折叠**尾部空格。
-    let collation_rows = grouped_by(
+    let collation_rows = grouped_collation_control(
         &db,
         "SELECT CAST(admission_state AS CHAR) COLLATE utf8mb4_bin AS bucket, COUNT(*) AS n \
          FROM devices WHERE CAST(admission_state AS BINARY) IN (CAST('PADX' AS BINARY), CAST('PADX ' AS BINARY)) \
@@ -401,6 +402,8 @@ async fn grouping_is_byte_exact_on_both_engines() {
     // ---- A3（设备侧·单类异常隔离，F2）：**每次只存在一类异常取值**也必须让
     // 映射返回 None → snapshot 稳定返回错误（Fail-Closed 503），排除"多类脏值
     // 混合才触发"的假阳性；同时钉住去敏：错误不得回显取值原文。
+    // 其中的尾空格变体（`"APPROVED "`）就是 TiDB v8.5.8 预编译线路折叠缺陷的回归
+    // 用例：折叠一旦复现，脏值会被并进合法分组、snapshot 反而返回 Ok，本用例必红。
     cleanup_rows(&db, &dirty).await;
     for value in ["CASE", "case", "PADX", "PADX ", "approved", "APPROVED "] {
         let one = fixture_rows(&db, &[value]).await;
@@ -549,7 +552,7 @@ async fn grouping_is_byte_exact_on_both_engines() {
             .expect("SHOW WARNINGS 必须与聚合 SQL 同连接执行");
         assert!(
             warnings.is_empty(),
-            "{name} 在同一连接上不得产生任何告警（含 CAST(... AS BINARY) 弃用告警）：{warnings:?}"
+            "{name} 在同一连接上不得产生任何告警（含 CONCAT/0x00 字面量的截断或字符集告警）：{warnings:?}"
         );
     }
     drop(conn);
@@ -658,7 +661,9 @@ async fn cleanup_task_rows(db: &DbPool, ids: &[Vec<u8>]) {
     }
 }
 
-async fn grouped_by(db: &DbPool, sql: &str) -> Vec<(String, i64)> {
+/// **不带哨兵的对照查询**专用：`COLLATE utf8mb4_bin` 对照语句自己选择列，返回值
+/// 就是原样字符串（MUST NOT 剥哨兵，否则对照组被悄悄改写成生产写法）。
+async fn grouped_collation_control(db: &DbPool, sql: &str) -> Vec<(String, i64)> {
     let rows = sqlx::query(sql).fetch_all(&db.0).await.unwrap();
     rows.iter()
         .map(|row| {
@@ -669,7 +674,38 @@ async fn grouped_by(db: &DbPool, sql: &str) -> Vec<(String, i64)> {
         .collect()
 }
 
-/// `TASK_AGGREGATE_SQL` 的 `(state, outcome, n)` 行：`outcome` 可为 `NULL`。
+/// 生产 SQL 的返回值契约：每列取值末尾恒有一个 `0x00` 哨兵
+/// （`CONCAT(CAST(<col> AS BINARY), 0x00)`）。
+/// 剥除**且只剥一个**；缺哨兵直接 panic——它同时钉住"生产 SQL 确实是哨兵写法"
+/// 与"引擎按字节原样回传（预编译线路）"两件事。
+fn strip_sentinel(bytes: &[u8]) -> String {
+    let Some(body) = bytes.strip_suffix(b"\0") else {
+        panic!(
+            "聚合取值必须以 0x00 尾部哨兵结尾，实测末字节 {:?}（长度 {}）",
+            bytes.last(),
+            bytes.len()
+        );
+    };
+    String::from_utf8_lossy(body).into_owned()
+}
+
+/// `DEVICE_AGGREGATE_SQL` 的 `(bucket, n)` 行（哨兵已按生产映射同规则剥除）。
+async fn grouped_devices(db: &DbPool) -> Vec<(String, i64)> {
+    let rows = sqlx::query(DEVICE_AGGREGATE_SQL)
+        .fetch_all(&db.0)
+        .await
+        .unwrap();
+    rows.iter()
+        .map(|row| {
+            let bucket: Vec<u8> = row.try_get("bucket").unwrap();
+            let n: i64 = row.try_get("n").unwrap();
+            (strip_sentinel(&bucket), n)
+        })
+        .collect()
+}
+
+/// `TASK_AGGREGATE_SQL` 的 `(state, outcome, n)` 行：`outcome` 可为 `NULL`
+/// （`CONCAT(CAST(NULL AS BINARY), 0x00)` 仍是 `NULL`，因此 `NULL` 不经过哨兵剥除）。
 async fn grouped_tasks(db: &DbPool) -> Vec<(String, Option<String>, i64)> {
     let rows = sqlx::query(TASK_AGGREGATE_SQL)
         .fetch_all(&db.0)
@@ -681,8 +717,8 @@ async fn grouped_tasks(db: &DbPool) -> Vec<(String, Option<String>, i64)> {
             let outcome: Option<Vec<u8>> = row.try_get("outcome").unwrap();
             let n: i64 = row.try_get("n").unwrap();
             (
-                String::from_utf8_lossy(&state).into_owned(),
-                outcome.map(|o| String::from_utf8_lossy(&o).into_owned()),
+                strip_sentinel(&state),
+                outcome.map(|o| strip_sentinel(&o)),
                 n,
             )
         })

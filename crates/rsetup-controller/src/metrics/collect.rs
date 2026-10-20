@@ -43,27 +43,42 @@ pub const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(500);
 /// 设备准入分布（字节级分组：`'APPROVED'` 与 `'approved'`/`'APPROVED '` 是三个独立分组）。
 /// 选择列表与 `GROUP BY` 的表达式逐字符相同（`ONLY_FULL_GROUP_BY`）。
 ///
-/// MUST NOT 改用 `COLLATE utf8mb4_bin`：`utf8mb4_bin` 是 `PAD SPACE` 校对规则，
-/// 比较时忽略尾部空格填充，`'PENDING' = 'PENDING '` 恒真，脏值会被折叠进合法分组，
-/// 整条 fail-closed 链路在 SQL 层就被吞掉（§5.3 约束 2）。也不使用已弃用的 `BINARY`
-/// 运算符（产生 deprecation 告警）——`CAST(... AS BINARY)` 不在弃用范围。
+/// 分组表达式是**二进制强制 + 尾部二进制哨兵**
+/// `CONCAT(CAST(<col> AS BINARY), 0x00)`，三条引擎事实共同决定它只能长这样：
+/// 1. MUST NOT 用裸列或 `COLLATE utf8mb4_bin`：两者都是 `PAD SPACE` 语义的比较，
+///    `'PENDING' = 'PENDING '` 恒真，脏值被折叠进合法分组（§5.3 约束 2；§7.7 实测
+///    `SELECT 'PADX' = 'PADX '` 在开发库上返回 1）。
+/// 2. MUST NOT 只做 `CONCAT(<col>, 0x00)`：十六进制字面量的 coercibility 低于列，
+///    结果集**沿用列的校对规则**。开发库列是 `utf8mb4_0900_ai_ci`（忽略大小写），
+///    于是 `'CASE'` 与 `'case'` 并成一个分组——`'approved'` 会被记进 `APPROVED`
+///    计数，比尾空格折叠更严重的 fail-open（§7.7 MySQL 8.0.46 轨实测：4 行脏值
+///    只回 3 组）。必须先 `CAST(... AS BINARY)` 把比较降到字节级。
+/// 3. MUST NOT 停在 `CAST(<col> AS BINARY)`：TiDB v8.5.8 在 **Prepared Statement
+///    协议**下对这种分组仍套用尾空格折叠（文本协议不折叠），缺陷只在 sqlx 实际使用的
+///    预编译线路上出现。追加 `0x00` 后尾空格不再位于串尾，任何"按串尾裁剪填充字符"
+///    的实现都无法再折叠它。
+///
+/// 因此取值末尾恒有一个 `0x00` 哨兵字节，由 [`strip_trailing_nul`] 在映射前剥除；
+/// 缺哨兵即 SQL 与映射不一致的契约外形态，一律 fail-closed（整次抓取 503）。
+/// `CAST(NULL AS BINARY)` 与 `CONCAT(NULL, 0x00)` 都是 `NULL`，`outcome` 的 `NULL`
+/// 语义不受影响（§7.7 实测 `CONCAT(CAST(NULL AS BINARY), 0x00) IS NULL` 为真）。
 ///
 /// `/*+ MAX_EXECUTION_TIME(2000) */` 提示按 §5.5.1 规则 5 属于 SHOULD：MUST 先在 §7.7
 /// 双引擎实测确认"被接受且生效"方可加入（Task 7），未确认前保持本拼法。
-pub const DEVICE_AGGREGATE_SQL: &str = r"
-SELECT CAST(admission_state AS BINARY) AS bucket, COUNT(*) AS n
-FROM devices
-GROUP BY CAST(admission_state AS BINARY)
-";
+pub const DEVICE_AGGREGATE_SQL: &str = "\
+SELECT CONCAT(CAST(admission_state AS BINARY), 0x00) AS bucket, COUNT(*) AS n \
+FROM devices \
+GROUP BY CONCAT(CAST(admission_state AS BINARY), 0x00)";
 
-/// 主任务状态分布（`state` 与 `outcome` 两列都按字节分组；`outcome` 可为 `NULL`）。
-pub const TASK_AGGREGATE_SQL: &str = r"
-SELECT CAST(state AS BINARY) AS state,
-       CAST(outcome AS BINARY) AS outcome,
-       COUNT(*) AS n
-FROM main_tasks
-GROUP BY CAST(state AS BINARY), CAST(outcome AS BINARY)
-";
+/// 主任务状态分布（`state` 与 `outcome` 两列都按"二进制强制 + 尾部哨兵"分组）。
+/// `outcome` 为 `NULL` 时整个表达式仍是 `NULL`，因此 §5.2.2 的 `NULL` 归类
+/// （终态缺 `outcome` → `failed`）不经过剥除，语义与哨兵无关。
+pub const TASK_AGGREGATE_SQL: &str = "\
+SELECT CONCAT(CAST(state AS BINARY), 0x00) AS state, \
+       CONCAT(CAST(outcome AS BINARY), 0x00) AS outcome, \
+       COUNT(*) AS n \
+FROM main_tasks \
+GROUP BY CONCAT(CAST(state AS BINARY), 0x00), CONCAT(CAST(outcome AS BINARY), 0x00)";
 
 /// 与 `http_device_status::DeviceStatusSnapshotSource` 同形态的 dyn-safe 注入面（§5.5）。
 pub type MetricsFuture<'a, T> =
@@ -218,10 +233,16 @@ async fn run_aggregates(
         .fetch_all(&mut **conn)
         .await?
     {
-        let bucket: Vec<u8> = row.try_get("bucket")?;
+        let raw_bucket: Vec<u8> = row.try_get("bucket")?;
         let count: i64 = row.try_get("n")?;
         let count = checked_count(count)?;
-        match admission_label(&bucket) {
+        // 哨兵剥除：取值必须以 `0x00` 结尾。缺哨兵说明聚合 SQL 与本映射已不一致
+        // （或引擎未按字节回传），与未知取值同样走 unknown admission state 去敏错误，
+        // 绝不做"宽容匹配"。
+        let Some(bucket) = strip_trailing_nul(&raw_bucket) else {
+            return Err(unknown_admission_state_error());
+        };
+        match admission_label(bucket) {
             None => return Err(unknown_admission_state_error()),
             Some(bucket) => match bucket {
                 AdmissionBucket::Approved => devices.approved += count,
@@ -236,12 +257,25 @@ async fn run_aggregates(
         .fetch_all(&mut **conn)
         .await?
     {
-        let state: Vec<u8> = row.try_get("state")?;
-        let outcome: Option<Vec<u8>> = row.try_get("outcome")?;
+        let raw_state: Vec<u8> = row.try_get("state")?;
+        let raw_outcome: Option<Vec<u8>> = row.try_get("outcome")?;
         let count: i64 = row.try_get("n")?;
         let count = checked_count(count)?;
-        match task_bucket(&state, outcome.as_deref()) {
-            None => return Err(task_aggregate_error(&state)),
+        // 两列各自剥除末尾的一个 `0x00`；`outcome` 的 `NULL` 不产生取值，
+        // 因此不进剥除分支，§5.2.2 末行的 `NULL` → `failed` 归类原样保持。
+        // 缺哨兵同样走 `task_aggregate_error`：裸 `state` 不在四值域内 → unknown task
+        // state，在其内 → unknown task outcome，两条去敏文案都不回显取值。
+        let Some(state) = strip_trailing_nul(&raw_state) else {
+            return Err(task_aggregate_error(&raw_state));
+        };
+        let outcome = match &raw_outcome {
+            Some(outcome) => {
+                Some(strip_trailing_nul(outcome).ok_or_else(|| task_aggregate_error(state))?)
+            }
+            None => None,
+        };
+        match task_bucket(state, outcome) {
+            None => return Err(task_aggregate_error(state)),
             Some(bucket) => match bucket {
                 TaskBucket::Pending => tasks.pending += count,
                 TaskBucket::Running => tasks.running += count,
@@ -252,6 +286,14 @@ async fn run_aggregates(
     }
 
     Ok(MetricsSnapshot { devices, tasks })
+}
+
+/// 剥除聚合取值末尾的**一个** `0x00` 哨兵字节（`CONCAT(<col>, 0x00)` 的产物）。
+///
+/// 只剥一个：取值内部出现的 `0x00` 属数据本身，MUST NOT 被顺带吃掉；末尾不是
+/// `0x00` 时返回 `None`，由调用方按该侧的未知取值 fail-closed。
+fn strip_trailing_nul(bytes: &[u8]) -> Option<&[u8]> {
+    bytes.strip_suffix(b"\0")
 }
 
 /// `COUNT(*)` 恒非负（无 `GROUP BY ... WITH ROLLUP`），负值只能是契约外数据 → fail-closed。
@@ -442,22 +484,25 @@ mod tests {
         );
     }
 
-    /// §5.3 约束 2/4：两条聚合的 SQL 必须是字节级 `CAST(... AS BINARY)` 分组写法，
-    /// 选择列表与 `GROUP BY` 的表达式逐字符相同（`ONLY_FULL_GROUP_BY`），且不含
-    /// `COLLATE`/`JOIN`/`WHERE`/`ORDER BY`/`MAX_EXECUTION_TIME`。
+    /// §5.3 约束 2/4：两条聚合的 SQL 必须是"二进制强制 + 尾部哨兵"
+    /// `CONCAT(CAST(<col> AS BINARY), 0x00)` 分组写法，选择列表与 `GROUP BY` 的表达式
+    /// 逐字符相同（`ONLY_FULL_GROUP_BY`），且不含 `COLLATE`/`JOIN`/`WHERE`/`ORDER BY`/
+    /// `MAX_EXECUTION_TIME`。两类退化写法分别由 §7.7 双引擎实测证伪：
+    /// 裸列/`utf8mb4_bin` 折叠尾空格；裸列 + 哨兵沿用列的 CI 校对规则并掉大小写；
+    /// 只有 `CAST` 则踩 TiDB v8.5.8 预编译线路的尾空格折叠。
     #[test]
     fn aggregate_sql_is_byte_level_grouping() {
         let normalized = |sql: &str| sql.split_whitespace().collect::<Vec<_>>().join(" ");
         assert_eq!(
             normalized(DEVICE_AGGREGATE_SQL),
-            "SELECT CAST(admission_state AS BINARY) AS bucket, COUNT(*) AS n \
-             FROM devices GROUP BY CAST(admission_state AS BINARY)"
+            "SELECT CONCAT(CAST(admission_state AS BINARY), 0x00) AS bucket, COUNT(*) AS n \
+             FROM devices GROUP BY CONCAT(CAST(admission_state AS BINARY), 0x00)"
         );
         assert_eq!(
             normalized(TASK_AGGREGATE_SQL),
-            "SELECT CAST(state AS BINARY) AS state, CAST(outcome AS BINARY) AS outcome, \
-             COUNT(*) AS n FROM main_tasks \
-             GROUP BY CAST(state AS BINARY), CAST(outcome AS BINARY)"
+            "SELECT CONCAT(CAST(state AS BINARY), 0x00) AS state, \
+             CONCAT(CAST(outcome AS BINARY), 0x00) AS outcome, COUNT(*) AS n FROM main_tasks \
+             GROUP BY CONCAT(CAST(state AS BINARY), 0x00), CONCAT(CAST(outcome AS BINARY), 0x00)"
         );
         for sql in [DEVICE_AGGREGATE_SQL, TASK_AGGREGATE_SQL] {
             let flat = normalized(sql);
@@ -465,6 +510,21 @@ mod tests {
                 !flat.contains("COLLATE"),
                 "MUST NOT 使用 COLLATE（PAD SPACE 陷阱）：{flat}"
             );
+            assert!(
+                flat.contains("AS BINARY), 0x00"),
+                "哨兵必须追加在 CAST(... AS BINARY) 之后，否则比较沿用列的校对规则：{flat}"
+            );
+            // 裸列 + 哨兵（`CONCAT(<col>, 0x00)`）正是被实测证伪的写法，不得复活。
+            for bare in [
+                "CONCAT(admission_state,",
+                "CONCAT(state,",
+                "CONCAT(outcome,",
+            ] {
+                assert!(
+                    !flat.contains(bare),
+                    "禁止裸列 + 哨兵（CI 校对并掉大小写 → fail-open）：{flat}"
+                );
+            }
             assert!(!flat.contains("JOIN"), "两条聚合都是单表查询：{flat}");
             assert!(!flat.contains("WHERE"), "全表分布不得加过滤条件：{flat}");
             assert!(
@@ -476,6 +536,33 @@ mod tests {
                 "该提示须先经 §7.7 双引擎确认才可加入（§5.5.1 规则 5）：{flat}"
             );
         }
+        // 哨兵数量恒等于分组列数：设备侧 1 个、任务侧 2 个，SELECT 与 GROUP BY 各一次。
+        assert_eq!(DEVICE_AGGREGATE_SQL.matches("0x00").count(), 2);
+        assert_eq!(TASK_AGGREGATE_SQL.matches("0x00").count(), 4);
+    }
+
+    /// 哨兵剥除的三条边界：只剥末尾一个 `0x00`、取值内部的 `0x00` 保持、
+    /// 缺哨兵必须返回 `None`（映射侧据此 fail-closed）。未剥哨兵的取值一律不是合法标签。
+    #[test]
+    fn trailing_nul_sentinel_is_stripped_exactly_once() {
+        assert_eq!(strip_trailing_nul(b"APPROVED\0"), Some(&b"APPROVED"[..]));
+        assert_eq!(
+            strip_trailing_nul(b"APPROVED\0\0"),
+            Some(&b"APPROVED\0"[..])
+        );
+        assert_eq!(strip_trailing_nul(b"A\0B\0"), Some(&b"A\0B"[..]));
+        assert_eq!(strip_trailing_nul(b"\0"), Some(&b""[..]));
+        assert_eq!(strip_trailing_nul(b"APPROVED"), None);
+        assert_eq!(strip_trailing_nul(b"APPROVED "), None);
+        assert_eq!(strip_trailing_nul(b""), None);
+        // 哨兵必须被剥掉后才可能匹配标签：带哨兵的取值在映射层是未知取值。
+        assert!(admission_label(b"APPROVED\0").is_none());
+        let stripped = strip_trailing_nul(b"APPROVED\0").expect("哨兵取值");
+        assert_eq!(admission_label(stripped), Some(AdmissionBucket::Approved));
+        // 尾空格取值剥哨兵后仍是未知取值（TiDB 折叠缺陷被哨兵挡住的核心证据）。
+        let padded = strip_trailing_nul(b"APPROVED \0").expect("哨兵取值");
+        assert!(admission_label(padded).is_none());
+        assert!(task_bucket(padded, None).is_none());
     }
 
     /// §5.5.1 规则 2 + 三轮复审 F1：连接借出后到 `close().await` 之间禁止 `?` 早退。
