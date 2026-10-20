@@ -33,7 +33,7 @@ Spec: 06 §6
 | T4-05 | PASS | 2026-10-18T16:40:00+08:00 | cargo-test | cargo test -p rsetup-controller --lib tasks::http::decision_tests | src/tasks/http.rs |
 | T4-06 | PASS | 2026-10-18T16:50:00+08:00 | cargo-test | cargo test -p rsetup-controller --lib http_device_status | src/http_device_status.rs |
 | T4-07 | PASS | 2026-10-18T16:40:00+08:00 | cargo-test | cargo test -p rsetup-controller --lib tasks::recovery | src/tasks/recovery.rs |
-| T4-08 | 未验证 | | | | |
+| T4-08 | PASS | 2026-10-20T19:09:00+08:00 | cargo-test | cargo test -p rsetup-board-agent --test wire_04_execution | crates/rsetup-board-agent/tests/wire_04_execution.rs |
 | T4-09 | BLOCKED | | | | |
 | T4-10 | PASS | 2026-10-19T02:20:00+08:00 | headless-browser | python3 scripts/headless_e2e_verify.py | /tmp/headless_login.png & scripts/headless_e2e_verify.py |
 | T4-11 | PASS | 2026-10-18T16:30:00+08:00 | cargo-test | cargo test -p rsetup-controller --test web_assets | tests/web_assets.rs |
@@ -79,6 +79,10 @@ Spec: 06 §6
   `task.get` 只读；迟到有效证据更新旧任务 outcome/counts 并递增 revision，不删新 generation 设备锁。
 - T4-08 板端 B04 故障：accepted/attempted 两阶段持久化与 OS 调用边界故障分类（以 03 §5 B-04 完整
   规范为准，不得泛化为“所有 OS 错误均断流”）；测试中宿主真实 reboot 恒 0（FakeOS 边界）。
+  证据覆盖 `insert_accepted`/`mark_attempted`/`finish` 三个写阶段 × 「rename 前确定失败」与
+  「rename 结果不明」两类共 6 个组合：仅 accepted 确未提交回非零 status + 空 payload（并释放占用、
+  可安全重试），attempted 确未提交回 status=0 的 accepted，OS 边界前后的结果不明一律断流；
+  生产边界 `HostRebootOs` 全链路走通后宿主物理重启计数仍恒 0。
 - T4-09 typed → 真实获批 wire：`rsetup-protocol::wire` 共享 DTO 先行；raw 字节入口 failclosed；
   精确 512KiB 信封与真实认证/双流互通须专家书面决议 + 用户复审 + 获批 codec——门禁未齐，保持 BLOCKED。
 - T4-10 浏览器任务流程与 a11y：预览→确认→详情→取消/time-review/unknown 释放，键盘/焦点/Esc/320px/

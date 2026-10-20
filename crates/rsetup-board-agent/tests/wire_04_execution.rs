@@ -717,11 +717,66 @@ fn host_reboot_boundary_is_unsupported_and_never_physically_reboots() {
     let boundary = HostRebootOs::new();
     let err = RebootOs::reboot(&boundary).expect_err("本切片绝不实现真实主机重启");
     assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    // 第二次、第三次被误调用同样只得到 Unsupported：拒绝不是一次性开关
+    for _ in 0..2 {
+        assert_eq!(
+            RebootOs::reboot(&boundary)
+                .expect_err("恒不实现真实主机重启")
+                .kind(),
+            std::io::ErrorKind::Unsupported
+        );
+    }
     // 真实主机重启入口从未被触达：自动化测试中宿主物理 reboot 恒 0
     assert_eq!(
         boundary.call_count(),
         0,
         "Unsupported 拒绝不是真实重启：宿主物理重启计数必须恒 0"
+    );
+}
+
+#[test]
+fn production_host_boundary_answers_failed_and_never_physically_reboots() {
+    // 把生产 OS 边界（`HostRebootOs`）真正接进 execute 全链路：
+    // accepted → attempted 可靠落盘 → 进入 OS 边界 → 恒 `Unsupported` 明确失败
+    // → failed/OS_ERROR 可靠落盘并以 status=0 回真实 failed。
+    // 全链路走完后宿主物理重启计数仍恒 0：`HostRebootOs::call_count()` 计的就是
+    // 「真实主机重启入口被实际触发的次数」，其值 0 即「自动化测试从未真实重启宿主」的直接证据。
+    let fixture = fixture_with(HostRebootOs::new(), BOOT_OLD);
+    let now = Instant::now();
+    let issued = fixture
+        .executor
+        .prepare(&KEY, "conn-1", &prepare_request(), now)
+        .expect("prepare");
+    let request = execute_request(issued.execution_token);
+    let payload_hash = canonical_reboot_payload_hash(&request);
+    match fixture
+        .executor
+        .execute(&KEY, "conn-1", &request, &payload_hash, now)
+    {
+        ExecuteOutcome::OsErrorPersisted(record) => {
+            assert_eq!(record.state, TaskState::Failed);
+            assert_eq!(record.reason_code.as_deref(), Some("OS_ERROR"));
+        }
+        other => panic!("expected OsErrorPersisted, got {other:?}"),
+    }
+    assert_eq!(
+        fixture.executor.os().call_count(),
+        0,
+        "生产边界被完整走通后，宿主物理重启计数仍必须恒 0"
+    );
+    assert!(
+        !fixture.executor.device_occupied(),
+        "终态 Failed 可靠落盘后必须释放占用：一次 Unsupported 失败不得永久锁死设备"
+    );
+    let reopened = JournalStore::open(fixture.journal.dir(), RealFs).expect("reopen");
+    assert_eq!(
+        reopened
+            .get(&KEY, SUB_TASK)
+            .expect("get")
+            .expect("record")
+            .state,
+        TaskState::Failed,
+        "failed/OS_ERROR 必须真实落盘，而非仅存在于内存"
     );
 }
 
@@ -955,8 +1010,8 @@ fn finish_all(journal: &JournalStore<RealFs>, ids: &[String]) {
 }
 
 /// 为指定 `sub_task_id` 现签票据并执行一次（占用阻断路径在票据消费之前，票据不被消耗）。
-fn prepare_and_execute<O: RebootOs>(
-    executor: &RebootExecutor<O, RealFs>,
+fn prepare_and_execute<O: RebootOs, F: Fs>(
+    executor: &RebootExecutor<O, F>,
     sub_task_id: &str,
     now: Instant,
 ) -> ExecuteOutcome {
@@ -1288,6 +1343,84 @@ fn faulty_fixture<O: RebootOs>(
         "agent-1",
     );
     (dir, journal, executor)
+}
+
+#[test]
+fn insert_accepted_definitely_not_committed_answers_non_zero_with_empty_payload() {
+    // B-04 分类矩阵中唯一允许「非零 status_code + 空 payload」的分支：
+    // insert_accepted 在 rename 之前确定失败（create_write）→ DefinitelyNotCommitted，
+    // 磁盘确定未变、请求确未被接受、尚未进入 OS 调用边界。
+    // 此分支既不得断流为 Indeterminate，也不得回 accepted/attempted 暗示已接收。
+    let (dir, journal, executor) = faulty_fixture(
+        "dnc-insert",
+        FakeOs::ok(),
+        Stage::InsertAccepted,
+        FAULT_CREATE_WRITE,
+    );
+    let now = Instant::now();
+    let issued = executor
+        .prepare(&KEY, "conn-1", &prepare_request(), now)
+        .expect("prepare");
+    let request = execute_request(issued.execution_token);
+    let payload_hash = canonical_reboot_payload_hash(&request);
+
+    let outcome = executor.execute(&KEY, "conn-1", &request, &payload_hash, now);
+    // 专用断言：确未提交 → `Rejected(status)`，`Err` 侧在类型上不携带任何 `TaskRecord` 载荷
+    let status = match &outcome {
+        ExecuteOutcome::Rejected(status) => *status,
+        other => panic!("expected Rejected(非零空 payload), got {other:?}"),
+    };
+    assert_eq!(
+        status,
+        BusinessStatus::InternalError,
+        "insert_accepted 确未提交必须映射到确定的非零业务错误，got {outcome:?}"
+    );
+    assert_ne!(
+        status as i32,
+        BusinessStatus::Success as i32,
+        "确未被接受必须回非零 status_code，绝不用 status=0 暗示已接收"
+    );
+    assert_ne!(
+        outcome,
+        ExecuteOutcome::Indeterminate,
+        "确未提交有明确事实支撑，不得退化为断流（无业务回包）"
+    );
+    assert_eq!(
+        executor.os().call_count(),
+        0,
+        "OS 边界前确定失败：fake OS 计数必须为 0（宿主物理 reboot 恒 0）"
+    );
+    // 非零回包必须与持久事实一致：rename 之前确定失败 ⇒ 内存与磁盘都不得留下该记录
+    assert_eq!(journal.record_count(), 0, "非零回包不得留下任何持久记录");
+    assert!(
+        journal.get(&KEY, SUB_TASK).expect("get").is_none(),
+        "去重键必须查无此任务"
+    );
+    let reopened = JournalStore::open(dir.path(), RealFs).expect("reopen");
+    assert_eq!(
+        reopened.record_count(),
+        0,
+        "重开日志同样 0 条记录：非零回复声称的「未接收」经得起重开复核"
+    );
+    // 确定未执行 ⇒ 占用必须释放，设备锁不得留给一条不存在的记录
+    assert!(
+        !executor.device_occupied(),
+        "确未提交必须释放占用，绝不把设备永久锁在一条不存在的记录上"
+    );
+    assert_eq!(executor.occupying_sub_task(), None);
+    // `DefinitelyNotCommitted` 不进 uncertain 隔离态（磁盘确定未变）：同一实例换新票据
+    // 重试同一 sub_task_id 现在可靠落盘并进入 OS 边界 —— 非零回复确实等于「未接收、可安全重试」
+    let retry = prepare_and_execute(&executor, SUB_TASK, now);
+    assert!(
+        matches!(retry, ExecuteOutcome::Attempted(_)),
+        "非零拒绝后同 ID 重试必须可正常受理, got {retry:?}"
+    );
+    assert_eq!(
+        executor.os().call_count(),
+        1,
+        "重试至多一次进入 OS 边界（fake 计数，宿主物理 reboot 恒 0）"
+    );
+    assert_eq!(journal.record_count(), 1, "重试只允许留下 1 条持久记录");
 }
 
 #[test]
@@ -1724,5 +1857,70 @@ fn dispatch_execute_with_uncertain_journal_has_no_business_reply_and_never_calls
         executor.os().call_count(),
         0,
         "OS 边界前断流：fake OS 计数必须为 0"
+    );
+}
+
+#[test]
+fn dispatch_execute_when_accepted_definitely_not_committed_is_non_zero_with_empty_payload() {
+    // 与上一个测试互补的另一半：穿过 BoardAgent 的非零回包分支。
+    // insert_accepted 在 rename 之前确定失败（DefinitelyNotCommitted）⇒ 请求确未被接受、
+    // 未进 OS 边界 ⇒ 只能回「非零 status_code + 空 payload」：
+    // `handle_typed_action` 的 `Err(status)` 侧在类型上不携带任何 `BusinessResponse` 载荷。
+    let dir = TempDir::new("dispatch-dnc");
+    let fs = FaultFs::new();
+    let journal = Arc::new(JournalStore::open(dir.path(), fs.clone()).expect("open journal"));
+    fs.activate_fault(Stage::InsertAccepted, FAULT_CREATE_WRITE);
+    let executor = Arc::new(RebootExecutor::new(
+        Arc::clone(&journal),
+        FakeOs::ok(),
+        TicketManager::new(),
+        Box::new(|| BOOT_OLD.to_string()),
+        "agent-1",
+    ));
+    let dispatcher: Arc<RebootExecutor<FakeOs, FaultFs>> = Arc::clone(&executor);
+    let dispatcher: Arc<dyn RebootDispatcher> = dispatcher;
+    let agent = BoardAgent::new(FakeSource, JournalReader(Arc::clone(&journal)), FixedEpoch)
+        .with_reboot(dispatcher, "conn-1");
+
+    let ticket = match agent.handle_typed_action(
+        &peer(&KEY),
+        "device.reboot.prepare",
+        &BusinessPayload::RebootPrepare(prepare_request()),
+    ) {
+        Ok(BusinessResponse::RebootTicket(ticket)) => ticket,
+        other => panic!("expected RebootTicket, got {other:?}"),
+    };
+    let execute = BusinessPayload::RebootExecute(execute_request(ticket.execution_token));
+    let reply = agent.handle_typed_action(&peer(&KEY), "device.reboot.execute", &execute);
+    match &reply {
+        // 非零分支：Err 携带 status_code，类型上保证 payload 为空（无 TaskRecord、无 Indeterminate）
+        Err(status) => assert_eq!(*status, BusinessStatus::InternalError),
+        Ok(response) => panic!(
+            "确未提交必须回非零 status_code，绝不回 Ok(TaskRecord)/Ok(Indeterminate), got {response:?}"
+        ),
+    }
+    assert_eq!(
+        executor.os().call_count(),
+        0,
+        "非零回包分支：fake OS 计数必须为 0（宿主物理 reboot 恒 0）"
+    );
+    assert_eq!(
+        journal.record_count(),
+        0,
+        "非零回包必须与磁盘事实一致：无任何持久记录"
+    );
+    assert!(
+        !executor.device_occupied(),
+        "确定未执行必须释放占用，否则非零回复会让设备永久 1005"
+    );
+    // 非零回复之后 device.task.get 仍查无此任务：磁盘确实未变，中控据非零码重发是合法路径
+    let query = BusinessPayload::TaskQuery(TaskQuery {
+        schema_version: BUSINESS_SCHEMA_VERSION,
+        sub_task_id: SUB_TASK.to_string(),
+    });
+    assert_eq!(
+        agent.handle_typed_action(&peer(&KEY), "device.task.get", &query),
+        Err(BusinessStatus::TaskNotFound),
+        "非零回包声称未接收，task.get 必须同样查无此任务"
     );
 }
