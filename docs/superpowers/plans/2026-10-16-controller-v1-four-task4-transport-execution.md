@@ -19,11 +19,11 @@
 - `crates/rsetup-board-agent` 直接依赖限定为：`rsetup-protocol`、`rsetup-core`、`tokio.workspace`、`uuid.workspace`、`thiserror.workspace`、`serde.workspace`、`serde_json.workspace`；`[dev-dependencies]` 仅 `tokio.workspace` 与 `uuid.workspace`。board-agent 若持久化序列化，必须使用上述已锁定的 `serde` 与 `serde_json`，绝不手写伪解析。
 
 **Spec:**
-- `docs/superpowers/specs/2026-10-16-controller-v1-four-task4-design.md`（§2 阶段 A/B/C 依赖顺序、§4 任务持久执行与证据、§6 验收账本分层）
+- `docs/superpowers/specs/2026-10-07-controller-v1-four-task4-design.md`（§2 阶段 A/B/C 依赖顺序、§4 任务持久执行与证据、§6 验收账本分层）
 - `docs/superpowers/specs/2026-09-23-controller-v1-03-device-protocol.md`（§1 信封与 action 目录、§2 载荷定义、§4 票据、§5 日志与状态、§6 事件合并、§7 WIRE-01..05）
 - `docs/superpowers/specs/2026-09-23-controller-v1-04-task-lifecycle.md`（§1 不变量、§2 预览提交、§3 子任务状态、§5 串行流程、§6 成功/失败证据、§7 恢复）
-- `docs/superpowers/plans/2026-10-16-controller-v1-remaining-transport-tdd.md`（Task 3/4 及其后续 Task 5/8/9/10 衔接）
-- `docs/superpowers/plans/2026-10-16-controller-v1-remaining-runtime-tdd.md`（Task 4 `BoardClient` 契约，本计划为它提供 DTO 与形态建议，不实现中控调度器）
+- `docs/superpowers/plans/2026-10-07-controller-v1-remaining-transport-tdd.md`（Task 3/4 及其后续 Task 5/8/9/10 衔接）
+- `docs/superpowers/plans/2026-10-07-controller-v1-remaining-runtime-tdd.md`（Task 4 `BoardClient` 契约，本计划为它提供 DTO 与形态建议，不实现中控调度器）
 
 ---
 

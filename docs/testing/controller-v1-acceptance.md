@@ -89,9 +89,17 @@ Spec: 06 §6
   对比度/减少动效、中英切换；A 层 fixture/mock 不批准 B 层真实浏览器。
 - T4-11 单二进制嵌入资源：缺 `dist` release 构建直接失败；脱离源码/静态目录运行；解析构建产物真实
   JS/CSS、精确 MIME 与 immutable 缓存；API/缺失资产不回退 HTML。
-- T4-12 真库门禁项（双引擎）：普通应用账号真实事务、设备锁、CAS、撤权/提交并发；须串行预检
-  （授权/隔离可丢弃/实际权限/schema 数据版本；真实备份 + 独立核验 + 排他停写）——门禁未齐，保持
-  BLOCKED；用户已决定跳过的仅 root 锁观察单独留痕，不阻断 Task 4。
+- T4-12 真库门禁项（双引擎）：普通应用账号真实事务、设备锁、CAS、撤权/提交并发。**当前状态以上方账本行为准：
+  已 PASS（2026-10-18T16:35，layer `real-db`，证据 `tests/migration_v4.rs`，MySQL 8.0 与 TiDB v7.5 双引擎实跑）**；
+  本小节标题已声明说明段不构成状态，此前遗留的"门禁未齐，保持 BLOCKED"是模板初始化（2026-10-18 建表）时的文案，
+  未随该行转 PASS 同步，已作废，不得再据以判定该项仍处 BLOCKED。
+  下列门禁是该次实跑**前置已满足**的条件，也是后续任何重跑仍须逐条重新满足的条件，而非未达成的现状：
+  串行预检（授权/隔离可丢弃/实际权限/schema 数据版本）、真实备份 + 独立核验 + 排他停写。
+  执行口径补充：`tests/migration_v4.rs` 的唯一用例带 `#[ignore = "requires operator confirmed physical
+  isolation and backup"]`，故账本中的 `cargo test -p rsetup-controller --test migration_v4` 是简写，
+  实际 PASS 证据来自以 `-- --ignored` 显式执行该门禁用例、且**逐引擎串行单 case**（③ 层）分别跑通两台引擎；
+  不带 `-- --ignored` 的普通执行只会把该用例记为 ignored，不构成该行的 PASS 证据。
+  用户已决定跳过的仅 root 锁观察一项，单独留痕，不阻断 Task 4，也不改变上述 PASS 的取证范围。
 
 后续索引（完整 V1 目标，本轮从 Task 4 执行范围移出，保留原强度，全部未验证）：
 

@@ -4,7 +4,7 @@
 >
 > 本计划交付的是**真实运行时执行路径**（NTP 启动门禁真请求关联、任务状态模型、schema v4、原子预览/提交与设备锁、共享 `BoardClient`、意图后发送与只读恢复、必需任务 HTTP 端点）。本计划**不授权**执行真实数据库迁移、不授权触碰真实凭据、不授权改动线协议 codec。凡涉及真实库的步骤均已明确标注为**条件门禁步骤**，未满足前置时必须保持未运行并在验收账本中记录 `BLOCKED`，**不得**以 `return`、空 fixture、常量结果或 `eprintln!("BLOCKED")` 冒充 PASS，也不得伪造 accepted/备份证据。
 
-**Goal:** 在四专题设计（`docs/superpowers/specs/2026-10-16-controller-v1-four-task4-design.md`）与 Runtime remaining 计划 Task 2/3/4 及必要 Task 6 HTTP 的裁决下，把 Controller V1 Runtime 从“纯模型 + 独立解析切片”推进到可独立审查的**任务执行闭环**：完整 NTP 30s 启动门禁真请求关联、10 状态任务模型与原因码、schema v4 版本化只读 guard 与五表 SQL、原子预览/提交与设备唯一操作锁、共享类型化 `BoardClient` 与“先提交意图、后再发送”、恢复只读不重发，以及最小必需任务 HTTP 端点（含 `time-review`、`release-lock`、分页授权子集投影）。
+**Goal:** 在四专题设计（`docs/superpowers/specs/2026-10-07-controller-v1-four-task4-design.md`）与 Runtime remaining 计划 Task 2/3/4 及必要 Task 6 HTTP 的裁决下，把 Controller V1 Runtime 从“纯模型 + 独立解析切片”推进到可独立审查的**任务执行闭环**：完整 NTP 30s 启动门禁真请求关联、10 状态任务模型与原因码、schema v4 版本化只读 guard 与五表 SQL、原子预览/提交与设备唯一操作锁、共享类型化 `BoardClient` 与“先提交意图、后再发送”、恢复只读不重发，以及最小必需任务 HTTP 端点（含 `time-review`、`release-lock`、分页授权子集投影）。
 
 **Architecture:**
 1. **时间门禁（真请求关联与 RFC 偏移）**：既有 `controller-v1-runtime-ntp-parser` 分支交付的纯结构解析器**从该独立分支导入**，只做 48B/LI/VN/Mode/Stratum/发送时戳结构校验，绝不产生 `NtpValid`。在 RED 桩测试前先在导入的 `ntp.rs` 中扩充 `NtpError` 枚举变体确保可编译。请求 T1 的 64 位唯一发送时戳/nonce 仅由响应 Originate 全量回显关联；响应 T2/T3 是服务端时间，不得当作客户端回显。响应来源必须校验为请求实际解析/发送到的 `SocketAddr`（禁止直接与 DNS host 字符串比较）。T1 快照同时保存本地墙钟与单调起点，T4 为同一瞬间快照。往返上限（RTT）由本地 T1/T4 单调跨度（monotonic span）严格度量；偏移（offset）由 RFC 四时戳公式经 UTC/NTP epoch checked i128 精确换算，产出专门定义的 `NtpSample`（不重用 `board_clock::ClockEstimate` 的 board_offset 模型以免混淆）。正反测试由标准服务器响应构造，即使本地当前墙钟存在大偏移仍可接受合格样本。`src/time/gate.rs` 承载单一 UDP socket 真实往返，`GateDeadline` 承载 **≤30s 启动预算**（00 §3 C-TIME 已确认约束：**30s 处强制关闭**），超时走 `SystemFallback` 并在后台有界退避重试。启动路径收敛为单一 `run_startup_sample`：只创建一次绝对 deadline（硬 ≤30s），socket bind/DNS/多源/全部重试同处一个绝对 `timeout_at` 之下，成功返回 sample+source 供 `start_time_gate` 写 `TimeEvidence`，超时返回 `None` 走 `SystemFallback`。
@@ -16,7 +16,7 @@
 
 **Tech Stack:** Rust 2024 / MSRV 1.85，Tokio 1.47（新增 dev-dependency 特性 `test-util` 仅用于测试且本计划不使用 `start_paused`），Axum 0.8，SQLx 0.8（MySQL，无 FK/CHECK），Chrono 0.4，Uuid 1.18，Serde 1.0，Sha2 0.10，Hex 0.4，Tower 0.5。全部构建/测试命令使用 `--offline --locked`。
 
-**Spec:** `docs/superpowers/specs/2026-10-16-controller-v1-four-task4-design.md`（本计划的正向裁决）；`docs/superpowers/specs/2026-09-23-controller-v1-04-task-lifecycle.md`（状态机与恢复）；`docs/superpowers/specs/2026-09-23-controller-v1-03-device-protocol.md`（板端消息）；`docs/superpowers/plans/2026-10-16-controller-v1-remaining-runtime-tdd.md` Task 2/3/4 与必要 Task 6；`docs/superpowers/plans/2026-10-16-controller-v1-remaining-identity-tdd.md` Task 2/3 协作点。执行者必须同时阅读设计文档与 Runtime remaining 计划的对应 Task，本计划与它们冲突时以设计文档的书面裁决为准并记录偏差。
+**Spec:** `docs/superpowers/specs/2026-10-07-controller-v1-four-task4-design.md`（本计划的正向裁决）；`docs/superpowers/specs/2026-09-23-controller-v1-04-task-lifecycle.md`（状态机与恢复）；`docs/superpowers/specs/2026-09-23-controller-v1-03-device-protocol.md`（板端消息）；`docs/superpowers/plans/2026-10-07-controller-v1-remaining-runtime-tdd.md` Task 2/3/4 与必要 Task 6；`docs/superpowers/plans/2026-10-07-controller-v1-remaining-identity-tdd.md` Task 2/3 协作点。执行者必须同时阅读设计文档与 Runtime remaining 计划的对应 Task，本计划与它们冲突时以设计文档的书面裁决为准并记录偏差。
 
 ---
 

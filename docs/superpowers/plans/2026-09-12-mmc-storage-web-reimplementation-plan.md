@@ -10,6 +10,13 @@ TUI/CLI/核心的 MMC 支持已在 `dev-aghost`（`ebc4f69`…`5b14b73`，已推
 
 ## 2. 恢复材料（已解包到本计划工作区 `recovery/`）
 
+> **【已完成状态说明】** 下表的 6 个 `recovery/*.patch` 是**本次开发过程一次性使用的恢复补丁**：在计划执行期于临时工作区 `recovery/` 下解包，按 Task 1/Task 2 的顺序 `git apply` 到工作树，随后作为普通改动随各任务提交直接合入源码。
+>
+> - 补丁文件本身**不入库**：本仓当前不存在 `recovery/` 目录，也没有任何 `*.patch` 文件。按本节命令再去找这些补丁会落空，属预期结果。
+> - 表中"原提交"（`5a40fca`、`bae3e23`、`11f5262`、`d8c3481`、`ae94e09`、`9713fb0`）属于已按 §1 所述物理删除的原提交链，**不在本仓当前历史中**，仅作为补丁出处的溯源标记保留。
+> - 因此本节已不再是可执行的操作入口，只作恢复来源与目标文件的对照记录。核对落地应直接查源码现状：`crates/rsetup-core/src/probe.rs` 的 `storage_detail()` 与 `storage` capability 条目、`crates/rsetup-app/src/server.rs` 的 `/api/v1/hardware/storage` 路由、`ui/i18n.js` 的 `storageTool.*` 键、`ui/app.js` 的 `renderStorageTool` / `renderStorageMmcCard`，以及 `ui/storage.test.mjs` 已存在、`ui/nvme.test.mjs` 已删除。
+> - 后续如需重放这段历史，应以上述源码现状与本计划 §5 验收标准为准，不要依赖已不存在的补丁文件。
+
 | 补丁 | 原提交 | 内容 | 目标文件 |
 | --- | --- | --- | --- |
 | `1-backend-probe-detail.patch` | `5a40fca` | `storage_detail()` helper + demo 快照 `storage` 条目 | `crates/rsetup-core/src/probe.rs` |

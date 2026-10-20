@@ -10,7 +10,7 @@
 - EndpointId裁决新增14读变体=10管理+3task+独立DeviceStatusRead，Me/Sessions保留；status已Runtimehandler/Identity桶，不计26/8；Identity全文传播/生产实现仍待，不能说已写代码。
 - Identity内部snapshot仍待原任务回调/正式审查；ManagementState/probes/GW0/v4/DB备份/专家+用户+codec/真实浏览器wire门均未完成；集成收敛稿正式CHANGES_REQUIRED3Important1Minor，部分后续修订待复审。
 - 本次仅事实标签同步，修改稿待指定模型限定静态复审，不改固定裁决/任何签名/DTO或用户批准字段，无实施/merge/push许可。
-日期：2026-10-16。范围：四份执行计划（identity/runtime/transport/web）+ 联合设计 spec `2026-10-16-controller-v1-four-task4-design.md` + 权威规格 00–05。
+日期：2026-10-16。范围：四份执行计划（identity/runtime/transport/web）+ 联合设计 spec `2026-10-07-controller-v1-four-task4-design.md` + 权威规格 00–05。
 代码佐证（worktree `controller-v1-four-task4-design`）：`auth/sqlx_repo.rs:105-110`（AUTH_PROCESS_EPOCH/SEQ 及"与 db.rs 完全独立"注释）、`db.rs:2681-2682`（独立 PROCESS_EPOCH/SEQ）、`http_auth.rs:106`（EndpointId 现仅 Me/Sessions；读桶键 (EndpointId,digest) 50/s、写桶键 session digest 20/s）、`http_auth.rs:239-242`（AppState 仅 db/auth 两字段，无法注入 probe）、`error.rs:1-2`（ControllerError 仅派生 Debug/thiserror::Error）、`lib.rs:42`（build_router 仅挂 /healthz、/readyz）、`main.rs`（当前只挂探活 build_router，生产装配未就位）。
 
 ## 1. 固定裁决（高于各草案）

@@ -1,9 +1,16 @@
 //! Production `LiveAuth` adapter over the object-safe `AuthServiceApi`
 //! boundary (Task 3d-a; Task 3f adds `is_live_session`).
 //!
-//! Compile-only deliverable: nothing wires `LiveAuth` into
-//! `build_http_router` or `main`; the four auth handlers and the login
-//! concurrency gates are NOT all ready, so `main` stays health-only.
+//! Production wiring: `main` builds this adapter as the sole `AuthServiceApi`
+//! implementation inside `production_inputs()` — `HttpAuthState::new(
+//! LiveAuth::new(AuthService::new(SqlxIdentityRepository), db)` — and
+//! `build_production_router` feeds that state to `http_auth::build_http_router`
+//! before merging the auth line with the management, tasks, device-status,
+//! metrics and web lines. The four auth handlers and the login concurrency
+//! gates are therefore registered and served; `main` is no longer
+//! health-only. See `production.rs` for the shared-auth-context identity guard
+//! that pins all lines to this one `LiveAuth` instance.
+//!
 //! `login` / `authenticate` / `change_password` / `logout` are plain boxed
 //! forwards to the identical inherent `AuthService` methods — no fabricated
 //! success, no process-epoch accessor, no internal state exposed.

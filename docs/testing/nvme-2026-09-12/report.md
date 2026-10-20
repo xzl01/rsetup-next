@@ -34,7 +34,7 @@
 | UI 测试 | `node --test ui/*.test.mjs`：47 passed、0 failed，其中 `ui/nvme.test.mjs` 4 项 | 渲染断言基于 DOM 字符串，非像素 |
 | CLI（实机，有 NVMe） | `hardware nvme` 中英文、`hardware nvme --json` 均正常；数值与 sysfs / `blockdev` 一致 | — |
 | CLI（实机，无 NVMe） | 输出"未检测到 NVMe 存储设备，模块未激活（No NVMe controller detected in system）"，退出码正常，无 panic | — |
-| HTTP API | `GET /api/v1/hardware/nvme` 在两类实机均 200，响应体为规范 `NvmeStatus`；`status --json` 的 `nvme` 能力项在 3A 为 `available:false` | 仅 GET，未覆盖写路径 |
+| HTTP API | `GET /api/v1/hardware/nvme` 在两类实机均 200，响应体为规范 `NvmeStatus`；`status --json` 的 `nvme` 能力项在 3A 为 `available:false`（**该端点已于同日提交 `6465543` 移除，现返回 404，见下节"端点后续变更"**） | 仅 GET，未覆盖写路径 |
 | TUI（实机） | 两类实机均正常启动、`:q` 正常退出；有 NVMe 时展示型号/容量/温度/寿命/备用；无 NVMe 时降级为单行提示并自适应收窄卡片 | 经 SSH PTY 采集，非物理控制台 |
 | Web（实机） | 桌面 1440×900 与移动 390×844（@2x）均正常；NVMe 抽屉展示完整 SMART 遥测；无 NVMe 时卡片置灰且不泄漏他机数据 | 浏览器控制台无 error |
 | 二进制依赖 | release 二进制 `readelf -d` 仅依赖 `libgcc_s.so.1`/`libm.so.6`/`libc.so.6`，无 `libnvme.so.1`；仓库内无 `libnvme` 引用 | 采集经 ioctl 直读，无 `libnvme` 依赖（见"规格偏差与处置"） |
@@ -52,6 +52,14 @@
 | 可用备用 / 阈值 | — | 100% / 1% | 100% / 1% |
 
 温度与读写计数随运行时间自然漂移，故不要求跨次采集严格相等。
+
+### 端点后续变更（报告结论的时效性说明）
+
+上表 HTTP API 一行记录的是**本次测试当时**的行为，其结论不作追溯修改。此后同日的提交 `6465543`（feat(core): restore unified storage capability and REST endpoint）把 NVMe 专用的 `GET /api/v1/hardware/nvme` 替换为统一存储端点：
+
+- `GET /api/v1/hardware/nvme` **已移除**，现在该路径返回 **404**；`crates/rsetup-app/src/server.rs` 中的 `legacy_nvme_route_is_removed` 用例即用于锁定这一事实。
+- NVMe 状态现统一由 **`GET /api/v1/hardware/storage`** 提供，响应体为聚合结构，NVMe 部分位于其 `nvme` 字段下（原 `NvmeStatus` 的字段与语义不变）。
+- 因此本报告对 HTTP 层的验收应理解为对"NVMe 遥测可经 HTTP 只读获取"这一能力的验证；复测该能力时须改用 `/api/v1/hardware/storage`，直接请求旧路径得到 404 属预期结果，不是回归缺陷。
 
 ## 测试中发现并修复的缺陷
 

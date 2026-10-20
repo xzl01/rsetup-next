@@ -2,7 +2,7 @@
 
 > **致执行代理：** 必需子技能：使用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 逐项落实；用 `- [ ]` 复选框跟踪步骤。本文是**条件性后续实施计划**：不是实施授权、真库操作许可或生产发布批准。文中所有 `cargo test` 命令均为**未来执行步骤**，本轮文档修订不运行任何代码、不连接任何数据库、不提交。
 >
-> **与既有计划的关系：** 本文**取代** `docs/superpowers/plans/2026-10-16-controller-v1-remaining-identity-tdd.md` 的 Task 2、Task 3、Task 4 三节的全部实施细节（该三节降级为历史草案，其余 Task 1/5/6/7/8 仍有效且不在本文范围内）。出现冲突时以本文 + 规格为准。
+> **与既有计划的关系：** 本文**取代** `docs/superpowers/plans/2026-10-07-controller-v1-remaining-identity-tdd.md` 的 Task 2、Task 3、Task 4 三节的全部实施细节（该三节降级为历史草案，其余 Task 1/5/6/7/8 仍有效且不在本文范围内）。出现冲突时以本文 + 规格为准。
 
 **Goal:** 为 Controller V1 交付 Identity Task 2/3/4 的可审查实施：真实 SQLx 管理读/写仓储（统一锁序、同事务脱敏审计、`authz_epoch` CAS、严格最后管理员防线）、授权与设备服务整合、共享可信认证门禁，以及 26 条管理路由从真实仓储装配的生产网关，并把 fixture 证据与真库证据严格分层记录。
 
@@ -11,14 +11,14 @@
 **Tech Stack:** Rust 2024 / MSRV 1.85；Axum 0.8、Tokio、SQLx 0.8（MySQL）、Argon2id、SHA-256、UUIDv4、Chrono、serde/serde_json、tower（dev-dependency，仅 `ServiceExt::oneshot`）；MySQL 8.4 LTS 与 TiDB 8.5 LTS 作为两个隔离开发引擎。**零新增 Cargo 依赖**：`sha2`、`hex`、`uuid`、`rand`、`serde` 均已在本 crate 声明，`cargo build --offline --locked` 必须继续成立。
 
 **Spec:**
-- [四专题 Task 4 收敛设计](../specs/2026-10-16-controller-v1-four-task4-design.md)（**权威**：第 3 节身份事务/HTTP 边界、第 6 节备份与分级验收）
+- [四专题 Task 4 收敛设计](../specs/2026-10-07-controller-v1-four-task4-design.md)（**权威**：第 3 节身份事务/HTTP 边界、第 6 节备份与分级验收）
 - [01 身份与授权规格](../specs/2026-09-23-controller-v1-01-identity-access.md)（§4 权限点、§5 动态授权、§6 可见性、§7 特殊管理操作、§8 专项验收）
 - [02 数据模型与管理 API 规格](../specs/2026-09-23-controller-v1-02-data-api.md)（§3 公共契约、§4–5 路由表、§7 系统端点、§8 验收）
 - [05 运行与资源参数](../specs/2026-09-23-controller-v1-05-runtime-operations.md)（§6 管理 API body/限速）
 - [应用层完整性设计](../specs/2026-10-03-controller-application-integrity-design.md)
 - [会话管理设计](../specs/2026-10-05-controller-session-management-design.md)
-- [Runtime 剩余计划](2026-10-16-controller-v1-remaining-runtime-tdd.md)（Task 3 v4 迁移/版本化 guard、Task 6 任务 HTTP）
-- [Web 剩余计划](2026-10-16-controller-v1-remaining-web-tdd.md)（Task 2/3/4/7 消费本计划路由）
+- [Runtime 剩余计划](2026-10-07-controller-v1-remaining-runtime-tdd.md)（Task 3 v4 迁移/版本化 guard、Task 6 任务 HTTP）
+- [Web 剩余计划](2026-10-07-controller-v1-remaining-web-tdd.md)（Task 2/3/4/7 消费本计划路由）
 - [跨专题集成与验收计划](2026-10-16-controller-v1-integration-acceptance-tdd.md)（G5、AT-01..18 证据分层）
 
 ---

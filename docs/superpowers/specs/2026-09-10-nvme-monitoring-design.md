@@ -146,14 +146,17 @@ pub struct NvmeSmartLog {
     - 若检测到，输出各 NVMe 设备的型号、容量、健康状态、温度、剩余寿命、读写统计与警告指示。
 
 ### 4.3 HTTP API 与 Web GUI / Tauri
-- HTTP 端点：`GET /api/v1/hardware/nvme`
+
+> **【已修订 2026-09-12】端点收敛**：本节的 `GET /api/v1/hardware/nvme` 已由提交 `6465543`（feat(core): restore unified storage capability and REST endpoint）**移除**，现请求该路径返回 **404**（由 `crates/rsetup-app/src/server.rs` 的 `legacy_nvme_route_is_removed` 用例锁定）。NVMe 状态统一由 **`GET /api/v1/hardware/storage`** 提供，返回聚合的 `StorageStatus { nvme, mmc }`，本节的 `NvmeStatus` JSON 即其 `nvme` 字段，字段与语义不变；`Controller::nvme_status` 亦保留，另由 `Controller::storage_status` 聚合 eMMC。下列各条中的 `nvmeStatus` 读取路径应相应理解为 `storageStatus.nvme`。
+
+- HTTP 端点：`GET /api/v1/hardware/nvme`（**已移除 → `GET /api/v1/hardware/storage`**）
   - 返回 `NvmeStatus` JSON。
 - Web GUI (前端):
   - 在 Hardware 工具箱中，根据 `nvmeStatus.initialized` 动态渲染卡片。
   - 若为 `false`，界面优雅提示“未检测到 NVMe 存储设备，模块未激活”。
   - 若为 `true`，以规整的 Soft UI 卡片呈现磁盘概览、温度计量条、寿命百分比环形/进度条及 SMART 告警指示。
 - Tauri:
-  - 注册 `nvme_status` command，直接桥接 `Controller::nvme_status`。
+  - 注册 `nvme_status` command，直接桥接 `Controller::nvme_status`（本仓当前无 Tauri 集成，该条为预留设计）。
 
 ---
 

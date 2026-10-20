@@ -8,7 +8,7 @@
 
 **Tech Stack:** 既有Rust/Axum/Tokio/SQLx/serde/sha2/hex/uuid/rand/tower，零新增依赖。
 
-**Spec:** [主Identity计划](2026-10-16-controller-v1-four-task4-identity-execution.md)、[收敛设计](../specs/2026-10-16-controller-v1-four-task4-design.md)、[01](../specs/2026-09-23-controller-v1-01-identity-access.md)、[02](../specs/2026-09-23-controller-v1-02-data-api.md)。
+**Spec:** [主Identity计划](../2026-10-16-controller-v1-four-task4-identity-execution.md)、[收敛设计](../../specs/2026-10-07-controller-v1-four-task4-design.md)、[01](../../specs/2026-09-23-controller-v1-01-identity-access.md)、[02](../../specs/2026-09-23-controller-v1-02-data-api.md)。
 
 ## Global Constraints
 

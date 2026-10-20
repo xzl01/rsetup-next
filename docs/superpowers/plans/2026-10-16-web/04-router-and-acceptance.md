@@ -618,7 +618,7 @@ git diff --name-only dev-aghost...HEAD 2>/dev/null || git diff --name-only HEAD~
 
 | # | 不一致点 | 证据 | 本计划采取的立场 |
 | --- | --- | --- | --- |
-| 1 | 上位计划 Task 4 的 `onReleaseLock` payload 用 `{ subtaskId, expected_revision, acknowledge_unknown, reason }`（camel/snake 混用） | `docs/superpowers/plans/2026-10-16-controller-v1-remaining-web-tdd.md:1216-1221` | 保持该形状不变（它是前端回调契约），HTTP body 由 `task-requests.ts` 明确构造为全 snake_case（`expected_revision`、`acknowledge_unknown`、`reason`） |
+| 1 | 上位计划 Task 4 的 `onReleaseLock` payload 用 `{ subtaskId, expected_revision, acknowledge_unknown, reason }`（camel/snake 混用） | `docs/superpowers/plans/2026-10-07-controller-v1-remaining-web-tdd.md:1216-1221` | 保持该形状不变（它是前端回调契约），HTTP body 由 `task-requests.ts` 明确构造为全 snake_case（`expected_revision`、`acknowledge_unknown`、`reason`） |
 | 2 | 上位计划 `TasksView` props 只声明 `previewTargets/previewToken/subtasks/onSubmit/onReleaseLock/isAdmin`，无预览请求入口，也无设备清单来源 | 同上 `:1086-1093` | 本计划为 `TasksView` 补齐 `devices`、`pendingDeviceId`、`onPreview`、`onLoadTasks`、`csrfToken`；子任务展示与 unknown 释放锁移入 `TaskDetailView`（`subtasks`/`onReleaseLock`/`isAdmin` 不再是 `TasksView` 契约），`onSubmit`/`onCancel` 语义保留 |
 | 3 | 上位计划的 `ts` 提示块里 `taskStateLabel(_state: string, ...)` 与实现签名 `SubTaskState` 不一致 | 同上 `:1077` | 以上位计划 **Step 3 实现**（`SubTaskState`）为准；本计划不改该签名 |
 | 4 | 上位计划 `previewTargets: Array<{ device_id: string; eligible: boolean }>` 缺 `reason`，但测试断言消费 `task.previewReason.*` | 同上 `:1128` 与 §Global Constraints 5 | 本计划用 `task-ops.ts` 的 `TaskPreviewTarget`（含可选 `reason`）作为唯一来源；组件不再接收 `previewTargets` 形状的裸数组 |

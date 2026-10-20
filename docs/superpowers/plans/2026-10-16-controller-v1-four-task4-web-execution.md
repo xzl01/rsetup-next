@@ -19,9 +19,9 @@
 **Tech Stack:** Vue 3.5.43、TypeScript 5.9.3 (strict)、Vite 8.3.2、Vitest 5.0.3、@testing-library/vue 8.1.0、jsdom 26.1.0、vue-tsc 3.3.12（全部为已锁定依赖，零新增）。后端契约只作为**只读**参考：Axum 0.8 路由尚未实现。
 
 **Spec:**
-- `docs/superpowers/specs/2026-10-16-controller-v1-four-task4-design.md`（本专题收敛设计，§3 §5 为 Web 权威约束）
+- `docs/superpowers/specs/2026-10-07-controller-v1-four-task4-design.md`（本专题收敛设计，§3 §5 为 Web 权威约束）
 - **取消入口固定合同（用户批准，本次修订的唯一新增合同）：** 新增字段仅主任务 `actions.can_cancel: boolean`，由后端按当前身份、目标设备 `device.reboot` 与合格 `queued`/`held` 子任务计算并返回；前端只判“可请求”，不保成功（服务端事务 CAS 与逐端点重验身份/权限为最终准绳）；`ViewScope` 必须兼容合法 `full` 与 `authorized_subset`（不新增 `can_time_review` 之类字段）；前端不得借 children 分页、`task.read` 或主任务状态（`queued`/`held`/`running`/`completed`）猜 reboot；缺 `actions` / 非法 `can_cancel` 布尔 / 未知 `view_scope` 一律 fail-closed 关闭危险入口，只读任务兼容缺 `actions`；`running` 主任务可以有可取消目标，`authorized_subset` 下的 `completed` 主任务也不能按主任务状态关闭。权威出处：01 §4 `device.reboot` 与 §6:71、04 §4/§8、设计文档 §3（逐端点重验与取消 CAS 语义）与 §5（Web 交互契约）。
-- `docs/superpowers/plans/2026-10-16-controller-v1-remaining-web-tdd.md` 的 `### Task 4`（上位增量计划，本计划是其可执行细化）
+- `docs/superpowers/plans/2026-10-07-controller-v1-remaining-web-tdd.md` 的 `### Task 4`（上位增量计划，本计划是其可执行细化）
 - `docs/superpowers/specs/2026-09-23-controller-v1-02-data-api.md`（§HTTP 端点与字段表：`/task-previews`、`/tasks`、children、cancel、time-review、release-lock）
 - `docs/superpowers/specs/2026-09-23-controller-v1-01-identity-access.md`（`device.task.read` 权限语义、404 统一投影）
 - `docs/superpowers/specs/2026-09-23-controller-v1-04-task-lifecycle.md`（主任务 4 态、子任务 10 状态、12 原因码、held 核验语义）
