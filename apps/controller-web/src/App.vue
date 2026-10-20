@@ -9,6 +9,13 @@ import DevicesView from './views/DevicesView.vue'
 import DeviceDetailView from './views/DeviceDetailView.vue'
 import TasksView from './views/TasksView.vue'
 import TaskDetailView from './views/TaskDetailView.vue'
+import AdminApprovalsView from './views/AdminApprovalsView.vue'
+import AdminGroupsView from './views/AdminGroupsView.vue'
+import AdminUsersView from './views/AdminUsersView.vue'
+import AdminRolesView from './views/AdminRolesView.vue'
+import AdminGrantsView from './views/AdminGrantsView.vue'
+import AdminAuditView from './views/AdminAuditView.vue'
+import AdminSystemView from './views/AdminSystemView.vue'
 import { createI18n, type Locale } from './i18n'
 import { createAuth } from './auth'
 import { createRouter, type AppRoute } from './router'
@@ -37,6 +44,27 @@ const router = createRouter(auth)
 const DEVICE_ID_HEX64 = /^[0-9a-f]{64}$/i
 
 const route = computed(() => router.currentRoute.value)
+
+// 管理端入口只对 `is_admin` 会话可见；路由守卫已在 router.ts 拦截非管理员，
+// 这里的显隐只是第二道防线（视图内部还会各自校验 isAdmin 后才发请求）。
+const isAdminUser = computed(() => auth.user.value?.is_admin === true)
+
+const ADMIN_ROUTE_LABELS: ReadonlyArray<{ route: AppRoute; labelKey: string }> = [
+  { route: { name: 'admin-approvals' }, labelKey: 'admin.nav.approvals' },
+  { route: { name: 'admin-groups' }, labelKey: 'admin.nav.groups' },
+  { route: { name: 'admin-users' }, labelKey: 'admin.nav.users' },
+  { route: { name: 'admin-roles' }, labelKey: 'admin.nav.roles' },
+  { route: { name: 'admin-grants' }, labelKey: 'admin.nav.grants' },
+  { route: { name: 'admin-audit' }, labelKey: 'admin.nav.audit' },
+  { route: { name: 'admin-system' }, labelKey: 'admin.nav.system' },
+]
+
+const adminNav = computed(() => ADMIN_ROUTE_LABELS.map((entry) => ({
+  route: entry.route,
+  label: t(entry.labelKey),
+})))
+
+const adminCsrfToken = computed(() => auth.csrfToken.value ?? '')
 
 const tasksPendingDevice = computed<string | null>(() => {
   const current = route.value
@@ -392,6 +420,17 @@ onUnmounted(() => {
         >
           {{ t('auth.sessions.title') }}
         </BaseButton>
+        <template v-if="isAdminUser">
+          <BaseButton
+            v-for="entry in adminNav"
+            :key="entry.label"
+            variant="secondary"
+            :disabled="busy"
+            @click="() => navigateTo(entry.route)"
+          >
+            {{ entry.label }}
+          </BaseButton>
+        </template>
       </nav>
       <BaseButton :loading="busy" :loading-label="t('button.loading')" @click="submitLogout">{{ t('auth.logout.label') }}</BaseButton>
 
@@ -444,6 +483,27 @@ onUnmounted(() => {
           :on-release-lock="adaptReleaseLock"
         />
       </template>
+      <template v-else-if="route.name === 'admin-approvals'">
+        <AdminApprovalsView :csrf-token="adminCsrfToken" :is-admin="isAdminUser" />
+      </template>
+      <template v-else-if="route.name === 'admin-groups'">
+        <AdminGroupsView :csrf-token="adminCsrfToken" :is-admin="isAdminUser" />
+      </template>
+      <template v-else-if="route.name === 'admin-users'">
+        <AdminUsersView :csrf-token="adminCsrfToken" :is-admin="isAdminUser" />
+      </template>
+      <template v-else-if="route.name === 'admin-roles'">
+        <AdminRolesView :csrf-token="adminCsrfToken" :is-admin="isAdminUser" />
+      </template>
+      <template v-else-if="route.name === 'admin-grants'">
+        <AdminGrantsView :csrf-token="adminCsrfToken" :is-admin="isAdminUser" />
+      </template>
+      <template v-else-if="route.name === 'admin-audit'">
+        <AdminAuditView :csrf-token="adminCsrfToken" :is-admin="isAdminUser" />
+      </template>
+      <template v-else-if="route.name === 'admin-system'">
+        <AdminSystemView :csrf-token="adminCsrfToken" :is-admin="isAdminUser" />
+      </template>
       <template v-else>
         <div class="app-placeholder">
           <p>{{ t('app.notConnected') }}</p>
@@ -490,7 +550,7 @@ onUnmounted(() => {
 .auth-signed-in > .auth-nav { grid-column: 3; justify-self: start; }
 .auth-signed-in > button { grid-column: 4; justify-self: end; }
 .auth-signed-in > :nth-child(n + 5) { grid-column: 1 / -1; }
-.auth-nav { display: flex; gap: var(--space-2); }
+.auth-nav { display: flex; flex-wrap: wrap; gap: var(--space-2); min-width: 0; }
 .auth-retry { margin-inline-start: auto; }
 .app-placeholder { display: grid; gap: var(--space-2); padding: var(--space-4); border: 1px dashed var(--color-border, #ccc); border-radius: 4px; }
 .app-placeholder p { margin: 0; color: var(--color-text-muted, #666); }

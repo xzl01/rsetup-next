@@ -175,7 +175,15 @@ export interface RequestOptions {
   idempotencyKey?: string
 }
 
-export async function post<T>(path: string, payload: unknown,
+/**
+ * Shared restricted write transport for POST/PUT/PATCH/DELETE.
+ *
+ * The header set stays a fixed whitelist: callers can only influence `X-CSRF-Token` and
+ * `Idempotency-Key` through validated `RequestOptions` fields. Arbitrary `RequestInit` or
+ * custom headers are never accepted, so nothing can be smuggled past the fetch boundary
+ * (the idempotency key travels as an HTTP header, never inside the JSON payload).
+ */
+async function writeRequest<T>(method: 'POST' | 'PUT' | 'PATCH' | 'DELETE', path: string, payload: unknown,
   options?: RequestOptions): Promise<ApiResponse<T>> {
   const url = safePath(path)
   const signal = options?.signal
@@ -191,11 +199,34 @@ export async function post<T>(path: string, payload: unknown,
   let response: Response
   try {
     response = await fetch(url, {
-      method: 'POST', credentials: 'same-origin', redirect: 'error',
+      method, credentials: 'same-origin', redirect: 'error',
       headers, body: JSON.stringify(payload), signal,
     })
   } catch (error) {
     throw localError(isAborted(error, signal) ? 'REQUEST_ABORTED' : 'NETWORK_ERROR')
   }
   return unwrap<T>(response, signal)
+}
+
+export async function post<T>(path: string, payload: unknown,
+  options?: RequestOptions): Promise<ApiResponse<T>> {
+  return writeRequest<T>('POST', path, payload, options)
+}
+
+/** Restricted `PUT` (02 §5 group member replacement); same header whitelist as `post`. */
+export async function put<T>(path: string, payload: unknown,
+  options?: RequestOptions): Promise<ApiResponse<T>> {
+  return writeRequest<T>('PUT', path, payload, options)
+}
+
+/** Restricted `PATCH` (CAS patches for users/roles/groups/devices); same header whitelist as `post`. */
+export async function patch<T>(path: string, payload: unknown,
+  options?: RequestOptions): Promise<ApiResponse<T>> {
+  return writeRequest<T>('PATCH', path, payload, options)
+}
+
+/** Restricted `DELETE`; the backend still requires a JSON body plus CSRF (02 §4). */
+export async function del<T>(path: string, payload: unknown,
+  options?: RequestOptions): Promise<ApiResponse<T>> {
+  return writeRequest<T>('DELETE', path, payload, options)
 }
