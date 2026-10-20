@@ -694,4 +694,25 @@ mod tests {
         fixture.write("sys/class/block/nvme0n1/device/transport", "pcie\n");
         assert_eq!(probe.collect().storage_counts, (1, 0, 0));
     }
+
+    #[test]
+    fn mmc_counts_come_from_the_injected_sysfs_root() {
+        // The unified storage capability once re-read `/sys/bus/mmc/devices/
+        // <name>/type` from the global root while the MMC manager read the
+        // same file under the injected one. Both the eMMC and the SD count
+        // now come from the injected root, so a fixture root that has no
+        // global /sys left cannot over- or under-report.
+        let fixture = Fixture::new();
+        for (name, kind) in [("mmcblk0", "MMC"), ("mmcblk1", "SD")] {
+            fixture.write(&format!("sys/class/block/{name}/dev"), "179:0\n");
+            fixture.write(&format!("sys/class/block/{name}/size"), "1000\n");
+            fixture.write(&format!("sys/class/block/{name}/device/type"), kind);
+        }
+        let mut probe = fixture.probe();
+        assert_eq!(
+            probe.collect().storage_counts,
+            (0, 1, 1),
+            "one eMMC and one SD card under the injected root"
+        );
+    }
 }
