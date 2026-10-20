@@ -13,9 +13,10 @@
 //! 证据 `SystemFallback`，不伪造设备样本或设备接收时间），满足前端
 //! `assertDeviceStatusReportShape` 的对象断言。`age_ms` 一律按缓存条目的
 //! **单调接收锚点**（`Instant`）计算，宿主墙钟前跳/回拨都不会使年龄倒退或清零。
-//! [`EmptyDeviceStatusSnapshotSource`] 是「缓存中确实没有任何样本」这一真实
-//! 状态的实现（transport 线 typed 缓存适配器接入前的唯一合法语义：恒无样本），
-//! 它不伪造任何快照、时间证据或新鲜度。
+//! [`EmptyDeviceStatusSnapshotSource`] 是「本进程尚未挂载任何 typed 缓存」这一真实
+//! 状态的实现：它不伪造任何快照、时间证据或新鲜度。transport 线 typed 缓存已交付
+//! 后，生产装配位改挂 [`crate::polling::SnapshotStore`]（内存最新快照 + 单调 30s
+//! 新鲜度 + 代际/序号校验），本模块的 handler 与投影不变。
 //!
 //! handler 固定顺序与 `src/http_auth.rs`、`src/tasks/http.rs` 完全一致，
 //! **不自写** Host/Cookie/CSRF：
@@ -110,10 +111,11 @@ pub enum DeviceStatusFreshness {
 
 /// 恒无样本状态源：真实反映「本进程缓存中没有任何设备状态样本」。
 ///
-/// 这是 transport 线 typed 缓存适配器交付前唯一不伪造数据的合法实现——它对任何
-/// 设备都返回 `Ok(None)`，因此响应恒为 `snapshot=null`、`freshness="unknown"`、
+/// 它对任何设备都返回 `Ok(None)`，因此响应恒为 `snapshot=null`、`freshness="unknown"`、
 /// `age_ms=null`（`received_time` 为中控系统后备 TimeEvidence 对象）；不返回
-/// 常量快照、不返回常量 `fresh`、也不返回错误。
+/// 常量快照、不返回常量 `fresh`、也不返回错误。生产装配位现由
+/// [`crate::polling::SnapshotStore`] 承担真实缓存，本类型保留给「显式不挂载缓存」
+/// 的装配与测试。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EmptyDeviceStatusSnapshotSource;
 

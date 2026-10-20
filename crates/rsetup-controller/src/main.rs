@@ -21,11 +21,12 @@ use rsetup_controller::auth::sqlx_repo::SqlxIdentityRepository;
 use rsetup_controller::authz::sqlx_repo::SqlxAuthorizationSnapshotRepository;
 use rsetup_controller::devices::service::AdmissionChangeEvent;
 use rsetup_controller::http_auth::{AppState, HttpAuthState};
-use rsetup_controller::http_device_status::{DeviceStatusState, EmptyDeviceStatusSnapshotSource};
+use rsetup_controller::http_device_status::DeviceStatusState;
 use rsetup_controller::http_live::LiveAuth;
 use rsetup_controller::http_security::HttpSecurityConfig;
 use rsetup_controller::metrics::collect::MetricsRuntime;
 use rsetup_controller::metrics::config::MetricsConfig;
+use rsetup_controller::polling::SnapshotStore;
 use rsetup_controller::production::{MetricsLineInputs, ProductionInputs, build_production_router};
 use rsetup_controller::tasks::SqlxTaskApi;
 use rsetup_controller::tasks::http::HttpTasksState;
@@ -145,7 +146,12 @@ fn production_inputs(
         tasks,
         status: DeviceStatusState {
             auth,
-            snapshot: Arc::new(EmptyDeviceStatusSnapshotSource),
+            // 真实 typed 内存快照源（polling::SnapshotStore）：代际/序号校验 + 单调
+            // 30s 新鲜度的本进程缓存。transport 线的轮询与认证连接管理器尚未接入，
+            // 当前还没有任何写入方，因此它对任何设备都真实地报告「尚无样本」
+            // （snapshot=null / freshness=unknown / age_ms=null），不伪造快照、时间
+            // 证据或新鲜度；轮询驱动接入时共享同一个 Arc<SnapshotStore> 写入即可。
+            snapshot: Arc::new(SnapshotStore::new()),
         },
         metrics: MetricsLineInputs {
             config: metrics_config,
