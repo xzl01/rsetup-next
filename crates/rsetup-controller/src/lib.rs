@@ -1,3 +1,4 @@
+pub mod admin_cli;
 pub mod api;
 pub mod audit;
 pub mod auth;
