@@ -119,12 +119,20 @@
 - **修复**：`capabilityCopy` 键改为 `storage`（中文 label「存储」），并补 `hardwareReason` 的 `"No storage devices detected" → "未检测到存储设备"` 映射；同时删除改名后不可达的 `value.id === "nvme"` 明细分支与 `"NVMe controllers detected"` 残留字符串。
 - **证据**：① 测试 `ui/i18n.test.mjs` 的 `storage capability card is localized under its renamed id`；把键还原为 `nvme` 后该用例 **FAIL**（控制器独立复现：1/16），修复后全绿。② 实机 DOM 复核：中文界面矩阵卡片为「存储」（88 `1 NVMe · 1 eMMC`、34 `1 eMMC`），英文界面为 `Storage`。③ 截图：`web-rock5b-storage-matrix.png`、`web-rock3a-storage-matrix.png`。
 
-### T1（外观问题，TUI）窄屏下 eMMC 设备行折行，容量数值跨行 — **待办**
+### T1（外观问题，TUI）窄屏下 eMMC 设备行折行，容量数值跨行 — **已修复（代码与用例；实机复检待做）**
 
 - **现象**：Rock 3A（100×30 终端、卡片内宽 59 列）上该行渲染为两行：`[eMMC] /dev/mmcblk0 · 064G02 · Toshiba (0x000011) · 58.24` / `GiB`。
 - **实测**：该行显示宽度 61 列 > 59 列内宽。Rock 5B（厂商为未映射的 `0x0000d6`，行宽更短）不折行，故问题只在厂商名带名称映射时出现。
 - **影响**：**无数据丢失**——卡片高度按折行行数计算（`crates/rsetup-app/src/tui.rs` 的 `wrapped_rows`），未发生截断；但「一台设备两行」的排版被破坏，容量数值被拆到第二行，可读性下降。
 - **一致性缺口**：NVMe 行有宽度自适应降级（`已用寿命:` 超宽时改成短标签），MMC 行没有等价的降级路径。
+
+**修复（提交 `26fab4b`）**——MMC 行补上与 NVMe 行同构的宽度降级路径：
+
+- **设备行**（`crates/rsetup-app/src/tui.rs` 的 `mmc_identity_line`）按 `/dev/` 前缀 → 厂商 → 型号 的顺位丢弃字段，仍放不下时以省略号截断标识部分；类型徽章与容量恒保留在同一行。Rock 3A 的行在 59 列内宽下降级为 `[eMMC] mmcblk0 · 064G02 · Toshiba (0x000011) · 58.24 GiB`（55 列），容量与单位不再拆分。
+- **状态行**同批处理：中文全写（`状态: 正常 · SLC 寿命: 10% · MLC 寿命: 10% · 预警: 正常`，55 列）可容纳，英文全写需 65 列，故先改用短寿命标签（新增 i18n 键 `storage_life_a_short`/`storage_life_b_short`），再舍弃取值为「正常/未定义」的 pre-EOL 段；pre-EOL 处于告警或紧急时不舍弃。
+- 附带修正：sysfs 读取失败的设备其 `model`/`manufacturer` 为空，原实现会打印悬空的 ` · ` 分隔符，现按非空字段拼接。
+
+**证据**：`crates/rsetup-app/src/tui.rs` 新增 5 个渲染/宽度用例——`test_render_storage_summary_keeps_mmc_capacity_on_one_row`（61 列下容量与徽章同行、`/dev/` 已舍弃，中英双语）、`test_render_storage_summary_mmc_identity_degrades_by_width`（100 列保留全量、59 列保留厂商）、`test_render_storage_summary_mmc_telemetry_line_fits_narrow_card`（中文全写 / 英文短标签）、`test_mmc_identity_line_fits_every_inner_width`（16~61 列逐列不变量，更窄处容量不丢）、`test_mmc_identity_line_skips_empty_identity_fields`。`cargo test -p rsetup-next` 92 项全绿。**尚未在 Rock 3A 实机复检**（需重新交叉编译部署并复采 `tui-rock3a-storage-zh.png`）。
 
 ## 6. 规范 vs 实现的等价差异（建议回写规范，非缺陷）
 
@@ -196,13 +204,13 @@ node scripts/capture-web-screenshot.mjs --url "http://127.0.0.1:19088/#hardware"
 
 ## 10. 建议后续动作
 
-1. **修 T1**（当前唯一实机可见待办）：为 MMC 设备行补一条宽度降级路径（例如超宽时省略 `/dev/` 前缀或厂商名，优先保住容量数值），并补一个 61 列边界的渲染用例；或按 TUI 规范改为两行专用排版。
+1. **修 T1**（当前唯一实机可见待办）：为 MMC 设备行补一条宽度降级路径（例如超宽时省略 `/dev/` 前缀或厂商名，优先保住容量数值），并补一个 61 列边界的渲染用例；或按 TUI 规范改为两行专用排版。——**已按第一种方案实现（提交 `26fab4b`），见第 5 节 T1 的修复与证据；实机复检待做**。
 2. **代码质量待办（本次任务审查记录的次要发现，不影响行为）**：
-   - `ui/styles.css` 的 `.storage-mmc-card` 与既有 `.nvme-card` 规则逐条重复 → 可改为 `class="nvme-card storage-mmc-card"`（需同步收紧 `ui/storage.test.mjs` 中 `!includes('class="nvme-card"')` 断言）；
-   - `storageTool.model`、`nvme.description`/`uninitialized`/`noDevices` 已无引用，`ui/index.html` 的 `icon-nvme` 成为孤立 symbol → 可清理；
-   - `crates/rsetup-core/src/probe.rs` 在探测 MMC 计数时以硬编码绝对路径重读 `type`，而 `MmcManager::probe_sysfs` 已按注入的 root 读取同一文件；
+   - `ui/styles.css` 的 `.storage-mmc-card` 与既有 `.nvme-card` 规则逐条重复 → 可改为 `class="nvme-card storage-mmc-card"`（需同步收紧 `ui/storage.test.mjs` 中 `!includes('class="nvme-card"')` 断言）；**已处理（提交 `1bfa6ce`）**：删除重复盒模型，卡片同时带 `.nvme-card`（盒模型）与 `.storage-mmc-card`（定位钩子，第 9 节的取值选择器不变），断言改为校验两张 MMC 卡都带共享盒模型与自身钩子；
+   - `storageTool.model`、`nvme.description`/`uninitialized`/`noDevices` 已无引用，`ui/index.html` 的 `icon-nvme` 成为孤立 symbol → 可清理；**部分处理（提交 `1bfa6ce`）**：`icon-nvme` 已删除；`storageTool.model` 与 `nvme.description`/`uninitialized`/`noDevices` 四个 i18n 键仍未被引用（`ui/i18n.test.mjs` 的字典用例仍断言其取值），留待与 i18n 字典一并清理；
+   - `crates/rsetup-core/src/probe.rs` 在探测 MMC 计数时以硬编码绝对路径重读 `type`，而 `MmcManager::probe_sysfs` 已按注入的 root 读取同一文件；**已消除（随 `b76df32` 接入 deviceinfo）**：该分支连同 `/sys/bus/mmc/devices` 一并移除，三类计数现均来自 `deviceinfo::inspect_storage(&self.root)`，其 `device/type` 读取本就相对注入根；提交 `1178221` 补 `mmc_counts_come_from_the_injected_sysfs_root` 用例钉住。附注：`probe.rs` 的 `spi_nor_detected()`、`probe_interfaces()` 与 GPIO/thermal/LED 的 `Path::new("/sys/...").exists()` 仍走全局绝对路径（与 MMC 无关，本项未覆盖）；
    - `ui/storage.test.mjs` 中 NVMe 卡片渲染现仅经由 stub 覆盖，保留的 NVMe 卡片断言较此前减少。
-   - `ui/styles.css` 的 `.nvme-metric-bar-fill.is-na` 目前是死 CSS：基础规则的 `width: var(--metric-percent, 0%)` 与 NA 分支的 `data-metric-percent="0"`（`ui/app.js`）叠加后，填充在 `overflow: hidden` 的 `.nvme-metric-bar` 轨道内宽度恒为 0%，因此「N/A」寿命条渲染为空轨道而非灰色斜纹填充；需决定给它一个可见宽度，或删除该规则、该 class 及 `ui/storage.test.mjs` 中对应的计数断言（`nvme-metric-bar-fill is-na` 计数为 2）。
+   - **已处理（提交 `1bfa6ce`，选择「给一个可见宽度」）**：`.nvme-metric-bar-fill.is-na` 加 `width: 100%`，并按第 4.2 节「null → 置灰」的设计意图去掉 N/A 填充上误导性的 `data-metric-percent`（N/A 不是百分比）；`ui/storage.test.mjs` 新增用例锁定「斜纹规则带宽度、N/A 填充不带百分比、`.storage-mmc-card` 不再出现第二条盒模型规则」。原缺陷描述：`ui/styles.css` 的 `.nvme-metric-bar-fill.is-na` 目前是死 CSS：基础规则的 `width: var(--metric-percent, 0%)` 与 NA 分支的 `data-metric-percent="0"`（`ui/app.js`）叠加后，填充在 `overflow: hidden` 的 `.nvme-metric-bar` 轨道内宽度恒为 0%，因此「N/A」寿命条渲染为空轨道而非灰色斜纹填充；需决定给它一个可见宽度，或删除该规则、该 class 及 `ui/storage.test.mjs` 中对应的计数断言（`nvme-metric-bar-fill is-na` 计数为 2）。
    - 历史文档 `docs/testing/nvme-2026-09-12/report.md` 与 `docs/superpowers/specs/2026-09-10-nvme-monitoring-design.md` 仍将 `GET /api/v1/hardware/nvme` 描述为在线端点；它们现已早于该端点被 `/api/v1/hardware/storage` 取代这一变更。
 3. 规范回写：第 6 节的三项等价差异建议直接在 TUI 规范 §5.1/§5.2 中改成实现现状，避免后续核验再次产生假阳性。
 4. 保留（非序列号、且是核验所需的设备上下文）：第 2.2 节的型号 `A3A562` / `064G02`、厂商 `0x0000d6` / `0x000011`、固件与容量。如需连型号/固件一并脱敏，可再处理。
