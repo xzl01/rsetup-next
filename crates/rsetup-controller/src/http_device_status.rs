@@ -267,7 +267,7 @@ mod tests {
     use super::*;
     use crate::auth::service::{IdentityUser, Login, Session, SessionPage};
     use crate::auth::session::token_digest;
-    use crate::http_auth::{AuthFuture, AuthServiceApi};
+    use crate::http_auth::{AuthFuture, AuthServiceApi, SessionAuthority};
     use crate::http_security::HttpSecurityConfig;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
@@ -319,6 +319,18 @@ mod tests {
         }
         fn is_live_session(&self, _digest: &[u8; 32]) -> bool {
             false
+        }
+        fn session_authority<'a>(
+            &'a self,
+            _digest: &'a [u8; 32],
+        ) -> AuthFuture<'a, SessionAuthority> {
+            Box::pin(async {
+                Ok(SessionAuthority {
+                    session_live: false,
+                    is_admin: false,
+                    authz_epoch: 0,
+                })
+            })
         }
         fn list_sessions<'a>(
             &'a self,
@@ -381,6 +393,19 @@ mod tests {
         }
         fn is_live_session(&self, _digest: &[u8; 32]) -> bool {
             true
+        }
+        fn session_authority<'a>(
+            &'a self,
+            _digest: &'a [u8; 32],
+        ) -> AuthFuture<'a, SessionAuthority> {
+            let is_admin = self.session.user.is_admin;
+            Box::pin(async move {
+                Ok(SessionAuthority {
+                    session_live: true,
+                    is_admin,
+                    authz_epoch: 0,
+                })
+            })
         }
         fn list_sessions<'a>(
             &'a self,

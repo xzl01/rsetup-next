@@ -39,7 +39,7 @@ use rsetup_controller::auth::session::token_digest;
 use rsetup_controller::authz::policy::{GrantScope, GrantSource, Permission};
 use rsetup_controller::devices::repository::{AuditCursor, AuditFilter, DeviceAdminView};
 use rsetup_controller::devices::service::AdmissionChangeEvent;
-use rsetup_controller::http_auth::{AuthFuture, AuthServiceApi, CsrfBinding};
+use rsetup_controller::http_auth::{AuthFuture, AuthServiceApi, CsrfBinding, SessionAuthority};
 use rsetup_controller::http_security::HttpSecurityConfig;
 use rsetup_controller::model::{AdmissionState, ReviewDecision};
 
@@ -78,6 +78,18 @@ impl AuthServiceApi for TestAuth {
     }
     fn is_live_session(&self, digest: &[u8; 32]) -> bool {
         *digest == token_digest(COOKIE_RAW.as_bytes())
+    }
+    fn session_authority<'a>(&'a self, digest: &'a [u8; 32]) -> AuthFuture<'a, SessionAuthority> {
+        // 权威侧与内存时钟同构（只认 COOKIE_RAW 的 digest），管理员标志与
+        // `authenticate` 返回的 fixture 用户一致，epoch 与 authz_epoch() 一致。
+        let session_live = *digest == token_digest(COOKIE_RAW.as_bytes());
+        Box::pin(async move {
+            Ok(SessionAuthority {
+                session_live,
+                is_admin: true,
+                authz_epoch: 1,
+            })
+        })
     }
     fn authz_epoch(&self) -> AuthFuture<'_, u64> {
         Box::pin(async { Ok(1) })

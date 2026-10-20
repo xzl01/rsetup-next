@@ -39,7 +39,7 @@ use crate::auth::service::{AuthService, Login, Session, SessionPage};
 use crate::auth::sqlx_repo::SqlxIdentityRepository;
 use crate::db::DbPool;
 use crate::error::ControllerError;
-use crate::http_auth::{AuthFuture, AuthServiceApi};
+use crate::http_auth::{AuthFuture, AuthServiceApi, SessionAuthority};
 
 /// Fixed, bound-only, read-only `schema_meta` singleton read.
 /// `LIMIT 2` bounds the fetch: a polluted duplicate row is rejected by the
@@ -110,6 +110,30 @@ impl AuthServiceApi for LiveAuth {
         // no idle renewal. A hit is only a necessary condition; the
         // DB-authoritative `authenticate` is unchanged.
         self.service.is_live_session(digest)
+    }
+
+    fn session_authority<'a>(&'a self, digest: &'a [u8; 32]) -> AuthFuture<'a, SessionAuthority> {
+        // 权威两步读：① `sessions` ⋈ `users` 的一行（撤销、停用、进程换代、
+        // 管理员降权都在这里暴露，时钟看不到它们）；② 与 `authz_epoch()` 同一条
+        // 固定 SQL 读当前授权 epoch。任何一步失败都原样上抛去敏错误，由调用方
+        // fail-closed 关流——这里绝不把「读不到」翻译成「仍然有效」。
+        Box::pin(async move {
+            let Some(user) = self.service.session_authority(digest).await? else {
+                // 会话已不在权威视图内：epoch 读不读都不改变结论。
+                return Ok(SessionAuthority {
+                    session_live: false,
+                    is_admin: false,
+                    authz_epoch: 0,
+                });
+            };
+            let is_admin = user.is_admin;
+            let authz_epoch = self.authz_epoch().await?;
+            Ok(SessionAuthority {
+                session_live: true,
+                is_admin,
+                authz_epoch,
+            })
+        })
     }
 
     fn list_sessions<'a>(

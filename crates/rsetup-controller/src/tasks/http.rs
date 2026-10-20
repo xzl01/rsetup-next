@@ -1142,7 +1142,7 @@ mod tests {
     use super::*;
     use crate::auth::service::{IdentityUser, Login, SessionPage};
     use crate::auth::session::token_digest;
-    use crate::http_auth::{AuthFuture, AuthServiceApi, CsrfBinding};
+    use crate::http_auth::{AuthFuture, AuthServiceApi, CsrfBinding, SessionAuthority};
     use crate::http_security::HttpSecurityConfig;
     use crate::tasks::model::ReasonCode;
     use crate::tasks::preview::PreviewTarget;
@@ -2054,6 +2054,22 @@ mod tests {
         }
         fn is_live_session(&self, digest: &[u8; 32]) -> bool {
             digest == &self.session.digest
+        }
+        fn session_authority<'a>(
+            &'a self,
+            digest: &'a [u8; 32],
+        ) -> AuthFuture<'a, SessionAuthority> {
+            // 任务线 fake：权威侧结论与内存时钟同构，管理员标志取 fake 会话用户。
+            // 任务路由不建 SSE 流，本实现只为边界完整性存在，刻意不做宽松默认。
+            let session_live = self.session.digest == *digest;
+            let is_admin = self.session.user.is_admin;
+            Box::pin(async move {
+                Ok(SessionAuthority {
+                    session_live,
+                    is_admin,
+                    authz_epoch: 0,
+                })
+            })
         }
         fn list_sessions<'a>(
             &'a self,

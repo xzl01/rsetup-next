@@ -101,7 +101,7 @@ mod typed {
     use rsetup_controller::authz::sqlx_repo::SqlxAuthorizationSnapshotRepository;
     use rsetup_controller::devices::service::AdmissionChangeEvent;
     use rsetup_controller::events::EventBus;
-    use rsetup_controller::http_auth::{AuthFuture, AuthServiceApi};
+    use rsetup_controller::http_auth::{AuthFuture, AuthServiceApi, SessionAuthority};
     use rsetup_controller::http_device_status::{
         DeviceStatusState, EmptyDeviceStatusSnapshotSource,
     };
@@ -177,6 +177,18 @@ mod typed {
         }
         fn is_live_session(&self, _digest: &[u8; 32]) -> bool {
             false
+        }
+        fn session_authority<'a>(
+            &'a self,
+            _digest: &'a [u8; 32],
+        ) -> AuthFuture<'a, SessionAuthority> {
+            Box::pin(async {
+                Ok(SessionAuthority {
+                    session_live: false,
+                    is_admin: false,
+                    authz_epoch: 0,
+                })
+            })
         }
         fn list_sessions<'a>(
             &'a self,
@@ -257,6 +269,22 @@ mod typed {
         }
         fn is_live_session(&self, digest: &[u8; 32]) -> bool {
             digest == &self.digest
+        }
+        fn session_authority<'a>(
+            &'a self,
+            digest: &'a [u8; 32],
+        ) -> AuthFuture<'a, SessionAuthority> {
+            // 与 `is_live_session`/`authenticate`/`authz_epoch` 同源的权威侧结论：
+            // 只认这枚 live token 的 digest，epoch 恒 7（与 authz_epoch() 一致）。
+            let session_live = *digest == self.digest;
+            let is_admin = self.session().user.is_admin;
+            Box::pin(async move {
+                Ok(SessionAuthority {
+                    session_live,
+                    is_admin,
+                    authz_epoch: 7,
+                })
+            })
         }
         fn list_sessions<'a>(
             &'a self,
@@ -373,6 +401,8 @@ mod typed {
             events: EventsState {
                 auth: Arc::clone(&auth),
                 bus: EventBus::new(),
+                // 装配测试不驱动流体内的周期复核，取默认周期即可。
+                revalidate_interval: rsetup_controller::http_events::DEFAULT_REVALIDATE_INTERVAL,
             },
             auth: AppState {
                 db: db.clone(),
@@ -457,24 +487,83 @@ mod typed {
         }
     }
 
+    /// 参与「共享 `Arc<HttpAuthState>` 指针一致性」门禁的四条线。
+    ///
+    /// 这里刻意用**枚举 + 穷尽 match**，而不是 `&str` + `_ =>` 兜底：字符串匹配
+    /// 会让 `"events"` 落进 `_` 分支、被同一分支里的 `status` 不一致**遮蔽**
+    /// ——status 先报错也让测试变绿，`events` 的 `Arc::ptr_eq` 门禁因此从未被
+    /// 真正验证过（删掉 `production.rs` 里那一行也照样通过，即测试假阳性）。
+    /// 枚举分支由编译器穷尽性执法，新增一条线漏写分支时直接编译失败。
+    #[derive(Clone, Copy, Debug)]
+    enum MismatchLine {
+        Management,
+        Tasks,
+        Status,
+        Events,
+    }
+
+    impl MismatchLine {
+        fn name(self) -> &'static str {
+            match self {
+                Self::Management => "management",
+                Self::Tasks => "tasks",
+                Self::Status => "status",
+                Self::Events => "events",
+            }
+        }
+    }
+
     #[tokio::test]
     async fn mismatched_auth_context_is_rejected_on_every_line() {
         // 任一条线换了 HttpAuthState 实例（哪怕只有一条），装配必须失败关闭。
-        for line in ["management", "tasks", "status", "events"] {
+        //
+        // 每个分支都**只**让这一条线不一致、其余线全部共享同一个 Arc，于是
+        // 「Err 只可能由这条线引起」是构造保证的事实：删掉 `production.rs` 中
+        // 对应那条线的 `Arc::ptr_eq` 检查，该轮就会返回 Ok 并被下面的 panic
+        // 当场抓住（events 尤其如此，不再由 status 代打）。
+        for line in [
+            MismatchLine::Management,
+            MismatchLine::Tasks,
+            MismatchLine::Status,
+            MismatchLine::Events,
+        ] {
             let shared = auth_state();
             let other = auth_state();
-            let (management, tasks, status) = match line {
-                "management" => (Arc::clone(&other), Arc::clone(&shared), Arc::clone(&shared)),
-                "tasks" => (Arc::clone(&shared), Arc::clone(&other), Arc::clone(&shared)),
-                _ => (Arc::clone(&shared), Arc::clone(&shared), Arc::clone(&other)),
+            let inputs = match line {
+                MismatchLine::Management => inputs(
+                    Arc::clone(&shared),
+                    Arc::clone(&other),
+                    Arc::clone(&shared),
+                    Arc::clone(&shared),
+                ),
+                MismatchLine::Tasks => inputs(
+                    Arc::clone(&shared),
+                    Arc::clone(&shared),
+                    Arc::clone(&other),
+                    Arc::clone(&shared),
+                ),
+                MismatchLine::Status => inputs(
+                    Arc::clone(&shared),
+                    Arc::clone(&shared),
+                    Arc::clone(&shared),
+                    Arc::clone(&other),
+                ),
+                // events 的独立穷尽分支：auth/management/tasks/status 四线全部
+                // 是同一个 Arc，只有 inputs.events.auth 换成另一个实例。
+                MismatchLine::Events => {
+                    let mut inputs = inputs(
+                        Arc::clone(&shared),
+                        Arc::clone(&shared),
+                        Arc::clone(&shared),
+                        Arc::clone(&shared),
+                    );
+                    inputs.events.auth = Arc::clone(&other);
+                    inputs
+                }
             };
-            let mut inputs = inputs(shared, management, tasks, status);
-            if line == "events" {
-                inputs.events.auth = Arc::clone(&other);
-            }
             match build_production_router(inputs) {
                 // 只断言「必须 Err」；不 Debug 打印 Router，避免失败输出被整张路由表淹没。
-                Ok(_) => panic!("{line} 线认证上下文不一致时必须 Err"),
+                Ok(_) => panic!("{} 线认证上下文不一致时必须 Err", line.name()),
                 Err(error) => assert_mismatch(error),
             }
         }

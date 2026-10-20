@@ -201,6 +201,8 @@ fn production_inputs(
     let events = EventsState {
         auth: auth.clone(),
         bus: EventBus::new(),
+        // 长连接权威复核周期：空闲连接也必须按会话/authz_epoch/降权切断。
+        revalidate_interval: rsetup_controller::http_events::DEFAULT_REVALIDATE_INTERVAL,
     };
 
     let transport = Arc::new(UnwiredTransportSources);

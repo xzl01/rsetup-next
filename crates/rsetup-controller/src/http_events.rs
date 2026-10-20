@@ -5,41 +5,61 @@
 //! [`crate::production::build_production_router`]。
 //!
 //! 握手顺序与 `src/http_auth.rs`、`src/tasks/http.rs`、
-//! `src/http_device_status.rs` 完全一致，**不自写** Host/Cookie/CSRF：
+//! [`crate::http_device_status`] 完全一致，**不自写** Host/Cookie/CSRF：
 //! ①[`authenticate_read`]`(EndpointId::EventsRead)`（单值 Host 允许列表 →
 //! 严格单值会话 Cookie → 进程内活会话预检 → DB 权威 authenticate → 读限速
 //! 50/s；未登录恒 401 `AUTH_REQUIRED`）→ ②[`require_business_session`]
 //! （临时密码会话一律 403 `PASSWORD_CHANGE_REQUIRED`，02 §7「已改密会话」）→
 //! ③Origin 允许列表（02 §7「握手校验 Host/Origin 允许列表」：`Origin` 缺失即
 //! 同源 GET，只由 Host 允许列表把关；携带时必须等于 `allowed_origin`，重复或
-//! 非 ASCII 失败关闭 403）→ ④订阅总线并进入 SSE 流。
+//! 非 ASCII 失败关闭 403）→ ④[`crate::http_auth::AuthServiceApi::session_authority`] 取**权威**
+//! 基准快照（会话仍有效 + 当前 `authz_epoch` + 当前 `is_admin`；会话已失效
+//! 401，权威源读不出 503，且门禁在订阅之前）→ ⑤订阅总线并进入 SSE 流。
 //!
 //! 响应标头：`Content-Type: text/event-stream`、`Cache-Control: no-cache`
 //! （二者由 axum `Sse` 写入）与显式 `Connection: keep-alive`。诚实界定：
 //! `Connection` 是 hop-by-hop 头，真实 HTTP/1.1 连接上的最终值由 hyper 依
 //! 连接复用状态决定，本层只负责按契约把它写进响应。
 //!
-//! 流的生命周期（06 §4）：
-//! - 每次将要外发一帧之前，先在**进程内会话时钟**里复查本连接绑定的
-//!   `session.digest`；已失效（登出/撤销/闲置到期）即结束流并释放订阅，
-//!   已排队的旧授权数据不再外发（权威判定仍在 DB 侧 `authenticate`，这里
-//!   只是必要非充分的内存预检）；
-//! - 管理员专属事件（`system.time.changed`）对非管理员订阅者直接跳过，
-//!   不发送、不占水位（06 §4「时间事件仅管理员」）；
-//! - 订阅者落后于总线容量（`Lagged`，即 06 §4 的「每连接最多 128 条待发，
-//!   满时发送 reset」）时，外发一帧 `event: reset` 并**继续**该订阅：客户端
-//!   据此清空对象水位、全量 GET 重取；服务端不补发丢失事件、不做历史重放；
-//! - 客户端断开 → axum 丢弃响应体 → 本流与其 `Drop` 一起释放广播订阅，
-//!   不等下一次事件才退出；总线关闭（所有 `EventBus` 句柄析构）同样结束流。
+//! 流的生命周期（06 §4「发送前验证 session 与 authz_epoch，撤权关闭旧订阅，
+//! 排队旧权限数据不得发送」）：
 //!
-//! 本切片**不**实现 `Last-Event-ID` 断档重放（06 §4 明示其只用于断档识别、
-//! 不保证重放）、也不实现逐事件的授权快照/epoch 复核（发布方在投递前完成
-//! 可见性过滤）；二者都在模块文档留痕，不假称已完成。
+//! 1. **逐帧权威复核是唯一的发送前置条件**。流里所有外发帧（含背压
+//!    `reset`）都先进入 `queued` 槽，再触发一次
+//!    [`crate::http_auth::AuthServiceApi::session_authority`] 权威读；核验通过后才有唯一一处
+//!    `Poll::Ready(Some(frame))` 出口。会话在权威库里被撤销、用户被停用、
+//!    进程换代、`authz_epoch` 与握手基准不等、`is_admin` 与握手基准不等、
+//!    权威源读取失败，一律**立即关流并丢弃待发事件**（fail-closed：宁断不
+//!    泄，客户端重连后按新授权重新握手）。因此在数据库里被降权/撤销的连接
+//!    不可能继续享用握手期冻结的旧权限；
+//! 2. **逐事件受众过滤**。总线的 `audience` 标注由发布方给出（02 §7「逐事件
+//!    过滤」），本流用连接自己的权威身份视角做 [`crate::events::EventAudience::visible_to`]
+//!    严格匹配，不属于本连接的受众**静默跳过**，不发送、不占水位。管理员专属
+//!    事件名（[`EventName::admin_only`]）与受众是两道并联门禁，缺一不可；
+//! 3. **每次 poll 都先跑内存会话时钟预检** [`crate::http_auth::AuthServiceApi::is_live_session`]：
+//!    已失效（登出/撤销/闲置到期）即结束流并释放订阅，这条廉价路径让内存侧
+//!    已知的失效不必等一次权威读；权威判定始终在 ①/复核侧，内存预检只是必要
+//!    非充分条件；
+//! 4. **周期性复核**（周期 [`EventsState::revalidate_interval`]，默认 5s）。
+//!    长时间无事件的空闲连接同样必须被切断，否则「数据库里已注销的会话」会
+//!    永远挂着订阅；
+//! 5. 订阅者落后于总线容量（`Lagged`，即 06 §4 的「每连接最多 128 条待发，
+//!    满时发送 reset」）时，把 `reset` 帧也走同一套核验后外发，并**继续**该
+//!    订阅：客户端据此清空对象水位、全量 GET 重取；服务端不补发丢失事件、
+//!    不做历史重放；
+//! 6. 客户端断开 → axum 丢弃响应体 → 本流与其 `Drop` 一起释放广播订阅，
+//!    不等下一次事件才退出；总线关闭（所有 `EventBus` 句柄析构）同样结束流。
+//!
+//! 成本界定（诚实）：每帧一次权威读 = 每帧至多两次 `SELECT`（会话行 +
+//! `schema_meta` epoch），上限由事件速率与复核周期决定，不与板端采集争抢
+//! （发布侧永不因慢订阅阻塞）；本切片**不**实现 `Last-Event-ID` 断档重放
+//! （06 §4 明示其只用于断档识别、不保证重放）。
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::{FromRef, State};
@@ -51,13 +71,28 @@ use axum::routing::get;
 use futures_core::Stream;
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::time::{Instant as TimerInstant, Interval, MissedTickBehavior, interval_at};
 
-use crate::events::{EventBus, EventEnvelope, EventName, RESET_REASON_BUFFER_OVERFLOW};
-use crate::http_auth::{EndpointId, HttpAuthState};
-use crate::http_gate::{authenticate_read, get_single_origin, origin_host_invalid};
+use crate::error::ControllerError;
+use crate::events::{
+    EventBus, EventEnvelope, EventName, EventViewer, RESET_REASON_BUFFER_OVERFLOW,
+};
+use crate::http_auth::{EndpointId, HttpAuthState, SessionAuthority};
+use crate::http_gate::{
+    auth_required, authenticate_read, backend_error, get_single_origin, origin_host_invalid,
+};
 use crate::tasks::http::require_business_session;
 
-/// SSE 事件读路由的显式状态：共享认证上下文 + 事件总线。
+/// 空闲连接的权威复核周期缺省值：与 `KeepAlive` 的 15s 心跳同数量级、
+/// 明显更快，使「数据库里被撤销/降权」在一轮复核内切断连接，而不是等
+/// 下一条事件才暴露。装配方可按部署形态收紧。
+pub const DEFAULT_REVALIDATE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// `poll_next` 里一次权威复核的周期下限：装配方给出 0 时也不许让
+/// `tokio::time::interval_at` 直接 panic。
+const MIN_REVALIDATE_INTERVAL: Duration = Duration::from_millis(1);
+
+/// SSE 事件读路由的显式状态：共享认证上下文 + 事件总线 + 复核周期。
 ///
 /// `auth` 必须与 auth/management/tasks/status 线来自**同一个**
 /// `Arc<HttpAuthState>`（共享 session 预过滤、CSRF 绑定表与限速桶），由
@@ -67,6 +102,20 @@ use crate::tasks::http::require_business_session;
 pub struct EventsState {
     pub auth: Arc<HttpAuthState>,
     pub bus: EventBus,
+    /// 长连接的权威复核周期（见模块头第 4 条）。生产用
+    /// [`DEFAULT_REVALIDATE_INTERVAL`]，测试可缩短以做确定性时序断言。
+    pub revalidate_interval: Duration,
+}
+
+impl EventsState {
+    /// 生产装配便捷入口：复核周期取 [`DEFAULT_REVALIDATE_INTERVAL`]。
+    pub fn new(auth: Arc<HttpAuthState>, bus: EventBus) -> Self {
+        Self {
+            auth,
+            bus,
+            revalidate_interval: DEFAULT_REVALIDATE_INTERVAL,
+        }
+    }
 }
 
 impl FromRef<EventsState> for Arc<HttpAuthState> {
@@ -94,11 +143,27 @@ async fn events_handler(State(state): State<EventsState>, headers: HeaderMap) ->
     if let Err(response) = check_handshake_origin(&state.auth, &headers) {
         return response;
     }
+    // 握手期就取**权威**基准快照：会话有效性、`authz_epoch`、`is_admin` 三项
+    // 都取权威侧此刻的值（而不是 `authenticate` 返回行的缓存值），之后每帧
+    // 复核都与这个基准比对。权威源读不出即 503（宁断不泄），会话已失效即
+    // 401；两者都发生在订阅之前，不给失效连接挂订阅。
+    let authority = match state.auth.auth.session_authority(&actor.digest).await {
+        Ok(authority) => authority,
+        Err(error) => return backend_error(&error),
+    };
+    if !authority.session_live {
+        return auth_required();
+    }
     let stream = SseEventStream::new(
         state.bus.subscribe(),
         Arc::clone(&state.auth),
+        EventViewer {
+            user_id: actor.user.id,
+            is_admin: authority.is_admin,
+        },
+        authority.authz_epoch,
         actor.digest,
-        actor.user.is_admin,
+        state.revalidate_interval,
     );
     let mut response = Sse::new(stream)
         // 15s 注释心跳：让中间代理与半关闭连接不至于把长连接当空闲回收。
@@ -140,6 +205,10 @@ type RecvOutcome = (Result<EventEnvelope, RecvError>, Receiver<EventEnvelope>);
 /// 常驻在流里的 boxed `recv_frame` future（见 `SseEventStream::pending` 字段）。
 type PendingRecv = Pin<Box<dyn Future<Output = RecvOutcome> + Send>>;
 
+/// 常驻在流里的 boxed 权威复核 future（见 `SseEventStream::verify` 字段）。
+type PendingVerify =
+    Pin<Box<dyn Future<Output = Result<SessionAuthority, ControllerError>> + Send>>;
+
 /// `recv()` future 与 `Receiver` 成对搬运：`Receiver` 不能被 `&mut` 借用进
 /// `'static` future，因此每次完成后把同一个 `Receiver` 连同结果一起取回，
 /// 立刻重建下一个 future（等价于 `tokio-stream` 的 `BroadcastStream`，
@@ -152,12 +221,26 @@ async fn recv_frame(mut rx: Receiver<EventEnvelope>) -> RecvOutcome {
 /// 单条 SSE 连接的订阅流。
 ///
 /// `Item = Result<Event, std::convert::Infallible>`：本流自身不产生错误，
-/// 唯一的外发失败（会话失效/总线关闭）表现为**正常结束**而不是错误帧。
+/// 唯一的外发失败（会话失效/降权/epoch 变更/权威源故障/总线关闭）表现为
+/// **正常结束**而不是错误帧——EventSource 侧的重连会重新握手取新授权。
+///
+/// 发送不变式（读代码时按这两条自查即可）：
+/// - 唯一的 `Poll::Ready(Some(..))` 出口在「权威复核成功之后」；
+/// - 任何 `queued` 里的事件在复核失败/受众不符时只能被丢弃，不能被发送。
 struct SseEventStream {
-    pending: PendingRecv,
     auth: Arc<HttpAuthState>,
+    /// 会话摘要：只用于复核，不含任何凭据（原始令牌从不留在流里）。
     digest: [u8; 32],
-    admin: bool,
+    /// 本连接的身份视角；`is_admin` 每次权威复核后按权威值刷新。
+    viewer: EventViewer,
+    /// 握手期基准 `authz_epoch`：不等即视为授权投影已变更，关流。
+    epoch: u64,
+    pending: PendingRecv,
+    /// 进行中的权威复核；非 `None` 期间一帧都不许外发。
+    verify: Option<PendingVerify>,
+    /// 已通过廉价受众过滤、等待权威复核后才可外发的事件。
+    queued: Option<EventEnvelope>,
+    tick: Box<Interval>,
     closed: bool,
 }
 
@@ -165,16 +248,67 @@ impl SseEventStream {
     fn new(
         rx: Receiver<EventEnvelope>,
         auth: Arc<HttpAuthState>,
+        viewer: EventViewer,
+        epoch: u64,
         digest: [u8; 32],
-        admin: bool,
+        revalidate_interval: Duration,
     ) -> Self {
+        let revalidate_after = revalidate_interval.max(MIN_REVALIDATE_INTERVAL);
+        let mut tick = Box::new(interval_at(
+            TimerInstant::now() + revalidate_after,
+            revalidate_after,
+        ));
+        // 长时间被 poll 不到（例如内核缓冲背压）后不补跑一串复核，只按
+        // 「最近一次之后重新计时」推进，避免唤醒风暴放大成 DB 抖动。
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         Self {
-            pending: Box::pin(recv_frame(rx)),
             auth,
             digest,
-            admin,
+            viewer,
+            epoch,
+            pending: Box::pin(recv_frame(rx)),
+            verify: None,
+            queued: None,
+            tick,
             closed: false,
         }
+    }
+
+    /// 廉价受众过滤（02 §7「逐事件过滤」）：管理员事件名门禁与受众门禁
+    /// 并联，任一不满足即静默跳过——连权威读都不必发起。
+    fn may_view(&self, envelope: &EventEnvelope) -> bool {
+        if envelope.name.admin_only() && !self.viewer.is_admin {
+            return false;
+        }
+        envelope.audience.visible_to(self.viewer)
+    }
+
+    /// 权威快照是否仍然**完全**支持这条连接继续服务：
+    /// 会话仍有效 + `authz_epoch` 与握手基准相等 + 管理员标志与握手基准相等。
+    /// 任何一项不等都关流：连接的受众视野是在握手期权限下算出来的，权限
+    /// 一旦移动（升或降）旧视野就不再可信，重连后按新授权重新握手。
+    fn accepted(&self, authority: &SessionAuthority) -> bool {
+        authority.session_live
+            && authority.authz_epoch == self.epoch
+            && authority.is_admin == self.viewer.is_admin
+    }
+
+    /// 发起一次权威复核。`async move` 块同时拥有 `Arc` 与 digest，内部对
+    /// `session_authority` 的借用不逃出这个块，因此可安全装箱成 `'static`。
+    fn start_verify(&mut self) {
+        let auth = Arc::clone(&self.auth);
+        let digest = self.digest;
+        self.verify = Some(Box::pin(async move {
+            auth.auth.session_authority(&digest).await
+        }));
+    }
+
+    /// 结束流：丢弃待发事件（旧授权数据不得外发）并释放订阅。
+    fn close(&mut self) -> Poll<Option<Result<Event, std::convert::Infallible>>> {
+        self.closed = true;
+        self.queued = None;
+        self.verify = None;
+        Poll::Ready(None)
     }
 }
 
@@ -187,29 +321,67 @@ impl Stream for SseEventStream {
             return Poll::Ready(None);
         }
         loop {
-            // 会话在本进程会话时钟里已失效（登出/撤销/闲置到期）：结束流并
-            // 释放订阅，已排队的旧授权数据一律不再外发（06 §4）。
+            // ① 进程会话时钟预检（登出/撤销/闲置到期）：廉价且每轮必查，
+            //    内存侧已知的失效不必再花一次权威读。
             if !this.auth.auth.is_live_session(&this.digest) {
-                this.closed = true;
-                return Poll::Ready(None);
+                return this.close();
             }
+            // ② 权威复核在飞：先把它跑完。`verify` 为 `Pending` 时整个 poll
+            //    挂起，`queued` 保持不动（一帧都不许外发）。
+            let in_flight = this.verify.as_mut().map(|verify| verify.as_mut().poll(cx));
+            if let Some(outcome) = in_flight {
+                match ready!(outcome) {
+                    Ok(authority) => {
+                        this.verify = None;
+                        if !this.accepted(&authority) {
+                            // 会话撤销/停用/换代、authz_epoch 变更、管理员
+                            // 标志变更：立即关流并丢弃待发事件。
+                            return this.close();
+                        }
+                        this.viewer.is_admin = authority.is_admin;
+                        if let Some(envelope) = this.queued.take() {
+                            // 复核通过后再核一次受众（纵深防御）：不匹配即丢弃。
+                            if this.may_view(&envelope) {
+                                return Poll::Ready(Some(Ok(sse_frame(
+                                    envelope.name,
+                                    &envelope.data,
+                                ))));
+                            }
+                        }
+                        continue;
+                    }
+                    // 权威源读取失败：无法证明「仍然有效」即等同于无效。
+                    Err(_) => return this.close(),
+                }
+            }
+            // ③ 有待发帧且尚无复核在飞 → 立即发起权威复核（唯一的发送前置）。
+            if this.queued.is_some() {
+                this.start_verify();
+                continue;
+            }
+            // ④ 周期复核到点：空闲连接也必须被切断，不能等下一条事件。
+            if this.tick.as_mut().poll_tick(cx).is_ready() {
+                this.start_verify();
+                continue;
+            }
+            // ⑤ 等下一条事件。
             let (result, rx) = ready!(this.pending.as_mut().poll(cx));
             this.pending = Box::pin(recv_frame(rx));
             match result {
                 Ok(envelope) => {
-                    if envelope.name.admin_only() && !this.admin {
+                    if !this.may_view(&envelope) {
+                        // 非本连接受众：静默跳过，不发送、不占水位、不关流。
                         continue;
                     }
-                    return Poll::Ready(Some(Ok(sse_frame(envelope.name, &envelope.data))));
+                    this.queued = Some(envelope);
                 }
-                // 背压/缓冲区溢出：只提示 reset，不补发丢失的事件（06 §4）。
+                // 背压/缓冲区溢出：reset 帧同样只有权威复核通过才外发，之后
+                // 订阅继续（不补发丢失的事件，06 §4）。
                 Err(RecvError::Lagged(_)) => {
-                    let reset = EventEnvelope::reset(RESET_REASON_BUFFER_OVERFLOW);
-                    return Poll::Ready(Some(Ok(sse_frame(reset.name, &reset.data))));
+                    this.queued = Some(EventEnvelope::reset(RESET_REASON_BUFFER_OVERFLOW));
                 }
                 Err(RecvError::Closed) => {
-                    this.closed = true;
-                    return Poll::Ready(None);
+                    return this.close();
                 }
             }
         }

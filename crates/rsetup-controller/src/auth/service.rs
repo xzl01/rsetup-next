@@ -384,6 +384,25 @@ impl<R: IdentityRepository> AuthService<R> {
         self.clock.check(digest, &self.clock.epoch, now())?;
         Ok(Session { user, digest })
     }
+    /// 权威（仓储侧）会话核验：`digest` 在**本进程 epoch 内**是否仍对应一条
+    /// 未撤销、且所属用户仍 active 的会话；是则返回该用户**此刻**的权限事实。
+    ///
+    /// 与 [`AuthService::authenticate`] 的差别只在输入与副作用：不接受原始
+    /// 令牌（长连接不保存凭据，只握有 digest），不写时钟、不续期、不刷新任何
+    /// deadline；读的是同一条权威会话视图（`find_session` 已把 `revoked` 与
+    /// 用户行内连接并判定），因此「DB 里撤销会话」「DB 里停用用户」「DB 里给
+    /// 管理员降权」都会在这里如实暴露，而进程时钟看不到这些变化。
+    ///
+    /// 闲置/绝对超时仍由 [`AuthService::is_live_session`] 的进程时钟把关，
+    /// 两者合起来才是长连接逐帧复核的完整门禁；本方法是纯只读，绝不改变
+    /// 会话生命周期。
+    pub async fn session_authority(
+        &self,
+        digest: &[u8; 32],
+    ) -> Result<Option<IdentityUser>, ControllerError> {
+        let user = self.repo.find_session(*digest, self.clock.epoch).await?;
+        Ok(user.filter(|user| user.active))
+    }
     pub async fn change_password(
         &self,
         session: &Session,

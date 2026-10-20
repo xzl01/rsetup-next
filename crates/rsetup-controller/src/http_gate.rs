@@ -354,7 +354,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::auth::service::{IdentityUser, Login, SessionPage};
-    use crate::http_auth::{AuthFuture, AuthServiceApi};
+    use crate::http_auth::{AuthFuture, AuthServiceApi, SessionAuthority};
     use crate::http_security::HttpSecurityConfig;
     use axum::body::to_bytes;
 
@@ -418,6 +418,18 @@ mod tests {
         }
         fn is_live_session(&self, _d: &[u8; 32]) -> bool {
             true
+        }
+        fn session_authority<'a>(
+            &'a self,
+            _digest: &'a [u8; 32],
+        ) -> AuthFuture<'a, SessionAuthority> {
+            Box::pin(async {
+                Ok(SessionAuthority {
+                    session_live: true,
+                    is_admin: false,
+                    authz_epoch: 0,
+                })
+            })
         }
         fn list_sessions<'a>(
             &'a self,

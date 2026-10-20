@@ -474,7 +474,7 @@ pub(crate) mod test_fixture {
     use super::*;
     use crate::auth::service::{IdentityUser, Login, SessionPage};
     use crate::error::ControllerError;
-    use crate::http_auth::{AuthFuture, AuthServiceApi, CsrfBinding};
+    use crate::http_auth::{AuthFuture, AuthServiceApi, CsrfBinding, SessionAuthority};
     use crate::http_security::HttpSecurityConfig;
     use axum::body::Body;
     use axum::http::{HeaderName, Request, header};
@@ -547,6 +547,18 @@ pub(crate) mod test_fixture {
         }
         fn is_live_session(&self, _d: &[u8; 32]) -> bool {
             true
+        }
+        fn session_authority<'a>(
+            &'a self,
+            _digest: &'a [u8; 32],
+        ) -> AuthFuture<'a, SessionAuthority> {
+            Box::pin(async {
+                Ok(SessionAuthority {
+                    session_live: true,
+                    is_admin: false,
+                    authz_epoch: 0,
+                })
+            })
         }
         fn list_sessions<'a>(
             &'a self,
