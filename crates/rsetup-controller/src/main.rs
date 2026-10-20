@@ -150,7 +150,9 @@ fn production_inputs(
             // 30s 新鲜度的本进程缓存。transport 线的轮询与认证连接管理器尚未接入，
             // 当前还没有任何写入方，因此它对任何设备都真实地报告「尚无样本」
             // （snapshot=null / freshness=unknown / age_ms=null），不伪造快照、时间
-            // 证据或新鲜度；轮询驱动接入时共享同一个 Arc<SnapshotStore> 写入即可。
+            // 证据或新鲜度；接入时轮询驱动共享同一个 Arc<SnapshotStore>，但每条设备
+            // 都必须先由认证连接管理器 confirm_generation，未确认代际的 update 一律
+            // NoActiveGeneration 拒绝（代际不由样本自行建立）。
             snapshot: Arc::new(SnapshotStore::new()),
         },
         metrics: MetricsLineInputs {

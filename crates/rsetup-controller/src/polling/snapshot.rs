@@ -1,18 +1,23 @@
 //! 内存最新设备状态快照存储（05 §6 RUN-01 与 R-02；计划 Task 5 快照部分）。
 //!
 //! 只驻留内存、每台设备仅保留**最新一份**可信状态样本，进程重启不恢复（05 §9：
-//! 「不恢复旧进程/流代际、online 或内存快照」）。写入侧唯一的两条可信入口是
-//! [`SnapshotStore::confirm_generation`]（认证连接管理器确认当前代际）与
-//! [`SnapshotStore::update`]（该代际流上收到的 `device.status.get` 应答），
+//! 「不恢复旧进程/流代际、online 或内存快照」）。写入侧的可信入口只有四个，且调用方
+//! 只能是认证连接管理器或轮询驱动：[`SnapshotStore::confirm_generation`]（确认当前
+//! 代际，唯一的代际推进入口）、[`SnapshotStore::update`]（该代际流上收到的
+//! `device.status.get` 应答）、[`SnapshotStore::record_error`]（该代际上的采集失败）
+//! 与 [`SnapshotStore::disconnect_generation`]（该代际的连接断开）；
 //! 读取侧 [`SnapshotStore::read`] 供 HTTP 只读缓存投影（GET 绝不触发采集）。
 //!
-//! 三条不可让渡的语义：
+//! 四条不可让渡的语义：
 //! 1. **代际只由认证连接管理器推进**（03 §139、05 R-02、计划 Task 5）：
 //!    `session_epoch`/`stream_epoch`/`boot_id`/`agent_epoch` 都是随机 UUIDv4，
 //!    **不存在任何可比的大小关系**。因此本 store 绝不比较 UUID 字节序来判新旧，
 //!    只承认「与当前确认代际相等」这一条：任何不相等的回调（旧会话、旧流、旧
 //!    boot、旧 agent）一律 `StaleGeneration` 拒绝，绝不覆盖当前快照。新代际只能
-//!    由连接管理器在双流完成认证与健康确认后显式 [`Self::confirm_generation`] 推进。
+//!    由连接管理器在双流完成认证与健康确认后显式 [`SnapshotStore::confirm_generation`] 推进。
+//!    因此设备**尚未确认任何代际**时，[`SnapshotStore::update`] 与 [`SnapshotStore::record_error`] 一律
+//!    `NoActiveGeneration` fail-closed 拒绝：本 store 绝不因为「收到一条自洽的样本」
+//!    就自行建立代际，否则任何能伪造首条 payload 的路径都绕过了认证连接管理器。
 //! 2. **同作用域内 `sample_seq` 严格递增**（03 §139：`sample_seq` 从 1 起单调增长，
 //!    作用域 `(boot_id, agent_epoch)`）：作用域内更低或相同的序号一律丢弃，最后好
 //!    样本原地保留；`boot_id` 或 `agent_epoch` 变化才是作用域切换，此时显式确认
@@ -24,8 +29,14 @@
 //!    年龄，无样本 unknown」）：年龄只由 `Instant` 锚点差算出，宿主墙钟前跳/回拨
 //!    都不会让年龄倒退、清零或变负（`saturating_duration_since`）；`TimeEvidence`
 //!    只随快照携带供展示，绝不参与年龄判定。
+//! 4. **连接清理只复位连接标记，绝不抹掉作用域**：连接断开走
+//!    [`SnapshotStore::disconnect_generation`]，且**只有传入代际与当前确认代际完全相等**时才生效
+//!    ——`(boot_id, agent_epoch)`、`seq_floor` 与最后好样本必须原样保留，否则同作用域
+//!    重连后序号下界丢失，断线前那条流的迟到旧样本会重新覆盖新值；旧连接延迟到达的
+//!    清理回调因代际不相等而零副作用，绝不误删新连接刚确认的代际。
+//!    [`SnapshotStore::forget`] 只表示设备从系统中**彻底移除**，是唯一允许丢弃作用域与下界的入口。
 //!
-//! 采集失败走 [`Self::record_error`]：**保留最后好样本与其单调年龄**，只附加去敏
+//! 采集失败走 [`SnapshotStore::record_error`]：**保留最后好样本与其单调年龄**，只附加去敏
 //! 稳定错误码，绝不把未知指标回填 0；下一条好样本到达即自动清除。
 //!
 //! 并发：单把 `RwLock<HashMap<..>>`。写入是「校验 + 覆盖一条目」的纯内存常数时间
@@ -89,9 +100,10 @@ impl SnapshotGeneration {
 /// [`SnapshotStore::confirm_generation`] 的结果。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GenerationOutcome {
-    /// 该设备首次确认代际：序号下界 0、无样本、无错误。
+    /// 该设备首次确认代际：序号下界 0、无样本、无错误、连接存活。
     Established,
-    /// 与当前确认代际完全相同：幂等确认，不改任何状态。
+    /// 与当前确认代际完全相同：幂等确认。除把连接标记复位为存活（连接管理器重申该代际
+    /// 仍然健康）外不改任何状态——序号下界、最后好样本与错误一概不动。
     AlreadyActive,
     /// 代际推进。`scope_changed = true` 表示 `boot_id`/`agent_epoch` 变化，序号下界
     /// 归零且丢弃旧 boot 样本；`false` 表示同 `(boot_id, agent_epoch)` 内重连，
@@ -100,6 +112,23 @@ pub enum GenerationOutcome {
         previous: SnapshotGeneration,
         scope_changed: bool,
         seq_floor: u64,
+    },
+}
+
+/// [`SnapshotStore::disconnect_generation`] 的结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DisconnectOutcome {
+    /// 该设备没有任何已确认代际（从未 confirm，或已被 [`SnapshotStore::forget`] 移除）。
+    NoActiveGeneration,
+    /// 传入代际与当前确认代际不相等：这是**旧连接延迟到达**的清理回调，当前确认的新
+    /// 代际、序号下界与最后好样本必须原样保留，零副作用。
+    StaleGeneration,
+    /// 代际完全匹配：连接标记已复位为断开。作用域 `(boot_id, agent_epoch)`、
+    /// `seq_floor`（`kept_seq_floor`）与最后好样本（`kept_sample_seq`）全部保留，
+    /// 同作用域重连后序号下界继续生效。
+    Disconnected {
+        kept_seq_floor: u64,
+        kept_sample_seq: Option<u64>,
     },
 }
 
@@ -113,7 +142,9 @@ pub struct UpdateAccepted {
 /// 因此不映射 HTTP 状态码；调用方按原因做去敏计数即可。
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum UpdateRejected {
-    /// 该设备还没有任何被确认的代际（既未 confirm 也未收到过样本）。
+    /// 该设备还没有任何**由认证连接管理器确认过**的代际（从未 `confirm_generation`，
+    /// 或已被 [`SnapshotStore::forget`] 移除）。这是 fail-closed 的正常拒绝：代际不由
+    /// 样本自己建立。
     #[error("device generation has not been confirmed by the authenticated connection manager")]
     NoActiveGeneration,
     /// 回调所属代际与当前确认代际不相等（旧 session/stream/boot/agent）。
@@ -198,6 +229,10 @@ struct Entry {
     /// 最后可信样本。`seq_floor > 0` 与 `sample.is_some()` 同生同灭。
     sample: Option<StoredSample>,
     last_error: Option<String>,
+    /// 该确认代际对应的连接是否仍然存活：`confirm_generation` 置真、
+    /// [`SnapshotStore::disconnect_generation`] 置假。只作连接态观测，**不参与**样本
+    /// 与错误的准入判定（准入只看代际相等 + 序号严格递增）。
+    connected: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -217,7 +252,10 @@ impl SnapshotStore {
 
     /// 认证连接管理器确认设备当前代际（双流已建立并通过认证与健康确认时调用）。
     ///
-    /// 这是唯一能让 `sample_seq` 下界归零的入口：只有 `(boot_id, agent_epoch)`
+    /// 这是设备首次接入与代际变更的**唯一**入口：本 store 不会因收到样本而自行建立
+    /// 代际（见 [`UpdateRejected::NoActiveGeneration`]）。
+    ///
+    /// 这也是唯一能让 `sample_seq` 下界归零的入口：只有 `(boot_id, agent_epoch)`
     /// 变化才归零并丢弃旧 boot 样本；同作用域内的重连保留下界与最后好样本。
     pub fn confirm_generation(
         &self,
@@ -233,10 +271,12 @@ impl SnapshotStore {
                     seq_floor: 0,
                     sample: None,
                     last_error: None,
+                    connected: true,
                 },
             );
             return GenerationOutcome::Established;
         };
+        entry.connected = true;
         if entry.active == generation {
             return GenerationOutcome::AlreadyActive;
         }
@@ -260,9 +300,12 @@ impl SnapshotStore {
     /// 写入一条状态样本：payload 先过 03 wire 合同与代际自洽，再要求它来自当前
     /// 确认代际，最后要求 `sample_seq` 严格超过作用域下界。三步任一失败都零副作用。
     ///
-    /// 设备既未 confirm 也未收到过样本时，首条 payload 自洽的样本按「连接管理器
-    /// 已在同一条已认证流上确认过该代际」采纳并建立条目——store 为空时无可覆盖对象，
-    /// 因此不存在伪造风险；此后一切不相等的代际都必须先经 [`Self::confirm_generation`]。
+    /// 设备尚未由认证连接管理器确认代际时**必须** `Err(NoActiveGeneration)` 拒绝：
+    /// 代际只由 [`Self::confirm_generation`] 建立与推进，本方法绝不因「payload 自洽」
+    /// 就自行建立 active generation，否则首条样本就成了绕过认证连接管理器的代际入口。
+    ///
+    /// 连接断开（[`Self::disconnect_generation`] 之后）不改变本方法的准入判定：同一
+    /// 已认证代际上迟到但仍严格递增的样本仍是可信数据，序号下界继续挡住旧样本。
     pub fn update(
         &self,
         device: &[u8; 32],
@@ -282,19 +325,12 @@ impl SnapshotStore {
 
         let mut entries = self.write();
         let entry = match entries.get_mut(device) {
-            Some(entry) => {
-                if &entry.active != generation {
-                    return Err(UpdateRejected::StaleGeneration);
-                }
-                entry
-            }
-            None => entries.entry(*device).or_insert_with(|| Entry {
-                active: generation.clone(),
-                seq_floor: 0,
-                sample: None,
-                last_error: None,
-            }),
+            Some(entry) => entry,
+            None => return Err(UpdateRejected::NoActiveGeneration),
         };
+        if &entry.active != generation {
+            return Err(UpdateRejected::StaleGeneration);
+        }
 
         if status.sample_seq <= entry.seq_floor {
             return Err(UpdateRejected::StaleSampleSeq {
@@ -316,7 +352,7 @@ impl SnapshotStore {
     }
 
     /// 记录一次采集失败：只附加去敏错误码，保留最后好样本、序号下界与单调年龄。
-    /// 被拒（旧代际/未确认）时零副作用，绝不把当前好样本降级。
+    /// 被拒（旧代际/未确认代际）时零副作用，绝不把当前好样本降级。
     pub fn record_error(
         &self,
         device: &[u8; 32],
@@ -332,6 +368,43 @@ impl SnapshotStore {
         }
         entry.last_error = Some(code.to_string());
         Ok(())
+    }
+
+    /// 连接断开时的**受控**清理：只有 `generation` 与当前确认代际**完全相等**时，
+    /// 才把该代际的连接标记复位为断开。
+    ///
+    /// 绝不做的事（这是本方法存在的全部理由）：
+    /// - **不删除条目、不清 `seq_floor`、不清最后好样本**：作用域 `(boot_id, agent_epoch)`
+    ///   跨重连不变，序号下界一旦丢失，断线前那条流的迟到旧样本就能重新覆盖新值；
+    /// - **不推进也不回退代际**：代际只由 [`Self::confirm_generation`] 推进；
+    /// - **不误伤新代际**：传入代际与当前确认代际不相等（旧连接延迟到达的清理回调）
+    ///   时返回 `StaleGeneration` 且零副作用。
+    ///
+    /// 内存回收不属本方法职责：条目只随设备总数增长，设备下线由 [`Self::forget`] 释放。
+    pub fn disconnect_generation(
+        &self,
+        device: &[u8; 32],
+        generation: &SnapshotGeneration,
+    ) -> DisconnectOutcome {
+        let mut entries = self.write();
+        let Some(entry) = entries.get_mut(device) else {
+            return DisconnectOutcome::NoActiveGeneration;
+        };
+        if &entry.active != generation {
+            return DisconnectOutcome::StaleGeneration;
+        }
+        entry.connected = false;
+        DisconnectOutcome::Disconnected {
+            kept_seq_floor: entry.seq_floor,
+            kept_sample_seq: entry.sample.as_ref().map(|prev| prev.status.sample_seq),
+        }
+    }
+
+    /// 当前确认代际的连接标记：`None` 表示该设备没有任何已确认代际（unknown）。
+    /// 只作连接态观测（`Some(false)` = 已确认代际但连接已断开，最后好样本仍在缓存里，
+    /// 由单调年龄自然转 `stale`），不参与任何准入判定。
+    pub fn is_connected(&self, device: &[u8; 32]) -> Option<bool> {
+        self.read_guard().get(device).map(|entry| entry.connected)
     }
 
     /// 读取该设备的最后好样本快照（HTTP 只读缓存路径）。
@@ -352,12 +425,20 @@ impl SnapshotStore {
         })
     }
 
-    /// 设备连接彻底移除时释放条目，使内存只随在线设备数增长。返回是否真的删掉了。
+    /// 设备从系统中**彻底移除**（退役、删除设备记录）时释放条目。返回是否真的删掉了。
+    ///
+    /// 这是唯一丢弃作用域与 `seq_floor` 的入口：调用后该设备回到「没有任何已确认代际」
+    /// 的状态，后续样本必须先由认证连接管理器重新 [`Self::confirm_generation`]，
+    /// 否则一律 `NoActiveGeneration` 拒绝。
+    ///
+    /// **连接断开不得调用本方法**：同 `(boot_id, agent_epoch)` 的重连要沿用旧的序号
+    /// 下界，误用本方法会让断线前那条流的迟到旧样本重新覆盖新值。断线清理请用
+    /// [`Self::disconnect_generation`]。
     pub fn forget(&self, device: &[u8; 32]) -> bool {
         self.write().remove(device).is_some()
     }
 
-    /// 已建立条目（已确认代际或已收到样本）的设备数。
+    /// 已建立条目（已确认代际）的设备数。
     pub fn len(&self) -> usize {
         self.read_guard().len()
     }
@@ -496,12 +577,81 @@ mod tests {
         );
     }
 
+    /// 认证连接管理器确认代际：`update`/`record_error` 的**硬前置条件**。
+    /// 除专测「未确认即拒绝」的用例外，任何写入前都必须先确认成功。
+    fn confirm(store: &SnapshotStore, g: &SnapshotGeneration) -> GenerationOutcome {
+        store.confirm_generation(DEVICE, g.clone())
+    }
+
+    fn confirmed(store: &SnapshotStore, g: &SnapshotGeneration) {
+        let outcome = confirm(store, g);
+        assert!(
+            matches!(
+                outcome,
+                GenerationOutcome::Established | GenerationOutcome::Replaced { .. }
+            ),
+            "确认代际必须成功，实得 {outcome:?}"
+        );
+        assert_eq!(
+            store.is_connected(&DEVICE),
+            Some(true),
+            "确认后连接必须存活"
+        );
+    }
+
+    /// P1：未确认代际时 `update` 必须 `NoActiveGeneration` fail-closed，且零副作用。
+    #[test]
+    fn update_without_confirmed_generation_is_rejected_without_side_effects() {
+        let store = SnapshotStore::new();
+        let g = make_generation(20, 20, BOOT_A, AGENT_1);
+        // payload 完全合同内且与声称代际自洽：唯一能被拒的理由就是「代际未经确认」。
+        let outcome = store.update(
+            &DEVICE,
+            &g,
+            &status(BOOT_A, AGENT_1, 1),
+            evidence(false),
+            Instant::now(),
+        );
+        assert_eq!(outcome.err(), Some(UpdateRejected::NoActiveGeneration));
+        assert!(store.is_empty(), "被拒的 update 绝不得建立条目或代际");
+        assert_eq!(store.len(), 0);
+        assert!(store.read(&DEVICE).is_none());
+        assert_eq!(
+            store.is_connected(&DEVICE),
+            None,
+            "unknown 设备无连接态可言"
+        );
+
+        // record_error 同样不得自行建立代际。
+        assert_eq!(
+            store
+                .record_error(&DEVICE, &g, "TRANSPORT_UNAVAILABLE")
+                .err(),
+            Some(UpdateRejected::NoActiveGeneration)
+        );
+        assert!(store.is_empty(), "被拒的 record_error 也不得建立条目");
+
+        // 断开连接同样不建立条目。
+        assert_eq!(
+            store.disconnect_generation(&DEVICE, &g),
+            DisconnectOutcome::NoActiveGeneration
+        );
+        assert!(store.is_empty());
+
+        // 只有显式确认才建立代际；建立后同一条样本才被接受。
+        assert_eq!(confirm(&store, &g), GenerationOutcome::Established);
+        assert!(store.read(&DEVICE).is_none(), "确认代际本身不产生样本");
+        accepted(&store, &g, 1, Instant::now());
+        assert_eq!(store.read(&DEVICE).unwrap().sample_seq(), 1);
+    }
+
     /// 单调新鲜度边界（05 §6：30s 单调接收年龄，含 30s 整点）。
     #[test]
-    fn first_sample_is_adopted_and_read_back_with_fresh_monotonic_age() {
+    fn first_sample_after_confirm_reads_back_with_fresh_monotonic_age() {
         let store = SnapshotStore::new();
         let g = make_generation(1, 1, BOOT_A, AGENT_1);
         let t0 = Instant::now();
+        confirmed(&store, &g);
         accepted(&store, &g, 1, t0);
 
         let view = store.read(&DEVICE).expect("首样本必须可读");
@@ -536,6 +686,7 @@ mod tests {
         let store = SnapshotStore::new();
         let g = make_generation(2, 2, BOOT_A, AGENT_1);
         let t0 = Instant::now();
+        confirmed(&store, &g);
         accepted(&store, &g, 1, t0);
 
         // 携带「墙钟前跳 1 小时」证据的第二条样本：锚点必须是传入的单调时刻，
@@ -584,6 +735,7 @@ mod tests {
         let store = SnapshotStore::new();
         let g = make_generation(3, 3, BOOT_A, AGENT_1);
         let t0 = Instant::now();
+        confirmed(&store, &g);
         accepted(&store, &g, 5, t0);
 
         let at = t0.checked_add(Duration::from_millis(10)).unwrap();
@@ -628,6 +780,7 @@ mod tests {
         // 只要实现偷偷按 UUID 大小判新旧，本用例就会放行旧回调而失败。
         let current = make_generation(0x01, 0x01, BOOT_A, AGENT_1);
         let t0 = Instant::now();
+        confirmed(&store, &current);
         accepted(&store, &current, 9, t0);
 
         let stale_callbacks = [
@@ -694,6 +847,22 @@ mod tests {
             Some(UpdateRejected::PayloadGenerationMismatch)
         );
         assert!(store.is_empty(), "不匹配的 payload 不得建立条目");
+
+        // 已确认代际后同理：不自洽 payload 只可能被拒，绝不动当前快照。
+        confirmed(&store, &g);
+        accepted(&store, &g, 9, t0);
+        let outcome = store.update(
+            &DEVICE,
+            &g,
+            &status(BOOT_B, AGENT_1, 10),
+            evidence(false),
+            t0.checked_add(Duration::from_millis(1)).unwrap(),
+        );
+        assert_eq!(
+            outcome.err(),
+            Some(UpdateRejected::PayloadGenerationMismatch)
+        );
+        assert_eq!(store.read(&DEVICE).unwrap().sample_seq(), 9, "零副作用");
     }
 
     /// 合同外 payload（sample_seq=0）不得进入缓存。
@@ -708,6 +877,16 @@ mod tests {
             "sample_seq=0 必须按合同拒绝，实得 {outcome:?}"
         );
         assert!(store.is_empty());
+
+        // 已确认代际且已有好样本时同样零副作用：合同外 payload 不得降级当前快照。
+        confirmed(&store, &g);
+        accepted(&store, &g, 4, Instant::now());
+        let outcome = store.update(&DEVICE, &g, &bad, evidence(false), Instant::now());
+        assert!(
+            matches!(outcome, Err(UpdateRejected::InvalidPayload { .. })),
+            "已确认代际下 sample_seq=0 仍须按合同拒绝，实得 {outcome:?}"
+        );
+        assert_eq!(store.read(&DEVICE).unwrap().sample_seq(), 4, "零副作用");
     }
 
     /// boot/agent 变更 = sample_seq 作用域切换：显式确认后序号从 1 重启，且旧 boot 的
@@ -717,6 +896,7 @@ mod tests {
         let store = SnapshotStore::new();
         let old_gen = make_generation(6, 6, BOOT_A, AGENT_1);
         let t0 = Instant::now();
+        confirmed(&store, &old_gen);
         accepted(&store, &old_gen, 500, t0);
 
         let rebooted = make_generation(7, 7, BOOT_B, AGENT_2);
@@ -744,6 +924,7 @@ mod tests {
         let store = SnapshotStore::new();
         let before = make_generation(8, 8, BOOT_A, AGENT_1);
         let t0 = Instant::now();
+        confirmed(&store, &before);
         accepted(&store, &before, 500, t0);
 
         let after = make_generation(9, 9, BOOT_A, AGENT_1);
@@ -798,10 +979,12 @@ mod tests {
             store.confirm_generation(DEVICE, g.clone()),
             GenerationOutcome::Established
         );
+        assert_eq!(store.is_connected(&DEVICE), Some(true));
         assert_eq!(
             store.confirm_generation(DEVICE, g.clone()),
             GenerationOutcome::AlreadyActive
         );
+        assert_eq!(store.is_connected(&DEVICE), Some(true));
         assert!(
             store.read(&DEVICE).is_none(),
             "已确认但尚无样本时必须 unknown"
@@ -819,6 +1002,7 @@ mod tests {
         let store = SnapshotStore::new();
         let g = make_generation(11, 11, BOOT_A, AGENT_1);
         let t0 = Instant::now();
+        confirmed(&store, &g);
         accepted(&store, &g, 7, t0);
 
         store
@@ -854,6 +1038,7 @@ mod tests {
         );
 
         let g = make_generation(12, 12, BOOT_A, AGENT_1);
+        confirmed(&store, &g);
         accepted(&store, &g, 3, Instant::now());
         let entry = source
             .snapshot(&DEVICE)
@@ -906,7 +1091,7 @@ mod tests {
         const PER_WRITER: u64 = 200;
         let store = Arc::new(SnapshotStore::new());
         let g = make_generation(13, 13, BOOT_A, AGENT_1);
-        store.confirm_generation(DEVICE, g.clone());
+        confirmed(&store, &g);
 
         let mut threads = Vec::new();
         for w in 0..WRITERS {
@@ -955,15 +1140,278 @@ mod tests {
         assert_eq!(store.len(), 1);
     }
 
-    /// 设备移除后条目必须彻底释放（内存只随在线设备数增长）。
+    /// P2：断开连接只复位连接标记，作用域 `(boot_id, agent_epoch)`、`seq_floor` 与
+    /// 最后好样本必须跨「断开 → 同作用域重连」保留，否则迟到的旧 `sample_seq` 会重新
+    /// 被接受。
     #[test]
-    fn forget_releases_device_state() {
+    fn disconnect_keeps_seq_floor_so_late_sample_after_reconnect_is_still_rejected() {
+        let store = SnapshotStore::new();
+        let g1 = make_generation(21, 21, BOOT_A, AGENT_1);
+        let t0 = Instant::now();
+        confirmed(&store, &g1);
+        accepted(&store, &g1, 500, t0);
+
+        // 断连：只允许复位连接标记，必须原样交出下界与最后好样本。
+        let at = t0.checked_add(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            store.disconnect_generation(&DEVICE, &g1),
+            DisconnectOutcome::Disconnected {
+                kept_seq_floor: 500,
+                kept_sample_seq: Some(500),
+            }
+        );
+        assert_eq!(
+            store.is_connected(&DEVICE),
+            Some(false),
+            "连接必须标记为断开"
+        );
+        assert_eq!(
+            store.read(&DEVICE).unwrap().sample_seq(),
+            500,
+            "断连不得清空最后好样本"
+        );
+
+        // 同 boot/agent 重连（仅 session/stream 变更）：下界 500 必须继续生效。
+        let g2 = make_generation(22, 22, BOOT_A, AGENT_1);
+        assert_eq!(
+            confirm(&store, &g2),
+            GenerationOutcome::Replaced {
+                previous: g1.clone(),
+                scope_changed: false,
+                seq_floor: 500,
+            },
+            "同作用域重连必须保留下界 500"
+        );
+        assert_eq!(
+            store.is_connected(&DEVICE),
+            Some(true),
+            "重连后连接必须复活"
+        );
+
+        // 断线前那条流的迟到旧样本必须仍被 StaleSampleSeq 拒绝。
+        let rejected = store.update(
+            &DEVICE,
+            &g2,
+            &status(BOOT_A, AGENT_1, 499),
+            evidence(false),
+            at,
+        );
+        assert!(
+            matches!(
+                rejected,
+                Err(UpdateRejected::StaleSampleSeq {
+                    accepted: 500,
+                    incoming: 499
+                })
+            ),
+            "seq_floor 被断连冲掉才会放行 499，实得 {rejected:?}"
+        );
+        assert_eq!(store.read(&DEVICE).unwrap().sample_seq(), 500, "零副作用");
+        accepted(&store, &g2, 501, at);
+        assert_eq!(store.read(&DEVICE).unwrap().sample_seq(), 501);
+    }
+
+    /// P2：旧连接延迟到达的清理回调绝不得误删或降级新连接刚确认的代际与快照。
+    #[test]
+    fn delayed_cleanup_from_previous_generation_never_touches_the_confirmed_one() {
+        let store = SnapshotStore::new();
+        let other_device = [0x66u8; 32];
+        let g1 = make_generation(23, 23, BOOT_A, AGENT_1);
+        let g2 = make_generation(24, 24, BOOT_A, AGENT_1);
+        let t0 = Instant::now();
+        confirmed(&store, &g1);
+        accepted(&store, &g1, 500, t0);
+        // 新连接已确认（同作用域重连），此时旧连接的清理才姗姗来迟。
+        assert!(matches!(
+            confirm(&store, &g2),
+            GenerationOutcome::Replaced { .. }
+        ));
+
+        assert_eq!(
+            store.disconnect_generation(&DEVICE, &g1),
+            DisconnectOutcome::StaleGeneration,
+            "旧代际的清理回调必须整体被拒"
+        );
+        assert_eq!(
+            store.disconnect_generation(&other_device, &g2),
+            DisconnectOutcome::NoActiveGeneration,
+            "别的设备没有已确认代际"
+        );
+        assert_eq!(
+            store.is_connected(&DEVICE),
+            Some(true),
+            "新代际连接不得被误标断开"
+        );
+        assert_eq!(
+            store.read(&DEVICE).unwrap().sample_seq(),
+            500,
+            "新代际已确认的快照不得被旧清理抹掉"
+        );
+        assert_eq!(store.len(), 1, "被拒清理不得凭空增删条目");
+
+        // 新代际照常可写，证明条目完好。
+        let at = t0.checked_add(Duration::from_secs(1)).unwrap();
+        accepted(&store, &g2, 501, at);
+        assert_eq!(store.read(&DEVICE).unwrap().sample_seq(), 501);
+
+        // 匹配当前代际的清理才生效，且仍保留作用域与样本。
+        assert_eq!(
+            store.disconnect_generation(&DEVICE, &g2),
+            DisconnectOutcome::Disconnected {
+                kept_seq_floor: 501,
+                kept_sample_seq: Some(501),
+            }
+        );
+        // 断开后同代际迟到的、序号仍严格递增的样本仍是可信数据（下界继续挡旧样本）。
+        accepted(&store, &g2, 502, at);
+        assert_eq!(store.read(&DEVICE).unwrap().sample_seq(), 502);
+        assert_eq!(store.is_connected(&DEVICE), Some(false));
+    }
+
+    /// 审查补充：旧代际的 `record_error` 必须被拒，绝不把新代际的好样本降级为 error。
+    #[test]
+    fn record_error_from_stale_generation_is_rejected_without_downgrading_current_sample() {
+        let store = SnapshotStore::new();
+        let g1 = make_generation(25, 25, BOOT_A, AGENT_1);
+        let g2 = make_generation(26, 26, BOOT_A, AGENT_1);
+        let t0 = Instant::now();
+        confirmed(&store, &g1);
+        accepted(&store, &g1, 7, t0);
+        assert!(matches!(
+            confirm(&store, &g2),
+            GenerationOutcome::Replaced { .. }
+        ));
+
+        assert_eq!(
+            store
+                .record_error(&DEVICE, &g1, "TRANSPORT_UNAVAILABLE")
+                .err(),
+            Some(UpdateRejected::StaleGeneration),
+            "旧代际的错误回调必须拒绝"
+        );
+        let view = store.read(&DEVICE).expect("好样本必须仍在");
+        assert_eq!(view.sample_seq(), 7);
+        assert_eq!(view.last_error, None, "被拒的错误回调不得污染当前快照");
+        assert_eq!(view.freshness_at(t0), DeviceStatusFreshness::Fresh);
+
+        // 当前代际的错误仍可记录，证明条目未被这次拒绝损坏。
+        store
+            .record_error(&DEVICE, &g2, "TRANSPORT_UNAVAILABLE")
+            .expect("当前确认代际必须可记录错误");
+        assert_eq!(
+            store.read(&DEVICE).unwrap().freshness_at(t0),
+            DeviceStatusFreshness::Error
+        );
+    }
+
+    /// 审查补充：仅 `boot_id` 变化就是作用域切换——下界归零、旧 boot 样本丢弃。
+    #[test]
+    fn boot_only_change_switches_the_sample_seq_scope() {
+        let store = SnapshotStore::new();
+        let before = make_generation(27, 27, BOOT_A, AGENT_1);
+        let t0 = Instant::now();
+        confirmed(&store, &before);
+        accepted(&store, &before, 500, t0);
+
+        // 同 agent、同 session/stream 字节，只有 boot 变化（板端重启）。
+        let rebooted = make_generation(27, 27, BOOT_B, AGENT_1);
+        assert_eq!(
+            confirm(&store, &rebooted),
+            GenerationOutcome::Replaced {
+                previous: before.clone(),
+                scope_changed: true,
+                seq_floor: 0,
+            },
+            "仅 boot 变化必须判定为作用域切换"
+        );
+        assert!(
+            store.read(&DEVICE).is_none(),
+            "旧 boot 的样本不得继续冒充重启后的当前状态"
+        );
+        // 新作用域从 1 重新起算；旧作用域的 500 不得继续压制。
+        accepted(
+            &store,
+            &rebooted,
+            1,
+            t0.checked_add(Duration::from_secs(1)).unwrap(),
+        );
+        assert_eq!(store.read(&DEVICE).unwrap().sample_seq(), 1);
+    }
+
+    /// 审查补充：仅 `agent_epoch` 变化（agent 升级重启）同样是作用域切换。
+    #[test]
+    fn agent_only_change_switches_the_sample_seq_scope() {
+        let store = SnapshotStore::new();
+        let before = make_generation(28, 28, BOOT_A, AGENT_1);
+        let t0 = Instant::now();
+        confirmed(&store, &before);
+        accepted(&store, &before, 500, t0);
+
+        let upgraded = make_generation(28, 28, BOOT_A, AGENT_2);
+        assert_eq!(
+            confirm(&store, &upgraded),
+            GenerationOutcome::Replaced {
+                previous: before.clone(),
+                scope_changed: true,
+                seq_floor: 0,
+            },
+            "仅 agent 变化必须判定为作用域切换"
+        );
+        assert!(store.read(&DEVICE).is_none(), "旧 agent 的样本必须丢弃");
+        accepted(
+            &store,
+            &upgraded,
+            1,
+            t0.checked_add(Duration::from_secs(1)).unwrap(),
+        );
+        assert_eq!(store.read(&DEVICE).unwrap().sample_seq(), 1);
+    }
+
+    /// `forget` 的语义是「设备从系统中彻底移除」：条目、代际、下界与样本一并释放，
+    /// 之后一切写入都必须重新经认证连接管理器确认，否则 fail-closed 拒绝。
+    #[test]
+    fn forget_removes_device_completely_and_requires_reconfirm() {
         let store = SnapshotStore::new();
         let g = make_generation(14, 14, BOOT_A, AGENT_1);
+        confirmed(&store, &g);
         accepted(&store, &g, 1, Instant::now());
+
         assert!(store.forget(&DEVICE));
-        assert!(!store.forget(&DEVICE));
+        assert!(!store.forget(&DEVICE), "重复移除必须返回 false");
         assert!(store.is_empty());
         assert!(store.read(&DEVICE).is_none());
+        assert_eq!(
+            store.is_connected(&DEVICE),
+            None,
+            "彻底移除后连接态也不存在"
+        );
+
+        // 已移除的设备：连同一代际的样本也不得再被接受（代际不复存在）。
+        assert_eq!(
+            store
+                .update(
+                    &DEVICE,
+                    &g,
+                    &status(BOOT_A, AGENT_1, 2),
+                    evidence(false),
+                    Instant::now(),
+                )
+                .err(),
+            Some(UpdateRejected::NoActiveGeneration)
+        );
+        assert_eq!(
+            store.disconnect_generation(&DEVICE, &g),
+            DisconnectOutcome::NoActiveGeneration
+        );
+        assert!(store.is_empty(), "移除后的任何写入都不得复活条目");
+
+        // 重新接入必须重新确认代际，且作用域从零起算。
+        assert_eq!(
+            confirm(&store, &g),
+            GenerationOutcome::Established,
+            "彻底移除后重新接入按首接入处理"
+        );
+        accepted(&store, &g, 1, Instant::now());
+        assert_eq!(store.read(&DEVICE).unwrap().sample_seq(), 1);
     }
 }
