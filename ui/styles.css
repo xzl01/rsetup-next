@@ -1989,6 +1989,10 @@ body.is-resolving .core-node { animation: core-resolve 820ms var(--ease-soft) bo
 .nvme-metric-bar-fill.is-critical { background: var(--coral); }
 .nvme-metric-bar-fill.is-cyan { background: var(--cyan); }
 .nvme-metric-bar-fill.is-na {
+  /* "No data" is not a zero-length fill: the grey hatch spans the whole
+     track, so it reads as a bar that cannot be measured rather than an
+     empty one. The N/A fill carries no --metric-percent (see lifeBlock). */
+  width: 100%;
   background: repeating-linear-gradient(
     45deg,
     var(--line),
@@ -1998,14 +2002,9 @@ body.is-resolving .core-node { animation: core-resolve 820ms var(--ease-soft) bo
   );
 }
 
-/* Unified storage tool: MMC/eMMC cards mirror the NVMe card visual language. */
-.storage-mmc-card {
-  padding: 22px 24px;
-  border-radius: 24px;
-  background: var(--field);
-  display: grid;
-  gap: 18px;
-}
+/* Unified storage tool: MMC/eMMC cards reuse the .nvme-card box and carry
+   .storage-mmc-card as their own hook for the storage tests and the
+   screenshot scripts, so no box rule is repeated here. */
 .storage-card-type-badge {
   display: inline-block;
   margin-left: 10px;

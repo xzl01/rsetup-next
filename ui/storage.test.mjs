@@ -211,6 +211,13 @@ test("renderStorageTool renders MMC card with life bars and N/A", () => {
   assert.ok(host.innerHTML.includes("storageTool.unsupported"));
   assert.ok(host.innerHTML.includes('data-metric-percent="10"'));
   assert.ok(!host.innerHTML.includes("nvme-metric-bar-fill is-critical"));
+  // MMC cards reuse the NVMe card box and add their own hook; a bare
+  // `class="nvme-card"` section is an NVMe card and must not show up here.
+  assert.equal(
+    host.innerHTML.split('class="nvme-card storage-mmc-card"').length - 1,
+    2,
+    "both MMC cards must carry the shared card box and their own hook",
+  );
   assert.ok(!host.innerHTML.includes('class="nvme-card"'));
   assert.ok(host.innerHTML.includes("2 MMC/eMMC"));
 });
@@ -228,9 +235,11 @@ test("renderStorageTool renders NVMe above MMC with combined counts", () => {
 
   context.renderStorageTool();
   const host = getElement("[data-hardware-body]");
+  // `class="nvme-card"` closes right after the name, so it only matches the
+  // NVMe card; the MMC card carries the extra hook.
   const nvmePos = host.innerHTML.indexOf('class="nvme-card"');
-  const mmcPos = host.innerHTML.indexOf("storage-mmc-card");
-  assert.ok(nvmePos >= 0 && mmcPos >= 0);
+  const mmcPos = host.innerHTML.indexOf('class="nvme-card storage-mmc-card"');
+  assert.ok(nvmePos >= 0 && mmcPos >= 0, "Expected one NVMe card and one MMC card");
   assert.ok(nvmePos < mmcPos, "NVMe section must render above MMC section");
   assert.ok(host.innerHTML.includes("1 NVMe"));
   assert.ok(host.innerHTML.includes("1 MMC/eMMC"));
@@ -248,6 +257,35 @@ test("renderStorageMmcCard maps healthState to badge classes", () => {
   assert.ok(createTestContext().context.renderStorageMmcCard(flagged).includes("nvme-badge-critical"));
   assert.ok(createTestContext().context.renderStorageMmcCard(emmcDevice).includes("nvme-badge-healthy"));
   assert.ok(createTestContext().context.renderStorageMmcCard(undefinedDev).includes("storageTool.preEolUndefined"));
+});
+
+test("A life-time estimate of null renders the grey N/A fill, not a zero-width one", () => {
+  const device = {
+    ...emmcDevice,
+    health: { preEolInfo: 1, lifeTimeEstAPercent: 10, lifeTimeEstBPercent: null, warningFlags: [] },
+  };
+  const html = createTestContext().context.renderStorageMmcCard(device);
+  const fills = html.match(/nvme-metric-bar-fill[^>]*/g) || [];
+  assert.equal(fills.length, 2, "SLC and MLC each render one metric bar fill");
+  assert.ok(fills[0].includes("is-normal") && fills[0].includes('data-metric-percent="10"'));
+  // The N/A fill has no percentage to show: a data-metric-percent on it would
+  // size the fill to an empty track instead of the grey "no data" fill.
+  assert.ok(fills[1].includes("is-na"), fills[1]);
+  assert.ok(!fills[1].includes("data-metric-percent"), fills[1]);
+
+  // The grey fill is only visible because its rule carries a width; without
+  // one it would be dead CSS inside the overflow-hidden track.
+  const styles = fs.readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+  const naRule = styles.match(/\.nvme-metric-bar-fill\.is-na\s*\{[^}]*\}/);
+  assert.ok(naRule, "Expected a .nvme-metric-bar-fill.is-na rule in styles.css");
+  assert.match(naRule[0], /width:\s*100%/, "The N/A fill must span the track");
+
+  // MMC cards reuse the .nvme-card box; a second box rule would repeat it
+  // declaration by declaration.
+  assert.ok(
+    !/\.storage-mmc-card\s*\{/.test(styles),
+    ".storage-mmc-card must stay a hook, not a copy of the .nvme-card box",
+  );
 });
 
 test("MMC unavailable explains permission failure in both locales", () => {

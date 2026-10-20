@@ -2499,6 +2499,8 @@ function renderStorageMmcCard(device) {
 
   function lifeBlock(labelKey, percent) {
     if (percent == null) {
+      // N/A is not a percentage: the bar carries no --metric-percent and CSS
+      // paints the whole track with the grey "no data" fill.
       return `
         <div class="nvme-metric-block">
           <div class="nvme-metric-header">
@@ -2506,7 +2508,7 @@ function renderStorageMmcCard(device) {
             <b>${escapeHtml(t("storageTool.na"))}</b>
           </div>
           <div class="nvme-metric-bar">
-            <div class="nvme-metric-bar-fill is-na" data-metric-percent="0"></div>
+            <div class="nvme-metric-bar-fill is-na"></div>
           </div>
         </div>`;
     }
@@ -2526,7 +2528,7 @@ function renderStorageMmcCard(device) {
   }
 
   return `
-    <section class="storage-mmc-card">
+    <section class="nvme-card storage-mmc-card">
       <div class="nvme-card-head">
         <div class="nvme-card-title">
           <strong>${escapeHtml(device.model || device.name)}<span class="storage-card-type-badge">${escapeHtml(typeLabel)}</span></strong>
