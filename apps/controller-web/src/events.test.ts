@@ -105,6 +105,9 @@ interface HarnessOptions {
   maxBufferSize?: number
   withCredentials?: boolean
   factory?: EventSourceFactory
+  /** 订阅方回调内注入副作用（如在 device 快照落库中途撤权），验证回调后的代际复核。 */
+  onSnapshotHook?: (kind: EntityKind) => void
+  onEntityUpdateHook?: (kind: EntityKind, patch: Record<string, unknown>) => void
 }
 
 function createHarness(options: HarnessOptions = {}): Harness {
@@ -154,8 +157,14 @@ function createHarness(options: HarnessOptions = {}): Harness {
         instance.init = init
         return instance
       }),
-    onSnapshot: (kind, items) => snapshots.push({ kind, count: items.length }),
-    onEntityUpdate: (kind, patch) => updates.push({ kind, patch }),
+    onSnapshot: (kind, items) => {
+      snapshots.push({ kind, count: items.length })
+      options.onSnapshotHook?.(kind)
+    },
+    onEntityUpdate: (kind, patch) => {
+      updates.push({ kind, patch })
+      options.onEntityUpdateHook?.(kind, patch)
+    },
     onSystemTimeChanged: (payload) => timeEvents.push(payload),
     onSessionExpired: (reason) => expired.push(reason),
     onError: (error) => errors.push(error.code),
@@ -436,7 +445,8 @@ describe('代际守卫与 kind+id 水位丢弃', () => {
     const h = createHarness({
       snapshotsConfig: 'both',
       deviceSnapshot: async () => [deviceItem('dev-1', '1000'), deviceItem('dev-2', '2')],
-      taskSnapshot: async () => [taskItem('task-1', '3')],
+      // task 快照里放一个与设备同名的成员（无 revision 基线），用于验证跨 kind 水位互不相干
+      taskSnapshot: async () => [taskItem('task-1', '3'), { id: 'dev-2', operation: 'reboot' }],
     })
     client = h.client
     h.es.emit('open')
@@ -476,7 +486,7 @@ describe('代际守卫与 kind+id 水位丢弃', () => {
     expect(h.updates).toHaveLength(1)
   })
 
-  it('重同步期间的缓冲在快照落库后按水位回放（低水位丢弃、高水位生效）', async () => {
+  it('同代际缓冲在快照落库后按水位回放（低水位丢弃、高水位生效）', async () => {
     const gate = deferred<ReadonlyArray<Record<string, unknown>>>()
     const h = createHarness({ snapshotsConfig: 'device-only', deviceSnapshot: () => gate.promise })
     client = h.client
@@ -484,15 +494,99 @@ describe('代际守卫与 kind+id 水位丢弃', () => {
 
     h.es.emitData('device.updated', { device_id: 'dev-1', revision: '4', display_name: '低于快照' })
     h.es.emitData('device.updated', { device_id: 'dev-1', revision: '6', display_name: '高于快照' })
-    h.es.emitData('device.updated', { device_id: 'dev-3', revision: '1', display_name: '新对象' })
     expect(h.updates).toHaveLength(0) // 同步中绝不回写旧快照
 
     gate.resolve([deviceItem('dev-1', '5')])
     await flush()
     expect(h.snapshots).toEqual([{ kind: 'device', count: 1 }])
-    expect(h.updates.map((u) => u.patch.device_id)).toEqual(['dev-1', 'dev-3'])
+    expect(h.updates.map((u) => u.patch.device_id)).toEqual(['dev-1'])
+    expect(h.updates[0]!.patch.revision).toBe('6')
     expect(h.client.watermarkOf('device', 'dev-1')).toBe('6')
     expect(h.client.isRealtime.value).toBe(true)
+  })
+
+  it('非快照成员的未知对象不凭提示打补丁：拒绝分发并触发当前授权 GET 重取', async () => {
+    const h = createHarness({
+      snapshotsConfig: 'device-only',
+      deviceSnapshot: async () => [deviceItem('dev-1', '5')],
+    })
+    client = h.client
+    h.es.emit('open')
+    await flush()
+    expect(h.devices).toHaveBeenCalledTimes(1)
+
+    // dev-9 不在当前授权快照成员中：属于「无法对应当前快照的对象」，只能重取（06 §4）
+    h.es.emitData('device.updated', { device_id: 'dev-9', revision: '1', display_name: '未知对象' })
+    expect(h.updates).toHaveLength(0)
+    expect(h.client.watermarkOf('device', 'dev-9')).toBeNull()
+    expect(h.errors).toContain('UNMAPPED_EVENT')
+    expect(h.client.lastSyncReason.value).toBe('unknown-member')
+    expect(h.client.isRealtime.value).toBe(false) // 重取期间不得标实时
+    expect(h.devices).toHaveBeenCalledTimes(2)
+
+    await flush()
+    expect(h.updates).toHaveLength(0) // 重取后仍不得把未知对象补进投影
+    expect(h.client.isRealtime.value).toBe(true)
+
+    // 已在快照成员中的对象不受影响
+    h.es.emitData('device.updated', { device_id: 'dev-1', revision: '6' })
+    expect(h.updates).toHaveLength(1)
+    expect(h.client.watermarkOf('device', 'dev-1')).toBe('6')
+  })
+
+  it('缓冲中的未知成员在回放时同样被拒绝，绝不作为补丁灌入', async () => {
+    let calls = 0
+    const gate = deferred<ReadonlyArray<Record<string, unknown>>>()
+    const h = createHarness({
+      snapshotsConfig: 'device-only',
+      deviceSnapshot: () => {
+        calls += 1
+        return calls === 1 ? gate.promise : Promise.resolve([deviceItem('dev-1', '5')])
+      },
+    })
+    client = h.client
+    h.es.emit('open')
+    h.es.emitData('device.updated', { device_id: 'dev-7', revision: '2', display_name: '未知对象' })
+    expect(h.updates).toHaveLength(0)
+
+    gate.resolve([deviceItem('dev-1', '5')])
+    await flush()
+    expect(h.updates).toHaveLength(0)
+    expect(h.client.watermarkOf('device', 'dev-7')).toBeNull()
+    expect(h.errors).toContain('UNMAPPED_EVENT')
+    expect(h.client.lastSyncReason.value).toBe('unknown-member')
+    expect(h.devices).toHaveBeenCalledTimes(2) // 安全重同步而非本地补一条未知对象
+    expect(h.client.isRealtime.value).toBe(true)
+  })
+
+  it('快照 revision 低于已应用水位时不回退：迟到的中间事件仍被正确丢弃', async () => {
+    const h = createHarness({
+      snapshotsConfig: 'device-only',
+      deviceSnapshot: async () => [deviceItem('dev-1', '5')],
+    })
+    client = h.client
+    h.es.emit('open')
+    await flush()
+    expect(h.client.watermarkOf('device', 'dev-1')).toBe('5')
+
+    h.es.emitData('device.updated', { device_id: 'dev-1', revision: '10' })
+    expect(h.client.watermarkOf('device', 'dev-1')).toBe('10')
+
+    // 慢一轮的旧快照（revision 仍是 5）落库：成员事实可覆盖，但水位绝不逆序回退
+    h.client.resync()
+    await flush()
+    expect(h.snapshots).toHaveLength(2)
+    expect(h.client.watermarkOf('device', 'dev-1')).toBe('10')
+
+    // revision 6 低于已应用水位 10：依然必须丢弃
+    h.es.emitData('device.updated', { device_id: 'dev-1', revision: '6' })
+    expect(h.updates).toHaveLength(1)
+    expect(h.client.watermarkOf('device', 'dev-1')).toBe('10')
+
+    // 只有真正更高的 revision 才推进水位
+    h.es.emitData('device.updated', { device_id: 'dev-1', revision: '11' })
+    expect(h.updates).toHaveLength(2)
+    expect(h.client.watermarkOf('device', 'dev-1')).toBe('11')
   })
 
   it('缓冲溢出：清空缓冲、标记非实时并重新发起全量同步', async () => {
@@ -564,35 +658,55 @@ describe('断线状态与实时指示', () => {
     expect(h.devices).toHaveBeenCalledTimes(2)
   })
 
-  it('断线期间到达的提示只缓冲，重连快照落库后按对象水位合并', async () => {
+  it('断线期间缓冲的提示属于旧连接代际：重连后安全丢弃，绝不回放进新连接', async () => {
     const h = createHarness({ snapshotsConfig: 'device-only' })
     client = h.client
     h.es.emit('open')
     await flush()
+    const epochBefore = h.client.connectionEpoch.value
+    const generationBefore = h.client.syncGeneration.value
+
     h.es.emit('error')
     h.es.emitData('device.updated', { device_id: 'dev-1', revision: '4', display_name: '低于新快照' })
-    h.es.emitData('device.updated', { device_id: 'dev-3', revision: '2', display_name: '新对象' })
+    h.es.emitData('device.updated', { device_id: 'dev-3', revision: '2', display_name: '旧连接提示' })
     expect(h.updates).toHaveLength(0) // 非实时期绝不回写投影
 
     h.es.emit('open')
+    expect(h.client.connectionEpoch.value).toBe(epochBefore + 1)
+    expect(h.client.syncGeneration.value).toBeGreaterThan(generationBefore)
     await flush()
-    expect(h.updates.map((u) => u.patch.device_id)).toEqual(['dev-3']) // dev-1 rev 4 ≤ 快照 5 丢弃
+    // 旧连接代际产生的缓冲事件一律安全丢弃：新快照才是当前授权事实（06 §4 不保证历史重放）
+    expect(h.updates).toHaveLength(0)
     expect(h.client.watermarkOf('device', 'dev-1')).toBe('5')
+    expect(h.client.watermarkOf('device', 'dev-3')).toBeNull()
     expect(h.client.isRealtime.value).toBe(true)
+
+    // 丢弃是代际范围的，不是把管线打死：新代际内的事件照常按水位生效
+    h.es.emitData('device.updated', { device_id: 'dev-1', revision: '6' })
+    expect(h.updates).toHaveLength(1)
   })
 
-  it('旧连接遗留的高水位提示在重连快照后仍可合并（不丢状态更新）', async () => {
+  it('旧连接遗留的高水位提示在重连后被安全丢弃（严禁跨代际回放）', async () => {
     const h = createHarness({ snapshotsConfig: 'device-only' })
     client = h.client
     h.es.emit('open')
     await flush()
     h.es.emit('error')
-    h.es.emitData('device.updated', { device_id: 'dev-1', revision: '99' })
+    const bufferedGeneration = h.client.syncGeneration.value
+    h.es.emitData('device.updated', { device_id: 'dev-1', revision: '99' }) // 旧连接代际的提示
     h.es.emit('open')
     await flush()
+    // 旧代际的 rev 99 绝不回灌：水位只由新连接的全量快照建立
+    expect(h.updates).toHaveLength(0)
+    expect(h.client.watermarkOf('device', 'dev-1')).toBe('5')
+    expect(h.client.syncGeneration.value).toBeGreaterThan(bufferedGeneration)
+    // 新代际内更高的事件仍可正常推进水位
+    h.es.emitData('device.updated', { device_id: 'dev-1', revision: '6' })
     expect(h.updates).toHaveLength(1)
-    expect(h.client.watermarkOf('device', 'dev-1')).toBe('99')
+    expect(h.client.watermarkOf('device', 'dev-1')).toBe('6')
   })
+})
+
 describe('撤权与会话失效', () => {
   it('快照 GET 返回 401：关闭订阅、清理投影、只回调一次', async () => {
     const h = createHarness({
@@ -613,6 +727,85 @@ describe('撤权与会话失效', () => {
     h.es.emit('permissions.changed')
     await flush()
     expect(h.expired).toHaveLength(1)
+  })
+
+  it('多源快照并发：一路 401 立即短路，绝不等待另一路挂起的 GET', async () => {
+    // task 快照永不 settle：若实现等到 Promise.allSettled 才处理 401，下面的断言永远无法成立
+    const hanging = new Promise<ReadonlyArray<Record<string, unknown>>>(() => {})
+    const h = createHarness({
+      snapshotsConfig: 'both',
+      deviceSnapshot: async () => {
+        throw Object.assign(new Error('unauthorized'), { status: 401, code: 'SESSION_EXPIRED' })
+      },
+      taskSnapshot: () => hanging,
+    })
+    client = h.client
+    h.es.emit('open')
+    await flush()
+
+    expect(h.expired).toEqual(['http-401']) // 401 当刻即触发重新鉴权，不等另一路 settle
+    expect(h.client.connectionState.value).toBe('unauthorized')
+    expect(h.client.syncState.value).toBe('expired')
+    expect(h.client.isRealtime.value).toBe(false)
+    expect(h.es.closed).toBe(true)
+    expect(h.es.closeCount).toBe(1)
+    expect(h.deviceSignals[0]!.aborted).toBe(true)
+    expect(h.taskSignals[0]!.aborted).toBe(true) // 挂起中的另一路 GET 被立即 abort
+    expect(h.snapshots).toHaveLength(0)
+    expect(h.updates).toHaveLength(0)
+    expect(h.errors).not.toContain('SNAPSHOT_FAILED')
+  })
+
+  it('device 快照回调内撤权：后续 task 的回调与水位灌入立即中断', async () => {
+    let c: EventStreamClient | null = null
+    const h = createHarness({
+      snapshotsConfig: 'both',
+      onSnapshotHook: (kind) => {
+        if (kind === 'device') c?.notifyUnauthorized() // 订阅方回调内部触发撤权
+      },
+    })
+    c = h.client
+    client = h.client
+    h.es.emit('open')
+    h.es.emitData('device.updated', { device_id: 'dev-1', revision: '9' }) // 同步中缓冲
+    h.es.emitData('task.updated', { id: 'task-1', revision: '9' })
+    await flush()
+
+    expect(h.expired).toEqual(['notified'])
+    expect(h.snapshots).toEqual([{ kind: 'device', count: 2 }]) // task 的 onSnapshot 绝不被调用
+    expect(h.client.watermarkOf('task', 'task-1')).toBeNull() // task 水位未被重新灌入
+    expect(h.client.watermarkOf('device', 'dev-1')).toBeNull()
+    expect(h.updates).toHaveLength(0) // 撤权后的缓冲绝不回放
+    expect(h.client.connectionState.value).toBe('unauthorized')
+    expect(h.client.syncState.value).toBe('expired')
+    expect(h.client.isRealtime.value).toBe(false)
+    expect(h.es.closed).toBe(true)
+  })
+
+  it('对象回调内撤权：同批缓冲的后续事件立即中断，不再灌入任何数据', async () => {
+    let c: EventStreamClient | null = null
+    const gate = deferred<ReadonlyArray<Record<string, unknown>>>()
+    const h = createHarness({
+      snapshotsConfig: 'device-only',
+      deviceSnapshot: () => gate.promise,
+      onEntityUpdateHook: () => {
+        c?.notifyUnauthorized() // 投影回调内部触发撤权
+      },
+    })
+    c = h.client
+    client = h.client
+    h.es.emit('open')
+    h.es.emitData('device.updated', { device_id: 'dev-1', revision: '6' })
+    h.es.emitData('device.updated', { device_id: 'dev-2', revision: '11' })
+    gate.resolve([deviceItem('dev-1', '5'), deviceItem('dev-2', '10')])
+    await flush()
+
+    expect(h.expired).toEqual(['notified'])
+    expect(h.updates).toHaveLength(1) // 撤权当刻之后的事件绝不灌入
+    expect(h.updates[0]!.patch.device_id).toBe('dev-1')
+    expect(h.client.watermarkOf('device', 'dev-2')).toBeNull()
+    expect(h.client.syncState.value).toBe('expired')
+    expect(h.client.isRealtime.value).toBe(false)
   })
 
   it('SSE 层 error 事件携带 401 视为认证失效', () => {
@@ -778,7 +971,6 @@ describe('订阅生命周期与注入工厂', () => {
     expect(c.isRealtime.value).toBe(true)
     expect(snapshots).toEqual(['device', 'device'])
   })
-})
 })
 
 describe('主动重同步与异常路径加固', () => {

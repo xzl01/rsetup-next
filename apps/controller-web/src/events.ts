@@ -11,7 +11,13 @@ import { isU64DecimalString } from './types'
  * 4. revision 水位只在同一对象 kind + 对象 ID 内单调递增比较，Page 无全局 revision；
  * 5. 断线重连期间状态指示器绝不标记为「实时」；
  * 6. `reset` 使旧同步代际失效、取消在途 GET、重置水位并重新全量 GET；
- * 7. `permissions.changed` 或 401/认证失效时关闭订阅并清理授权投影。
+ * 7. `permissions.changed` 或 401/认证失效时关闭订阅并清理授权投影，任一快照来源报 401 当刻立即
+ *    终止整轮同步（abort 全部在途 GET），绝不等待其他来源 settle；
+ * 8. 同步缓冲条目绑定产生时的连接/同步代际，跨代际一律安全丢弃，绝不回放到新连接；
+ * 9. 快照落库只前进水位：对象 revision 低于已应用水位时保留更高水位，绝不逆序回退；
+ * 10. 事件对象不在当前全量快照成员中时不凭提示直接打补丁，改为当前授权 GET 重取；
+ * 11. 每次调用外部回调（`onSnapshot`/`onEntityUpdate`）之后与每条缓冲事件应用之前，都必须复核
+ *     连接/同步代际，撤权或 reset 后绝不继续灌入数据。
  */
 
 /** 统一命名事件；客户端对五个名称分别注册独立监听（不能只监听默认 `message`）。 */
@@ -38,7 +44,7 @@ export type SyncState = 'idle' | 'syncing' | 'synced' | 'stale' | 'expired'
 
 export type SyncReason =
   | 'open' | 'reset' | 'system-time-changed' | 'buffer-overflow'
-  | 'invalid-event' | 'snapshot-failed' | 'manual'
+  | 'invalid-event' | 'unknown-member' | 'snapshot-failed' | 'manual'
 
 /** 订阅终止原因：撤权事件、HTTP 401、SSE 层报告认证失效、外部主动通知。 */
 export type ShutdownReason = 'permissions.changed' | 'http-401' | 'sse-401' | 'notified'
@@ -198,10 +204,27 @@ export function createEventStreamClient(options: EventStreamClientOptions = {}):
 
   let active = true
   let open = false
-  /** 同步期间的事件缓冲：不回写旧快照，快照落库后按水位过滤回放。 */
-  const buffer: Array<{ kind: EntityKind; payload: Record<string, unknown> }> = []
+  /**
+   * 同步期间的事件缓冲条目：必须记录产生时的连接/同步代际。
+   * 旧代际事件（断线前的连接、上一轮同步）绝不跨代际回放到新连接（06 §4）。
+   */
+  interface BufferedEvent {
+    kind: EntityKind
+    payload: Record<string, unknown>
+    epoch: number
+    generation: number
+  }
+  /** 同步期间的事件缓冲：不回写旧快照，仅回放与当前同步代际同源的条目并按水位过滤。 */
+  const buffer: BufferedEvent[] = []
   /** 对象水位表：key = kind + 分隔符 + id，跨 kind/跨对象绝不互相比较。 */
   const watermarks = new Map<string, string>()
+  /**
+   * 当前全量快照成员集合：只有已成功落库的快照才拥有成员事实。
+   * 不在集合内的对象提示属于「列表成员变化/无法对应快照」，只能重取，不能当补丁分发。
+   */
+  const members = new Map<EntityKind, Set<string>>()
+  /** 已注册快照来源的 kind：未注册来源的 kind 没有成员事实，不做成员判定。 */
+  const sourceKinds = new Set<EntityKind>(sources.map((source) => source.kind))
   let inFlight: AbortController | null = null
 
   function watermarkKey(kind: EntityKind, id: string): string {
@@ -221,13 +244,35 @@ export function createEventStreamClient(options: EventStreamClientOptions = {}):
     }
   }
 
-  function ticketOf(signal: AbortSignal, epoch: number, generation: number): { epoch: number; generation: number; signal: AbortSignal } {
+  /** 一轮同步的身份票据：连接代际 + 同步代际 + abort 信号，用于回写与外部分发前的复核。 */
+  interface SyncTicket {
+    epoch: number
+    generation: number
+    signal: AbortSignal
+  }
+
+  function ticketOf(signal: AbortSignal, epoch: number, generation: number): SyncTicket {
     return { epoch, generation, signal }
   }
 
-  function isCurrent(ticket: { epoch: number; generation: number; signal: AbortSignal }): boolean {
-    return active && open && connectionEpoch.value === ticket.epoch &&
-      syncGeneration.value === ticket.generation && !ticket.signal.aborted
+  /** 撤权/自毁复核：订阅仍活跃、票据未被 abort 且连接/同步代际都未被推进。 */
+  function isValidTicket(ticket: SyncTicket): boolean {
+    return active && !ticket.signal.aborted && connectionEpoch.value === ticket.epoch &&
+      syncGeneration.value === ticket.generation
+  }
+
+  function isCurrent(ticket: SyncTicket): boolean {
+    return open && isValidTicket(ticket)
+  }
+
+  /** 代际切换：丢弃一切不属于当前连接/同步代际的未确认缓冲事件，绝不跨代际回放。 */
+  function pruneBuffer(): void {
+    for (let index = buffer.length - 1; index >= 0; index -= 1) {
+      const entry = buffer[index]!
+      if (entry.epoch !== connectionEpoch.value || entry.generation !== syncGeneration.value) {
+        buffer.splice(index, 1)
+      }
+    }
   }
 
   interface PendingUpdate {
@@ -237,8 +282,36 @@ export function createEventStreamClient(options: EventStreamClientOptions = {}):
     payload: Record<string, unknown>
   }
 
-  /** 同一 kind+id 低于或等于已应用水位的事件直接丢弃；更高才推进水位并分发。 */
-  function applyUpdate(update: PendingUpdate): void {
+  function isKnownMember(kind: EntityKind, id: string): boolean {
+    const known = members.get(kind)
+    return known !== undefined && known.has(id)
+  }
+
+  /**
+   * 快照水位只前进不后退：与已应用水位逐对象比对，只有更高才推进。
+   * 快照版本低于已有水位时保留更高水位（快照对列表成员是权威的，但绝不能把水位逆序拉回，
+   * 否则迟到的旧事件会被误判为更新）。只有 reset/撤权/关闭才清空水位重建基线。
+   */
+  function advanceWatermark(key: string, revision: string): void {
+    const applied = watermarks.get(key)
+    if (applied === undefined) {
+      watermarks.set(key, revision)
+      return
+    }
+    if (compareRevision(revision, applied) > 0) watermarks.set(key, revision)
+  }
+
+  /**
+   * 应用单个对象补丁。返回 false 表示外部回调期间连接/同步代际已失效（撤权、close 或 reset），
+   * 调用方必须立即中断后续流程，绝不继续灌入数据。
+   */
+  function applyUpdate(update: PendingUpdate, alive: () => boolean): boolean {
+    // 未知成员：06 §4 明确「无法对应当前快照的对象」不得凭提示直接打补丁，必须当前授权 GET 重取。
+    if (sourceKinds.has(update.kind) && !isKnownMember(update.kind, update.id)) {
+      fail('UNMAPPED_EVENT', { kind: update.kind, detail: 'event_object_not_in_snapshot' })
+      startSync('unknown-member')
+      return false
+    }
     const key = watermarkKey(update.kind, update.id)
     const applied = watermarks.get(key)
     if (applied !== undefined) {
@@ -248,24 +321,31 @@ export function createEventStreamClient(options: EventStreamClientOptions = {}):
       } catch {
         fail('INVALID_REVISION', { kind: update.kind, detail: 'revision_not_canonical_u64' })
         startSync('invalid-event')
-        return
+        return alive()
       }
-      if (comparison <= 0) return
+      if (comparison <= 0) return alive()
     }
     watermarks.set(key, update.revision)
     options.onEntityUpdate?.(update.kind, update.payload)
+    // 订阅方回调可能内部触发撤权或 reset：其后绝不再分发任何数据
+    return alive()
   }
 
-  function drainBuffer(): void {
+  /** 快照落库后回放缓冲：只回放同代际条目，且每条应用前后都复核代际与撤权。 */
+  function drainBuffer(ticket: SyncTicket): void {
     const pending = buffer.splice(0, buffer.length)
+    const alive = (): boolean => isCurrent(ticket)
     for (const entry of pending) {
+      if (!isCurrent(ticket)) return
+      // 跨代际兜底：不属于本轮票据的缓冲条目一律安全丢弃，绝不回放到新连接/新同步代际。
+      if (entry.epoch !== ticket.epoch || entry.generation !== ticket.generation) continue
       const id = pickEntityId(entry.kind, entry.payload)
       const revision = entry.payload.revision
       if (id === null || !isU64DecimalString(revision)) {
         fail('UNMAPPED_EVENT', { kind: entry.kind, detail: 'buffered_event_unmapped' })
         continue
       }
-      applyUpdate({ kind: entry.kind, id, revision, payload: entry.payload })
+      if (!applyUpdate({ kind: entry.kind, id, revision, payload: entry.payload }, alive)) return
     }
   }
 
@@ -274,8 +354,6 @@ export function createEventStreamClient(options: EventStreamClientOptions = {}):
     lastSyncReason.value = reason
     isRealtime.value = false
     abortInFlight()
-    // 注意：这里绝不清空缓冲。断线/重同步期间缓存的变更提示必须在新快照落库后按水位合并，
-    // 否则短暂断线期间的状态更新会永久丢失。缓冲上限由 maxBufferSize 兜底，reset/shutdown 显式清空。
     if (!open) {
       // 断线期间绝不发起 GET：重连后的独立 GET 成功同样不能标记实时，必须等下一次 open。
       syncState.value = 'stale'
@@ -284,6 +362,9 @@ export function createEventStreamClient(options: EventStreamClientOptions = {}):
     const generation = syncGeneration.value + 1
     const epochAtStart = connectionEpoch.value
     syncGeneration.value = generation
+    // 同步代际切换：本轮之前的缓冲条目属于旧代际，安全丢弃，绝不回放到新快照之后的新代际。
+    // 新代际内（GET 在途期间）到达的提示继续缓冲，上限由 maxBufferSize 兜底；reset/shutdown 显式清空。
+    pruneBuffer()
     const controller = new AbortController()
     inFlight = controller
     syncState.value = 'syncing'
@@ -296,25 +377,36 @@ export function createEventStreamClient(options: EventStreamClientOptions = {}):
       })
   }
 
-  async function runSync(
-    ticket: { epoch: number; generation: number; signal: AbortSignal },
-    controller: AbortController,
-  ): Promise<void> {
-    // 快照实现的同步抛错也必须变成 rejected，否则整条链路会抛出未处理拒绝并卡在 syncing。
-    const settled = await Promise.allSettled(sources.map((source) =>
-      new Promise<ReadonlyArray<Record<string, unknown>>>((resolve) => {
-        resolve(source.fetch({ signal: controller.signal }))
-      }),
-    ))
+  /**
+   * 单个来源的快照 GET：快照实现的同步抛错也必须变成 rejected，否则整条链路会抛出未处理拒绝并卡在 syncing。
+   * 401/会话失效在被识别的当刻立即整体 shutdown，绝不等待其他来源 settle。
+   */
+  function fetchSnapshotItems(
+    source: SnapshotSource,
+    signal: AbortSignal,
+  ): Promise<ReadonlyArray<Record<string, unknown>>> {
+    return new Promise<ReadonlyArray<Record<string, unknown>>>((resolve, reject) => {
+      const onFailure = (error: unknown): void => {
+        if (isUnauthorizedError(error)) shutdown('http-401')
+        reject(error)
+      }
+      try {
+        Promise.resolve(source.fetch({ signal })).then(resolve, onFailure)
+      } catch (error) {
+        onFailure(error)
+      }
+    })
+  }
+
+  async function runSync(ticket: SyncTicket, controller: AbortController): Promise<void> {
+    const settled = await Promise.allSettled(
+      sources.map((source) => fetchSnapshotItems(source, controller.signal)),
+    )
     if (!isCurrent(ticket)) return
     if (inFlight === controller) inFlight = null
 
-    for (const result of settled) {
-      if (result.status === 'rejected' && isUnauthorizedError(result.reason)) {
-        shutdown('http-401')
-        return
-      }
-    }
+    // 说明：401 已在各来源 rejection 的当刻完成 shutdown（不等其他来源 settle），
+    // 此时 isCurrent 必为 false，上面的代际检查即已终止本轮后续处理。
     const rejected = settled.find((result) => result.status === 'rejected')
     if (rejected !== undefined) {
       // 快照失败保持非实时且不自动重试：重试由下一次 open、reset 或页面主动 resync 触发，避免 GET 风暴。
@@ -323,8 +415,14 @@ export function createEventStreamClient(options: EventStreamClientOptions = {}):
       return
     }
 
-    // 先全量校验再原子提交：非法项绝不部分污染水位表或页面投影。
-    const commits: Array<{ kind: EntityKind; items: ReadonlyArray<Record<string, unknown>>; entries: Array<{ key: string; revision: string }> }> = []
+    // 先全量校验再原子提交：非法项绝不部分污染水位表、成员集合或页面投影。
+    interface SnapshotCommit {
+      kind: EntityKind
+      items: ReadonlyArray<Record<string, unknown>>
+      entries: Array<{ key: string; revision: string }>
+      memberIds: string[]
+    }
+    const commits: SnapshotCommit[] = []
     for (let index = 0; index < sources.length; index += 1) {
       const source = sources[index]!
       const items = (settled[index] as PromiseFulfilledResult<ReadonlyArray<Record<string, unknown>>>).value
@@ -334,6 +432,7 @@ export function createEventStreamClient(options: EventStreamClientOptions = {}):
         return
       }
       const entries: Array<{ key: string; revision: string }> = []
+      const memberIds: string[] = []
       for (const item of items) {
         if (!isRecord(item)) {
           syncState.value = 'stale'
@@ -346,6 +445,7 @@ export function createEventStreamClient(options: EventStreamClientOptions = {}):
           fail('INVALID_SNAPSHOT_ITEM', { kind: source.kind, detail: 'item_id_invalid' })
           return
         }
+        memberIds.push(id)
         const revision = item.revision
         if (revision === undefined) continue // 列表项可不带 revision：无基线，首个更高事件建立水位
         if (!isU64DecimalString(revision)) {
@@ -355,16 +455,20 @@ export function createEventStreamClient(options: EventStreamClientOptions = {}):
         }
         entries.push({ key: watermarkKey(source.kind, id), revision })
       }
-      commits.push({ kind: source.kind, items, entries })
+      commits.push({ kind: source.kind, items, entries, memberIds })
     }
 
     // 回写前再次核对代际：abort 无效或已返回的旧响应绝不能覆盖新状态。
     if (!isCurrent(ticket)) return
     for (const commit of commits) {
-      for (const entry of commit.entries) watermarks.set(entry.key, entry.revision)
+      // 外部回调可能内部触发撤权或 reset：每轮提交前都必须复核，失效立即中断后续 kind 的灌入。
+      if (!isCurrent(ticket)) return
+      // 快照对列表成员是权威的：成员集合整体替换；水位只前进不后退，绝不因旧快照逆序回退。
+      for (const entry of commit.entries) advanceWatermark(entry.key, entry.revision)
+      members.set(commit.kind, new Set(commit.memberIds))
       options.onSnapshot?.(commit.kind, commit.items)
     }
-    drainBuffer()
+    drainBuffer(ticket)
     if (!isCurrent(ticket)) return
     syncState.value = 'synced'
     isRealtime.value = true
@@ -391,33 +495,38 @@ export function createEventStreamClient(options: EventStreamClientOptions = {}):
       return
     }
     // 只有「当前同步代际的快照已落库」才可直接回写；同步中或断线待重连都先缓冲，
-    // 等下一次成功快照后按对象水位合并回放，绝不把事件写进旧快照。
+    // 等本轮快照落库后按对象水位合并回放，绝不把事件写进旧快照。
     if (syncState.value !== 'synced') {
-      // 重同步期间重新缓冲，不把事件写入旧快照。
+      // 重同步期间重新缓冲，不把事件写入旧快照。缓冲条目绑定当前连接/同步代际，
+      // 代际一旦切换（断线、重连、reset、重同步）即安全丢弃，绝不跨代际回放。
       if (buffer.length >= maxBufferSize) {
         buffer.length = 0
         fail('BUFFER_OVERFLOW', { kind, detail: 'buffer_exceeded' })
         startSync('buffer-overflow')
         return
       }
-      buffer.push({ kind, payload })
+      buffer.push({ kind, payload, epoch: connectionEpoch.value, generation: syncGeneration.value })
       return
     }
-    applyUpdate({ kind, id, revision, payload })
+    // 直接分发路径：唯一的外部副作用是 onEntityUpdate，回调后订阅可能已撤权/自毁。
+    applyUpdate({ kind, id, revision, payload }, () => active)
   }
 
   function handleSystemTimeChanged(raw: unknown): void {
     if (!active) return
     const payload = parseEventData(raw)
     options.onSystemTimeChanged?.(payload)
+    // 时间回调可能内部触发撤权：不再发起任何 GET
+    if (!active) return
     // 时间事件只是变化提示（无对象 ID）：重新 GET 当前授权快照，不凭事件宣称时钟已同步。
     startSync('system-time-changed')
   }
 
   function handleReset(): void {
     if (!active) return
-    // 旧同步代际失效：水位表与缓冲一并作废，重连后的快照重新建立基线。
+    // 旧同步代际失效：水位表、成员集合与缓冲一并作废，重连后的快照重新建立全量基线。
     watermarks.clear()
+    members.clear()
     buffer.length = 0
     startSync('reset')
   }
@@ -433,6 +542,7 @@ export function createEventStreamClient(options: EventStreamClientOptions = {}):
     abortInFlight()
     buffer.length = 0
     watermarks.clear() // 清理授权投影，绝不继续展示已撤权数据
+    members.clear()
     try {
       eventSource.close()
     } catch {
@@ -453,8 +563,9 @@ export function createEventStreamClient(options: EventStreamClientOptions = {}):
     connectionState.value = 'reconnecting'
     syncGeneration.value += 1 // 在途旧 GET 立即失效
     abortInFlight()
-    // 断线前缓存的变更提示保留：撤权由 permissions.changed 单独清理，普通重连同一会话授权不变，
-    // 重连快照落库后按对象 kind+id 水位合并，旧提示因不高于水位自然丢弃。
+    // 断线即代际切换：旧连接未确认的缓冲事件一律安全丢弃（06 §4 不保证历史重放），
+    // 重连 open 后的新快照是当前授权事实的唯一来源，绝不把旧连接事件回放进新连接。
+    pruneBuffer()
   }
 
   function handleClose(): void {
@@ -472,6 +583,7 @@ export function createEventStreamClient(options: EventStreamClientOptions = {}):
     abortInFlight()
     buffer.length = 0
     watermarks.clear()
+    members.clear()
     try {
       eventSource.close()
     } catch {
