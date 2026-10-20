@@ -456,7 +456,7 @@ target missing按protected目标用户加载映射NotFound，不误映Permission
 
 ### Task 13: 管理生产适配器与26路由网关证据
 
-完整实施内容见[管理适配器与调用矩阵子计划](2026-10-16-controller-v1-task4-identity-management-adapters.md)，作为本执行计划的必要组成；主Task6为唯一State/Gateway/probe契约来源。Identity不修改main或创建顶层builder，唯一顶层装配归集成Task0。
+完整实施内容见[管理适配器与调用矩阵子计划](05-adapters-matrix.md)，作为本执行计划的必要组成；主Task6为唯一State/Gateway/probe契约来源。Identity不修改main或创建顶层builder，唯一顶层装配归集成Task0。
 
 ---
 

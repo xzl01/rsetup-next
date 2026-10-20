@@ -157,14 +157,14 @@ pub struct StorageStatus {
 
 实现位于 `crates/rsetup-app/src/tui.rs::render_storage_summary`，函数重命名与 `storage_telemetry` 标题均已按本节落实；其余差异如下：
 
-1. **统一汇总的数据来源**：卡片数据由 `App::refresh_storage` 经 `Controller::storage_status()` 一次取回聚合的 `StorageStatus`，再拆成 `nvme_status` / `mmc_status` 两份渲染，并各带一条 `nvme_error` / `mmc_error` 枚举错误。**枚举失败与"无设备"是两种不同状态**：任一枚举出错时不显示 `storage_not_detected`，改为在设备列表前渲染 `storage_nvme_enum_failed` / `storage_mmc_enum_failed` 错误行（原规范未定义该区分）。
+1. **统一汇总的数据来源**：卡片数据由 `App::refresh_storage`（`crates/rsetup-app/src/tui.rs:242-271`）**分两次独立采集**：先 `controller.nvme_status()`，成功写入 `nvme_status` 并清空 `nvme_error`，失败则把 `nvme_status` 重置为 `initialized = false` 的空设备表并记下 `nvme_error`；再 `controller.mmc_status()`，同样各自 `match`、各自记录 `mmc_status` / `mmc_error`。两线互不覆盖，一次刷新可能一侧成功、一侧失败。**不经 `Controller::storage_status()` 一次取回聚合的 `StorageStatus`**——该方法只服务 `hardware storage` CLI 子命令（`crates/rsetup-app/src/main.rs:742-748`）与 HTTP 处理器（`crates/rsetup-app/src/server.rs:730`），TUI 渲染路径不经过它。**枚举失败与"无设备"是两种不同状态**：任一枚举出错时不显示 `storage_not_detected`，改为在设备列表前渲染 `storage_nvme_enum_failed` / `storage_mmc_enum_failed` 错误行（原规范未定义该区分）。
 2. **N = 0**：占用高度 3 行（边框 + 1 行 `storage_not_detected`），与规范一致。
 3. **不按 N 切换排版**：实现未在 $N = 1$ 时切换到"完整规格展开"，也不在 $N \ge 2$ 时压缩为固定每盘 2 行；实际恒定为**每盘 2–3 行 + 盘间 1 行空行分隔**：
    - NVMe 在 SMART 可读时占 3 行：第 1 行设备名与容量，第 2 行健康状态 / 温度 / 已用寿命 / 可用备用，第 3 行读写量与备用空间阈值；无 SMART 时为 2 行（第 2 行给出不可读取原因）。
-   - NVMe 第 1 行为 `nvme0 (/dev/nvme0n1) · 型号 · 容量`，**不带 `[NVMe]` 前缀**；仅 MMC/SD 第 1 行带 `[MMC]` / `[SD]` 前缀，即该前缀只对 MMC 族有意义。
+   - NVMe 第 1 行为 `nvme0 (/dev/nvme0n1) · 型号 · 容量`，**不带 `[NVMe]` 前缀**；仅 MMC/SD 第 1 行带类型徽章，取自 i18n 键 `storage_emmc` / `storage_sd`，即中文 `[eMMC]` / `[SD 卡]`、英文 `[eMMC]` / `[SD Card]`（**不是** `[MMC]` / `[SD]`），即该徽章只对 MMC 族有意义。
    - NVMe 第 2 行字段顺序为 `状态 · 温度 · 已用寿命 · 备用`，读写量与阈值另起第 3 行，并非规范示例中的单行合并形式。英文 `Used Endurance:` 在整行超出卡片内宽时退化为 `Used:`，以保证必需展示的"可用备用空间"不被挤出。
    - eMMC 第 2 行为 `状态: 正常 · SLC 寿命: p% · MLC 寿命: q% · 预警: 正常`（`SD 卡` 走同一渲染，仅类型前缀不同）；寿命按生命周期字段的特殊取值映射为 `90–100%`、`>100%`，缺失时显示 `不支持`。遥测不可用时该行改为不可读取原因，不支持时给出 `storage_telemetry_unsupported`。
-   - MMC/SD 第 1 行按卡片内宽做省略降级，保证末尾的容量值不被折行挤掉。
+   - **按卡片内宽降级（commit `26fab4b`）**：`mmc_device_lines` 已接收 `inner_width` 形参，`render_mission` 的高度预估与 `render_storage_summary` 的渲染两处调用均传入。第 1 行由 `mmc_identity_line` 逐级让位直到整行 `<= inner_width`：`块设备全路径 · 型号 · 厂商 · 容量` → 去掉 `/dev/` 前缀 → 舍弃厂商 → 只留块设备名 → 仍放不下时以 `…` 截断标识部分；**类型徽章与容量（含单位）始终保持在同一行**，不再被 Paragraph 折到第二行。标识字段为空（sysfs 读取失败的设备）时不输出悬空的 ` · ` 分隔符。第 2 行同样按内宽降级：先改用短寿命标签（i18n `storage_life_a_short` / `storage_life_b_short`；英文全写在 59 列卡片内宽下需要短标签，中文全写可容纳），再舍弃取值为正常/未定义的 pre-EOL 段，pre-EOL 处于告警或紧急时不舍弃。
 4. **高度按实际换行行数贪心装填**，而非 $2 + 2N$ 公式：预算为 `area.height - 2`，每个设备的行数按卡片内宽**换行后**统计（并计入其前置空行），先装填枚举错误行再装填设备行；NVMe 全部排在前、MMC/SD 排在后。
 5. **截断提示**文案为 `... 更多设备 M`（中）/ `... M more device(s)`（英），且仅在剩余预算 $\ge 1$ 行时才追加，与原示例的 `... (+M more devices)` 字面不同。
 

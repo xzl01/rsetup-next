@@ -2,10 +2,11 @@
 //! and `logout`; Task 3e: session-write and endpoint-read rate limiting;
 //! Task 3f: pre-auth `me` clock gate).
 //!
-//! The partial router is NEVER wired to `main`: all auth endpoints stay
-//! unregistered in `main` until the production `LiveAuth` adapter and the
-//! six-method SQLx repository review land. See
-//! `.superpowers/sdd/2026-10-03-controller-auth-http/`.
+//! The auth router IS wired into production: `main.rs` is the one and only
+//! construction point of the shared `HttpAuthState`, built on top of the
+//! `LiveAuth` adapter (`AuthService` over `SqlxIdentityRepository`) and
+//! cloned into every line's state, so the handlers below back the registered
+//! `/auth/*` endpoints. See `crates/rsetup-controller/src/main.rs`.
 //!
 //! Contract: envelopes come from `crate::http_api`; fixed allowed
 //! code/message_key with empty redacted `params`; credentials, tokens and
