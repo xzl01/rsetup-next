@@ -1219,7 +1219,7 @@ fn render_mission(frame: &mut Frame, app: &App, area: Rect) {
         app.mmc_status
             .devices
             .iter()
-            .map(|dev| wrapped_rows(&mmc_device_lines(app, dev), inner_width))
+            .map(|dev| wrapped_rows(&mmc_device_lines(app, dev, inner_width), inner_width))
             .sum()
     } else {
         0
@@ -1417,7 +1417,7 @@ fn render_storage_summary(frame: &mut Frame, app: &App, area: Rect) {
     for (idx, dev) in devices.iter().enumerate() {
         let dev_lines = match dev {
             Device::Nvme(d) => nvme_device_lines(app, d, inner_width),
-            Device::Mmc(d) => mmc_device_lines(app, d),
+            Device::Mmc(d) => mmc_device_lines(app, d, inner_width),
         };
         // A blank row separates consecutive devices, or devices from errors; charge it to the device.
         let needs_sep = idx > 0 || !lines.is_empty();
@@ -1678,29 +1678,131 @@ fn nvme_device_lines(
     }
 }
 
-fn mmc_device_lines(app: &App, dev: &rsetup_core::MmcDevice) -> Vec<Line<'static>> {
-    // Line 1: [type] block_path · model · manufacturer · capacity
+/// Display width of a plain string, measured exactly the way the paragraph
+/// that renders it wraps it.
+fn text_width(text: &str) -> usize {
+    Span::raw(text).width()
+}
+
+/// Truncate `text` to at most `max` display columns, marking the cut with a
+/// single ellipsis. Returns an empty string when even the ellipsis would not
+/// fit, so a caller never renders a lone `…`.
+fn ellipsize(text: &str, max: usize) -> String {
+    if text_width(text) <= max {
+        return text.to_owned();
+    }
+    if max < 2 {
+        return String::new();
+    }
+    let mut taken = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let width = text_width(ch.encode_utf8(&mut [0u8; 4]));
+        if used + width + 1 > max {
+            break;
+        }
+        taken.push(ch);
+        used += width;
+    }
+    taken.push('…');
+    taken
+}
+
+/// Join the non-empty identity fields of a device with the card separator.
+///
+/// A device whose sysfs read failed carries empty `model`/`manufacturer`
+/// fields; joining them verbatim would print dangling ` · ` separators.
+fn join_identity(parts: &[&str]) -> String {
+    parts
+        .iter()
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// Identity line of an MMC/SD card: `[type] block · model · vendor · capacity`.
+///
+/// One column too wide and the paragraph wraps the capacity unit onto a
+/// second row (mmc report §5 T1), so the identity gives fields up before
+/// that can happen: the `/dev/` prefix first, then the vendor, then the
+/// model, and only the remainder gets ellipsized. The type badge and the
+/// capacity are never given up.
+fn mmc_identity_line(
+    type_label: &str,
+    dev: &rsetup_core::MmcDevice,
+    inner_width: usize,
+) -> Line<'static> {
+    let badge = format!("[{type_label}] ");
+    let capacity = crate::format_bytes(dev.total_bytes);
+    let short_block = dev
+        .block_path
+        .strip_prefix("/dev/")
+        .unwrap_or(dev.block_path.as_str());
+    let detail_full = join_identity(&[&dev.block_path, &dev.model]);
+    let detail_short = join_identity(&[short_block, &dev.model]);
+    let vendor = dev.manufacturer.trim();
+    let vendor = (!vendor.is_empty()).then(|| vendor.to_string());
+    let block_only = join_identity(&[short_block]);
+
+    let width_of = |detail: &str, vendor: Option<&str>| -> usize {
+        let parts = vec![detail, vendor.unwrap_or(""), &capacity]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        text_width(&badge) + text_width(&join_identity(&parts))
+    };
+
+    let candidates = [
+        (detail_full, vendor.clone()),
+        (detail_short.clone(), vendor.clone()),
+        (detail_short.clone(), None),
+        (block_only, None),
+    ];
+    let chosen = candidates
+        .into_iter()
+        .find(|(detail, vendor)| width_of(detail, vendor.as_deref()) <= inner_width);
+    let (detail, vendor) = chosen.unwrap_or_else(|| {
+        // Even the leanest identity is too wide: ellipsize it so the badge
+        // and the capacity keep their one row.
+        let room = inner_width
+            .saturating_sub(text_width(&badge) + text_width(" · ") + text_width(&capacity));
+        (ellipsize(&detail_short, room), None)
+    });
+
+    let mut spans = vec![Span::styled(
+        badge,
+        Style::default().fg(BONE).add_modifier(Modifier::BOLD),
+    )];
+    if !detail.is_empty() {
+        spans.push(Span::styled(
+            format!("{detail} · "),
+            Style::default().fg(BONE),
+        ));
+    }
+    if let Some(vendor) = vendor {
+        spans.push(Span::styled(
+            format!("{vendor} · "),
+            Style::default().fg(MUTED),
+        ));
+    }
+    spans.push(Span::styled(capacity, Style::default().fg(AMBER)));
+    Line::from(spans)
+}
+
+fn mmc_device_lines(
+    app: &App,
+    dev: &rsetup_core::MmcDevice,
+    inner_width: usize,
+) -> Vec<Line<'static>> {
+    // Line 1: [type] block_path · model · manufacturer · capacity, degraded to
+    // the card's inner width so the capacity never wraps.
     let type_label = if dev.card_type == "MMC" {
         app.locale.text("storage_emmc")
     } else {
         app.locale.text("storage_sd")
     };
-    let line1 = Line::from(vec![
-        Span::styled(
-            format!("[{}] ", type_label),
-            Style::default().fg(BONE).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!("{} · ", dev.block_path), Style::default().fg(BONE)),
-        Span::styled(format!("{} · ", dev.model), Style::default().fg(BONE)),
-        Span::styled(
-            format!("{} · ", dev.manufacturer),
-            Style::default().fg(MUTED),
-        ),
-        Span::styled(
-            crate::format_bytes(dev.total_bytes),
-            Style::default().fg(AMBER),
-        ),
-    ]);
+    let line1 = mmc_identity_line(type_label, dev, inner_width);
 
     // Line 2: Health state or telemetry error/unsupported banner
     let health_label = format!("{}: ", app.locale.text("storage_health"));
@@ -1750,9 +1852,6 @@ fn mmc_device_lines(app: &App, dev: &rsetup_core::MmcDevice) -> Vec<Line<'static
             ),
         ]),
         rsetup_core::TelemetryReadState::Available => {
-            let life_a_label = format!("{}: ", app.locale.text("storage_life_a"));
-            let life_b_label = format!("{}: ", app.locale.text("storage_life_b"));
-            let pre_eol_label = format!("{}: ", app.locale.text("storage_pre_eol"));
             let format_life = |value: Option<u8>| -> String {
                 match value {
                     Some(100) => "90–100%".to_string(),
@@ -1770,24 +1869,66 @@ fn mmc_device_lines(app: &App, dev: &rsetup_core::MmcDevice) -> Vec<Line<'static
                 3 => app.locale.text("storage_eol_urgent"),
                 _ => app.locale.text("storage_eol_undefined"),
             };
-            Line::from(vec![
-                Span::styled(health_label, Style::default().fg(MUTED)),
-                Span::styled(
-                    health_text,
-                    Style::default()
-                        .fg(health_color)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(" · ", Style::default().fg(MUTED)),
-                Span::styled(life_a_label, Style::default().fg(MUTED)),
-                Span::styled(life_a, Style::default().fg(BONE)),
-                Span::styled(" · ", Style::default().fg(MUTED)),
-                Span::styled(life_b_label, Style::default().fg(MUTED)),
-                Span::styled(life_b, Style::default().fg(BONE)),
-                Span::styled(" · ", Style::default().fg(MUTED)),
-                Span::styled(pre_eol_label, Style::default().fg(MUTED)),
-                Span::styled(eol, Style::default().fg(BONE)),
-            ])
+            // The full spelling of both life-time labels plus the pre-EOL
+            // segment is wider than the 59 columns the card gets on a
+            // 100-column terminal, so this line degrades like the NVMe one:
+            // shorten the labels first, then drop the pre-EOL value, but only
+            // while that value carries no warning.
+            let build_line = |short_labels: bool, with_eol: bool| -> Line<'static> {
+                let (life_a_key, life_b_key) = if short_labels {
+                    ("storage_life_a_short", "storage_life_b_short")
+                } else {
+                    ("storage_life_a", "storage_life_b")
+                };
+                let mut spans = vec![
+                    Span::styled(health_label.clone(), Style::default().fg(MUTED)),
+                    Span::styled(
+                        health_text,
+                        Style::default()
+                            .fg(health_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" · ", Style::default().fg(MUTED)),
+                    Span::styled(
+                        format!("{}: ", app.locale.text(life_a_key)),
+                        Style::default().fg(MUTED),
+                    ),
+                    Span::styled(life_a.clone(), Style::default().fg(BONE)),
+                    Span::styled(" · ", Style::default().fg(MUTED)),
+                    Span::styled(
+                        format!("{}: ", app.locale.text(life_b_key)),
+                        Style::default().fg(MUTED),
+                    ),
+                    Span::styled(life_b.clone(), Style::default().fg(BONE)),
+                ];
+                if with_eol {
+                    spans.push(Span::styled(" · ", Style::default().fg(MUTED)));
+                    spans.push(Span::styled(
+                        format!("{}: ", app.locale.text("storage_pre_eol")),
+                        Style::default().fg(MUTED),
+                    ));
+                    spans.push(Span::styled(eol, Style::default().fg(BONE)));
+                }
+                Line::from(spans)
+            };
+            let eol_carries_news = matches!(dev.health.pre_eol_info, 2 | 3);
+            let mut ladder = vec![(false, true), (true, true)];
+            if !eol_carries_news {
+                ladder.extend_from_slice(&[(false, false), (true, false)]);
+            }
+            let built = ladder
+                .into_iter()
+                .map(|(short_labels, with_eol)| build_line(short_labels, with_eol))
+                .collect::<Vec<_>>();
+            let leanest = built.len() - 1;
+            let index = built
+                .iter()
+                .position(|line| line.width() <= inner_width)
+                .unwrap_or(leanest);
+            built
+                .into_iter()
+                .nth(index)
+                .expect("degrade ladder is not empty")
         }
     };
 
@@ -2921,6 +3062,164 @@ mod tests {
         );
     }
 
+    /// The Rock 3A device of mmc report §5 T1: its identity line is 61 display
+    /// columns wide, one more than the 59 columns the storage card gets on a
+    /// 100-column terminal, which used to push the capacity unit onto a second
+    /// row.
+    fn rock3a_mmc_app(locale: Locale) -> App {
+        let controller = Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun);
+        let mut app = App::new(controller, locale).expect("init app");
+        let mut dev = app.mmc_status.devices[0].clone();
+        dev.block_path = "/dev/mmcblk0".into();
+        dev.card_type = "MMC".into();
+        dev.model = "064G02".into();
+        dev.manufacturer = "Toshiba (0x000011)".into();
+        dev.total_bytes = 62_537_072_640; // 58.24 GiB
+        app.mmc_status.devices = vec![dev];
+        app.nvme_status.devices.clear();
+        app.nvme_status.initialized = false;
+        app
+    }
+
+    /// Render the storage card alone and return its rows as plain text.
+    fn render_storage_rows(app: &App, width: u16, height: u16) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("init test terminal");
+        terminal
+            .draw(|frame| {
+                render_storage_summary(frame, app, Rect::new(0, 0, width, height));
+            })
+            .expect("draw");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(width as usize)
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn test_render_storage_summary_keeps_mmc_capacity_on_one_row() {
+        for locale in [Locale::En, Locale::ZhCn] {
+            let app = rock3a_mmc_app(locale);
+            let rows = render_storage_rows(&app, 61, 8);
+            let screen = rows.join("\n");
+            let row = rows
+                .iter()
+                .find(|row| row.contains("58.24 GiB"))
+                .unwrap_or_else(|| {
+                    panic!("{locale:?}: capacity fell off the device row:\n{screen}")
+                });
+            assert!(
+                row.contains("[eMMC] mmcblk0"),
+                "{locale:?}: the capacity must share its row with the device badge, got {row:?} in:\n{screen}"
+            );
+            assert!(
+                !row.contains("/dev/"),
+                "{locale:?}: the /dev/ prefix is the first field to give up, got {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_render_storage_summary_mmc_identity_degrades_by_width() {
+        // A wide card keeps everything the probe reported.
+        let wide = render_storage_rows(&rock3a_mmc_app(Locale::En), 100, 8).join("\n");
+        assert!(
+            wide.contains("[eMMC] /dev/mmcblk0 · 064G02 · Toshiba (0x000011) · 58.24 GiB"),
+            "Expected the full identity line on a wide card, got:\n{wide}"
+        );
+
+        // 59 inner columns give up the /dev/ prefix but keep the vendor name.
+        let narrow = render_storage_rows(&rock3a_mmc_app(Locale::En), 61, 8).join("\n");
+        assert!(
+            narrow.contains("[eMMC] mmcblk0 · 064G02 · Toshiba (0x000011) · 58.24 GiB"),
+            "Expected the /dev/-less identity line at 59 columns, got:\n{narrow}"
+        );
+    }
+
+    #[test]
+    fn test_render_storage_summary_mmc_telemetry_line_fits_narrow_card() {
+        // The Chinese spelling is short enough to keep the whole line, the
+        // pre-EOL segment included.
+        let zh = render_storage_rows(&rock3a_mmc_app(Locale::ZhCn), 61, 8)
+            .into_iter()
+            // A double-width glyph leaves a blank cell behind in the buffer,
+            // so compare the line without its padding.
+            .map(|row| row.replace(' ', ""))
+            .find(|row| row.contains("SLC寿命"))
+            .expect("Chinese telemetry line");
+        assert!(
+            zh.contains("SLC寿命:10%") && zh.contains("预警:正常"),
+            "Expected the full Chinese telemetry line, got {zh:?}"
+        );
+
+        // English needs the short life-time spelling to keep pre-EOL on the
+        // same row.
+        let en = render_storage_rows(&rock3a_mmc_app(Locale::En), 61, 8)
+            .into_iter()
+            .find(|row| row.contains("SLC"))
+            .expect("English telemetry line");
+        assert!(
+            en.contains("SLC: 10%") && en.contains("Pre-EOL: Normal"),
+            "Expected the compact English telemetry line, got {en:?}"
+        );
+    }
+
+    #[test]
+    fn test_mmc_identity_line_fits_every_inner_width() {
+        let app = rock3a_mmc_app(Locale::En);
+        let dev = &app.mmc_status.devices[0];
+        // The badge and the capacity alone take 16 columns; nothing narrower
+        // than that can be rendered, so the ladder only answers for the card
+        // widths a real terminal can offer.
+        for inner_width in 16..=61usize {
+            let line = mmc_identity_line("eMMC", dev, inner_width);
+            assert!(
+                line.width() <= inner_width,
+                "identity line is {} columns wide for a {inner_width}-column card",
+                line.width()
+            );
+        }
+        // Below that floor the capacity survives and only the identity goes.
+        for inner_width in 1..16usize {
+            let line = mmc_identity_line("eMMC", dev, inner_width);
+            assert_eq!(
+                line.spans.last().expect("capacity span").content.as_ref(),
+                "58.24 GiB",
+                "the capacity must survive a {inner_width}-column card"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mmc_identity_line_skips_empty_identity_fields() {
+        // A device whose sysfs read failed reports no model and no vendor; its
+        // line must not carry dangling separators.
+        let mut app = rock3a_mmc_app(Locale::En);
+        {
+            let dev = &mut app.mmc_status.devices[0];
+            dev.model.clear();
+            dev.manufacturer.clear();
+        }
+        let line = mmc_identity_line("SD Card", &app.mmc_status.devices[0], 59);
+        assert_eq!(line_text(&line), "[SD Card] /dev/mmcblk0 · 58.24 GiB");
+    }
+
     #[test]
     fn test_render_full_tui_with_nvme_zh() {
         let controller = Controller::new(ProbeMode::Demo, ExecutionPolicy::DryRun);
@@ -3216,12 +3515,14 @@ mod tests {
             raw_text.contains("nvme0"),
             "Expected NVMe device in buffer, got: {raw_text}"
         );
+        // The card is 61 columns wide in the full layout, so both MMC lines
+        // give up the /dev/ prefix instead of wrapping the capacity (§5 T1).
         assert!(
-            raw_text.contains("/dev/mmcblk0"),
+            raw_text.contains("mmcblk0"),
             "Expected eMMC device in buffer, got: {raw_text}"
         );
         assert!(
-            raw_text.contains("/dev/mmcblk1"),
+            raw_text.contains("mmcblk1"),
             "Expected SD device in buffer, got: {raw_text}"
         );
     }
@@ -3456,7 +3757,7 @@ mod tests {
 
             // Test lines directly
             let dev = &app.mmc_status.devices[0];
-            let lines = mmc_device_lines(&app, dev);
+            let lines = mmc_device_lines(&app, dev, usize::MAX);
             let combined_lines_text = lines
                 .iter()
                 .flat_map(|line| line.spans.iter().map(|s| s.content.as_ref()))
