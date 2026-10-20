@@ -38,8 +38,22 @@ const busy = ref(false)
 const actionErrorKey = ref<string | null>(null)
 const newName = ref('')
 const nameInvalid = ref(false)
-const editing = ref<{ id: string; name: string } | null>(null)
-const membersDraft = ref<{ id: string; text: string } | null>(null)
+
+/** 编辑/成员草稿都在打开时刻冻结 `expectedRevision`；后续列表刷新绝不改写它。 */
+interface GroupDraft {
+  id: string
+  name: string
+  expectedRevision: string
+}
+
+interface MembersDraft {
+  id: string
+  text: string
+  expectedRevision: string
+}
+
+const editing = ref<GroupDraft | null>(null)
+const membersDraft = ref<MembersDraft | null>(null)
 const referenceDevices = ref<string[]>([])
 const referenceLoading = ref(false)
 
@@ -47,8 +61,31 @@ function ctx() {
   return { csrfToken: props.csrfToken }
 }
 
+/** 草稿冻结版本与当前列表投影不一致：草稿已过期，提交由服务端 CAS 裁决为 409。 */
+function isDraftStale(id: string, expectedRevision: string): boolean {
+  const current = list.items.value.find((item) => item.id === id)
+  return current !== undefined && current.revision !== expectedRevision
+}
+
+const renameDraftStale = computed(() => {
+  const draft = editing.value
+  return draft !== null && isDraftStale(draft.id, draft.expectedRevision)
+})
+const membersDraftStale = computed(() => {
+  const draft = membersDraft.value
+  return draft !== null && isDraftStale(draft.id, draft.expectedRevision)
+})
+
+/** 打开改名草稿：冻结当前读取到的 revision。 */
+function openRename(group: AdminGroupItem): void {
+  if (!props.isAdmin || busy.value) return
+  nameInvalid.value = false
+  actionErrorKey.value = null
+  editing.value = { id: group.id, name: group.name, expectedRevision: group.revision }
+}
+
 async function submitCreate(): Promise<void> {
-  if (busy.value) return
+  if (!props.isAdmin || busy.value) return
   if (!isValidAdminName(newName.value)) {
     nameInvalid.value = true
     return
@@ -58,10 +95,13 @@ async function submitCreate(): Promise<void> {
   busy.value = true
   try {
     await createGroup(newName.value, ctx())
+    // 撤权后的迟到响应不得再产生副作用。
+    if (!props.isAdmin) return
     newName.value = ''
     await list.reload()
   } catch (error: unknown) {
-    if (!isAbortedError(error)) actionErrorKey.value = adminErrorKey(error)
+    if (!props.isAdmin || isAbortedError(error)) return
+    actionErrorKey.value = adminErrorKey(error)
   } finally {
     busy.value = false
   }
@@ -69,43 +109,48 @@ async function submitCreate(): Promise<void> {
 
 async function submitRename(): Promise<void> {
   const draft = editing.value
-  if (!draft || busy.value) return
+  if (!props.isAdmin || !draft || busy.value) return
   if (!isValidAdminName(draft.name)) {
     nameInvalid.value = true
     return
   }
-  const group = list.items.value.find((item) => item.id === draft.id)
-  if (!group) return
   nameInvalid.value = false
   actionErrorKey.value = null
   busy.value = true
   try {
-    await patchGroup(draft.id, { expectedRevision: group.revision, name: draft.name }, ctx())
+    // CAS 版本严格取草稿打开时冻结的 expected_revision，绝不回读列表最新版本。
+    await patchGroup(draft.id, { expectedRevision: draft.expectedRevision, name: draft.name }, ctx())
+    if (!props.isAdmin) return
     editing.value = null
     await list.reload()
   } catch (error: unknown) {
-    if (!isAbortedError(error)) actionErrorKey.value = adminErrorKey(error)
+    if (!props.isAdmin || isAbortedError(error)) return
+    actionErrorKey.value = adminErrorKey(error)
   } finally {
     busy.value = false
   }
 }
 
 async function archiveGroup(group: AdminGroupItem): Promise<void> {
-  if (busy.value || group.archived) return
+  if (!props.isAdmin || busy.value || group.archived) return
   actionErrorKey.value = null
   busy.value = true
   try {
     await patchGroup(group.id, { expectedRevision: group.revision, archived: true }, ctx())
+    if (!props.isAdmin) return
     await list.reload()
   } catch (error: unknown) {
-    if (!isAbortedError(error)) actionErrorKey.value = adminErrorKey(error)
+    if (!props.isAdmin || isAbortedError(error)) return
+    actionErrorKey.value = adminErrorKey(error)
   } finally {
     busy.value = false
   }
 }
 
+/** 打开成员草稿：同样冻结 revision，成员替换整体 PUT 才不会隐式升级版本。 */
 function openMembers(group: AdminGroupItem): void {
-  membersDraft.value = { id: group.id, text: '' }
+  if (!props.isAdmin || busy.value) return
+  membersDraft.value = { id: group.id, text: '', expectedRevision: group.revision }
   actionErrorKey.value = null
 }
 
@@ -120,39 +165,48 @@ const memberInputRejected = computed(() => {
 
 async function submitMembers(): Promise<void> {
   const draft = membersDraft.value
-  if (!draft || busy.value) return
-  const group = list.items.value.find((item) => item.id === draft.id)
-  if (!group) return
+  if (!props.isAdmin || !draft || busy.value) return
   actionErrorKey.value = null
   busy.value = true
   try {
-    await replaceGroupMembers(draft.id, group.revision, memberIds.value, ctx())
+    await replaceGroupMembers(draft.id, draft.expectedRevision, memberIds.value, ctx())
+    if (!props.isAdmin) return
     membersDraft.value = null
     await list.reload()
   } catch (error: unknown) {
-    if (!isAbortedError(error)) actionErrorKey.value = adminErrorKey(error)
+    if (!props.isAdmin || isAbortedError(error)) return
+    actionErrorKey.value = adminErrorKey(error)
   } finally {
     busy.value = false
   }
 }
 
 async function loadReferenceDevices(): Promise<void> {
-  if (referenceLoading.value) return
+  if (!props.isAdmin || referenceLoading.value) return
   referenceLoading.value = true
   actionErrorKey.value = null
   try {
     const res = await listDevicesForAdmin(null, ctx())
+    if (!props.isAdmin) return
     referenceDevices.value = res.data.items.map((item) => item.device_id)
   } catch (error: unknown) {
-    if (!isAbortedError(error)) actionErrorKey.value = adminErrorKey(error)
+    if (!props.isAdmin || isAbortedError(error)) return
+    actionErrorKey.value = adminErrorKey(error)
   } finally {
     referenceLoading.value = false
   }
 }
 
 function reload(): void {
+  // 二次门禁（P1）：头部刷新按钮渲染在 `v-if="!isAdmin"` 之外，未授权时既禁用按钮也在入口返回。
+  if (!props.isAdmin) return
   actionErrorKey.value = null
   void list.reload()
+}
+
+function loadMore(): void {
+  if (!props.isAdmin) return
+  void list.loadMore()
 }
 
 onMounted(() => {
@@ -184,8 +238,8 @@ onBeforeUnmount(() => list.reset())
   <section class="admin-view" :aria-label="t('admin.groups.title')">
     <header class="admin-view__header">
       <h3>{{ t('admin.groups.title') }}</h3>
-      <BaseButton variant="secondary" :disabled="busy" :loading="busy && list.loading.value"
-        :loading-label="t('button.loading')" @click="reload">
+      <BaseButton variant="secondary" :disabled="!isAdmin || busy" :loading="busy && list.loading.value"
+        :loading-label="t('button.loading')" data-testid="groups-reload" @click="reload">
         {{ t('admin.common.reload') }}
       </BaseButton>
     </header>
@@ -226,7 +280,7 @@ onBeforeUnmount(() => list.reset())
           </div>
           <div class="admin-view__actions">
             <BaseButton variant="secondary" :disabled="busy || group.archived"
-              :loading-label="t('button.loading')" @click="editing = { id: group.id, name: group.name }">
+              :loading-label="t('button.loading')" @click="() => openRename(group)">
               {{ t('admin.common.rename') }}
             </BaseButton>
             <BaseButton variant="secondary" :disabled="busy || group.archived"
@@ -242,22 +296,34 @@ onBeforeUnmount(() => list.reset())
       </ul>
 
       <div v-if="editing" class="admin-view__panel" data-testid="group-rename-panel">
+        <p>{{ t('admin.common.revision') }}: {{ editing.expectedRevision }}</p>
+        <p v-if="renameDraftStale" class="admin-view__warning" data-testid="group-rename-draft-stale">
+          {{ t('admin.common.staleDraft') }}
+        </p>
         <BaseInput id="group-rename-name" v-model="editing.name" :label="t('admin.groups.nameLabel')"
           :error="nameInvalid ? t('admin.common.fieldError') : undefined" :disabled="busy" />
         <div class="admin-view__actions">
-          <BaseButton :disabled="busy" @click="submitRename">{{ t('admin.common.confirmAction') }}</BaseButton>
+          <BaseButton :disabled="busy" data-testid="group-rename-submit" @click="submitRename">
+            {{ t('admin.common.confirmAction') }}
+          </BaseButton>
           <BaseButton variant="secondary" :disabled="busy" @click="editing = null">{{ t('common.cancel') }}</BaseButton>
         </div>
       </div>
 
       <div v-if="membersDraft" class="admin-view__panel" data-testid="group-members-panel">
+        <p>{{ t('admin.common.revision') }}: {{ membersDraft.expectedRevision }}</p>
+        <p v-if="membersDraftStale" class="admin-view__warning" data-testid="group-members-draft-stale">
+          {{ t('admin.common.staleDraft') }}
+        </p>
         <label for="group-members-input">{{ t('admin.groups.members') }}</label>
         <textarea id="group-members-input" v-model="membersDraft.text" rows="4"
           :disabled="busy" :placeholder="t('admin.device.id')"></textarea>
         <p>{{ t('admin.groups.membersHint') }}</p>
         <p v-if="memberInputRejected" data-testid="members-invalid-notice">{{ t('admin.groups.membersInvalid') }}</p>
         <div class="admin-view__actions">
-          <BaseButton :disabled="busy" @click="submitMembers">{{ t('admin.groups.saveMembers') }}</BaseButton>
+          <BaseButton :disabled="busy" data-testid="group-members-submit" @click="submitMembers">
+            {{ t('admin.groups.saveMembers') }}
+          </BaseButton>
           <BaseButton variant="secondary" :disabled="busy" @click="membersDraft = null">{{ t('common.cancel') }}</BaseButton>
         </div>
       </div>
@@ -274,7 +340,7 @@ onBeforeUnmount(() => list.reset())
 
       <div v-if="list.nextCursor.value" class="admin-view__pagination">
         <BaseButton variant="secondary" :disabled="busy" :loading="busy && list.loading.value"
-          :loading-label="t('button.loading')" @click="() => list.loadMore()">
+          :loading-label="t('button.loading')" @click="loadMore">
           {{ t('admin.common.loadMore') }}
         </BaseButton>
       </div>
@@ -290,6 +356,7 @@ onBeforeUnmount(() => list.reset())
 .admin-view__item { display: flex; justify-content: space-between; gap: var(--space-2); flex-wrap: wrap; padding: var(--space-2); border: 1px solid var(--color-border, #eee); border-radius: 4px; }
 .admin-view__item-main { display: flex; gap: var(--space-2); flex-wrap: wrap; align-items: baseline; overflow-wrap: anywhere; }
 .admin-view__badge { background: var(--color-surface-subtle, #f1f5f9); border-radius: 9999px; padding: 2px 8px; font-size: 0.875rem; }
+.admin-view__warning { color: var(--color-danger, #b91c1c); font-weight: 600; margin: 0; }
 .admin-view__actions { display: flex; gap: var(--space-2); flex-wrap: wrap; }
 .admin-view__panel { display: grid; gap: var(--space-2); padding: var(--space-3); border: 1px dashed var(--color-border, #ccc); border-radius: 4px; }
 .admin-view__panel textarea { font: inherit; max-width: 100%; }

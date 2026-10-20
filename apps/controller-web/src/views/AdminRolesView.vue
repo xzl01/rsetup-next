@@ -37,10 +37,40 @@ const newName = ref('')
 const newPermissions = ref('')
 const formInvalid = ref(false)
 const builtinBlocked = ref(false)
-const editing = ref<{ id: string; name: string; permissions: string } | null>(null)
+
+/** 编辑草稿：`expectedRevision` 在打开草稿的一刻冻结，之后的列表刷新绝不改写它。 */
+interface RoleDraft {
+  id: string
+  name: string
+  permissions: string
+  expectedRevision: string
+}
+
+const editing = ref<RoleDraft | null>(null)
 
 function ctx() {
   return { csrfToken: props.csrfToken }
+}
+
+/** 草稿冻结版本与当前列表投影不一致：草稿已过期，提交会由服务端 CAS 裁决为 409。 */
+const draftStale = computed(() => {
+  const draft = editing.value
+  if (!draft) return false
+  const current = list.items.value.find((item) => item.id === draft.id)
+  return current !== undefined && current.revision !== draft.expectedRevision
+})
+
+/** 打开编辑草稿：显式冻结读取到的 revision，禁止提交时回读列表最新版本。 */
+function openEdit(role: AdminRoleItem): void {
+  if (!props.isAdmin || busy.value) return
+  builtinBlocked.value = false
+  actionErrorKey.value = null
+  editing.value = {
+    id: role.id,
+    name: role.name,
+    permissions: role.permissions.join(', '),
+    expectedRevision: role.revision,
+  }
 }
 
 /** 逗号/空白分隔的权限点集合：去空、去重、保持输入顺序。 */
@@ -57,7 +87,7 @@ function parsePermissions(raw: string): string[] {
 }
 
 async function submitCreate(): Promise<void> {
-  if (busy.value) return
+  if (!props.isAdmin || busy.value) return
   const permissions = parsePermissions(newPermissions.value)
   if (!isValidAdminName(newName.value) || permissions.length === 0) {
     formInvalid.value = true
@@ -68,11 +98,14 @@ async function submitCreate(): Promise<void> {
   busy.value = true
   try {
     await createRole(newName.value, permissions, ctx())
+    // 撤权后的迟到响应不得再产生副作用：不刷新、不回填表单。
+    if (!props.isAdmin) return
     newName.value = ''
     newPermissions.value = ''
     await list.reload()
   } catch (error: unknown) {
-    if (!isAbortedError(error)) actionErrorKey.value = adminErrorKey(error)
+    if (!props.isAdmin || isAbortedError(error)) return
+    actionErrorKey.value = adminErrorKey(error)
   } finally {
     busy.value = false
   }
@@ -80,9 +113,7 @@ async function submitCreate(): Promise<void> {
 
 async function submitPatch(): Promise<void> {
   const draft = editing.value
-  if (!draft || busy.value) return
-  const role = list.items.value.find((item) => item.id === draft.id)
-  if (!role) return
+  if (!props.isAdmin || !draft || busy.value) return
   const permissions = parsePermissions(draft.permissions)
   if (!isValidAdminName(draft.name) || permissions.length === 0) {
     formInvalid.value = true
@@ -92,18 +123,26 @@ async function submitPatch(): Promise<void> {
   actionErrorKey.value = null
   busy.value = true
   try {
-    await patchRole(draft.id, { expectedRevision: role.revision, name: draft.name, permissions }, ctx())
+    // CAS 版本严格取草稿打开时冻结的 expected_revision：即便列表已刷新到更新的 revision，
+    // 也绝不隐式升级，冲突由服务端 409 REVISION_CONFLICT 显式裁决。
+    await patchRole(draft.id, {
+      expectedRevision: draft.expectedRevision,
+      name: draft.name,
+      permissions,
+    }, ctx())
+    if (!props.isAdmin) return
     editing.value = null
     await list.reload()
   } catch (error: unknown) {
-    if (!isAbortedError(error)) actionErrorKey.value = adminErrorKey(error)
+    if (!props.isAdmin || isAbortedError(error)) return
+    actionErrorKey.value = adminErrorKey(error)
   } finally {
     busy.value = false
   }
 }
 
 async function archiveRole(role: AdminRoleItem): Promise<void> {
-  if (busy.value) return
+  if (!props.isAdmin || busy.value) return
   if (role.builtin) {
     // 内置角色归档必然被服务端拒绝：不发送请求，直接给出说明。
     builtinBlocked.value = true
@@ -115,18 +154,27 @@ async function archiveRole(role: AdminRoleItem): Promise<void> {
   busy.value = true
   try {
     await patchRole(role.id, { expectedRevision: role.revision, archived: true }, ctx())
+    if (!props.isAdmin) return
     await list.reload()
   } catch (error: unknown) {
-    if (!isAbortedError(error)) actionErrorKey.value = adminErrorKey(error)
+    if (!props.isAdmin || isAbortedError(error)) return
+    actionErrorKey.value = adminErrorKey(error)
   } finally {
     busy.value = false
   }
 }
 
 function reload(): void {
+  // 二次门禁（P1）：头部刷新按钮渲染在 `v-if="!isAdmin"` 之外，未授权时既禁用按钮也在入口返回。
+  if (!props.isAdmin) return
   actionErrorKey.value = null
   builtinBlocked.value = false
   void list.reload()
+}
+
+function loadMore(): void {
+  if (!props.isAdmin) return
+  void list.loadMore()
 }
 
 onMounted(() => {
@@ -155,8 +203,8 @@ onBeforeUnmount(() => list.reset())
   <section class="admin-view" :aria-label="t('admin.roles.title')">
     <header class="admin-view__header">
       <h3>{{ t('admin.roles.title') }}</h3>
-      <BaseButton variant="secondary" :disabled="busy" :loading="busy && list.loading.value"
-        :loading-label="t('button.loading')" @click="reload">
+      <BaseButton variant="secondary" :disabled="!isAdmin || busy" :loading="busy && list.loading.value"
+        :loading-label="t('button.loading')" data-testid="roles-reload" @click="reload">
         {{ t('admin.common.reload') }}
       </BaseButton>
     </header>
@@ -203,7 +251,7 @@ onBeforeUnmount(() => list.reset())
           </div>
           <div class="admin-view__actions">
             <BaseButton variant="secondary" :disabled="busy || role.archived" :loading-label="t('button.loading')"
-              @click="editing = { id: role.id, name: role.name, permissions: role.permissions.join(', ') }">
+              @click="() => openEdit(role)">
               {{ t('admin.common.rename') }}
             </BaseButton>
             <BaseButton variant="danger" :disabled="busy || role.archived || role.builtin"
@@ -215,19 +263,25 @@ onBeforeUnmount(() => list.reset())
       </ul>
 
       <div v-if="editing" class="admin-view__panel" data-testid="role-edit-panel">
+        <p>{{ t('admin.common.revision') }}: {{ editing.expectedRevision }}</p>
+        <p v-if="draftStale" class="admin-view__warning" data-testid="role-draft-stale">
+          {{ t('admin.common.staleDraft') }}
+        </p>
         <BaseInput id="role-edit-name" v-model="editing.name" :label="t('admin.roles.nameLabel')"
           :error="formInvalid ? t('admin.common.fieldError') : undefined" :disabled="busy" />
         <BaseInput id="role-edit-permissions" v-model="editing.permissions" :label="t('admin.roles.permissionsLabel')"
           :hint="t('admin.roles.permissionsHint')" :disabled="busy" />
         <div class="admin-view__actions">
-          <BaseButton :disabled="busy" @click="submitPatch">{{ t('admin.common.confirmAction') }}</BaseButton>
+          <BaseButton :disabled="busy" data-testid="role-draft-submit" @click="submitPatch">
+            {{ t('admin.common.confirmAction') }}
+          </BaseButton>
           <BaseButton variant="secondary" :disabled="busy" @click="editing = null">{{ t('common.cancel') }}</BaseButton>
         </div>
       </div>
 
       <div v-if="list.nextCursor.value" class="admin-view__pagination">
         <BaseButton variant="secondary" :disabled="busy" :loading="busy && list.loading.value"
-          :loading-label="t('button.loading')" @click="() => list.loadMore()">
+          :loading-label="t('button.loading')" @click="loadMore">
           {{ t('admin.common.loadMore') }}
         </BaseButton>
       </div>
@@ -243,6 +297,7 @@ onBeforeUnmount(() => list.reset())
 .admin-view__item { display: flex; justify-content: space-between; gap: var(--space-2); flex-wrap: wrap; padding: var(--space-2); border: 1px solid var(--color-border, #eee); border-radius: 4px; }
 .admin-view__item-main { display: flex; gap: var(--space-2); flex-wrap: wrap; align-items: baseline; overflow-wrap: anywhere; }
 .admin-view__badge { background: var(--color-surface-subtle, #f1f5f9); border-radius: 9999px; padding: 2px 8px; font-size: 0.875rem; }
+.admin-view__warning { color: var(--color-danger, #b91c1c); font-weight: 600; margin: 0; }
 .admin-view__actions { display: flex; gap: var(--space-2); flex-wrap: wrap; }
 .admin-view__panel { display: grid; gap: var(--space-2); padding: var(--space-3); border: 1px dashed var(--color-border, #ccc); border-radius: 4px; }
 .admin-view__pagination { display: flex; justify-content: center; }

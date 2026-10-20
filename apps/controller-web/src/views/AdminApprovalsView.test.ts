@@ -2,7 +2,7 @@ import { fireEvent, render, screen } from '@testing-library/vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import AdminApprovalsView from './AdminApprovalsView.vue'
 import { createI18n } from '../i18n'
-import { fail, ok, stubBackend } from './admin-test-helpers'
+import { fail, nextTick, ok, stubBackend } from './admin-test-helpers'
 
 const DEVICE_A = 'a'.repeat(64)
 const DEVICE_B = 'b'.repeat(64)
@@ -171,5 +171,34 @@ describe('AdminApprovalsView', () => {
     await vi.waitFor(() => expect(calls.filter((call) => call.method === 'GET')).toHaveLength(2))
     // 新一轮加载中旧选择已作废
     expect(screen.queryByTestId('frozen-selection-notice')).toBeNull()
+  })
+
+  it('未授权时头部刷新按钮禁用且点击零请求（二次权限门禁）', async () => {
+    const calls = stubBackend({})
+    renderView(false)
+    await nextTick()
+    const reloadButton = screen.getByTestId('approvals-reload') as HTMLButtonElement
+    await fireEvent.click(reloadButton)
+    await fireEvent.click(reloadButton)
+    await nextTick()
+    // 未授权时任何触发路径都必须零请求
+    expect(calls).toHaveLength(0)
+    expect(reloadButton.disabled).toBe(true)
+    expect(screen.getByText('仅管理员可访问管理页面')).toBeTruthy()
+  })
+
+  it('运行中被降权后点击刷新仍零请求', async () => {
+    const calls = stubBackend({ 'GET /api/v1/approvals': [ok({ items: [item(DEVICE_A, '3')], next_cursor: null })] })
+    const { rerender } = renderView()
+    await vi.waitFor(() => expect(screen.getByTestId(`select-${DEVICE_A}`)).toBeTruthy())
+    await rerender({ isAdmin: false })
+    await nextTick()
+    const before = calls.length
+    const reloadButton = screen.getByTestId('approvals-reload') as HTMLButtonElement
+    await fireEvent.click(reloadButton)
+    await nextTick()
+    // 撤权后点击刷新必须零请求
+    expect(calls).toHaveLength(before)
+    expect(reloadButton.disabled).toBe(true)
   })
 })

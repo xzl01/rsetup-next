@@ -64,6 +64,7 @@ const succeededCount = computed(() => (batchResult.value?.results ?? []).filter(
 
 /** 勾选时刻冻结 expected_revision；再次点击取消勾选。 */
 function toggleSelect(item: ApprovalItem): void {
+  if (!props.isAdmin) return
   const next = new Map(frozen.value)
   if (next.has(item.device_id)) {
     next.delete(item.device_id)
@@ -90,6 +91,7 @@ function decisionLabel(decision: AdminReviewDecision): string {
 
 /** 切换筛选后游标即失效：重新从第一页加载，而不是带着旧筛选的 cursor 继续翻页。 */
 function onDecisionFilterChange(event: Event): void {
+  if (!props.isAdmin) return
   const raw = (event.target as HTMLSelectElement).value
   decisionFilter.value = raw === '' ? '' : raw as AdminReviewDecision
   reload()
@@ -105,7 +107,8 @@ function resetActionState(): void {
 }
 
 async function runBatch(kind: 'approve' | 'reject'): Promise<void> {
-  if (!canSubmit.value) return
+  // canSubmit 已含 props.isAdmin；此处再显式入口校验，避免调用路径变化时静默失去门禁。
+  if (!props.isAdmin || !canSubmit.value) return
   if (kind === 'reject' && !isValidAdminReason(reason.value)) {
     reasonInvalid.value = true
     return
@@ -118,6 +121,8 @@ async function runBatch(kind: 'approve' | 'reject'): Promise<void> {
     const res = kind === 'approve'
       ? await approveApprovals(submitted, ctx())
       : await rejectApprovals(submitted, reason.value.trim(), ctx())
+    // 撤权后的迟到响应不得再产生副作用：不写结果、不清选择集、不刷新列表。
+    if (!props.isAdmin) return
     batchResult.value = res.data
     // 已提交的目标从选择集合移除：绝不把同一批目标重复提交，也不吸纳刷新后新增的设备。
     const next = new Map(frozen.value)
@@ -126,14 +131,15 @@ async function runBatch(kind: 'approve' | 'reject'): Promise<void> {
     confirmRisk.value = false
     await list.reload()
   } catch (error: unknown) {
-    if (!isAbortedError(error)) actionErrorKey.value = adminErrorKey(error)
+    if (!props.isAdmin || isAbortedError(error)) return
+    actionErrorKey.value = adminErrorKey(error)
   } finally {
     busy.value = false
   }
 }
 
 async function runSingle(action: 'reopen' | 'revoke' | 'reauthorize', item: ApprovalItem): Promise<void> {
-  if (busy.value) return
+  if (!props.isAdmin || busy.value) return
   if ((action === 'revoke') && !isValidAdminReason(reason.value)) {
     resetActionState()
     reasonInvalid.value = true
@@ -149,9 +155,11 @@ async function runSingle(action: 'reopen' | 'revoke' | 'reauthorize', item: Appr
     } else {
       await reauthorizeDevice(item.device_id, item.revision, ctx())
     }
+    if (!props.isAdmin) return
     await list.reload()
   } catch (error: unknown) {
-    if (!isAbortedError(error)) actionErrorKey.value = adminErrorKey(error)
+    if (!props.isAdmin || isAbortedError(error)) return
+    actionErrorKey.value = adminErrorKey(error)
   } finally {
     busy.value = false
   }
@@ -159,11 +167,13 @@ async function runSingle(action: 'reopen' | 'revoke' | 'reauthorize', item: Appr
 
 /** 改名前先读取中控档案真值，以档案返回的 revision 做 CAS，绝不用列表旧版本覆盖。 */
 async function openRename(item: ApprovalItem): Promise<void> {
-  if (busy.value) return
+  if (!props.isAdmin || busy.value) return
   resetActionState()
   busy.value = true
   try {
     const res = await getDeviceProfile(item.device_id, ctx())
+    // 撤权后的迟到响应不得再打开编辑草稿。
+    if (!props.isAdmin) return
     const profile = res.data as { display_name?: unknown; revision?: unknown }
     if (typeof profile.display_name !== 'string' || typeof profile.revision !== 'string') {
       actionErrorKey.value = 'admin.error.generic'
@@ -171,7 +181,8 @@ async function openRename(item: ApprovalItem): Promise<void> {
     }
     renaming.value = { deviceId: item.device_id, revision: profile.revision, displayName: profile.display_name }
   } catch (error: unknown) {
-    if (!isAbortedError(error)) actionErrorKey.value = adminErrorKey(error)
+    if (!props.isAdmin || isAbortedError(error)) return
+    actionErrorKey.value = adminErrorKey(error)
   } finally {
     busy.value = false
   }
@@ -179,23 +190,33 @@ async function openRename(item: ApprovalItem): Promise<void> {
 
 async function submitRename(): Promise<void> {
   const draft = renaming.value
-  if (!draft || busy.value) return
+  if (!props.isAdmin || !draft || busy.value) return
   resetActionState()
   busy.value = true
   try {
+    // 草稿打开时冻结档案 revision，提交不读取任何刷新后的最新版本。
     await patchDeviceProfile(draft.deviceId, draft.revision, draft.displayName, ctx())
+    if (!props.isAdmin) return
     renaming.value = null
     await list.reload()
   } catch (error: unknown) {
-    if (!isAbortedError(error)) actionErrorKey.value = adminErrorKey(error)
+    if (!props.isAdmin || isAbortedError(error)) return
+    actionErrorKey.value = adminErrorKey(error)
   } finally {
     busy.value = false
   }
 }
 
 function reload(): void {
+  // 二次门禁（P1）：头部刷新按钮渲染在 `v-if="!isAdmin"` 之外，未授权时既禁用按钮也在入口返回。
+  if (!props.isAdmin) return
   resetActionState()
   void list.reload()
+}
+
+function loadMore(): void {
+  if (!props.isAdmin) return
+  void list.loadMore()
 }
 
 onMounted(() => {
@@ -227,8 +248,8 @@ onBeforeUnmount(() => list.reset())
   <section class="admin-view" :aria-label="t('admin.approvals.title')">
     <header class="admin-view__header">
       <h3>{{ t('admin.approvals.title') }}</h3>
-      <BaseButton variant="secondary" :disabled="busy" :loading="busy && list.loading.value"
-        :loading-label="t('button.loading')" @click="reload">
+      <BaseButton variant="secondary" :disabled="!isAdmin || busy" :loading="busy && list.loading.value"
+        :loading-label="t('button.loading')" data-testid="approvals-reload" @click="reload">
         {{ t('admin.common.reload') }}
       </BaseButton>
     </header>
@@ -364,7 +385,7 @@ onBeforeUnmount(() => list.reset())
 
       <div v-if="list.nextCursor.value" class="admin-view__pagination">
         <BaseButton variant="secondary" :disabled="busy" :loading="busy && list.loading.value"
-          :loading-label="t('button.loading')" @click="() => list.loadMore()">
+          :loading-label="t('button.loading')" @click="loadMore">
           {{ t('admin.common.loadMore') }}
         </BaseButton>
       </div>

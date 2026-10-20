@@ -40,6 +40,8 @@ const list = createAdminListResource<AdminAuditItem>(
 const busy = ref(false)
 
 function applyFilters(): void {
+  // 二次门禁：撤权后筛选入口虽被隐藏，仍需在函数入口拒绝任何越权触发。
+  if (!props.isAdmin) return
   const actorId = actorDraft.value.trim()
   const deviceId = deviceDraft.value.trim()
   if ((actorId.length > 0 && !isCanonicalUuidV4(actorId)) || (deviceId.length > 0 && !isDeviceIdHex64(deviceId))) {
@@ -52,8 +54,16 @@ function applyFilters(): void {
 }
 
 function reload(): void {
+  // 二次门禁（P1）：头部刷新按钮渲染在 `v-if="!isAdmin"` 之外，因此未授权时既禁用按钮，
+  // 也在入口直接返回，保证任何路径触发都零请求。
+  if (!props.isAdmin) return
   filterInvalid.value = false
   void list.reload()
+}
+
+function loadMore(): void {
+  if (!props.isAdmin) return
+  void list.loadMore()
 }
 
 onMounted(() => {
@@ -77,8 +87,8 @@ onBeforeUnmount(() => list.reset())
   <section class="admin-view" :aria-label="t('admin.audit.title')">
     <header class="admin-view__header">
       <h3>{{ t('admin.audit.title') }}</h3>
-      <BaseButton variant="secondary" :disabled="busy" :loading="busy && list.loading.value"
-        :loading-label="t('button.loading')" @click="reload">
+      <BaseButton variant="secondary" :disabled="!isAdmin || busy" :loading="busy && list.loading.value"
+        :loading-label="t('button.loading')" data-testid="audit-reload" @click="reload">
         {{ t('admin.common.reload') }}
       </BaseButton>
     </header>
@@ -140,7 +150,7 @@ onBeforeUnmount(() => list.reset())
 
       <div v-if="list.nextCursor.value" class="admin-view__pagination">
         <BaseButton variant="secondary" :disabled="busy" :loading="busy && list.loading.value"
-          :loading-label="t('button.loading')" @click="() => list.loadMore()">
+          :loading-label="t('button.loading')" @click="loadMore">
           {{ t('admin.common.loadMore') }}
         </BaseButton>
       </div>

@@ -159,6 +159,7 @@ const messages: Record<string, string> = {
   'admin.common.archive': 'Archive',
   'admin.common.rename': 'Rename',
   'admin.common.fieldError': 'Check the input.',
+  'admin.common.staleDraft': 'This draft is based on a stale revision: the target changed while you were editing. Submitting will be reported as a CAS conflict. Reload and edit again.',
   'admin.device.id': 'Device ID',
   'admin.approvals.title': 'Admission approvals',
   'admin.approvals.filterDecision': 'Filter by review decision',

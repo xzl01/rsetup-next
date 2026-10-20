@@ -119,4 +119,33 @@ describe('AdminAuditView', () => {
     await vi.waitFor(() => expect(screen.getByText('暂无记录')).toBeTruthy())
     expect(screen.queryByRole('button', { name: '重试' })).toBeNull()
   })
+
+  it('未授权时头部刷新按钮禁用且点击零请求（二次权限门禁）', async () => {
+    const calls = stubBackend({})
+    renderView(false)
+    await nextTick()
+    const reloadButton = screen.getByTestId('audit-reload') as HTMLButtonElement
+    await fireEvent.click(reloadButton)
+    await fireEvent.click(reloadButton)
+    await nextTick()
+    // 未授权时任何触发路径都必须零请求
+    expect(calls).toHaveLength(0)
+    expect(reloadButton.disabled).toBe(true)
+    expect(screen.getByText('仅管理员可访问管理页面')).toBeTruthy()
+  })
+
+  it('运行中被降权后点击刷新仍零请求', async () => {
+    const calls = stubBackend({ 'GET /api/v1/audit': [ok({ items: [event()], next_cursor: null })] })
+    const { rerender } = renderView()
+    await vi.waitFor(() => expect(screen.getByTestId(`audit-${EVENT_ID}`)).toBeTruthy())
+    await rerender({ isAdmin: false })
+    await nextTick()
+    const before = calls.length
+    const reloadButton = screen.getByTestId('audit-reload') as HTMLButtonElement
+    await fireEvent.click(reloadButton)
+    await nextTick()
+    // 撤权后点击刷新必须零请求
+    expect(calls).toHaveLength(before)
+    expect(reloadButton.disabled).toBe(true)
+  })
 })

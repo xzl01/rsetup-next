@@ -4,6 +4,8 @@
 // 安全约束：
 // - 创建与重置密码返回的 `temporary_password` 只在一次性模态框中呈现：不写 localStorage、
 //   不写日志、关闭即从内存清除；关闭后无法再次查看。
+// - 写动作绑定独立的 AbortController 与操作代际：撤权、认证代际轮换或卸载会 abort 在途请求，
+//   任何迟到或跨代际的成功响应一律丢弃，绝不重新暴露临时密码，也绝不触发额外 GET。
 // - 最后管理员保护：后端 409 `LAST_ADMIN` 显式呈现，界面不假装可绕过。
 // - 停用与降级都是 CAS 补丁，版本冲突由服务端裁决。
 import { computed, inject, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
@@ -21,6 +23,7 @@ import {
   patchUser,
   resetUserPassword,
   type AdminEffectivePermissionItem,
+  type AdminRequestContext,
   type AdminUserItem,
 } from '../admin-api'
 import { createAdminListResource } from '../admin-list'
@@ -49,8 +52,44 @@ const dialog = ref<HTMLElement | null>(null)
 const closeButton = ref<HTMLElement | null>(null)
 const permissionsDraft = ref<{ userId: string; items: AdminEffectivePermissionItem[] } | null>(null)
 
-function ctx() {
-  return { csrfToken: props.csrfToken }
+/**
+ * 写动作（创建用户/重置密码等）的取消控制与操作代际。
+ *
+ * 撤权（`isAdmin` 变为 false）、认证代际轮换（`csrfToken` 变更）或组件卸载都会推进代际并
+ * abort 在途请求；被 abort 或被跨代际的迟到响应必须整体丢弃——绝不赋值 `temporaryPassword`，
+ * 也绝不触发列表 reload，否则会出现“已登出/无权限提示 + 一次性密码弹窗”并存的越权泄露。
+ */
+let actionGeneration = 0
+let actionController: AbortController | null = null
+
+interface AdminAction {
+  generation: number
+  signal: AbortSignal | undefined
+}
+
+function invalidateActions(): void {
+  actionGeneration += 1
+  if (actionController) {
+    actionController.abort()
+    actionController = null
+  }
+  busy.value = false
+}
+
+function beginAction(): AdminAction {
+  invalidateActions()
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null
+  actionController = controller
+  return { generation: actionGeneration, signal: controller?.signal }
+}
+
+function actionContext(action: AdminAction): AdminRequestContext {
+  return { csrfToken: props.csrfToken, signal: action.signal }
+}
+
+/** 响应能否落地：仍持有管理员权限且没有跨越代际。 */
+function canCommit(action: AdminAction): boolean {
+  return props.isAdmin && action.generation === actionGeneration
 }
 
 function handleError(error: unknown): void {
@@ -60,72 +99,91 @@ function handleError(error: unknown): void {
 }
 
 async function submitCreate(): Promise<void> {
-  if (busy.value) return
-  if (username.value.trim().length === 0 || displayName.value.trim().length === 0) {
+  if (!props.isAdmin || busy.value) return
+  const nextUsername = username.value.trim()
+  const nextDisplayName = displayName.value.trim()
+  if (nextUsername.length === 0 || nextDisplayName.length === 0) {
     formInvalid.value = true
     return
   }
+  const nextIsAdmin = isAdminFlag.value
   formInvalid.value = false
   lastAdminBlocked.value = false
   actionErrorKey.value = null
+  const action = beginAction()
   busy.value = true
   try {
-    const res = await createUser(username.value.trim(), displayName.value.trim(), isAdminFlag.value, ctx())
+    const res = await createUser(nextUsername, nextDisplayName, nextIsAdmin, actionContext(action))
+    // 迟到或跨代际响应：直接丢弃，绝不呈现临时密码，也不刷新列表。
+    if (!canCommit(action)) return
     temporaryPassword.value = res.data.temporary_password
     username.value = ''
     displayName.value = ''
     isAdminFlag.value = false
     await list.reload()
   } catch (error: unknown) {
+    if (!canCommit(action)) return
     handleError(error)
   } finally {
-    busy.value = false
+    if (action.generation === actionGeneration) busy.value = false
   }
 }
 
 async function setActive(user: AdminUserItem, active: boolean): Promise<void> {
-  if (busy.value) return
+  if (!props.isAdmin || busy.value) return
+  const expectedRevision = user.revision
   lastAdminBlocked.value = false
   actionErrorKey.value = null
+  const action = beginAction()
   busy.value = true
   try {
-    await patchUser(user.id, { expectedRevision: user.revision, active }, ctx())
+    await patchUser(user.id, { expectedRevision, active }, actionContext(action))
+    if (!canCommit(action)) return
     await list.reload()
   } catch (error: unknown) {
+    if (!canCommit(action)) return
     handleError(error)
   } finally {
-    busy.value = false
+    if (action.generation === actionGeneration) busy.value = false
   }
 }
 
 async function resetPassword(user: AdminUserItem): Promise<void> {
-  if (busy.value) return
+  if (!props.isAdmin || busy.value) return
+  const expectedRevision = user.revision
   lastAdminBlocked.value = false
   actionErrorKey.value = null
+  const action = beginAction()
   busy.value = true
   try {
-    const res = await resetUserPassword(user.id, user.revision, ctx())
+    const res = await resetUserPassword(user.id, expectedRevision, actionContext(action))
+    // 撤权/换 token 之后迟到的重置响应：绝不赋值 temporaryPassword，也不刷新列表。
+    if (!canCommit(action)) return
     // 重置密码会撤销该账号既有会话，列表需重新拉取以反映 must_change_password
     temporaryPassword.value = res.data.temporary_password
     await list.reload()
   } catch (error: unknown) {
+    if (!canCommit(action)) return
     handleError(error)
   } finally {
-    busy.value = false
+    if (action.generation === actionGeneration) busy.value = false
   }
 }
 
 async function loadPermissions(user: AdminUserItem): Promise<void> {
-  if (busy.value) return
+  if (!props.isAdmin || busy.value) return
   actionErrorKey.value = null
+  const action = beginAction()
   busy.value = true
   try {
-    const res = await listEffectivePermissions(user.id, {}, ctx())
+    const res = await listEffectivePermissions(user.id, {}, actionContext(action))
+    if (!canCommit(action)) return
     permissionsDraft.value = { userId: user.id, items: res.data.items }
   } catch (error: unknown) {
+    if (!canCommit(action)) return
     handleError(error)
   } finally {
-    busy.value = false
+    if (action.generation === actionGeneration) busy.value = false
   }
 }
 
@@ -162,9 +220,16 @@ watch(temporaryPassword, async (value) => {
 })
 
 function reload(): void {
+  // 二次门禁（P1）：头部刷新按钮渲染在 `v-if="!isAdmin"` 之外，未授权时既禁用按钮也在入口返回。
+  if (!props.isAdmin) return
   actionErrorKey.value = null
   lastAdminBlocked.value = false
   void list.reload()
+}
+
+function loadMore(): void {
+  if (!props.isAdmin) return
+  void list.loadMore()
 }
 
 onMounted(() => {
@@ -172,6 +237,8 @@ onMounted(() => {
 })
 
 watch(() => props.isAdmin, (allowed) => {
+  // 撤权或恢复：先作废在途写动作（含 abort），再清理一次性敏感投影。
+  invalidateActions()
   if (!allowed) {
     list.reset()
     temporaryPassword.value = null
@@ -182,6 +249,7 @@ watch(() => props.isAdmin, (allowed) => {
 })
 
 watch(() => props.csrfToken, () => {
+  invalidateActions()
   list.reset()
   temporaryPassword.value = null
   permissionsDraft.value = null
@@ -189,6 +257,7 @@ watch(() => props.csrfToken, () => {
 })
 
 onBeforeUnmount(() => {
+  invalidateActions()
   list.reset()
   temporaryPassword.value = null
 })
@@ -198,8 +267,8 @@ onBeforeUnmount(() => {
   <section class="admin-view" :aria-label="t('admin.users.title')">
     <header class="admin-view__header">
       <h3>{{ t('admin.users.title') }}</h3>
-      <BaseButton variant="secondary" :disabled="busy" :loading="busy && list.loading.value"
-        :loading-label="t('button.loading')" @click="reload">
+      <BaseButton variant="secondary" :disabled="!isAdmin || busy" :loading="busy && list.loading.value"
+        :loading-label="t('button.loading')" data-testid="users-reload" @click="reload">
         {{ t('admin.common.reload') }}
       </BaseButton>
     </header>
@@ -278,13 +347,13 @@ onBeforeUnmount(() => {
 
       <div v-if="list.nextCursor.value" class="admin-view__pagination">
         <BaseButton variant="secondary" :disabled="busy" :loading="busy && list.loading.value"
-          :loading-label="t('button.loading')" @click="() => list.loadMore()">
+          :loading-label="t('button.loading')" @click="loadMore">
           {{ t('admin.common.loadMore') }}
         </BaseButton>
       </div>
     </template>
 
-    <div v-if="temporaryPassword !== null" ref="dialog" class="admin-view__overlay"
+    <div v-if="isAdmin && temporaryPassword !== null" ref="dialog" class="admin-view__overlay"
       role="dialog" aria-modal="true" aria-labelledby="temp-password-title" tabindex="-1"
       data-testid="temporary-password-dialog" @keydown="onDialogKeydown">
       <div class="admin-view__dialog">

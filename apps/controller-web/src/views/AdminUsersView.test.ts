@@ -2,7 +2,7 @@ import { fireEvent, render, screen } from '@testing-library/vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import AdminUsersView from './AdminUsersView.vue'
 import { createI18n } from '../i18n'
-import { DEVICE_A, USER_ID, USER_ID_B, fail, nextTick, ok, stubBackend } from './admin-test-helpers'
+import { DEVICE_A, USER_ID, USER_ID_B, fail, nextTick, ok, stubBackend, stubPendingBackend } from './admin-test-helpers'
 
 const i18n = createI18n({ initialLocale: 'zh-CN', storage: null })
 
@@ -175,5 +175,92 @@ describe('AdminUsersView', () => {
     await vi.waitFor(() => expect(screen.getByTestId('effective-permissions-panel')).toBeTruthy())
     expect(calls.some((call) => call.url === `/api/v1/users/${USER_ID}/effective-permissions`)).toBe(true)
     expect(screen.getByTestId(`effective-${DEVICE_A}`).textContent).toContain('device.reboot')
+  })
+
+  it('未授权时头部刷新按钮禁用且点击零请求（二次权限门禁）', async () => {
+    const calls = stubBackend({})
+    renderView(false)
+    await nextTick()
+    const reloadButton = screen.getByTestId('users-reload') as HTMLButtonElement
+    await fireEvent.click(reloadButton)
+    await fireEvent.click(reloadButton)
+    await nextTick()
+    // 未授权时任何触发路径都必须零请求
+    expect(calls).toHaveLength(0)
+    expect(reloadButton.disabled).toBe(true)
+    expect(screen.getByText('仅管理员可访问管理页面')).toBeTruthy()
+  })
+
+  it('撤权后迟到的重置密码响应被整体丢弃：不暴露临时密码也不追加 GET', async () => {
+    const backend = stubPendingBackend({
+      'GET /api/v1/users': [ok({ items: [user()], next_cursor: null })],
+      [`POST /api/v1/users/${USER_ID}/reset-password`]: [ok({
+        user: user({ must_change_password: true, revision: '4' }),
+        temporary_password: 'Tmp-Late-9f3k',
+      })],
+    })
+    const { rerender } = renderView()
+    await backend.release()
+    await vi.waitFor(() => expect(screen.getByTestId(`user-${USER_ID}`)).toBeTruthy())
+
+    await fireEvent.click(screen.getByRole('button', { name: '重置密码' }))
+    await vi.waitFor(() => expect(backend.calls.some((call) => call.method === 'POST')).toBe(true))
+    const postCall = backend.calls.find((call) => call.method === 'POST')
+    expect(postCall?.url).toBe(`/api/v1/users/${USER_ID}/reset-password`)
+    expect(postCall?.body).toEqual({ expected_revision: '2' })
+    // 写动作必须绑定可取消的 AbortSignal
+    expect(postCall?.signal).not.toBeNull()
+    expect(postCall?.signal?.aborted).toBe(false)
+
+    // 响应尚未返回时管理员被降级为普通用户
+    await rerender({ isAdmin: false })
+    await nextTick()
+    expect(postCall?.signal?.aborted).toBe(true)
+
+    // 迟到的成功响应返回：整体丢弃，绝不出现一次性密码弹窗，也不得追加 GET /users
+    await backend.release()
+    expect(screen.queryByTestId('temporary-password-dialog')).toBeNull()
+    expect(document.body.textContent).not.toContain('Tmp-Late-9f3k')
+    expect(backend.calls.filter((call) => call.method === 'GET')).toHaveLength(1)
+  })
+
+  it('csrfToken 轮换后迟到的创建用户响应不显示临时密码', async () => {
+    const backend = stubPendingBackend({
+      'GET /api/v1/users': [ok({ items: [], next_cursor: null })],
+      'POST /api/v1/users': [ok({ user: user(), temporary_password: 'Tmp-Late-Create' })],
+    })
+    const { rerender } = renderView()
+    await backend.release()
+    await vi.waitFor(() => expect(screen.getByRole('button', { name: '添加用户' })).toBeTruthy())
+    await fireEvent.update(byId('user-create-username'), 'ops')
+    await fireEvent.update(byId('user-create-display-name'), '运维')
+    await fireEvent.click(screen.getByRole('button', { name: '添加用户' }))
+    await vi.waitFor(() => expect(backend.calls.some((call) => call.method === 'POST')).toBe(true))
+
+    await rerender({ csrfToken: 'csrf-token-2', isAdmin: true })
+    await backend.release()
+    expect(screen.queryByTestId('temporary-password-dialog')).toBeNull()
+    expect(document.body.textContent).not.toContain('Tmp-Late-Create')
+  })
+
+  it('卸载后迟到的重置密码响应不再写状态也不追加请求', async () => {
+    const backend = stubPendingBackend({
+      'GET /api/v1/users': [ok({ items: [user()], next_cursor: null })],
+      [`POST /api/v1/users/${USER_ID}/reset-password`]: [ok({
+        user: user(),
+        temporary_password: 'Tmp-Late-Unmount',
+      })],
+    })
+    const { unmount } = renderView()
+    await backend.release()
+    await vi.waitFor(() => expect(screen.getByRole('button', { name: '重置密码' })).toBeTruthy())
+    await fireEvent.click(screen.getByRole('button', { name: '重置密码' }))
+    await vi.waitFor(() => expect(backend.calls.some((call) => call.method === 'POST')).toBe(true))
+    const postCall = backend.calls.find((call) => call.method === 'POST')
+    unmount()
+    expect(postCall?.signal?.aborted).toBe(true)
+    await backend.release()
+    expect(document.body.textContent).not.toContain('Tmp-Late-Unmount')
+    expect(backend.calls.filter((call) => call.method === 'GET')).toHaveLength(1)
   })
 })

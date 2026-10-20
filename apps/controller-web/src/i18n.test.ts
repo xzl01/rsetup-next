@@ -55,6 +55,7 @@ const ADMIN_KEYS = [
   'admin.common.archive',
   'admin.common.rename',
   'admin.common.fieldError',
+  'admin.common.staleDraft',
   'admin.device.id',
   'admin.approvals.title',
   'admin.approvals.filterDecision',

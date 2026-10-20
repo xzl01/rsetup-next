@@ -159,6 +159,7 @@ const messages: Record<string, string> = {
   'admin.common.archive': '归档',
   'admin.common.rename': '改名',
   'admin.common.fieldError': '请检查输入内容',
+  'admin.common.staleDraft': '草稿版本已过期：目标在编辑期间被并发修改，提交将按 CAS 冲突返回，请刷新后重新编辑',
   'admin.device.id': '设备标识',
   'admin.approvals.title': '准入审批',
   'admin.approvals.filterDecision': '审核决定筛选',

@@ -142,4 +142,47 @@ describe('AdminRolesView', () => {
       permissions: ['device.read', 'device.reboot'],
     })
   })
+
+  it('未授权时头部刷新按钮禁用且点击零请求（二次权限门禁）', async () => {
+    const calls = stubBackend({})
+    renderView(false)
+    await nextTick()
+    const reloadButton = screen.getByTestId('roles-reload') as HTMLButtonElement
+    await fireEvent.click(reloadButton)
+    await fireEvent.click(reloadButton)
+    await nextTick()
+    // 未授权时任何触发路径都必须零请求
+    expect(calls).toHaveLength(0)
+    expect(reloadButton.disabled).toBe(true)
+    expect(screen.getByText('仅管理员可访问管理页面')).toBeTruthy()
+  })
+
+  it('编辑草稿冻结打开时的 revision：列表刷新后提交仍用旧版本并显式冲突', async () => {
+    const calls = stubBackend({
+      'GET /api/v1/roles': [
+        ok({ items: [role()], next_cursor: null }),
+        ok({ items: [role({ revision: '2', permissions: ['device.read'] })], next_cursor: null }),
+      ],
+      [`PATCH /api/v1/roles/${ROLE_ID}`]: [fail(409, 'REVISION_CONFLICT')],
+    })
+    renderView()
+    await vi.waitFor(() => expect(screen.getByRole('button', { name: '改名' })).toBeTruthy())
+    await fireEvent.click(screen.getByRole('button', { name: '改名' }))
+    await vi.waitFor(() => expect(screen.getByTestId('role-edit-panel')).toBeTruthy())
+    // 后台刷新把服务端版本推进到 '2'，且权限集合已变：草稿不得被隐式升级或改写
+    await fireEvent.click(screen.getByRole('button', { name: '刷新' }))
+    await vi.waitFor(() => expect(screen.getByTestId('role-draft-stale')).toBeTruthy())
+    await fireEvent.update(byId('role-edit-name'), 'operator-2')
+    await fireEvent.click(screen.getByTestId('role-draft-submit'))
+    await vi.waitFor(() => expect(calls.some((call) => call.method === 'PATCH')).toBe(true))
+    const patchCall = calls.find((call) => call.method === 'PATCH')
+    expect(patchCall?.body).toEqual({
+      expected_revision: '1',
+      name: 'operator-2',
+      permissions: ['device.read', 'device.reboot'],
+    })
+    await vi.waitFor(() => expect(screen.getByText(/版本冲突/)).toBeTruthy())
+    // 冲突后草稿保持打开，由管理员显式重新编辑，绝不隐式覆盖已撤回的权限
+    expect(screen.getByTestId('role-edit-panel')).toBeTruthy()
+  })
 })

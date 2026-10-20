@@ -81,7 +81,7 @@ function scopeLabel(scope: AdminGrantScope): string {
 }
 
 async function submitCreate(): Promise<void> {
-  if (busy.value) return
+  if (!props.isAdmin || busy.value) return
   const input = { userId: userId.value.trim(), source: buildSource(), scope: buildScope() }
   if (!validateGrantInput(input)) {
     combinationInvalid.value = true
@@ -92,6 +92,8 @@ async function submitCreate(): Promise<void> {
   busy.value = true
   try {
     await createGrant(input, ctx())
+    // 撤权后的迟到响应不得再产生副作用。
+    if (!props.isAdmin) return
     userId.value = ''
     roleId.value = ''
     directPermissions.value = ''
@@ -99,34 +101,45 @@ async function submitCreate(): Promise<void> {
     deviceId.value = ''
     await list.reload()
   } catch (error: unknown) {
-    if (!isAbortedError(error)) actionErrorKey.value = adminErrorKey(error)
+    if (!props.isAdmin || isAbortedError(error)) return
+    actionErrorKey.value = adminErrorKey(error)
   } finally {
     busy.value = false
   }
 }
 
 async function removeGrant(grant: AdminGrantItem): Promise<void> {
-  if (busy.value) return
+  if (!props.isAdmin || busy.value) return
   actionErrorKey.value = null
   busy.value = true
   try {
     await deleteGrant(grant.id, grant.revision, ctx())
+    if (!props.isAdmin) return
     await list.reload()
   } catch (error: unknown) {
-    if (!isAbortedError(error)) actionErrorKey.value = adminErrorKey(error)
+    if (!props.isAdmin || isAbortedError(error)) return
+    actionErrorKey.value = adminErrorKey(error)
   } finally {
     busy.value = false
   }
 }
 
 function reload(): void {
+  // 二次门禁（P1）：头部刷新按钮渲染在 `v-if="!isAdmin"` 之外，未授权时既禁用按钮也在入口返回。
+  if (!props.isAdmin) return
   actionErrorKey.value = null
   combinationInvalid.value = false
   void list.reload()
 }
 
+function loadMore(): void {
+  if (!props.isAdmin) return
+  void list.loadMore()
+}
+
 /** 筛选条件绑定签名游标：应用新筛选必须从第一页重新开始。 */
 function applyFilter(): void {
+  if (!props.isAdmin) return
   appliedFilter.value = userFilter.value.trim()
   reload()
 }
@@ -152,8 +165,8 @@ onBeforeUnmount(() => list.reset())
   <section class="admin-view" :aria-label="t('admin.grants.title')">
     <header class="admin-view__header">
       <h3>{{ t('admin.grants.title') }}</h3>
-      <BaseButton variant="secondary" :disabled="busy" :loading="busy && list.loading.value"
-        :loading-label="t('button.loading')" @click="reload">
+      <BaseButton variant="secondary" :disabled="!isAdmin || busy" :loading="busy && list.loading.value"
+        :loading-label="t('button.loading')" data-testid="grants-reload" @click="reload">
         {{ t('admin.common.reload') }}
       </BaseButton>
     </header>
@@ -242,7 +255,7 @@ onBeforeUnmount(() => list.reset())
 
       <div v-if="list.nextCursor.value" class="admin-view__pagination">
         <BaseButton variant="secondary" :disabled="busy" :loading="busy && list.loading.value"
-          :loading-label="t('button.loading')" @click="() => list.loadMore()">
+          :loading-label="t('button.loading')" @click="loadMore">
           {{ t('admin.common.loadMore') }}
         </BaseButton>
       </div>
