@@ -1,7 +1,7 @@
 //! 生产路由装配（Task 0a 纯拓扑合并 + Task 0b typed 生产装配 + 指标线六线合并）。
 //!
-//! 本模块是中控六线（auth / management / tasks / status / metrics / web）**唯一**的
-//! 顶层装配点：
+//! 本模块是中控七线（auth / management / tasks / status / events / metrics / web）
+//! **唯一**的顶层装配点：
 //! - [`compose_component_routers`] 只做纯拓扑合并，不额外注册探活路径，路径集合
 //!   归各条线所有，组件合并顺序无业务语义；
 //! - [`build_production_router`] 接收各条线已构造好的 typed 状态，先强制校验原四线
@@ -22,6 +22,7 @@ use crate::ControllerError;
 use crate::api::{ManagementState, build_management_router};
 use crate::http_auth::{self, AppState};
 use crate::http_device_status::{DeviceStatusState, build_device_status_router};
+use crate::http_events::{EventsState, build_events_router};
 use crate::metrics::collect::{
     MAX_CONCURRENT_SCRAPE, MetricsRuntime, MetricsSnapshotSource, SqlxMetricsSnapshotSource,
 };
@@ -39,7 +40,7 @@ pub struct MetricsLineInputs {
     pub runtime: Arc<MetricsRuntime>,
 }
 
-/// 生产顶层 router 的全部 typed 输入：六线状态各由所属条线的生产适配器构造，
+/// 生产顶层 router 的全部 typed 输入：七线状态各由所属条线的生产适配器构造，
 /// 本模块不构造任何默认源、测试网关或占位池。
 pub struct ProductionInputs {
     /// Identity 认证线（含 `/healthz`、`/readyz` 探活）。
@@ -50,13 +51,19 @@ pub struct ProductionInputs {
     pub tasks: HttpTasksState,
     /// 设备状态读线（1 条状态路由）。
     pub status: DeviceStatusState,
+    /// SSE 事件读线（1 条 `GET /api/v1/events` 路由 + 事件总线订阅面）。
+    ///
+    /// 其 `bus` 与生产进程内唯一的 [`crate::events::EventBus`] 是同一通道句柄；各条线的发布方
+    /// 通过同一个句柄投递命名事件（本切片尚无业务发布方，事件流因此真实地
+    /// 只有心跳，不伪造任何事件）。
+    pub events: EventsState,
     /// Prometheus 指标线（1 条路由，独立 Basic 认证边界）。
     pub metrics: MetricsLineInputs,
     /// Web 嵌入静态资源线。
     pub web: Router<()>,
 }
 
-/// 唯一生产装配入口：校验共享认证上下文指针一致后合并六线子 router。
+/// 唯一生产装配入口：校验共享认证上下文指针一致后合并七线子 router。
 ///
 /// 真实汇总源只能在本函数内部由 `auth.db` 构造（I2）；不一致时返回去敏固定
 /// `Config`（不回显任何指针/地址值），进程应在触达监听套接字之前失败关闭。
@@ -85,6 +92,7 @@ fn build_router(
     if !Arc::ptr_eq(&inputs.auth.auth, &inputs.management.auth)
         || !Arc::ptr_eq(&inputs.auth.auth, &inputs.tasks.auth)
         || !Arc::ptr_eq(&inputs.auth.auth, &inputs.status.auth)
+        || !Arc::ptr_eq(&inputs.auth.auth, &inputs.events.auth)
     {
         return Err(ControllerError::Config(
             "production auth context mismatch".into(),
@@ -107,25 +115,28 @@ fn build_router(
         build_management_router(inputs.management),
         build_tasks_router(inputs.tasks),
         build_device_status_router(inputs.status),
+        build_events_router(inputs.events),
         metrics,
         inputs.web,
     ))
 }
 
-/// 把 auth / management / tasks / status / metrics / web 六个组件子 router 合并为
-/// 顶层路由。`metrics` 固定排在 `status` 之后、`web` 之前（web 含 SPA 兜底，必须
-/// 最后合并）。
+/// 把 auth / management / tasks / status / events / metrics / web 七个组件子 router
+/// 合并为顶层路由。`metrics` 固定排在 `events` 之后、`web` 之前（web 含 SPA 兜底，
+/// 必须最后合并）。
 pub fn compose_component_routers(
     auth: Router<()>,
     management: Router<()>,
     tasks: Router<()>,
     status: Router<()>,
+    events: Router<()>,
     metrics: Router<()>,
     web: Router<()>,
 ) -> Router<()> {
     auth.merge(management)
         .merge(tasks)
         .merge(status)
+        .merge(events)
         .merge(metrics)
         .merge(web)
 }

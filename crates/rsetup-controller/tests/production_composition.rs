@@ -31,6 +31,7 @@ fn composed() -> Router<()> {
         component("/api/v1/users", "management"),
         component("/api/v1/tasks", "tasks"),
         component("/api/v1/devices/test/status", "status"),
+        component("/api/v1/events", "events"),
         component("/metrics", "metrics"),
         component("/", "web"),
     )
@@ -45,6 +46,7 @@ async fn every_component_is_reachable_without_duplicate_probes() {
         ("/api/v1/users", "management"),
         ("/api/v1/tasks", "tasks"),
         ("/api/v1/devices/test/status", "status"),
+        ("/api/v1/events", "events"),
         ("/metrics", "metrics"),
         ("/", "web"),
     ] {
@@ -69,6 +71,7 @@ fn duplicate_business_path_panics_instead_of_being_hidden_by_override() {
         component("/api/v1/users", "management"),
         component("/api/v1/users", "tasks"),
         component("/api/v1/devices/test/status", "status"),
+        component("/api/v1/events", "events"),
         component("/metrics", "metrics"),
         component("/", "web"),
     );
@@ -97,10 +100,12 @@ mod typed {
     use rsetup_controller::auth::session::token_digest;
     use rsetup_controller::authz::sqlx_repo::SqlxAuthorizationSnapshotRepository;
     use rsetup_controller::devices::service::AdmissionChangeEvent;
+    use rsetup_controller::events::EventBus;
     use rsetup_controller::http_auth::{AuthFuture, AuthServiceApi};
     use rsetup_controller::http_device_status::{
         DeviceStatusState, EmptyDeviceStatusSnapshotSource,
     };
+    use rsetup_controller::http_events::EventsState;
     use rsetup_controller::http_security::HttpSecurityConfig;
     use rsetup_controller::metrics::collect::{
         MAX_CONCURRENT_SCRAPE, MetricsFuture, MetricsRuntime, MetricsSnapshot,
@@ -362,7 +367,13 @@ mod typed {
         metrics: MetricsLineInputs,
     ) -> ProductionInputs {
         let transport = Arc::new(SyntheticSources);
+        // events 线复用认证线的同一个 Arc<HttpAuthState>；不一致负例通过覆盖
+        // `inputs.events.auth` 制造（见 mismatched_auth_context_is_rejected_on_every_line）。
         ProductionInputs {
+            events: EventsState {
+                auth: Arc::clone(&auth),
+                bus: EventBus::new(),
+            },
             auth: AppState {
                 db: db.clone(),
                 auth,
@@ -449,7 +460,7 @@ mod typed {
     #[tokio::test]
     async fn mismatched_auth_context_is_rejected_on_every_line() {
         // 任一条线换了 HttpAuthState 实例（哪怕只有一条），装配必须失败关闭。
-        for line in ["management", "tasks", "status"] {
+        for line in ["management", "tasks", "status", "events"] {
             let shared = auth_state();
             let other = auth_state();
             let (management, tasks, status) = match line {
@@ -457,7 +468,11 @@ mod typed {
                 "tasks" => (Arc::clone(&shared), Arc::clone(&other), Arc::clone(&shared)),
                 _ => (Arc::clone(&shared), Arc::clone(&shared), Arc::clone(&other)),
             };
-            match build_production_router(inputs(shared, management, tasks, status)) {
+            let mut inputs = inputs(shared, management, tasks, status);
+            if line == "events" {
+                inputs.events.auth = Arc::clone(&other);
+            }
+            match build_production_router(inputs) {
                 // 只断言「必须 Err」；不 Debug 打印 Router，避免失败输出被整张路由表淹没。
                 Ok(_) => panic!("{line} 线认证上下文不一致时必须 Err"),
                 Err(error) => assert_mismatch(error),
@@ -466,8 +481,9 @@ mod typed {
     }
 
     #[tokio::test]
-    async fn shared_auth_context_composes_all_six_lines() {
-        // 原五线断言全部保留，另加指标线：四件事同时成立才是单端口六线合并。
+    async fn shared_auth_context_composes_all_seven_lines() {
+        // 原五线断言全部保留，另加指标线与 SSE 事件线：四件事同时成立才是
+        // 单端口七线合并（auth / management / tasks / status / events / metrics / web）。
         let shared = auth_state();
         let db = lazy_db();
         let router = build_production_router_with_metrics_source(
@@ -514,6 +530,7 @@ mod typed {
             "/api/v1/tasks/00000000-0000-4000-8000-000000000001",
             DEVICE_STATUS_PATH,
             "/api/v1/devices/%FF/status",
+            "/api/v1/events",
         ] {
             let (status, body) = request_get(&router, path).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "业务路径 {path} 必须 401");
@@ -734,6 +751,7 @@ mod typed {
             component("/api/v1/users", "management"),
             component("/api/v1/tasks", "tasks"),
             component("/api/v1/devices/test/status", "status"),
+            component("/api/v1/events", "events"),
             component("/metrics", "metrics"),
             component("/metrics", "duplicate-metrics"),
         );

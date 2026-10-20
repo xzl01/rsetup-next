@@ -125,6 +125,8 @@ pub enum EndpointId {
     TaskDetail,
     TaskChildren,
     DeviceStatusRead,
+    /// SSE 事件流 `GET /api/v1/events` 的独立读桶（握手一次计一次）。
+    EventsRead,
 }
 
 /// Fixed sliding rate-window duration: 1 second.

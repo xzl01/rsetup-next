@@ -321,6 +321,9 @@ pub(crate) fn endpoint_cursor_code(endpoint: EndpointId) -> u16 {
         EndpointId::TaskDetail => 14,
         EndpointId::TaskChildren => 15,
         EndpointId::DeviceStatusRead => 16,
+        // SSE 事件流不分页、不签发 cursor，故不占 Task 1 的 1..=16 映射表；
+        // 该分支只为穷尽性服务，任何 cursor 使用都是缺陷。
+        EndpointId::EventsRead => 0,
     }
 }
 

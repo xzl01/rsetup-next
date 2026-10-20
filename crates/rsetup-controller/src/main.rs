@@ -20,8 +20,10 @@ use rsetup_controller::auth::service::AuthService;
 use rsetup_controller::auth::sqlx_repo::SqlxIdentityRepository;
 use rsetup_controller::authz::sqlx_repo::SqlxAuthorizationSnapshotRepository;
 use rsetup_controller::devices::service::AdmissionChangeEvent;
+use rsetup_controller::events::EventBus;
 use rsetup_controller::http_auth::{AppState, HttpAuthState};
 use rsetup_controller::http_device_status::DeviceStatusState;
+use rsetup_controller::http_events::EventsState;
 use rsetup_controller::http_live::LiveAuth;
 use rsetup_controller::http_security::HttpSecurityConfig;
 use rsetup_controller::metrics::collect::MetricsRuntime;
@@ -192,6 +194,15 @@ fn production_inputs(
         HttpSecurityConfig::from_env()?,
     ));
 
+    // 事件总线：进程内唯一通道句柄（broadcast 容量 128）。SSE 读线与未来的
+    // 业务发布方共享同一个句柄；本切片只交付发布/订阅基础设施本身，尚无业务
+    // 发布方接线，因此事件流上真实出现的只有心跳与总线自身产生的 reset，
+    // 不伪造任何 device/task/permissions/time 事件。
+    let events = EventsState {
+        auth: auth.clone(),
+        bus: EventBus::new(),
+    };
+
     let transport = Arc::new(UnwiredTransportSources);
     let management = build_sqlx_management_state(
         db.clone(),
@@ -218,6 +229,7 @@ fn production_inputs(
         },
         management,
         tasks,
+        events,
         status: DeviceStatusState {
             auth,
             // 真实 typed 内存快照源（polling::SnapshotStore）：代际/序号校验 + 单调

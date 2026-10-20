@@ -1504,6 +1504,7 @@ dependencies = [
  "axum",
  "base64",
  "chrono",
+ "futures-core",
  "hex",
  "libc",
  "rand",
