@@ -29,13 +29,20 @@ use rsetup_controller::metrics::config::MetricsConfig;
 use rsetup_controller::polling::SnapshotStore;
 use rsetup_controller::production::{MetricsLineInputs, ProductionInputs, build_production_router};
 use rsetup_controller::tasks::SqlxTaskApi;
+use rsetup_controller::tasks::board_client::{BoardClient, BoardClientError, BoardFuture};
 use rsetup_controller::tasks::http::HttpTasksState;
+use rsetup_controller::tasks::recover_process;
 use rsetup_controller::tasks::repository::SqlxTaskRepository;
 use rsetup_controller::tasks::service::TaskService;
+use rsetup_controller::time::{TimeGateConfig, start_time_gate};
 use rsetup_controller::web_router;
 use rsetup_controller::{
     BootstrapSecretSink, ControllerConfig, ControllerError, DbPool, bootstrap_admin,
     check_identity_schema,
+};
+
+use rsetup_protocol::wire::{
+    Capabilities, ClockSample, DeviceStatus, RebootExecute, RebootTicket, TaskRecord,
 };
 
 struct LogSecretSink(std::path::PathBuf);
@@ -91,6 +98,73 @@ impl ManagementNotificationSink for UnwiredTransportSources {
         Err(ControllerError::Config(
             "admission notification channel not wired".into(),
         ))
+    }
+}
+
+/// 板端 `BoardClient` 的 **fail-closed** 装配位：真实 transport（连接管理器/板端
+/// 控制流）尚未交付，本装配位对 6 个方法一律回 `DeviceOffline`（设备控制流不在线/
+/// 不可达），绝不返回伪造的 `Capabilities`/`DeviceStatus`/`ClockSample`/`TaskRecord`，
+/// 也绝不假装 `Ok(None)`（那会被恢复路径误读为 `TASK_NOT_FOUND(1006)` 并计入已核验）。
+///
+/// 唯一被启动期消费的入口是 [`BoardClient::task_record`]（见 `recover_process` 阶段 2）：
+/// 返回 `Err(DeviceOffline)` 经 `query_board_task_record` 记为「未核验」outcome 但**绝不**
+/// 让恢复上抛失败，`queued` 子任务仍按不可信期限保守置 `held`。真实适配器交付后只需替换
+/// 本结构，`recover_process` 的三阶段编排与五线装配拓扑不变。
+struct UnwiredBoardClient;
+
+impl BoardClient for UnwiredBoardClient {
+    fn capabilities<'a>(&'a self, _device: &'a [u8; 32]) -> BoardFuture<'a, Capabilities> {
+        Box::pin(async { Err(BoardClientError::DeviceOffline) })
+    }
+    fn status<'a>(&'a self, _device: &'a [u8; 32]) -> BoardFuture<'a, DeviceStatus> {
+        Box::pin(async { Err(BoardClientError::DeviceOffline) })
+    }
+    fn clock<'a>(&'a self, _device: &'a [u8; 32]) -> BoardFuture<'a, ClockSample> {
+        Box::pin(async { Err(BoardClientError::DeviceOffline) })
+    }
+    fn prepare<'a>(
+        &'a self,
+        _device: &'a [u8; 32],
+        _sub_task_id: uuid::Uuid,
+        _expected_boot_id: &'a str,
+    ) -> BoardFuture<'a, RebootTicket> {
+        Box::pin(async { Err(BoardClientError::DeviceOffline) })
+    }
+    fn execute<'a>(
+        &'a self,
+        _device: &'a [u8; 32],
+        _ticket: &'a RebootTicket,
+        _request: &'a RebootExecute,
+    ) -> BoardFuture<'a, TaskRecord> {
+        Box::pin(async { Err(BoardClientError::DeviceOffline) })
+    }
+    fn task_record<'a>(
+        &'a self,
+        _device: &'a [u8; 32],
+        _sub_task_id: uuid::Uuid,
+    ) -> BoardFuture<'a, Option<TaskRecord>> {
+        Box::pin(async { Err(BoardClientError::DeviceOffline) })
+    }
+}
+
+/// 从环境变量装配时间门禁配置（每次进程启动只调用一次，随 `start_time_gate` 消费）。
+///
+/// 基线是 [`TimeGateConfig::default()`]：`servers` 为空 → 采样器无源可用 → 启动采样在
+/// 总预算内直接回退 `SystemFallback`，安全 fail-closed 与 fallback 规则完全不变。仅当
+/// `NTP_SERVERS` 环境变量存在时按其切分（逗号与任意空白分隔，忽略空段）填充 `servers`。
+fn time_gate_config_from_env() -> TimeGateConfig {
+    let servers = std::env::var("NTP_SERVERS")
+        .map(|raw| {
+            raw.split(|c: char| c == ',' || c.is_whitespace())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    TimeGateConfig {
+        servers,
+        ..TimeGateConfig::default()
     }
 }
 
@@ -198,6 +272,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ControllerConfig::from_env()?;
     // 指标配置门禁：在连接数据库与绑定端口之前完成（§3.6 fail-closed 无副作用）。
     let metrics_config = Arc::new(MetricsConfig::from_env()?);
+    // NTP 时间门禁：在建立数据库连接与启动任何生产服务之前启动（每次进程启动只调用一次）。
+    // 单调进程时钟纪元 clock_epoch 只在此生成一次；`start_time_gate` 在 tokio 运行时内 spawn
+    // 后台 driver（startup 预算采样，就绪或超时后对外提供时间快照），本进程全程持有 handle。
+    // servers 为空（未设 NTP_SERVERS）即走 SystemFallback，安全 fail-closed 与 fallback 规则不变。
+    let clock_epoch = uuid::Uuid::new_v4();
+    let time_gate = start_time_gate(time_gate_config_from_env(), clock_epoch);
+    eprintln!(
+        "controller 时间门禁已启动: clock_epoch={clock_epoch} ready={}",
+        time_gate.is_ready()
+    );
     let db = DbPool::connect(&config).await?;
     let secret_path = std::env::var_os("CONTROLLER_BOOTSTRAP_SECRET_LOG")
         .map(std::path::PathBuf::from)
@@ -207,6 +291,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_handle = db.clone();
     start_if_ready(check_identity_schema(&db), || async move {
         bootstrap_admin(&db_handle, &LogSecretSink(secret_path)).await?;
+        // 启动恢复：schema 校验通过 + 管理员 bootstrap 完成后、对外监听之前，对未决任务做
+        // 只读核验（阶段 1 只读短事务读未决集 → 阶段 2 事务外板端核验 → 阶段 3 写入短事务落
+        // recovery_checks 与 queued→held）。板端 transport 未接线（UnwiredBoardClient）：
+        // task_record 一律回未连接错误，被记为未核验但绝不让恢复上抛，恢复路径永不发送。
+        // 失败即上抛（fail-closed），未对账完成前不进入对外服务。
+        let process_epoch = uuid::Uuid::new_v4();
+        let task_repo = SqlxTaskRepository::new(db_handle.0.clone());
+        let board_client = UnwiredBoardClient;
+        let recovery = recover_process(&task_repo, &board_client, process_epoch).await?;
+        eprintln!(
+            "controller 启动恢复对账完成: process_epoch={process_epoch} \
+             已核验={} 置held={} 置expired={} 发送={}",
+            recovery.read_only_verified,
+            recovery.marked_held,
+            recovery.marked_expired,
+            recovery.execute_calls,
+        );
         // 唯一生产装配点：认证四线共享同一 Arc<HttpAuthState>（指标线是独立认证
         // 边界），指针不一致即失败关闭。
         let router = build_production_router(production_inputs(
