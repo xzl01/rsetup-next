@@ -35,6 +35,9 @@ let isMounted = true
 
 function abortPendingLoadMore() {
   paginationGeneration++
+  // 代际已推进：在途 loadMore 的 finally 因 `currentGen !== paginationGeneration` 不会再复位 busy，
+  // 这里必须显式落地，否则 loadingMore 永远为 true，「加载更多」按钮被永久 disabled。
+  loadingMore.value = false
   if (abortController) {
     abortController.abort()
     abortController = null

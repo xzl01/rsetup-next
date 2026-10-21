@@ -16,13 +16,21 @@ import { isU64DecimalString } from './types'
  * 8. 同步缓冲条目绑定产生时的连接/同步代际，跨代际一律安全丢弃，绝不回放到新连接；
  * 9. 快照落库只前进水位：对象 revision 低于已应用水位时保留更高水位，绝不逆序回退；
  * 10. 事件对象不在当前全量快照成员中时不凭提示直接打补丁，改为当前授权 GET 重取；
- * 11. 每次调用外部回调（`onSnapshot`/`onEntityUpdate`）之后与每条缓冲事件应用之前，都必须复核
- *     连接/同步代际，撤权或 reset 后绝不继续灌入数据；
+ * 11. 每次调用外部回调（`onSnapshot`/`onEntityUpdate`/`onUpdateHint`）之后与每条缓冲事件应用之前，
+ *     都必须复核连接/同步代际，撤权或 reset 后绝不继续灌入数据。入口直发的 `onUpdateHint` 之后
+ *     复核订阅活跃性：宿主若在回调内撤权/关闭即就地终止；若其内部另起一轮同步，后续条目按
+ *     **复核后**的最新代际入库，绝不被旧票据吞掉；
  * 12. 缓冲提取按代际取子集：`drainBuffer` 入口先复核票据，且只移除并回放属于本轮票据代际的条目，
  *     其他代际（含订阅方回调内部 reset/resync 后新产生的条目）原序留在共享缓冲，交给各自那一轮回放，
  *     绝不被失效的旧同步流程抽空吞掉；
  * 13. 未注册快照来源的 kind 没有任何已授权成员事实，其提示 fail-closed 静默忽略：不分发补丁，
  *     也不建立或污染水位（06 §4）。
+ * 14. `onUpdateHint` 是**成员判定之前**发出的对象级失效提示（只含 kind + id）：未知成员同样送达，
+ *    使宿主上不属于列表快照投影的读取（如任务详情）也能接进失效链路；它仍是提示不是数据，
+ *    不建立水位，也不放宽「未知对象只重取不打补丁」的既有契约。
+ * 15. 该提示与补丁缓冲**完全解耦**：在事件分发入口通过校验的当刻直发，不进缓冲、不等快照落地、
+ *    不受同步状态影响，回放时不重发。因此同步窗口里即使补丁被提前中断（未知成员触发重同步、
+ *    缓冲溢出丢弃、断线丢弃旧代际）提示也绝不丢失——它不携带载荷，宿主的重取自带单调保护。
  */
 
 /** 统一命名事件；客户端对五个名称分别注册独立监听（不能只监听默认 `message`）。 */
@@ -102,6 +110,24 @@ export interface EventStreamClientOptions {
   withCredentials?: boolean
   onSnapshot?: (kind: EntityKind, items: ReadonlyArray<Record<string, unknown>>) => void
   onEntityUpdate?: (kind: EntityKind, patch: Record<string, unknown>) => void
+  /**
+   * 对象级失效提示：**只带 kind + id，绝不带载荷**，且覆盖范围比 `onEntityUpdate` 更宽。
+   *
+   * `onEntityUpdate` 只对「当前全量快照的已知成员」分发（06 §4：未知成员不得凭提示打补丁），
+   * 因此宿主上那些**不属于列表快照投影**的读取——典型是任务详情的 `/tasks/:id` 与
+   * `/tasks/:id/children`——若只挂 `onEntityUpdate`，在深链进入或分页进入（对象不在首屏快照成员里）
+   * 时永远收不到失效提示：那条事件走 `unknown-member` 重同步，宿主只见列表快照重取。
+   *
+   * 时序（审查 P1：提示必须与补丁缓冲解耦）：本回调在**事件分发入口**触发——载荷可解析、
+   * 对象 ID 与 revision 通过校验的当刻立即发出，位置早于同步状态判定、缓冲入队、成员判定与
+   * 水位过滤。因此每条经校验的更新事件恰好通知一次（缓冲条目回放时不再重复发出），且**任何**
+   * 使补丁落地失败或延后的情形都不会吞掉提示：同步窗口内未知成员中断本轮回放、缓冲溢出丢弃、
+   * 断线丢弃旧代际条目、水位判定事件过时被丢弃。
+   *
+   * 代价是「事件 revision 不高于已应用水位」的过时提示也会通知一次——提示不携带数据，宿主据其
+   * 按当前授权重取，配合宿主自身的 revision 单调保护无回滚风险。
+   */
+  onUpdateHint?: (kind: EntityKind, id: string) => void
   onSystemTimeChanged?: (payload: Record<string, unknown> | null) => void
   onSessionExpired?: (reason: ShutdownReason) => void
   onError?: (error: EventStreamError) => void
@@ -314,6 +340,9 @@ export function createEventStreamClient(options: EventStreamClientOptions = {}):
     // 未注册快照来源的 kind：客户端对该 kind 没有任何已授权成员事实，06 §4 禁止把未知对象当作补丁
     // 直接分发（也不能借分发建立/污染水位）。此类提示 fail-closed 静默忽略，不分发、不建水位。
     if (!sourceKinds.has(update.kind)) return alive()
+    // 失效提示（onUpdateHint）不在这里发出：它已在事件分发入口通过校验的当刻直发（审查 P1），
+    // 与补丁缓冲彻底解耦。挂在此处会让同步窗口里的提示依附于回放能否走完——未知成员触发
+    // 重同步即中断本轮回放，被 take 出来的后续条目连同其提示一起丢失。
     // 未知成员：06 §4 明确「无法对应当前快照的对象」不得凭提示直接打补丁，必须当前授权 GET 重取。
     if (!isKnownMember(update.kind, update.id)) {
       fail('UNMAPPED_EVENT', { kind: update.kind, detail: 'event_object_not_in_snapshot' })
@@ -363,6 +392,9 @@ export function createEventStreamClient(options: EventStreamClientOptions = {}):
         fail('UNMAPPED_EVENT', { kind: entry.kind, detail: 'buffered_event_unmapped' })
         continue
       }
+      // 返回 false 时中断本轮回放：只影响**补丁**的落地（未知成员会另起一轮全量重取，权威快照
+      // 覆盖这些对象；代际失效则本轮数据本就该作废）。缓冲条目的失效提示已在事件入口直发，
+      // 故此处提前退出不会让任何对象对宿主失明（审查 P1）。
       if (!applyUpdate({ kind: entry.kind, id, revision, payload: entry.payload }, alive)) return
     }
   }
@@ -516,6 +548,18 @@ export function createEventStreamClient(options: EventStreamClientOptions = {}):
       fail('UNMAPPED_EVENT', { kind, detail: 'event_without_object_revision' })
       startSync('invalid-event')
       return
+    }
+    // 对象级失效提示在**校验通过的当刻**直发（契约 14/15：与补丁缓冲解耦）。这是全客户端唯一的
+    // onUpdateHint 发出点：提示只含 kind + id，不携带任何可能因同步窗口而过期的载荷，所以它既
+    // 不需要缓冲、也不需要成员判定与水位过滤，更不该依附补丁回放能否走完。宿主（任务详情等
+    // 不属于列表快照投影的读取）据此立刻发起带自身 revision 单调保护的授权 GET。
+    // 未注册快照来源的 kind 仍 fail-closed（契约 13）：对它一无所知，连提示也不建立。
+    if (sourceKinds.has(kind)) {
+      options.onUpdateHint?.(kind, id)
+      // 提示同样是外部回调：宿主可能在其内部撤权或关闭订阅，其后绝不再分发任何补丁。
+      // 宿主若在回调内另起一轮同步也不危险——下面的分支与缓冲入库读取的都是**复核后**的
+      // 最新 syncState/connectionEpoch/syncGeneration，条目归入它自己那一代际。
+      if (!active) return
     }
     // 只有「当前同步代际的快照已落库」才可直接回写；同步中或断线待重连都先缓冲，
     // 等本轮快照落库后按对象水位合并回放，绝不把事件写进旧快照。

@@ -25,6 +25,14 @@ const props = withDefaults(defineProps<{
   initialTasks?: TaskItem[]
   initialNextCursor?: string | null
   pendingDeviceId?: string | null
+  /** SSE 正在管理任务首屏：列表唯一获取源是父级的全量快照，本组件不再另发初始 GET（避免两条获取路径互相覆盖）。 */
+  listManagedExternally?: boolean
+  /**
+   * 父级数据源（SSE 快照或其兜底普通 GET）最近一次首屏获取失败的提示。
+   * 组件自有的 listError 只覆盖自己发起的分页失败；SSE 管理期本组件不发请求，
+   * 失败只能由父级如实传入，否则表格会停在旧列表/「无法加载」而指示器另行其是（审查第 4/6 项）。
+   */
+  projectionError?: string | null
   csrfToken?: string
   onPreview?: (operation: 'reboot', deviceIds: string[], signal?: AbortSignal) => Promise<TaskPreview>
   onSubmit?: (payload: { preview_token: string; confirm: true }, options: { idempotencyKey: string; signal?: AbortSignal }) => Promise<{ task_id: string; accepted: boolean }>
@@ -32,10 +40,16 @@ const props = withDefaults(defineProps<{
   onLoadTasks?: (cursor: string | null) => Promise<{ items: TaskItem[]; next_cursor: string | null }>
 }>(), {
   devices: () => [], initialNextCursor: null, pendingDeviceId: null,
+  projectionError: null,
   csrfToken: '',
 })
 
-const emit = defineEmits<{ openTask: [taskId: string]; rebootDevice: [deviceId: string] }>()
+const emit = defineEmits<{
+  openTask: [taskId: string]
+  rebootDevice: [deviceId: string]
+  /** 父级投影获取失败后的显式重试：由唯一数据 owner（App）决定走 resync 还是普通 GET。 */
+  retryProjection: []
+}>()
 const i18n = inject<ReturnType<typeof createI18n>>('i18n')!
 const t = (key: string) => i18n.t(key)
 
@@ -68,6 +82,13 @@ const tasks = ref<TaskItem[]>(props.initialTasks ?? [])
 const nextCursor = ref<string | null>(props.initialNextCursor ?? null)
 const listError = ref<string | null>(null)
 const loadMoreBusy = ref(false) // WEB-R6-1：loadMore 防重入门控
+/**
+ * 列表获取代际（审查第 2/6 项）：外部快照接管、取得/失去外部管理、卸载都在当刻 ++。
+ * 分页与首屏请求发起时捕获该票，落地（含 catch/finally）前再核一次：
+ * 服务端或测试夹具即便忽略 AbortSignal，旧游标的响应也不得追加成员或覆盖新 cursor。
+ */
+let listGeneration = 0
+const invalidateListRequests = (): void => { listGeneration += 1 }
 let abortController: AbortController | null = null
 let fingerprint = ''
 // 统一操作代际（参照 Task 9 isStale 风格）：preview 与 submit 共用同一代际计数，任一操作开始即递增；
@@ -173,8 +194,10 @@ async function submitBatch() {
 async function loadMore() {
   if (!props.onLoadTasks || !nextCursor.value || loadMoreBusy.value) return
   loadMoreBusy.value = true // WEB-R6-1：同一 nextCursor 连击不得并发发起两次请求
+  const gen = listGeneration // 审查第 2 项：这次分页属于当前代，接管当刻即作废
   try {
     const page = await props.onLoadTasks(nextCursor.value)
+    if (gen !== listGeneration) return // 迟到响应整页丢弃：既不追加成员也不推进 cursor
     assertTaskPageShape(page)
     const seenIds = new Set(tasks.value.map((item) => item.id)) // WEB-R7-1：兼防同一页内重复的新 ID
     const newItems = page.items.filter((item) => {
@@ -186,21 +209,26 @@ async function loadMore() {
     nextCursor.value = page.next_cursor
     listError.value = null // WEB-R5-2：分页成功必须清除列表错误，否则表格永久隐藏
   } catch {
+    if (gen !== listGeneration) return // 旧代的失败不得污染接管后的新快照
     listError.value = t('state.error')
   } finally {
-    loadMoreBusy.value = false
+    if (gen === listGeneration) loadMoreBusy.value = false // 旧代 finally 不得清除新代的 busy
   }
 }
 
 async function initialLoad() {
-  if (props.initialTasks !== undefined || !props.onLoadTasks) return
+  // SSE 管理期或父级已给首屏时不发起第二条获取路径；分页仍由 loadMore 延续快照游标
+  if (props.listManagedExternally || props.initialTasks !== undefined || !props.onLoadTasks) return
+  const gen = listGeneration
   try {
     listError.value = null
     const page = await props.onLoadTasks(null)
+    if (gen !== listGeneration) return
     assertTaskPageShape(page)
     tasks.value = page.items
     nextCursor.value = page.next_cursor
   } catch {
+    if (gen !== listGeneration) return
     // 首屏加载失败呈现错误态，绝不伪装为空列表
     listError.value = t('state.error')
   }
@@ -221,18 +249,39 @@ watch(() => props.pendingDeviceId, (id) => {
   }
 })
 
-watch(() => props.initialTasks, (val) => {
-  if (val !== undefined) {
-    tasks.value = val
+// 外部首屏接管（SSE 快照或父级兜底 GET）：items 与 cursor 原子替换，同时作废上一代的在途分页
+// 并清空其错误/busy——否则「表格说无法加载、指示器说实时」与旧成员回灌都会发生（审查第 2/6 项）。
+watch([() => props.initialTasks, () => props.initialNextCursor], () => {
+  const val = props.initialTasks
+  if (val === undefined) {
     nextCursor.value = props.initialNextCursor ?? null
+    return
   }
+  invalidateListRequests()
+  loadMoreBusy.value = false
+  listError.value = null
+  tasks.value = val
+  nextCursor.value = props.initialNextCursor ?? null
 })
 
-watch(() => props.initialNextCursor, (val) => {
-  nextCursor.value = val ?? null
+// 取得/失去外部管理都是所有权切换：在途分页当刻作废（不等响应落地），
+// busy 不能悬挂在已失效的代际上，否则「加载更多」会永久 disabled。
+watch(() => props.listManagedExternally, (managed, wasManaged) => {
+  if (managed === wasManaged) return
+  invalidateListRequests()
+  loadMoreBusy.value = false
+})
+
+// owner 报告本代获取失败（SSE 快照或其兜底 GET）：这次失败同样属于上一代——
+// 发起兜底 GET 时代际已被 owner 递增，在途分页早已被作废，这里只负责让 busy 落地。
+watch(() => props.projectionError, (error, previous) => {
+  if (error === previous) return
+  invalidateListRequests()
+  loadMoreBusy.value = false
 })
 
 onBeforeUnmount(() => {
+  invalidateListRequests()
   abortController?.abort()
 })
 </script>
@@ -303,6 +352,23 @@ onBeforeUnmount(() => {
 
     <section class="tasks-view__list">
       <h2>{{ t('task.list.title') }}</h2>
+      <!--
+        父级投影（SSE 快照或兜底 GET）最近一次获取失败：如实提示 + 显式重试，
+        但保留最后合法快照在表格里（06 §4：非认证失效不清空已授权数据）。
+        必须排在 listError 之前：插到 listError 与下面的 v-else-if 之间会截断 v-if 链，
+        使表格被错误地让位给空态。
+      -->
+      <AppNotice
+        v-if="projectionError"
+        tone="error"
+        :tone-label="t('common.error')"
+        :title="t('state.error')"
+      >
+        <span>{{ projectionError }}</span>
+        <BaseButton variant="secondary" @click="emit('retryProjection')">
+          {{ t('state.retry') }}
+        </BaseButton>
+      </AppNotice>
       <AppNotice
         v-if="listError"
         tone="error"

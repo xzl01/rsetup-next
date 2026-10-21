@@ -91,6 +91,8 @@ interface Harness {
   taskSignals: AbortSignal[]
   snapshots: Array<{ kind: EntityKind; count: number }>
   updates: Array<{ kind: EntityKind; patch: Record<string, unknown> }>
+  /** 对象级失效提示（kind + id）：覆盖面比 updates 更宽，含未知成员与缓冲回放。 */
+  hints: Array<{ kind: EntityKind; id: string }>
   timeEvents: Array<Record<string, unknown> | null>
   expired: string[]
   errors: string[]
@@ -108,6 +110,8 @@ interface HarnessOptions {
   /** 订阅方回调内注入副作用（如在 device 快照落库中途撤权），验证回调后的代际复核。 */
   onSnapshotHook?: (kind: EntityKind) => void
   onEntityUpdateHook?: (kind: EntityKind, patch: Record<string, unknown>) => void
+  /** 在失效提示回调内部注入副作用（如宿主自行撤权），验证提示之后的活跃性复核。 */
+  onUpdateHintHook?: (kind: EntityKind, id: string) => void
 }
 
 function createHarness(options: HarnessOptions = {}): Harness {
@@ -133,6 +137,7 @@ function createHarness(options: HarnessOptions = {}): Harness {
 
   const snapshots: Array<{ kind: EntityKind; count: number }> = []
   const updates: Array<{ kind: EntityKind; patch: Record<string, unknown> }> = []
+  const hints: Array<{ kind: EntityKind; id: string }> = []
   const timeEvents: Array<Record<string, unknown> | null> = []
   const expired: string[] = []
   const errors: string[] = []
@@ -165,12 +170,16 @@ function createHarness(options: HarnessOptions = {}): Harness {
       updates.push({ kind, patch })
       options.onEntityUpdateHook?.(kind, patch)
     },
+    onUpdateHint: (kind, id) => {
+      hints.push({ kind, id })
+      options.onUpdateHintHook?.(kind, id)
+    },
     onSystemTimeChanged: (payload) => timeEvents.push(payload),
     onSessionExpired: (reason) => expired.push(reason),
     onError: (error) => errors.push(error.code),
   })
 
-  return { client, es, devices, tasks, deviceSignals, taskSignals, snapshots, updates, timeEvents, expired, errors, created }
+  return { client, es, devices, tasks, deviceSignals, taskSignals, snapshots, updates, hints, timeEvents, expired, errors, created }
 }
 
 let client: EventStreamClient | null = null
@@ -576,6 +585,144 @@ describe('代际守卫与 kind+id 水位丢弃', () => {
     h.es.emitData('device.updated', { device_id: 'dev-1', revision: '6' })
     expect(h.updates).toHaveLength(1)
     expect(h.client.watermarkOf('device', 'dev-1')).toBe('6')
+  })
+
+  it('onUpdateHint 覆盖未知成员：补丁被拒但提示照达，宿主上的投影外读取不至于失明', async () => {
+    // 审查 P1 根因：`onEntityUpdate` 只对已知成员分发，宿主上不属于列表快照投影的读取
+    // （任务详情的 /tasks/:id）若只挂该回调，深链/分页进入的对象其事件走 unknown-member
+    // 重同步，详情永远收不到失效通知。提示通道必须先于成员判定送达。
+    const h = createHarness({
+      snapshotsConfig: 'device-only',
+      deviceSnapshot: async () => [deviceItem('dev-1', '5')],
+    })
+    client = h.client
+    h.es.emit('open')
+    await flush()
+
+    h.es.emitData('device.updated', { device_id: 'dev-9', revision: '1', display_name: '未知对象' })
+    // 缺陷点：旧实现里 hints 为空——未知成员只触发整轮重同步，宿主无从得知是哪个对象变了
+    expect(h.hints).toEqual([{ kind: 'device', id: 'dev-9' }])
+    expect(h.updates).toHaveLength(0) // 提示归提示，补丁照旧被拒
+    expect(h.client.lastSyncReason.value).toBe('unknown-member')
+
+    // 已知成员同样只算提示：载荷仍只经 onEntityUpdate 这一条授权后的重取路径落地
+    await flush()
+    h.es.emitData('device.updated', { device_id: 'dev-1', revision: '6' })
+    expect(h.hints).toEqual([{ kind: 'device', id: 'dev-9' }, { kind: 'device', id: 'dev-1' }])
+    expect(h.updates).toHaveLength(1)
+  })
+
+  it('onUpdateHint 与补丁缓冲解耦：同步在途即时送达，回放不重发，未注册 kind 不建立提示', async () => {
+    const gate = deferred<ReadonlyArray<Record<string, unknown>>>()
+    let calls = 0
+    const h = createHarness({
+      snapshotsConfig: 'device-only',
+      deviceSnapshot: () => {
+        calls += 1
+        return calls === 1 ? gate.promise : Promise.resolve([deviceItem('dev-1', '5')])
+      },
+    })
+    client = h.client
+    h.es.emit('open')
+    // 审查 P1：提示不再依附补丁落地。同步在途时事件补丁照旧进缓冲（本轮快照尚未落库，
+    // 绝不能写进旧快照），但提示在事件到达当刻就送达——同步窗口越长，宿主上「投影之外」的
+    // 读取（任务详情）越需要尽早失效，而不是等这一轮 GET 回来。
+    h.es.emitData('device.updated', { device_id: 'dev-3', revision: '2' })
+    expect(h.hints).toEqual([{ kind: 'device', id: 'dev-3' }])
+    expect(h.updates).toHaveLength(0) // 补丁仍在缓冲，未写入旧快照
+
+    gate.resolve([deviceItem('dev-1', '5')])
+    await flush()
+    // 补丁通道仍按原契约处理（dev-3 不在成员集合里 → 只触发 unknown-member 重同步，不补投影）；
+    // 提示每条经校验的更新事件恰好一次，回放绝不重发
+    expect(h.hints).toEqual([{ kind: 'device', id: 'dev-3' }])
+    expect(h.updates).toHaveLength(0)
+  })
+
+  it('同步期间未知成员中断本轮回放，也不得吞掉同批其他对象的失效提示（审查 P1）', async () => {
+    // 缺陷点：提示原先挂在 applyUpdate 内部，而同步期间的补丁要等 drainBuffer 回放。
+    // 本轮快照落库后回放缓冲，第一条若是未知 device 成员，applyUpdate 触发 unknown-member
+    // 重同步并返回 false，drainBuffer 就地 break——pending 已被 take 出缓冲，排在后面的
+    // task.updated 连同它的 onUpdateHint 一起永久丢失，宿主上的任务详情彻底错过这次失效。
+    const gate = deferred<ReadonlyArray<Record<string, unknown>>>()
+    let calls = 0
+    const h = createHarness({
+      deviceSnapshot: () => {
+        calls += 1
+        return calls === 1 ? gate.promise : Promise.resolve([deviceItem('dev-1', '5')])
+      },
+    })
+    client = h.client
+    h.es.emit('open')
+    // 同步在途：dev-9 不在（尚未落库的）快照成员中，task-1 是当前详情页正在浏览的对象
+    h.es.emitData('device.updated', { device_id: 'dev-9', revision: '2', display_name: '未知对象' })
+    h.es.emitData('task.updated', { id: 'task-1', revision: '4' })
+    // 两条提示都即时送达，与同步状态、缓冲顺序、成员判定全部无关
+    expect(h.hints).toEqual([
+      { kind: 'device', id: 'dev-9' },
+      { kind: 'task', id: 'task-1' },
+    ])
+
+    gate.resolve([deviceItem('dev-1', '5')])
+    await flush()
+    // 回放确实被未知成员中断（补丁按契约交回权威快照，宿主失明风险由提示兜住），
+    // 但提示绝不因中断而丢失，也绝不因回放而重发
+    expect(h.hints).toEqual([
+      { kind: 'device', id: 'dev-9' },
+      { kind: 'task', id: 'task-1' },
+    ])
+    expect(h.errors).toContain('UNMAPPED_EVENT')
+    expect(h.client.lastSyncReason.value).toBe('unknown-member')
+    expect(h.client.watermarkOf('device', 'dev-9')).toBeNull()
+  })
+
+  it('断线丢弃旧代际缓冲条目时提示已经送达：补丁可弃，提示不可弃', async () => {
+    const h = createHarness()
+    client = h.client
+    h.es.emit('open')
+    await flush()
+    // 断线：状态转 reconnecting，事件只能缓冲，重连即被 pruneBuffer 安全丢弃（06 §4 不重放历史）
+    h.es.emit('error')
+    h.es.emitData('task.updated', { id: 'task-1', revision: '4' })
+    // 提示不依赖补丁能否落地，断线窗口内同样送达，宿主立刻按当前授权重取
+    expect(h.hints).toEqual([{ kind: 'task', id: 'task-1' }])
+    expect(h.updates).toHaveLength(0)
+    expect(h.client.isRealtime.value).toBe(false)
+  })
+
+  it('宿主在 onUpdateHint 内撤权：入口复核订阅活跃性，其后绝不再分发补丁', async () => {
+    let bound: EventStreamClient | null = null
+    const h = createHarness({
+      snapshotsConfig: 'device-only',
+      deviceSnapshot: async () => [deviceItem('dev-1', '5')],
+      onUpdateHintHook: () => { bound?.notifyUnauthorized() },
+    })
+    bound = h.client
+    client = h.client
+    h.es.emit('open')
+    await flush()
+
+    // 提示同样是外部回调：宿主在其内部撤权（与 App 的会话失效链路同构）之后，
+    // 同一条事件的补丁绝不能再分发出去（契约 11）
+    h.es.emitData('device.updated', { device_id: 'dev-1', revision: '6' })
+    expect(h.hints).toEqual([{ kind: 'device', id: 'dev-1' }])
+    expect(h.updates).toHaveLength(0)
+    expect(h.client.connectionState.value).toBe('unauthorized')
+  })
+
+  it('未注册快照来源的 kind 没有任何成员事实：既不分发补丁也不发提示', async () => {
+    const h = createHarness({
+      snapshotsConfig: 'device-only',
+      deviceSnapshot: async () => [deviceItem('dev-1', '5')],
+    })
+    client = h.client
+    h.es.emit('open')
+    await flush()
+
+    // task kind 未注册快照来源：客户端对它一无所知，提示同样 fail-closed 静默忽略
+    h.es.emitData('task.updated', { id: 'task-9', revision: '4' })
+    expect(h.hints).toHaveLength(0)
+    expect(h.updates).toHaveLength(0)
   })
 
   it('缓冲中的未知成员在回放时同样被拒绝，绝不作为补丁灌入', async () => {

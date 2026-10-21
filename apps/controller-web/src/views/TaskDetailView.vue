@@ -9,6 +9,7 @@ import {
   type TaskItem,
 } from '../task-ops'
 import { isU64DecimalString } from '../types'
+import { compareRevision } from '../events'
 import { TIME_REVIEW_DECISIONS, mainTaskStateLabel, timeReviewDecisionKeys } from '../task-presentation'
 import type { TimeReviewEvidenceKind } from '../task-requests'
 import type { createI18n } from '../i18n'
@@ -22,6 +23,12 @@ const props = withDefaults(defineProps<{
   initialTask?: TaskItem | null
   initialChildren?: SubTaskItem[]
   initialNextCursor?: string | null
+  /**
+   * SSE 失效刷新信号（App 在 `task.updated` 失效提示且当前处于详情页时推进）。
+   * 详情页的 `/tasks/:id` 与 `/tasks/:id/children` 不属于 SSE 全量快照来源，
+   * 只能由这个显式信号接进失效链路；推进即按当前授权重新拉取主任务与 children。
+   */
+  refreshToken?: number
   isAdmin?: boolean
   devicePermissions?: Record<string, string[]>
   onLoadTask?: (taskId: string) => Promise<TaskItem>
@@ -121,18 +128,59 @@ async function loadChildren(cursor: string | null = null) {
   }
 }
 
+/**
+ * 主任务**读取代际**（复审 P2：同任务详情读取没有代际保护）。
+ *
+ * `detailGeneration` 只在切换 `props.taskId` 时递增，管不了同一个详情页里的并发读取：连续两条
+ * `task.updated`（refreshToken 推进两次）、或写操作后的同代重取与一次外部刷新重叠时，
+ * 两条 `/tasks/:id` 的 (gen, id) 完全相同，后发先至、先发迟到就会把详情**回滚**成旧快照。
+ * 规则：最后启动的那次读取是唯一的合法落地者，任何更晚启动一次都让本次响应整体作废
+ * （不写 task、不清 taskError——本次响应已不代表当前状态，也没资格断言失败）。
+ */
+let taskFetchGeneration = 0
+
+/**
+ * 同 ID 主任务的 revision 单调保护：incoming 严格更旧时不倒灌（复审 P2 第二道防线）。
+ *
+ * 读取代际拦住"同页并发 GET 的迟到者"，这一层再拦住**不经过 loadTask 的较新写入**：
+ * 时间评审成功后直接采用服务端返回的 DTO（不经 loadTask，也就不推进读取代际），
+ * 此前任何一条在途 GET 的旧 DTO 迟到返回时都不能把它盖回去。
+ * 同一个函数也用于写响应自身（复审 P1）：评审响应在途期间 SSE 失效提示可能已由 loadTask 把
+ * 主任务推进到更高 revision，迟到的评审响应（CAS 提交时的旧版本）同样不得倒灌。
+ * 跨 ID 一律放行：revision 只在同一对象内单调，不同任务的 revision 之间没有可比性
+ * （与 events.ts 的 kind + id 水位同一口径）。
+ * 判定 fail-open：任一侧缺 revision 或不是 canonical u64 十进制时无法证明回退，照常采纳，
+ * 绝不因字段异常把合法新数据丢掉（比较走 compareRevision，不经 Number，u64 全域无损）。
+ */
+function keepsRevisionMonotonic(current: TaskItem | null, incoming: TaskItem): boolean {
+  const previous = current?.revision
+  if (previous === undefined) return true
+  if (current !== null && current.id !== incoming.id) return true
+  if (!isU64DecimalString(previous) || !isU64DecimalString(incoming.revision)) return true
+  return compareRevision(incoming.revision, previous) >= 0
+}
+
 async function loadTask() {
   if (!props.onLoadTask) return
   const gen = detailGeneration.value
   const id = props.taskId
+  // 读取代际在**每次启动**时推进（含写操作成功后的同代重取）：detailGeneration 只跟 taskId 走，
+  // 同任务页面内两次刷新信号并发时它不变，必须由 fetchGen 判定"最后一次启动才是唯一有效的落地者"
+  const fetchGen = ++taskFetchGeneration
+  // 过期 = 组件代际失效 ∪ taskId 变化 ∪ 已有更晚一次读取启动（本次响应无论多完整都整体丢弃）
+  const expired = () => isStale(gen, id) || fetchGen !== taskFetchGeneration
   try {
     const data = await props.onLoadTask(id)
-    if (isStale(gen, id)) return
+    if (expired()) return
     assertTaskItemShape(data)
+    // 同 ID 主任务 revision 单调：更旧 DTO 不倒灌。fetchGen 挡住"同页并发 GET 的迟到者"，
+    // 这一层再挡住"不经过 loadTask 的较新写入"（时间评审成功直接回写服务端 DTO 后，
+    // 之前那条在途 GET 的旧响应不得覆盖它）
+    if (!keepsRevisionMonotonic(task.value, data)) return
     task.value = data
     taskError.value = null
   } catch {
-    if (isStale(gen, id)) return
+    if (expired()) return
     taskError.value = t('state.error') // 保留旧数据，不伪装成功；不触碰 childrenError/actionError
   }
 }
@@ -192,7 +240,12 @@ async function runTimeReview(decision: 'resume_original_deadline' | 'expire') {
     })
     if (isStale(gen, id)) return // 过期返回：旧 DTO 不得覆盖新任务的 task
     assertTaskItemShape(updated)
-    task.value = updated          // 只采用服务端返回，绝不本地推断"已恢复/已延期"
+    // 复审 P1：写响应自身同样受同 ID revision 单调保护（与 loadTask 同一判定、同样 fail-open）。
+    // 评审在途窗口内，SSE 失效提示可能已让 loadTask 把主任务推进到更高 revision（例如并发写者
+    // 已完成该任务、或另一轮刷新拿到更新快照），CAS 提交时那个 revision 的响应迟到返回时不得把
+    // 详情倒灌回旧版本。不倒灌不等于失败：本次 CAS 已被服务端接受，故动作错误照清、children 照
+    // 按原子结果重取，仅跳过对更新 task 快照的回写（更高 revision 的快照本身已包含评审后的状态）。
+    if (keepsRevisionMonotonic(task.value, updated)) task.value = updated
     actionError.value = null      // 写操作成功必须清除动作错误
     await loadChildren(null)      // 按服务端原子结果重取 children
   } catch {
@@ -230,6 +283,19 @@ watch(
       loadTask()
       loadChildren(null)
     }
+  },
+)
+
+// SSE 失效提示（App 的 refreshToken 推进）：主任务与 children 都按当前授权重新拉取。
+// 不重建组件实例（:key 不变）：已选时间证据与批处理幂等键属于本次操作意图，不该被一次
+// 外部变化抹掉；两条读取各自走 (gen,id) 与 (gen,cGen,id) 代际令牌，写操作在途时同样安全，
+// 失败只落各自领域错误并保留旧数据（不伪装成功、不伪装空）。
+watch(
+  () => props.refreshToken,
+  (token, previous) => {
+    if (token === previous || !props.taskId) return
+    void loadTask()
+    void loadChildren(null)
   },
 )
 </script>

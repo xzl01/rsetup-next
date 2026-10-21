@@ -493,3 +493,158 @@ it('renders error state truthfully when the detail requests fail with 404', asyn
   // 两路读取都失败：绝不伪装成功，也不伪装为空详情
   expect(screen.queryByTestId('task-id')).toBeNull()
 })
+
+describe('同任务详情读取的读取代际与 revision 单调（复审 P2）', () => {
+  // 复审 P2：`detailGeneration` 只在切换 taskId 时递增，同一个详情页里的并发读取（连续两条
+  // task.updated 把 refreshToken 推进两次）拿到的是同一组 (gen, id)，旧实现照单全收：
+  // 后发请求先回、先发请求迟到 → 主任务被回滚成旧版本，甚至被迟到的失败抹成错误态。
+  const flush = () => new Promise<void>((r) => setTimeout(r, 0))
+
+  it('同任务并发重取时迟到的旧响应被丢弃：主任务不回滚成旧 revision', async () => {
+    let calls = 0
+    let resolveFirst!: (value: TaskItem) => void
+    const onLoadTask = vi.fn(() => {
+      calls += 1
+      // R1（先发，网络迟缓）挂起；R2（后发）立即带回 rev 10
+      if (calls === 1) return new Promise<TaskItem>((resolve) => { resolveFirst = resolve })
+      return Promise.resolve({ ...heldTask, revision: '10' })
+    })
+    const onLoadChildren = vi.fn(async () => ({ items: [child()], next_cursor: null }))
+    const wrapper = mount({
+      taskId: TASK_ID, initialTask: heldTask, initialChildren: [child()],
+      refreshToken: 0, onLoadTask, onLoadChildren,
+    })
+    // 已有 initialTask 与 initialChildren：挂载不自发读取，之后的每条 GET 都由刷新信号发起
+    expect(onLoadTask).not.toHaveBeenCalled()
+
+    await wrapper.rerender({ refreshToken: 1 })
+    await wrapper.rerender({ refreshToken: 2 })
+    await waitFor(() => expect(onLoadTask).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.getByTestId('task-revision').textContent).toContain('10'))
+
+    // 迟到的 R1 带回更旧的 rev 9：缺陷点是它把详情原样写回，用户看到主任务倒退
+    resolveFirst({ ...heldTask, revision: '9' })
+    await flush()
+    expect(screen.getByTestId('task-revision').textContent).toContain('10')
+  })
+
+  it('迟到的读取失败不得把已更新的详情抹成错误态（catch 分支同受读取代际约束）', async () => {
+    let calls = 0
+    let rejectFirst!: (reason: unknown) => void
+    const onLoadTask = vi.fn(() => {
+      calls += 1
+      if (calls === 1) return new Promise<TaskItem>((_resolve, reject) => { rejectFirst = reject })
+      return Promise.resolve({ ...heldTask, revision: '10' })
+    })
+    const onLoadChildren = vi.fn(async () => ({ items: [child()], next_cursor: null }))
+    const wrapper = mount({
+      taskId: TASK_ID, initialTask: heldTask, initialChildren: [child()],
+      refreshToken: 0, onLoadTask, onLoadChildren,
+    })
+    await wrapper.rerender({ refreshToken: 1 })
+    await wrapper.rerender({ refreshToken: 2 })
+    await waitFor(() => expect(screen.getByTestId('task-revision').textContent).toContain('10'))
+
+    // 已被更新读取取代的那一条失败：本次响应已不代表当前状态，既不清数据也不落错误
+    rejectFirst(new Error('network down'))
+    await flush()
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.getByTestId('task-revision').textContent).toContain('10')
+  })
+
+  it('写操作回写后迟到的 GET 携带更旧版本：由 revision 单调兜住，不倒灌服务端权威结果', async () => {
+    // 时间评审成功直接采用服务端 DTO 回写（不经 loadTask、不推进读取代际），
+    // 因此该场景读取代际完全拦不住——必须由同 ID revision 单调保护接手
+    let resolveLoad!: (value: TaskItem) => void
+    const onLoadTask = vi.fn(() => new Promise<TaskItem>((resolve) => { resolveLoad = resolve }))
+    const onLoadChildren = vi.fn(async () => ({ items: [child()], next_cursor: null }))
+    const onTimeReview = vi.fn(async () => ({
+      ...heldTask, state: 'queued' as const, revision: '8', counts: zeroTaskCounts(),
+    }))
+    const wrapper = mount({
+      taskId: TASK_ID,
+      initialTask: { ...heldTask, view_scope: 'full', counts: { ...zeroTaskCounts(), held: '1' } },
+      initialChildren: [child()],
+      refreshToken: 0, isAdmin: true, onLoadTask, onLoadChildren, onTimeReview,
+    })
+    await wrapper.rerender({ refreshToken: 1 })
+    await waitFor(() => expect(onLoadTask).toHaveBeenCalledTimes(1))
+
+    await fireEvent.click(screen.getByLabelText(name('task.timeReview.evidence.reference_deadline_proven')))
+    await fireEvent.click(screen.getByRole('button', { name: name('task.held.reviewResumeOriginalDeadline') }))
+    await waitFor(() => expect(screen.getByTestId('task-revision').textContent).toContain('8'))
+    expect(onTimeReview).toHaveBeenCalledTimes(1)
+
+    // 刷新在途的那条 GET 迟到返回写前的 rev 7：不得把评审结果盖回去
+    resolveLoad({ ...heldTask, revision: '7' })
+    await flush()
+    expect(screen.getByTestId('task-revision').textContent).toContain('8')
+    expect(screen.getByTestId('task-state').textContent).toContain(i18n.t('task.mainState.queued'))
+  })
+})
+
+describe('写响应自身的 revision 单调（审查 P1）', () => {
+  const flush = () => new Promise<void>((r) => setTimeout(r, 0))
+  // SSE 失效提示驱动的刷新结果：并发写者已把任务推进到终态（rev 9 已完成）
+  const completedTask = (): TaskItem => ({
+    ...heldTask, state: 'completed', outcome: 'success', revision: '9', counts: zeroTaskCounts(),
+  })
+
+  it('时间评审响应迟到：不得把刷新已落成的 rev 9 倒灌回 CAS 提交时的 rev 8', async () => {
+    // 缺陷点：runTimeReview 校验后无条件 `task.value = updated`，绕过了 loadTask 的 revision 单调
+    // 保护。评审在途窗口内 SSE 失效提示触发的 GET 先落成 rev 9，随后迟到的评审响应（携带 CAS
+    // 提交时的 rev 8 快照）会把详情从「已完成」回滚成「排队中」——用户看到已消失的状态复辟。
+    let resolveReview!: (value: TaskItem) => void
+    const onLoadTask = vi.fn(async () => completedTask())
+    const onLoadChildren = vi.fn(async () => ({ items: [child()], next_cursor: null }))
+    const onTimeReview = vi.fn(() => new Promise<TaskItem>((resolve) => { resolveReview = resolve }))
+    const wrapper = mount({
+      taskId: TASK_ID,
+      initialTask: { ...heldTask, view_scope: 'full', counts: { ...zeroTaskCounts(), held: '1' } },
+      initialChildren: [child()],
+      refreshToken: 0, isAdmin: true, onLoadTask, onLoadChildren, onTimeReview,
+    })
+
+    await fireEvent.click(screen.getByLabelText(name('task.timeReview.evidence.reference_deadline_proven')))
+    await fireEvent.click(screen.getByRole('button', { name: name('task.held.reviewResumeOriginalDeadline') }))
+    await waitFor(() => expect(onTimeReview).toHaveBeenCalledTimes(1))
+
+    // 评审仍在途：SSE 失效提示推进 refreshToken，loadTask 把详情推进到 rev 9
+    await wrapper.rerender({ refreshToken: 1 })
+    await waitFor(() => expect(screen.getByTestId('task-revision').textContent).toContain('9'))
+    expect(onLoadTask).toHaveBeenCalledTimes(1)
+
+    // 迟到的评审响应带回 CAS 提交时的 rev 8（严格更旧）：只允许跳过快照回写，不允许回滚
+    resolveReview({ ...heldTask, state: 'queued', revision: '8', counts: zeroTaskCounts() })
+    await flush()
+    expect(screen.getByTestId('task-revision').textContent).toContain('9')
+    expect(screen.getByTestId('task-revision').textContent).not.toContain('8')
+    expect(screen.getByTestId('task-state').textContent).toContain(i18n.t('task.mainState.completed'))
+    // 不倒灌 ≠ 失败：CAS 已被服务端接受，故按原子结果重取 children（刷新信号那次 + 写成功这次），
+    // 且绝不落出动作错误
+    expect(onLoadChildren).toHaveBeenCalledTimes(2)
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('时间评审响应更新（更高 revision）时照常采纳：单调保护不得退化成忽略写响应', async () => {
+    let resolveReview!: (value: TaskItem) => void
+    const onLoadTask = vi.fn(async () => completedTask())
+    const onLoadChildren = vi.fn(async () => ({ items: [child()], next_cursor: null }))
+    const onTimeReview = vi.fn(() => new Promise<TaskItem>((resolve) => { resolveReview = resolve }))
+    const wrapper = mount({
+      taskId: TASK_ID,
+      initialTask: { ...heldTask, view_scope: 'full', counts: { ...zeroTaskCounts(), held: '1' } },
+      initialChildren: [child()],
+      refreshToken: 0, isAdmin: true, onLoadTask, onLoadChildren, onTimeReview,
+    })
+    await fireEvent.click(screen.getByLabelText(name('task.timeReview.evidence.reference_deadline_proven')))
+    await fireEvent.click(screen.getByRole('button', { name: name('task.held.reviewResumeOriginalDeadline') }))
+    await wrapper.rerender({ refreshToken: 1 })
+    await waitFor(() => expect(screen.getByTestId('task-revision').textContent).toContain('9'))
+
+    // 服务端评审结果的 revision 更高：这是权威最新事实，必须照常采用（只拦严格更旧）
+    resolveReview({ ...heldTask, state: 'completed', outcome: 'partial', revision: '10', counts: zeroTaskCounts() })
+    await flush()
+    await waitFor(() => expect(screen.getByTestId('task-revision').textContent).toContain('10'))
+  })
+})

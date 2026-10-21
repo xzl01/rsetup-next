@@ -290,4 +290,68 @@ describe('DevicesView pagination, projection and permissions', () => {
     await new Promise(r => setTimeout(r, 50))
     expect(onPageLoaded).not.toHaveBeenCalled()
   })
+
+  it('parentGeneration 变更作废在途分页后必须复位 loadingMore，「加载更多」不得永久 disabled', async () => {
+    // 缺陷回归（审查 P2）：abortPendingLoadMore 递增 paginationGeneration 后，
+    // loadMore 的 finally 因 currentGen !== paginationGeneration 不再复位 loadingMore，
+    // 按钮停在 aria-busy/disabled，用户永远翻不了下一页。
+    interface Pending {
+      signal: AbortSignal | null
+      resolve: (value: Response) => void
+    }
+    const pending: Pending[] = []
+    const fetchSpy = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (!url.includes('cursor=')) throw new Error(`Unexpected url ${url}`)
+      let resolve!: (value: Response) => void
+      const promise = new Promise<Response>((res) => { resolve = res })
+      pending.push({ signal: init?.signal ?? null, resolve })
+      return promise
+    })
+    vi.stubGlobal('fetch', fetchSpy)
+
+    const page1: DeviceItem[] = [
+      { device_id: '1'.repeat(64), display_name: 'Dev 1', effective_permissions: ['device.read'] },
+    ]
+    const { rerender } = render(DevicesView, {
+      props: {
+        initialDevices: page1,
+        initialNextCursor: 'c2',
+        parentGeneration: 1,
+      },
+      global: { provide: { i18n } },
+    })
+
+    await fireEvent.click(screen.getByTestId('load-more-btn'))
+    expect(pending).toHaveLength(1)
+    const firstButton = screen.getByTestId('load-more-btn') as HTMLButtonElement
+    expect(firstButton.disabled).toBe(true)
+
+    // 父级代际切换（SSE 接管 / 授权变更 / 首屏投影替换）：作废在途分页
+    await rerender({
+      initialDevices: page1,
+      initialNextCursor: 'c2',
+      parentGeneration: 2,
+    })
+
+    expect(pending[0]!.signal?.aborted).toBe(true)
+    const afterAbort = screen.getByTestId('load-more-btn') as HTMLButtonElement
+    expect(afterAbort.disabled).toBe(false)
+    expect(afterAbort.getAttribute('aria-busy')).not.toBe('true')
+
+    // 迟到的旧页即使落地也不追加成员（代际已推进）
+    pending[0]!.resolve(new Response(JSON.stringify({
+      data: {
+        items: [{ device_id: '2'.repeat(64), display_name: 'Dev 2', effective_permissions: ['device.read'] }],
+        next_cursor: null,
+      },
+      request_id: '12345678-1234-4234-8234-123456789abc',
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    await new Promise(r => setTimeout(r, 20))
+    expect(screen.queryByText('Dev 2')).toBeNull()
+
+    // 复位后的按钮必须真的能再发起一次分页（旧缺陷下这里永远不会产生第二条请求）
+    await fireEvent.click(screen.getByTestId('load-more-btn'))
+    await vi.waitFor(() => expect(pending).toHaveLength(2))
+  })
 })
