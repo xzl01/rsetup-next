@@ -53,20 +53,20 @@
 
 MySQL 侧表现为 120s 级挂起（sqlx 池对 `after_connect` 失败反复重建连接），TiDB 侧表现为快速失败（`task4_fixture_operation_failed`），两者根因同一前置。
 
-### 4.2 TiDB 两个 legacy 升级挂起——待定位的真实缺陷
+### 4.2 TiDB 两个 legacy 升级挂起——已定位并加有界保护，仍超时未闭环
 
 用例：`partial_v1_column_is_resumed_only_by_explicit_command`、`tidb_legacy_v2_to_v3_positive_single_case`。
 
-实测证据：
+**定位过程（临时埋点，已移除）**：
 
-- 直接执行 `migrate-identity-test --mode upgrade`（partial-v1 夹具之后）**90s 未返回**；
-- 同时 TiDB 侧 `information_schema.DDL_JOBS` 显示相关 `create table` / `modify column` 全部 `synced`，库内 11 张表已建成；
-- TiDB `PROCESSLIST` 无该进程的活跃查询，说明挂起发生在**本地等待**而非数据库执行；
-- 同样路径在 MySQL 上 1.5s 内 PASS，`legacy_v1` 与 `legacy_mixed` 在 TiDB 上也 PASS。
+1. 直接执行 `migrate-identity-test --mode upgrade`（partial-v1 夹具之后）**90s 未返回**；
+2. 同时 TiDB 侧 `information_schema.DDL_JOBS` 显示相关 `create table` / `modify column` 全部 `synced`，库内 11 张表已建成；
+3. 在 `upgrade_legacy_with_probe` 与 `preflight_legacy_with_probe` / `validate_schema_shape_with_policy` 逐阶段插桩后确认：挂起发生在**某次 `information_schema` 元数据查询**（`SELECT ... FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name=?` 一类），且挂起点随运行漂移（alter 3 / alter 5 / `device_groups` 列读取等），属时间相关而非固定位置；
+4. 用 `pymysql` 独立连接手动执行同样的 6 条 `ALTER TABLE ... MODIFY COLUMN`，每条后立即查询 `information_schema.columns`：全部 0.02s 返回。**说明 TiDB 元数据本身可用，问题出在迁移进程经 sqlx 连接池连续 DDL 后的查询路径**。
 
-初判：`upgrade_legacy_with_probe` 在 v2 与 partial-v1 形态下的某个 `preflight`/`alter` 往返后停止推进，具体停点需插桩定位（下一轮：在每个 `probe.alter` / `probe.preflight` 前后输出阶段标记，观察最后完成阶段）。
+**已落地的保护（提交 `be339e8`）**：`preflight_with_retry` 以 3s 单次超时、120 次上限、500ms 退避做探测式重试；超限返回明确 `preflight timeout` 错误，把「无限挂起」变成有界失败，绝不把超时当成功。
 
-**当前状态：未闭环，如实记为失败，不计入通过。**
+**当前状态**：MySQL 同路径实测无回归（1.5s 内通过）；TiDB 在 280s 内仍未完成（重试能让进度继续推进，但每次元数据查询阻塞可达数十秒）。该实例的元数据查询不稳定属环境侧，**本项仍未闭环，如实记为失败，不计入通过**。
 
 ## 5. 未纳入本轮的用例
 
