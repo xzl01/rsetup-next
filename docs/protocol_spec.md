@@ -111,7 +111,7 @@
   0                   1                   2                   3
   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
- |          Magic (0x5345, 2B)   |   Ver (0x02)  |  FrameType(1B)|
+ |          Magic (0x5345, 2B)   |   Ver (0x03)  |  FrameType(1B)|
  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
  |                        Payload Length (4B)                    |
  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -119,7 +119,7 @@
  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 * **Magic**：固定 `0x53,0x45`（ASCII "SE"）。
-* **Ver**：`0x02`。本版增加审批阶段握手级 ping-pong；与 `0x01` 不兼容，双方不得自动降级，收到旧版本立即拒绝。最外层 Magic 保持不变；本次设计只定义变更，未实现代码。
+* **Ver**：`0x03`。v3 首帧遇 0x02 即断开且不自动降级；与 `0x01`/`0x02` 均不兼容，双方不得自动降级，收到旧版本或未知版本立即拒绝并断开 TCP。同一及新 TCP 不自动回退。最外层 Magic 保持不变。
 * **FrameType**：
   * `0x01`: `CLIENT_HELLO`
   * `0x02`: `SERVER_CHALLENGE`
@@ -143,7 +143,7 @@
   * 明文 ping-pong 仅作连通性提示，没有认证中控或批准设备的效力；主动中间人仍可能伪造未签名的挂起通知。客户端只有验证最终签名后才能进入加密业务阶段，保活不能提升信任或改变授权。
 
 
-### 4.2 握手消息 Protobuf 定义
+### 4.2 握手消息 Protobuf 定义与严格 wire 校验
 ```protobuf
 syntax = "proto3";
 
@@ -180,21 +180,40 @@ message ServerAuthResponse {
 }
 ```
 
-### 4.3 签名输入字节布局
-签名输入按以下顺序直接拼接，**无长度前缀**、无填充。
+* **严格 wire 校验契约**：
+  * **逐条审计范围**：接收侧必须从**接收到的原始帧字节**出发，对 `ClientHello`、`ServerChallenge`、`ClientAuthRequest`、嵌套 `DeviceDescriptor`、`ServerAuthResponse`、`ServerPending`、`PendingPong` **逐条**执行严格审计；不得先做宽松解析、再依赖业务字段校验兜底，也不得只对顶层消息审计而放行嵌套结构。
+  * 接收侧在处理握手消息时，严格拒绝未知字段、已知字段重复、非最短 varint、错误 wire type 与非法 UTF-8；其中非最短 varint 同时覆盖**字段 key varint、长度前缀 varint 与整数值 varint**；同样拒绝非法长度（声明长度越过 Payload 尾、与帧头 `Payload Length` 不符或嵌套长度自相矛盾）、错误 wire type、**未消费的尾随字节**与非法枚举组合。
+  * 必要 bytes/公钥（32B）、签名（64B）、descriptor 各恰一次；
+  * 缺失的 proto3 scalar 缺省值按 0 严格解释，不将缺省推导为另一状态；
+  * 任何不符合上述严格 wire 契约的帧直接关闭 TCP 连接。
+  * **审计先于副作用**：上述严格审计完全通过之前，不得创建或更新任何准入记录、不得触发审批流程、不得向 h2c 或业务层交付任何握手结果或明文；审计失败的帧不进入任何状态机迁移。
+* **`descriptor_raw` 提取规则**：
+  * 签名所引用的 `descriptor_raw` 只能是 `CLIENT_AUTH_REQUEST` Payload 内 `device_descriptor` length-delimited 嵌套消息的**内容原字节**（不含外层 key/长度 varint/帧头）；
+  * 客户端只编码一次并保留，服务端从原始帧中截取该原字节用于验签与业务解析，禁止服务端重编码后验签；
+  * 长度前缀使用 `BE32(descriptor_raw_len)`，长度必须严格等于截取的原字节数。
+
+### 4.3 签名输入字节布局与状态语义
+签名输入采用带版本标识的显式域分离前缀，按以下顺序原样连续拼接，除明确标出的 `BE32` 外不添加隐含前缀或填充：
 
 1. **客户端签名输入**（使用板端 Ed25519 长期私钥签名）：
    ```text
-   client_random (32B) || server_random (32B) || client_x25519_eph_pub (32B) || device_descriptor_wire_bytes
+   ClientSignInput = ASCII("rsetup-next/client-auth/v3") || 0x00 || 0x03
+     || client_random(32) || server_random(32)
+     || client_ed25519_pub(32) || client_x25519_eph_pub(32)
+     || BE32(descriptor_raw_len) || descriptor_raw
    ```
-   * 其中 `device_descriptor_wire_bytes` = 帧内 `DeviceDescriptor` 的 Protobuf 序列化字节原样。客户端只序列化一次：帧内携带字节与签名输入字节必须完全一致，服务端不得重新序列化（须按帧内字节原样验签）。
 2. **服务端签名输入**（使用中控端 Ed25519 长期私钥签名；覆盖板端全部认证数据，使批准/拒绝结果与具体板端密码学绑定）：
    ```text
-   server_random (32B) || client_random (32B) || client_ed25519_pub (32B) || client_x25519_eph_pub (32B) || device_descriptor_wire_bytes || server_x25519_eph_pub (32B) || status (1B)
+   ServerSignInput = ASCII("rsetup-next/server-auth/v3") || 0x00 || 0x03
+     || server_random(32) || client_random(32)
+     || client_ed25519_pub(32) || client_x25519_eph_pub(32)
+     || BE32(descriptor_raw_len) || descriptor_raw
+     || server_x25519_eph_pub(32) || status(1B) || BE32(reason_code)
    ```
-   * `client_ed25519_pub`、`client_x25519_eph_pub`、`device_descriptor_wire_bytes` 均取 `CLIENT_AUTH_REQUEST` 帧内携带值原样（其中 `device_descriptor_wire_bytes` 与第 1 条板端签名输入所用字节一致）；
-   * 板端用自身发送的字段与收到的 `SERVER_AUTH_RESPONSE` 字段重建期望签名输入后验签：中控端若未针对本板端认证数据签名，验签必然失败；
-   * `REJECTED` 时 `server_x25519_eph_pub` 为全零（与消息体内全零占位一致）；`status` 为 1 字节（0 = APPROVED, 1 = REJECTED）。
+   * 签名输入中 `status` 为恰一字节（0 或 1），`reason_code` 是语义 uint32 的恰 4 字节大端整数（`BE32(reason_code)`），**不是** Protobuf 的 wire varint；
+   * APPROVED(status=0) 必须 reason_code=0，且 `server_x25519_eph_pub` 恰 32B 并满足 §4.4 X25519 共享密钥非零约束；
+   * REJECTED(status=1) 的临时公钥为 32B 全零，`reason_code` 仅限合法枚举：`0=UNSPECIFIED, 2=REVOKED, 3=APPROVAL_DENIED, 4=HANDSHAKE_TIMEOUT（仅相应握手步超时）, 5=SERVER_ERROR`；枚举 `1=SIGNATURE_INVALID` 虽定义但在 v3 中绝不作为发出值；
+   * 任何非法的 status/reason_code/公钥组合直接断开 TCP 连接。
 3. **重放防护**：`server_random` 为每会话新鲜值并绑定进双方签名，因此跨会话重放握手帧必然验签失败。
 
 ### 4.4 X25519 约束
@@ -208,42 +227,43 @@ message ServerAuthResponse {
           | 1. TCP Connect                                        |
           |------------------------------------------------------>|
           |                                                       |
-          | 2. CLIENT_HELLO (client_random, 32B)                  |
+          | 2. CLIENT_HELLO (v3, client_random, 32B)              |
           |------------------------------------------------------>|
           |                                                       |
-          | 3. SERVER_CHALLENGE (server_random, 32B)              |
+          | 3. SERVER_CHALLENGE (v3, server_random, 32B)          |
           |<------------------------------------------------------|
           |                                                       |
           | [本地准备] 生成临时 X25519 密钥对 (c_eph_pri, c_eph_pub)  |
           |    按 §4.3 布局以板端 Ed25519 私钥签名                 |
-          | 4. CLIENT_AUTH_REQUEST                                |
+          | 4. CLIENT_AUTH_REQUEST (v3)                           |
           |       - client_ed25519_pub (32B)                      |
           |       - client_x25519_eph_pub (32B)                   |
           |       - device_descriptor (SN, Model, FW, Extra)      |
           |       - signature (64B)                               |
           |------------------------------------------------------>|
-          |                                                       | 5. 校验板端签名
-          |                                                       |    失败 -> REJECTED (reason_code=1)
+          |                                                       | 5. 严格解析与校验板端签名
+          |                                                       |    客户端签名失败直接关闭 TCP，不发送 REJECTED(SIGNATURE_INVALID)
           |                                                       | 6. 按公钥查库 (同公钥过程加锁串行化):
           |                                                       |    REVOKED  -> REJECTED (reason_code=2)
           |                                                       |    APPROVED -> 批准
           |                                                       |    未录入   -> PENDING, 挂起连接, 触发审批
           |                                                       |
           |              [PENDING 分支：握手级 ping-pong]              |
-          | 7a. SERVER_PENDING (token, status_nonce, probe_seq)       |
+          | 7a. SERVER_PENDING (v3, token, status_nonce, probe_seq)   |
           |<------------------------------------------------------|
-          | 7b. PENDING_PONG (板端→中控，回显 token/status_nonce/probe_seq) |
+          | 7b. PENDING_PONG (v3, 回显 token/status_nonce/probe_seq)|
           |------------------------------------------------------>|
           |                                                       |
-          |              [审批结果]          |
-          | 7c. SERVER_AUTH_RESPONSE                              |
+          |              [审批结果: 具备完整已验签上下文]           |
+          | 7c. SERVER_AUTH_RESPONSE (v3)                         |
           |       - status = 0 (APPROVED) / 1 (REJECTED)          |
           |       - reason_code (仅 REJECTED 有效)                 |
           |       - server_x25519_eph_pub (REJECTED 时全零占位)    |
           |       - signature (64B)                               |
           |<------------------------------------------------------|
           |                                                       |
-          | 8. 校验中控端签名 (匹配可信中控公钥列表)                 |
+          | 8. 严格解析与校验中控端签名 (匹配可信中控公钥列表)        |
+          |    服务端签名失败直接关闭 TCP，不依据未认证 reason_code 停止重连
           |    APPROVED: 计算 X25519 共享密钥                      |
           |               HKDF 派生会话密钥                        |
           |    REJECTED: 见 §4.6 客户端行为                        |
@@ -260,6 +280,7 @@ message ServerAuthResponse {
 * **PENDING 挂起**：审批没有总期限；按 §4.1 的名义 5s 周期、10s pong 期限和客户端 15s 静默期限检测连接，不叠加总等待时限。超时仅关闭当前连接，保留最新持久准入决定，重连必须从新握手开始。
 * **审批与 probe 竞争**：按 §4.1 停止新 probe 并结清在途；最终接纳前复查当前代际和准入决定，延迟 pong 不得覆盖吊销。
 * **REJECTED 分支**：`status=1` 时 `server_x25519_eph_pub` 为全零占位；客户端验签后按 §4.6 的客户端行为处理。
+* **验签失败处理**：客户端签名失败直接关闭 TCP，不发送 REJECTED(SIGNATURE_INVALID)，不写永久未授权决定；服务端签名失败直接关闭 TCP，不依据未认证 reason_code 停止重连。
 * 任何非法帧类型、乱序、Magic/Ver 不匹配，双方均立即断开 TCP；握手阶段不在 HTTP/2 流中混入握手帧。
 
 ### 4.6 准入状态机
@@ -275,7 +296,7 @@ message ServerAuthResponse {
 1. **有界资源**：未认证连接、挂起连接、新身份记录分别限额，并限制全局及来源的握手速率。按公钥去重不防御攻击者生成大量不同公钥，因此即使验签通过，新身份入库也必须受容量约束。已接纳且健康的挂起连接不为容纳新连接而按等待时长驱逐；已接纳记录保留。
 2. **资源不足不是拒绝审批**：已具备完整认证上下文时返回签名 `REJECTED(reason=SERVER_ERROR)`，客户端退避重试；尚未具备该上下文时直接拒接/关闭 TCP，并按连接失败退避。不得用 `APPROVAL_DENIED` 或 `REVOKED` 表示过载，也不写入吊销决定；中控日志明确记录资源限额原因。
 3. **锁与连接代际**：验签、查库和连接登记的同公钥状态转换串行化，但等待人工审批、等待 pong 和网络写入不长时间持锁。新连接替换旧挂起连接后，旧连接的异步回调无权更改新连接状态；批准接纳与吊销需要按最新代际重新检查。
-4. **拒绝后的板端行为**：`REVOKED` 或 `APPROVAL_DENIED` 停止自动重连并置未授权；其他拒绝原因按 §7 退避重试。`APPROVAL_DENIED` 的持久记录及管理员重新开放申请流程仍需应用层细化，不与资源拒绝混用。
+4. **拒绝后的板端行为**：只有在收到通过合法签名的 `REVOKED` 或 `APPROVAL_DENIED` 时才停止自动重连并置未授权；其他拒绝原因按 §7 退避重试。`APPROVAL_DENIED` 的持久记录及管理员重新开放申请流程仍需应用层细化，不与资源拒绝混用。
 5. **审批界面边界**：应用设计建议提供按明确公钥清单的批量审批，不能仅依赖 IP 或序列号自动信任。公钥预录入为后续可选能力，不是本协议的隐式准入路径。
 
 数据持久化边界：以板端公钥为主键保存准入状态、最后活跃时间及状态代际等；具体表结构、审批 API/UI 和多设备管理见[中控应用设计 §5](superpowers/specs/2026-09-22-controller-design.md)。
@@ -310,7 +331,7 @@ message ServerAuthResponse {
  |       Record Length (4B, BE)  |   AES-256-GCM 密文 + 16B Tag  |
  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
-* **Record Length**（4B，大端）= 其后密文字节数（含 16B GCM Tag）；**单记录上限 64KiB（密文+Tag）**。
+* **Record Length**（4B，大端）= 其后密文字节数（含 16B GCM Tag）；有效长度必须严格满足 **16 ≤ Record Length ≤ 65536（含 16B tag）**，即**单条记录体（密文 + 16B Tag）上限为 65536 字节**。允许 16B 零明文记录（恰含 16B Tag，明文 0 字节）；接收方必须先校验长度和缓冲预算再分配，**接收未完成缓冲区上限为 65540 字节（4B 长度前缀 + 最大 65536 字节记录体）**，接收缓冲超限立即致命关闭整条 TCP；长度 `<16` 或 `>65536` 直接判定致命错误。
 * **Nonce 生成**：
   * 发送方独立维护单调自增计数器 `TxSeq`（uint64，初值 0，每发一记录 +1）；
   * Nonce 前 4 字节 = IV_Base 前 4 字节；
@@ -319,10 +340,14 @@ message ServerAuthResponse {
     $$\text{Nonce}[4:12] = \text{IV\_Base}[4:12] \oplus \text{BE64}(\text{TxSeq})$$
 * **AAD 保护**：
   * $\text{AAD} = \text{Record Length (4B)} \parallel \text{BE64}(\text{SeqID})$（共 12B），防止长度字段与计数器位置被篡改。其中 `SeqID` 为**当前记录所对应序号的 64 位值**（即参与该记录 Nonce 构造的同一计数值）：发送方填入其 `TxSeq`，接收方用当前期望的 `RcvSeq` 重建 AAD 参与校验。
-* **接收端规则**：
-  * 接收方维护 `RcvSeq`（初值 0），用当前 `RcvSeq` 重建期望 Nonce 进行 GCM 校验；
-  * 仅当校验通过后 `RcvSeq += 1`；校验失败的记录丢弃且计数器不自增；
-  * 由此本会话内重放旧记录必然因 Nonce 错位导致 Tag 校验失败。
+* **发送端串行化与 `TxSeq` 推进**：发送端在**每个方向独立且串行化**地执行记录加密与写出，同一方向不得并发交错写出两条记录；必须在**整条记录完整成功写出**（长度字段与密文+Tag 全部经传输层确认发出）之后才推进 `TxSeq`。部分写入，或任何无法确认整条记录已完整写出的情形，均直接关闭整条 TCP 并失效双向 key/IV/seq/缓冲；已加密但未确认写出的记录，其 key/nonce 一律不得复用或在重连后重放。
+* **序号末值与平滑收尾**：`TxSeq`/`RcvSeq` 均为 uint64，序号 0..2^64-2 是唯一有效范围，严禁回绕；发送方在发出序号 `2^64-2` 的记录后必须主动平滑关闭整条 TCP，不再发送任何记录；接收方一旦收到序号 `2^64-1` 立即终止连接。
+* **接收端规则与致命错误处理**：
+  * 接收方维护 `RcvSeq`（初值 0，按期望序号严格递增，禁止回绕，收到 `2^64-1` 立即终止）；
+  * **记录部分帧有界读取 deadline**：由单调时钟计时，**从该记录帧第一个字节到达的第一瞬时（含尚不完整的 4B 长度字段）或发送端写入阻塞出现的第一瞬时起算，单调 deadline 为 30,000ms（30s）**；绝不使用墙钟，排队、重试或系统调用返回 `EINTR` 等都不暂停计时；
+  * 发送部分写入即关闭整条 TCP；错误 tag 或 AAD 即关闭整条 TCP；
+  * **交付前校验**：整条记录的认证（Record Length、GCM Tag 与 AAD）完全通过之前，不得向 h2c/业务层交付任何明文；失败记录不交付明文、不增加 RcvSeq，且不在原连接重同步；
+  * 任何截断、超时、tag 校验失败、序号耗尽均为连接级致命故障，立即终止整条 TCP 连接，使双向连接密钥、IV、序号、接收缓冲与 h2c 全部流状态失效，不在原连接尝试后续帧解析、补发或扫描帧头重同步。
 
 ---
 
@@ -343,7 +368,6 @@ service TunnelService {
 
 ### 6.3 流路由规则
 两种流共用同一 `TunnelPacket` 信封结构（见 §6.4），路由规则如下：
-
 * `TYPE_SYSTEM` 仅允许在控制流上发送，且只用于 `tunnel.kick` / `tunnel.revoke`；`tunnel.ping` 不得使用 `TYPE_SYSTEM`；
 * `TYPE_REQUEST`/`TYPE_RESPONSE` 可在任一流发送；`RESPONSE` 必须回到与其 `REQUEST` 相同的流，并保持同 action、同 trace_id；
 * `TYPE_EVENT` 可在任一流发送，不回包；高频事件优先走数据流；
@@ -379,7 +403,6 @@ message TunnelPacket {
 ```
 
 信封字段约束：
-
 * 序列化后整包 **≤512KiB**；gRPC 收发最大消息尺寸均配置为 **1MiB**；
 * `action`：小写字母/数字/点分隔（如 `tunnel.kick`），长度 **≤64B**；`tunnel.kick`、`tunnel.revoke` 仅作 `TYPE_SYSTEM` 信令，`tunnel.ping` 仅作双流应用 `TYPE_REQUEST`/`TYPE_RESPONSE` 探测；其他业务 action 不得使用 `tunnel.` 前缀；
 * `metadata`：**≤16 项**，key **≤64B**，value **≤256B**；
@@ -404,7 +427,7 @@ message TunnelPacket {
 
 ### 6.6 流级与连接级故障处理
 
-* 连接级致命错误（非优雅 GOAWAY、HTTP/2 错误或连接死链）→ 关闭 TCP、失败结清该代际全部未决请求、按 §7 退避重连并重新握手。多个故障结果合并处理，不重复清理或启动多条重连循环。
+* 记录层致命错误关闭整个 TCP 并结清当前连接代际所有流的未决请求。非优雅 GOAWAY、HTTP/2 错误或连接死链同样触发整条 TCP 关闭并失败结清。按 §7 退避重连并重新完整 v3 握手。多个故障结果合并处理，不重复清理或启动多条重连循环。
 * 单流 `RST_STREAM` 或 §6.7 的应用探测失败 → 仅关闭该流并结清该流未决请求，另一流不自动判坏。板端作为 gRPC 发起方负责重开原类型的流；中控通过 `RST_STREAM` 触发，不能反向调用 RPC 创建替代流。
 * 初次开流/重开建立的等待期限为 15s；建立后立即发首个应用 probe，首次健康确认期限为该 probe 的 15s。打开失败或未通过首次健康确认算一次重开失败，连续 3 次才升级为连接级重建。各端只有收到本端首次 probe 的有效 pong 后才重置该流重开失败计数，不能仅因 RPC 打开成功重置；任一端认为失败均可终止该流。
 * 重开后分配新流代际，旧流响应、定时器和排队消息不能作用于新流。未完成的业务操作不能因重开流而自动重放，是否核实结果由业务协议决定。
@@ -447,7 +470,7 @@ message TunnelPacket {
 2. **死链快速检测 (Keepalive)**：
    * HTTP/2 `PING`/`ACK` 连接级保活和双流应用 `tunnel.ping` 探测分别按 §6.7.1 与 §6.7.2 执行；运行期连续失败与重开流的首次健康确认规则按 §6.6 处理，不把连接健康当成业务成功。
 3. **退避重连与连接排他**：
-   * **重连退避**：板端断线后执行指数退避重连（1s, 2s, 4s, …，上限 60s），每次在退避值上附加 **[0,1s) 均匀随机抖动**，避免服务端网络抖动时的重连风暴。
+   * **重连退避**：板端断线后执行指数退避重连（1s, 2s, 4s, …，上限 60s），每次在退避值上附加 **[0,1s) 均匀随机抖动**，避免服务端网络抖动时的重连风暴。使用新 TCP、新完整 v3 握手、新随机数和新临时密钥，旧 key/seq/PENDING token 绝不复用；不自动重放可能已执行的设备变更或重启，由持久任务恢复与核查链路处理。
    * **单连接排他（抢占式）**：中控检测到同公钥新连接完成准入后，先在旧连接控制流发送 `TYPE_SYSTEM` "tunnel.kick"（若旧流仍可用），**延迟 500ms 后关闭旧 TCP**，保障同一公钥仅存一条活跃连接。
 4. **踢出与吊销信令**：
    * **临时踢出 (Kick)**：中控下发 `type = TYPE_SYSTEM`，`action = "tunnel.kick"`，随后关闭 TCP。板端按退避重连。
@@ -457,8 +480,9 @@ message TunnelPacket {
 
 ## 8. 一致性测试与验收
 
-1. 握手各消息须提供跨实现 test vectors（含验签、HKDF 派生、Nonce 构造的固定输入输出）；Ver `0x01` 必须拒绝且不得自动降级，Magic 保持不变。
+1. 双端固定数值向量：握手各消息须提供跨实现 test vectors（含双域签名转录、HKDF 派生、Nonce 构造、16B 零明文记录的固定输入输出）；须覆盖 Record Length **合法边界 16B 与 65536B**、**越界边界 15B 与 65537B**、**AAD 篡改**、**重放**、**乱序**与**序号耗尽**（`2^64-2` 末值与 `2^64-1` 非法值）的固定输入及期望错误分类，并覆盖**跨 Protobuf 库解析器一致性差异**——不同运行时/版本对未知字段、已知字段重复、非最短 key/length/integer varint、错误 wire type、非法 UTF-8、非法长度与未消费尾随字节的接受/拒绝结果必须逐项一致；Ver `0x01` 与 `0x02` 必须拒绝且不得自动降级，Magic 保持不变。
 2. 握手解析器与记录层解析器必须通过 fuzz 测试（畸形帧、超长长度、乱序、重放记录）；覆盖 `SERVER_PENDING`/`PENDING_PONG` 的 token、status_nonce、probe_seq 匹配、单连接单在途和 10s 步超时，验证超时断线后 PENDING 记录保留。
 3. 双端实现必须通过双流路由规则与流故障处理的互操作测试：两条流均发送/响应 `tunnel.ping`，类型为 `TYPE_REQUEST`/`TYPE_RESPONSE`，同 action、trace_id、流和 16B nonce；验证有业务与空 OpenData 都探测，3 个 15s 窗口失败只重开流，升级条件和连接级 PING/ACK 分层一致。
-4. 容量测试覆盖约 1024 台设备、未认证/挂起按来源与全局配额、审批等待锁外、按公钥去重持久化和批量明确选钥；验证超限为明确资源拒绝，不因未知随机身份无限增库。
-5. 覆盖审批等待超过原有总期限仍健康保留、审批决定与在途 pong 竞争、超限拒接可退避重连、客户端静默检测、旧流响应与探测 nonce 不匹配、发送队列阻塞和墙钟回跳；协议计时不因 NTP 恢复改变。中控 NTP、备份和界面验收另见[中控应用设计 §13](superpowers/specs/2026-09-22-controller-design.md)。
+4. 两进程负向互操作：真实中控与真实板端独立进程间测试坏签名、篡改拒绝原因、版本协商回退拒绝、记录层 15B 截断/65537B 越界/坏 tag 致命终止及重连新密钥生成；另须注入 **30s 部分帧读取/写入阻塞 deadline 超时**、**发送端部分写入与整条记录写出结果不确定**、接收缓冲超 65540 字节（4B 长度前缀 + 最大 65536 字节记录体）、**重放与乱序记录**、**序号耗尽后的主动平滑关闭及 `2^64-1` 立即终止**、**零明文（16B）记录的交付**，以及**跨 Protobuf 库解析器一致性差异**导致的握手拒绝；每项均须观察到整条 TCP 被关闭、失败记录零明文交付、双向 key/IV/seq 全部失效，且重连使用全新握手与新密钥。库内 fake、同进程桩或单 crate 单元测试不构成此处的网络证据。
+5. 容量测试覆盖约 1024 台设备、未认证/挂起按来源与全局配额、审批等待锁外、按公钥去重持久化和批量明确选钥；验证超限为明确资源拒绝，不因未知随机身份无限增库。
+6. 覆盖审批等待超过原有总期限仍健康保留、审批决定与在途 pong 竞争、超限拒接可退避重连、客户端静默检测、旧流响应与探测 nonce 不匹配、发送队列阻塞和墙钟回跳；协议计时不因 NTP 恢复改变。中控 NTP、备份和界面验收另见[中控应用设计 §13](superpowers/specs/2026-09-22-controller-design.md)。

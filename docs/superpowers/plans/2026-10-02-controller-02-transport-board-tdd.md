@@ -11,8 +11,8 @@
 **Spec:** `docs/superpowers/specs/2026-09-22-controller-design.md`、`docs/superpowers/specs/2026-09-23-controller-v1-00-index.md`、`docs/superpowers/specs/2026-09-23-controller-v1-02-data-api.md`、`docs/superpowers/specs/2026-09-23-controller-v1-03-device-protocol.md`、`docs/superpowers/specs/2026-09-23-controller-v1-04-task-lifecycle.md`、`docs/superpowers/specs/2026-09-23-controller-v1-05-runtime-operations.md`、`docs/protocol_spec.md`、`crates/rsetup-core/src/lib.rs`、`Cargo.toml`。
 
 ## Global Constraints
-- **安全生产阻断：** reason_code未签名覆盖、验签失败描述冲突、AEAD tag失效后终止未定。不可擅选密码布局；协议修订审查、双方实现审查与双端测试完成前不得交付生产/宣称安全，不可忽略安全测试。
-- v1不得自动降级v2；握手payload≤16KiB、record密文+tag≤64KiB、信封≤512KiB，gRPC1MiB是待验证建议。
+- **安全生产阻断：** 协议 v3 文本规范已消除 reason 未签、验签失败动作与 AEAD 失败终止三大文本缺口；但在双方实现审查、真实独立固定向量与两进程负向互操作完成前，实现与生产发布仍严格保持 BLOCKED。不可擅选密码布局；实现审查、真向量与双端负向互操作未完成前不得交付生产/宣称安全，不可忽略安全测试。
+- 握手 Ver=0x03；业务 schema_version=1；握手 v3 不得自动降级握手 v2（含新 TCP），业务 schema_version=1 不接受未知业务版本；握手payload≤16KiB、record密文+tag≤64KiB、信封≤512KiB，gRPC1MiB是待验证建议。
 - 两流双端均主动`tunnel.ping`：TYPE_REQUEST/TYPE_RESPONSE、raw16B nonce，同action/trace/流/代际。业务存在及空闲OpenData均probe。HTTP2 PING/ACK、应用probe、硬件结果不同。
 - 健康PENDING无人工审批总TTL；握手5s名义、pong10s、客户端静默15s与流15s窗口分离，均单调时钟。资源有界、超限不误记REVOKED/APPROVAL_DENIED；等待审批/I/O锁外、旧代际回调无效。
 - 远端白名单仅capabilities/status/clock/task.get、reboot.prepare/execute、task.result事件；绝不暴露现有单板HTTP危险动作、任意shell/命令、配置写入、关机/升级/分发。
@@ -46,12 +46,20 @@
 
 ## Task 2：握手与准入
 **Files:** `proto/handshake.proto`、`src/{frame,admission}.rs`、`tests/{frame_sequences,admission_state}.rs`、`fuzz/{Cargo.toml,fuzz_targets/frame_decoder.rs}`。
-**Interfaces:** `FrameDecoder::push`、`AdmissionSnapshot`/`AdmissionStore::{load,compare_and_set}`、`AdmissionDecision`；SE/v2/BE长度/16KiB/严格序列；PENDING token/status_nonce/probe_seq严格匹配。新身份 PENDING+none，人工拒绝 PENDING+denied，吊销 REVOKED+revoked；按公钥和expected_revision/旧状态及决定CAS，不把denied合并到Revoked，也不把已拒绝视为新身份。
+**Interfaces:** `FrameDecoder::push`、`AdmissionSnapshot`/`AdmissionStore::{load,compare_and_set}`、`AdmissionDecision`；SE/v3/BE长度/16KiB/严格序列；**规范§4.2严格raw wire契约**：从接收到的原始帧对`ClientHello`/`ServerChallenge`/`ClientAuthRequest`/嵌套`DeviceDescriptor`/`ServerAuthResponse`/`ServerPending`/`PendingPong`逐条审计未知字段、已知字段重复、非最短key/length/integer varint、错误wire type、非法长度、未消费尾随字节与非法UTF-8，缺失proto3 scalar按0严格解释，审计通过前不得创建准入记录或交付业务；PENDING token/status_nonce/probe_seq严格匹配。新身份 PENDING+none，人工拒绝 PENDING+denied，吊销 REVOKED+revoked；按公钥和expected_revision/旧状态及决定CAS，不把denied合并到Revoked，也不把已拒绝视为新身份。
 - [ ] 红测试：
 ```rust
 #[test] fn rejects_old_version_and_resource_misclassification() {
     assert_eq!(FrameDecoder::default().push(&v1_hello()), Err(ProtocolError::UnsupportedVersion(1)));
     assert_eq!(classify_new_identity(IdentitySlot::CapacityExhausted), AdmissionDecision::RetryableServerError); // ADM-01：资源耗尽不记denied/revoked
+}
+#[test] fn rejects_v2_and_mixed_version_without_any_downgrade() {
+    assert_eq!(FrameDecoder::default().push(&v2_hello()), Err(ProtocolError::UnsupportedVersion(2)));
+    // 混合版本：同一条TCP上新帧首帧为v2、或握手过程中混发v1/v2/v3帧，均立即断开且绝不回退协商
+    let mut f = FrameDecoder::default();
+    assert!(f.push(&v3_hello()).is_ok());
+    assert_eq!(f.push(&v2_challenge()), Err(ProtocolError::UnsupportedVersion(2)));
+    assert_eq!(f.downgrade_offered(), None); // 拒绝且无降级：不得发出任何降级协商帧
 }
 #[test] fn denied_identity_stays_denied_across_reconnect() {
     let mut f = AdmissionFixture::pending_none();
@@ -61,6 +69,7 @@
     assert!(f.cas_review_approved(denied.revision - 1).is_conflict());
 }
 ```
+红测试须覆盖Task 4 Step 2要求的**严格raw wire用例**：`v1_hello()`、`v2_hello()`与v3/v2/v1混合帧均判`UnsupportedVersion`并关闭TCP、不产生任何降级通道或回退重试（拒绝且无降级）；另对规范§4.2逐条构造raw字节负例（未知字段、已知字段重复、非最短key/length/integer varint、错误wire type、非法长度、未消费尾随字节、非法UTF-8，以及缺失proto3 scalar按0解释后的合法/非法组合），断言严格审计通过前不创建准入记录、不触发审批、不交付业务。
 `AdmissionFixture` 是未来 `admission_state` 测试契约：同一公钥内存持久store，可设置 PENDING+none、提交 CAS、断线重新调用握手判定并查看最新revision/决定；不是现成API。上述测试先使断言因缺少拒绝判定/CAS代际检查而失败，不能用缺类型/编译失败替代RED。
 - [ ] 失败：`cargo test -p rsetup-protocol --test frame_sequences && cargo test -p rsetup-protocol --test admission_state`，分别确认行为断言失败。
 - [ ] 实现：
@@ -78,8 +87,8 @@ pub fn classify_new_identity(slot: IdentitySlot) -> AdmissionDecision {
 
 ## Task 3：认证与密钥协商（安全阻断）
 **Files:** `src/crypto.rs`、`tests/{crypto_vectors,handshake_interop}.rs`、获批后依赖。
-**Interfaces:** `IdentitySigner`、`SignatureVerifier`、`EphemeralKeyAgreement`、`HandshakeTranscript`；库和reason_code布局未定。
-- [ ] 红测试（仅使用修订审查提供的向量；下方测试体与向量随修订统一，当前暂定，若修订选择不同修法须同步调整测试体）：
+**Interfaces:** `IdentitySigner`、`SignatureVerifier`、`EphemeralKeyAgreement`、`HandshakeTranscript`；**签名转录布局已由协议 v3 文本定义为显式握手 `Ver=0x03` 与双域精确转录**（`ClientSignInput`/`ServerSignInput` ASCII 域前缀 || 0x00 || 0x03，`BE32(descriptor_raw_len)||descriptor_raw`，服务端侧含 `status(1B)||BE32(reason_code)`），reason 已被签名覆盖、不再存在“未签”缺口；**密码库选型、双方实现审查与真实独立固定向量通过前，本 Task 3 实现保持 BLOCKED**。
+- [ ] 红测试（仅使用独立生成并复核的真实固定向量文件 `docs/superpowers/vectors/2026-10-03-tunnel-v3-wire-vectors.json`；该向量尚未由独立人员产出，未产出即停，不得自造或按本文示意实现）：
 ```rust
 #[test] fn changing_rejection_reason_invalidates_signature() {
     let v = approved_protocol_vectors::signed_rejection();
@@ -89,29 +98,33 @@ pub fn classify_new_identity(slot: IdentitySlot) -> AdmissionDecision {
 }
 ```
 向量不得自造。
-- [ ] 失败：`cargo test -p rsetup-protocol --test crypto_vectors`；签名布局已存在于`docs/protocol_spec.md`，修订是否覆盖reason_code未批，BLOCKED。
+- [ ] 真向量的解析器一致性范围：真向量必须包含**至少两种彼此独立的 Protobuf 运行时（如 `prost` 与 Google 官方 `protobuf`）**在同一批原始字节上对**未知字段、已知字段重复、非最短 varint（字段 key、长度前缀与整数值）**接受/拒绝结果的一致性测试记录，逐例并排登记两侧运行时的实际结论与版本号；任一分歧即判整套向量不合格，本 Task 3 不得转 GREEN，也不得以单一运行时的自证代替。
+- [ ] 失败：`cargo test -p rsetup-protocol --test crypto_vectors`；签名域前缀、双域转录顺序、`BE32(reason_code)` 覆盖与合法 status/reason/公钥组合已在`docs/protocol_spec.md`§4.2/§4.3文本定稿，**reason 未签这一文本缺口已消除**；但密码库选型未批、独立固定向量未提交、双方实现审查未完成，本任务实现保持 BLOCKED，红测试只能因缺真实向量而报“未验证”，不得以示意 hex 换 GREEN。
 - [ ] 实现仅批准后：
 ```rust
 let input=transcript.approved_server_response_input(response)?;
 verifier.verify(key,&input,&response.signature).map_err(|_|HandshakeError::SignatureInvalid)
 ```
-两端按修订统一验签失败动作，握手前不启动h2c。
+两端按已定稿文本执行统一验签失败动作：**客户端或服务端验签失败均立即关闭整条 TCP，不发送`REJECTED(SIGNATURE_INVALID)`或任何诊断明文，不依据未认证`reason_code`置永久未授权**；验签与准入通过、握手前不启动h2c。
 - [ ] 通过：`cargo test -p rsetup-protocol --test crypto_vectors --test handshake_interop`；双端向量、重放、可信key、非法X25519点。
 - [ ] 重构/提交：记录修订/库review/双端证据，fmt+全测后提交`feat(protocol): implement reviewed handshake crypto`；未过门不生产。
 
 ## Task 4：AEAD record（失效策略阻断）
 **Files:** `src/record.rs`、`tests/record_layer.rs`、`fuzz/fuzz_targets/record_decoder.rs`、获批provider。
-**Interfaces:** `RecordEncoder::encode`、`RecordDecoder::decode`、方向独立序号，Nonce/AAD按修订，tag失效终止未定。
-- [ ] 红测试：`let r=tx.encode(b"frame")?; assert_eq!(rx.decode(&r)?,b"frame"); assert!(rx.decode(&tamper_length(r)).is_err());`，另测tag/重放；超限负例仅测record密文+tag>64KiB，信封整包>512KiB归Task 1 wire/业务层。
-- [ ] 失败：`cargo test -p rsetup-protocol --test record_layer`；终止策略未批保持BLOCKED。
+**Interfaces:** `RecordEncoder::encode`、`RecordDecoder::decode`、方向独立序号，Nonce/AAD按`docs/protocol_spec.md`§5.2定稿文本；**失效动作已在文本规范确定：任何`RecordError`（长度非法/截断/tag失效/序号耗尽）一律致命关闭整条TCP并失效双向key/seq**；双方实现审查与两进程负向互操作完成前实现仍保持 BLOCKED。
+- [ ] 红测试：`let r=tx.encode(b"frame")?; assert_eq!(rx.decode(&r)?,b"frame"); assert!(rx.decode(&tamper_length(r)).is_err());`，另测tag/AAD篡改、重放、乱序、序号`2^64-2`末值与`2^64-1`、30s部分帧deadline与发送部分写入；**每条负例的断言对象是“整条TCP连接被关闭且双向key/seq失效、失败记录零明文交付”，仅返回`RecordError`而连接继续存活不算GREEN**；长度边界正例16B与65536B、负例15B与65537B，超限负例仅测record密文+tag>64KiB，信封整包>512KiB归Task 1 wire/业务层。
+- [ ] 失败：`cargo test -p rsetup-protocol --test record_layer`；终止动作文本已定（连接级致命），但双方实现审查、真向量与两进程负向互操作未完成，保持BLOCKED，不得据此宣称记录层可用。
 - [ ] 实现：
 ```rust
-let frame = parse_bounded_record(bytes, MAX_CIPHERTEXT_PLUS_TAG)?;
+// 任何一步失败都必须冒泡为“连接级致命”，由调用方立即关闭整条TCP
+let frame = parse_bounded_record(bytes, MAX_CIPHERTEXT_PLUS_TAG)
+    .map_err(|_| RecordError::FatalConnection)?;          // 长度<16 / >65536 / 截断 / 缓冲超64KiB / deadline超时
 let plaintext = cipher.open(expected_nonce, &frame.aad, frame.ciphertext)
-    .map_err(|_| RecordError::AuthenticationFailed)?;
-rx_seq = rx_seq.checked_add(1).ok_or(RecordError::SequenceExhausted)?;
+    .map_err(|_| RecordError::FatalConnection)?;          // tag或AAD失效
+// 整条记录认证完全通过后，才允许向h2c/业务交付明文并推进序号
+rx_seq = rx_seq.checked_add(1).ok_or(RecordError::FatalConnection)?; // 序号耗尽同样致命
 ```
-仅认证成功推进序号；认证失败连接处置待修订。
+**发生任何`RecordError`（长度非法/截断/tag失效/序号耗尽）都必须直接致命关闭整条TCP连接，并失效双向key/IV/seq、接收缓冲与h2c全部流状态；绝不能推进`rx_seq`后让连接继续读取、补发或在原连接扫描帧头重同步。整条记录认证（length/tag/AAD）完全通过前不得向h2c/业务交付任何明文。**
 - [ ] 通过：`cargo test -p rsetup-protocol --test record_layer && cargo fuzz run record_decoder -- -max_len=65540`，畸形/超限/乱序无panic越界。
 - [ ] 重构/提交：双端tag失败review后fmt+全测，提交`feat(protocol): add authenticated record layer`。
 
@@ -267,11 +280,11 @@ match os.reboot() {
 - [ ] 红测试：先建立可加载的跨crate测试边界，再分别RED测双端握手→先OpenControl后OpenData→Control业务请求/响应与板端`device.task.result`事件→双流各自probe及连接PING/ACK→prepare/execute票据、accepted/attempted落盘后固定OS调用；故障路径不重复执行。新增**跨crate消息级**场景：OS尝试后切换boot，板端重启恢复持久`succeeded`/`observed_boot_id`/`boot_transition_observed`及增加的record_version；先丢`device.task.result`事件，随后测试中的中控消费端经Control `device.task.get`查询相同持久TaskRecord并检查可收敛的成功证据（身份、sub_task、journal_epoch、version、boot与无矛盾failed；真实中控持久任务 unknown→succeeded 由03 Task 3联合验收）；反向先query后重复/迟到事件不二次改变结果，同version异内容报一致性异常。另测same boot、仅accepted与日志丢失时事件或query不得伪造成功/可靠failed，也不得重发execute；已可靠failed/OS_ERROR后boot变不得覆盖。新增01提交后的`{device_id,revision}`通知→02重读DB→对应Control TYPE_SYSTEM revoke/关闭/停止重连及同公钥新连接kick/500ms旧连接关闭的互通；旧revision通知不关新代际，通知/重读失败定向关闭并补偿，审批事务内零网络。
 - [ ] 失败：`cargo test -p rsetup-board-agent --test interop_dual_stream`；controller 接线另运行 `cargo test -p rsetup-controller --test admission_tunnel`，该测试使用01注入式 repository fixture 与真实 protocol 连接管理器，不需要真实 DB（DB事务原子性由01真实库测试验收）。确认每条跨crate消息级/故障断言因互操作或接线行为缺失而失败，测试模块/依赖缺失不算有效RED；获批安全修订前不宣称握手互通。
 - [ ] 实现：绑定board-agent dispatch与protocol已认证双流，复用前述wire、probe、journal、ticket及Task 5通知接口，不重复定义中控侧BoardClient；查询与event共用板端持久记录和03/04版本/证据规则。controller `devices/admission_events.rs` 实现01的 `AdmissionChangeSink::after_commit`：调用02的 `on_admission_committed`，有界投递失败时调用02按device_id定向fail-closed/补偿入口；在启动组装时向审批服务注入该 adapter，覆盖 approve/reject/reopen/revoke/reauthorize 的提交后路径。`admission_tunnel` 通过真实服务调用验证提交前无通知、revoke提交后旧TCP关闭、通知失败DB决定不撤销、旧revision/代际不误关新连接；不能仅测protocol入口后声称controller已接线。
-- [ ] 通过：`cargo test -p rsetup-board-agent --test interop_dual_stream && cargo test -p rsetup-controller --test admission_tunnel && cargo test --workspace --locked`；留存跨crate双端query/event丢失补偿、boot证据、kick/revoke及controller提交后通知互操作结果，获批协议修订的双方测试仍是生产前置门。
+- [ ] 通过：`cargo test -p rsetup-board-agent --test interop_dual_stream && cargo test -p rsetup-controller --test admission_tunnel && cargo test --workspace --locked`；留存跨crate双端query/event丢失补偿、boot证据、kick/revoke及controller提交后通知互操作结果，获批协议修订的双方测试仍是生产前置门。**跨 crate 互通不充当 Task 10 两独立进程坏签名/tag/截断/错序号的网络证据**：本任务的同进程跨 crate 组装不得被引用为 Task 10 的记录层致命错误、握手验签失败或版本回退拒绝证据，两类证据必须分别留档。
 - [ ] 重构/提交：fmt+全测并复核握手/业务/探测/票据证据，提交`feat(board-agent): dual-stream interop`。
 
 ## Task 10：生产入口与两进程网络接线（条件性，非安全门替代）
-**前置：** 01 中控可执行启动/配置/DB准入适配、Task 7–9持久journal与双流接线就绪；获批的协议修订及Task 3/4双方安全审查/测试未完成时，真实认证隧道与生产发布仍阻断，不以此前的跨crate消息级互操作或本任务的进程启动绕过。03 的 NTP启动关卡与持久恢复/调度尚未完成时，可以分阶段验证02网络接线，但**不能**将独立02检查宣称为最终ready/生产验收。下述完整 `process_loopback_smoke` 的只读RPC与结果断言还依赖03的生产 `BoardClient` 和轮询/任务核实接线；03未就绪时仅记录端口、握手、准入和probe的分阶段证据，不将完整smoke记PASS。
+**前置：** 01 中控可执行启动/配置/DB准入适配、Task 7–9持久journal与双流接线就绪；获批的协议修订及Task 3/4双方安全审查/测试未完成时，真实认证隧道与生产发布仍阻断，不以此前的跨crate消息级互操作或本任务的进程启动绕过。**Task 9 的跨 crate 互通不充当本 Task 10 的两独立进程坏签名/tag/截断/错序号网络证据**：握手验签失败立即关闭TCP、篡改`reason_code`验签失败、record坏tag/AAD、15B/65537B长度与截断、错序号/重放/乱序、序号耗尽与发送部分写入，以及**至少两种彼此独立 Protobuf 运行时（如 `prost` 与 Google 官方 `protobuf`）对未知字段/已知字段重复/非最短 varint 的拒绝一致性**（须与 Task 2/3 真向量中双运行时并排记录逐例对照，任一分歧按本 Task 负向互操作失败处理），都必须在本任务两个真实独立进程上亲自注入并观察整条TCP关闭、零明文交付与重连新密钥，同进程fake、库内桩或跨crate组装一律不计为网络证据。03 的 NTP启动关卡与持久恢复/调度尚未完成时，可以分阶段验证02网络接线，但**不能**将独立02检查宣称为最终ready/生产验收。下述完整 `process_loopback_smoke` 的只读RPC与结果断言还依赖03的生产 `BoardClient` 和轮询/任务核实接线；03未就绪时仅记录端口、握手、准入和probe的分阶段证据，不将完整smoke记PASS。
 **Files:** 新增 `crates/rsetup-board-agent/src/main.rs`、条件性 `src/config.rs` 与 `tests/process_loopback_smoke.rs`，修改 board-agent `Cargo.toml`；修改 `crates/rsetup-controller/src/main.rs` 与必要的 `src/config.rs`/设备接线模块、`Cargo.toml`，依赖变更同步根 `Cargo.lock`。实际配置模块位置依01既有配置组织调整，不另造第二个中控服务进程。
 - [ ] RED准备：先使可执行板端入口和01中控入口可启动、可注入测试配置/固定只读source与journal；测试启动**两个真实独立进程**而非同进程fake/仅trait组合。`process_loopback_smoke` 用例全部标 `#[ignore]`，沿用01的 `CONTROLLER_TEST_DATABASE_URL` 独占隔离空库契约，使用真实中控DB adapter，不给生产入口增加fake repository开关。测试helper核对两端待测可执行产物路径，使用隔离loopback地址、临时配置/密钥/journal目录；缺DB URL或缺任一产物报告未验证，不冒充行为RED或PASS。fixture/模块缺失不算RED。
 - [ ] 独立RED→GREEN：板端可执行入口读取板端连接目标和可信中控Ed25519公钥列表，由板端**主动外联**；中控现有单进程启动中并列挂接管理HTTP与**独立安全设备TCP监听**、准入repository/02 tunnel、已认证Control/Data服务，绝不把设备入口复用成明文管理HTTP或开放未认证h2c。配置字段载体、绑定端口、附加安全参数只依已存规格和审批决定，不在此固定。双方长期Ed25519私钥首次缺失时使用安全随机生成，以防覆盖的原子创建、文件及所在目录可靠同步后落盘并限制文件权限`0600`，并发首次启动/写入失败不得以临时key继续接受连接或覆盖原key；后续重启加载复用原密钥、权限异常拒绝不安全启动；不写日志/审计或嵌入二进制。吊销时板端停止所有自动重连、持久本地未授权状态；恢复必须中控管理员重新授权**且**板端本地人工受控重置（入口仅限本机可信操作者，不添加远程动作或不经审核的新命令名），kick/临时断线可按既定退避重连。板端启动/重连后加载并恢复journal、确认`journal_epoch`/不确定任务证据，**先于接收任何execute**；不可读/丢失时按Task 7 fail-closed/unknown，不恢复自动执行。分别单独测试两端密钥首次生成/重启复用/坏权限和写入失败、板端配置不可信key拒绝、中控设备监听绑定/认证后开流、板端恢复先后顺序及吊销/人工重置路径。
@@ -294,10 +307,10 @@ match os.reboot() {
 | TYPE_SYSTEM kick/revoke仅Control、同公钥连接替换kick+500ms、指数退避与吊销停重连 | 5、9 |
 | 连接级PING/ACK与流级probe分层、3窗口死链 | 5 |
 | 仅reboot.execute在持久dispatching提交后发送；readonly/prepare可先行 | 8、9（03调度跨专题） |
-| reason_code/验签/AEAD安全修订和双端测试 | 3、4，未完成不可生产 |
+| 协议 v3 文本已消除 reason 未签/验签失败动作/AEAD 失败终止三项缺口；双方实现审查、真向量与双端负向测试 | 3、4，未完成不可生产 |
 | 只读与固定OS，不暴露单板危险HTTP动作 | 6、8 |
-| 握手→双流→业务→probe→票据跨crate双端互操作 | 9 |
+| 握手→双流→业务→probe→票据跨crate双端互操作（不充当Task 10两进程坏签名/tag/截断/错序号网络证据） | 9 |
 | 板端可执行入口/外联与可信key、同进程独立设备监听、长期Ed25519密钥0600可靠落盘/重启复用、journal先恢复、吊销与人工重置 | 10（依赖01；03联合门） |
-| 两进程loopback安全认证双流/只读/重启身份与journal复用，无开发宿主reboot或远端危险测试后门 | 10（3、4获批后） |
+| 两进程loopback安全认证双流/只读/重启身份与journal复用，含坏签名/tag/截断/错序号负例，无开发宿主reboot或远端危险测试后门 | 10（3、4获批后） |
 
-最终运行 `cargo fmt --all -- --check`、`cargo test --workspace --locked`（与`make test`的Rust命令一致）、`cargo clippy --workspace --all-targets -- -D warnings`；有界独立目标命令为 `cargo test -p rsetup-protocol --test wire_contract`、`cargo test -p rsetup-protocol --test tunnel_probe`、`cargo test -p rsetup-board-agent --test interop_dual_stream`、`cargo test -p rsetup-controller --test admission_tunnel`；`process_loopback_smoke` 则先构建两端产物，再严格按Task 10的MySQL/TiDB显式URL与 `--ignored --nocapture --test-threads=1` 命令独立运行，逐项核对实际运行测试数/失败数（01/03的真实DB测试仍需按各自门控另跑）。留存fuzz、双端互操作（Task 9跨crate与Task 10两进程真实网络分别留证）、库审查和目标板构建（Task 8/G2记录待审批target与结果）证据。**最终联合门：** 01真实中控启动/DB适配 + 02 Task 3/4获批协议双端安全审查/测试与Task 10进程网络smoke + 03 Task 1 NTP启动gate（未结束前不开放业务/设备接入/恢复下发）和Task 3持久恢复/dispatching先于execute，共同通过后方可验收；Task 10单独提前通过不解除03 gate。不得声称候选库、参数或1024设备容量已验证；本文仅计划，以上命令尚未运行，也不得据此宣称生产绿。
+最终运行 `cargo fmt --all -- --check`、`cargo test --workspace --locked`（与`make test`的Rust命令一致）、`cargo clippy --workspace --all-targets -- -D warnings`；有界独立目标命令为 `cargo test -p rsetup-protocol --test wire_contract`、`cargo test -p rsetup-protocol --test tunnel_probe`、`cargo test -p rsetup-board-agent --test interop_dual_stream`、`cargo test -p rsetup-controller --test admission_tunnel`；`process_loopback_smoke` 则先构建两端产物，再严格按Task 10的MySQL/TiDB显式URL与 `--ignored --nocapture --test-threads=1` 命令独立运行，逐项核对实际运行测试数/失败数（01/03的真实DB测试仍需按各自门控另跑）。留存fuzz、双端互操作（Task 9跨crate与Task 10两进程真实网络分别留证，**Task 9跨crate互通不充当Task 10两独立进程坏签名/tag/截断/错序号的网络证据**）、库审查和目标板构建（Task 8/G2记录待审批target与结果）证据。协议 v3 文本规范已消除 reason 未签、验签失败动作与 AEAD 失败终止三大文本缺口，但**该文本进度不解除任何实现或发布阻断**。**最终联合门：** 01真实中控启动/DB适配 + 02 Task 3/4获批协议双端安全审查/测试与Task 10进程网络smoke + 03 Task 1 NTP启动gate（未结束前不开放业务/设备接入/恢复下发）和Task 3持久恢复/dispatching先于execute，共同通过后方可验收；Task 10单独提前通过不解除03 gate。不得声称候选库、参数或1024设备容量已验证；本文仅计划，以上命令尚未运行，也不得据此宣称生产绿。
