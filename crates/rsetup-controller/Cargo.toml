@@ -1,6 +1,8 @@
 [package]
 name = "rsetup-controller"
 default-run = "rsetup-controller"
+# 构建期把 apps/controller-web/dist 的真实前端产物编成静态资产表（缺产物即失败关闭）。
+build = "build.rs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
