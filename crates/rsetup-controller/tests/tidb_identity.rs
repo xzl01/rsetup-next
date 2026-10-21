@@ -30,12 +30,16 @@ async fn fresh_v3_single_authorized_tidb_case() {
     );
 }
 
+// 夹具已升级到 v4（当前受支持版本），v3 仅作为显式 test migration 的迁移起点；
+// 用例名保留历史名称（如 fresh_v3），避免破坏 --exact 调用与既有文档。
 #[tokio::test]
 #[ignore = "one independently backed-up isolated disposable EMPTY TiDB dev DB; never run without operator confirmation"]
 async fn admission_missing_actor_is_atomic_on_fresh_v3_tidb() {
     let db = common::required_fresh_identity_db().await;
     common::run_explicit_identity_test_command("upgrade");
     common::assert_actor_fixture_v3_without_check_or_fk(&db).await;
+    // v3 夹具（迁移起点）就绪后、调用 v4-only 生产入口前，升到 v4。
+    common::upgrade_fixture_to_v4(&db).await;
     common::admission_missing_actor_is_atomic(&db).await;
 }
 
@@ -66,30 +70,42 @@ async fn tidb_legacy_mixed_v1_to_v3_positive_single_case() {
         .await;
 }
 
+// 夹具已升级到 v4（当前受支持版本），v3 仅作为显式 test migration 的迁移起点；
+// 用例名保留历史名称（如 fresh_v3），避免破坏 --exact 调用与既有文档。
 #[tokio::test]
 #[ignore = "one independently backed-up isolated disposable EMPTY tidb dev DB; never run without operator confirmation"]
 async fn admission_actor_permissions_are_atomic_on_fresh_v3_tidb() {
     let db = common::required_fresh_identity_db().await;
     common::run_explicit_identity_test_command("upgrade");
     common::assert_fresh_v3_is_check_and_fk_free(&db).await;
+    // v3 夹具（迁移起点）就绪后、调用 v4-only 生产入口前，升到 v4。
+    common::upgrade_fixture_to_v4(&db).await;
     common::admission_actor_permissions_are_atomic(&db).await;
 }
 
+// 夹具已升级到 v4（当前受支持版本），v3 仅作为显式 test migration 的迁移起点；
+// 用例名保留历史名称（如 fresh_v3），避免破坏 --exact 调用与既有文档。
 #[tokio::test]
 #[ignore = "one independently backed-up isolated disposable EMPTY tidb dev DB; never run without operator confirmation"]
 async fn admission_polluted_combinations_are_readonly_rejected_on_fresh_v3_tidb() {
     let db = common::required_fresh_identity_db().await;
     common::run_explicit_identity_test_command("upgrade");
     common::assert_fresh_v3_is_check_and_fk_free(&db).await;
+    // v3 夹具（迁移起点）就绪后、调用 v4-only 生产入口前，升到 v4。
+    common::upgrade_fixture_to_v4(&db).await;
     common::admission_polluted_combinations_are_readonly_rejected(&db).await;
 }
 
+// 夹具已升级到 v4（当前受支持版本），v3 仅作为显式 test migration 的迁移起点；
+// 用例名保留历史名称（如 fresh_v3），避免破坏 --exact 调用与既有文档。
 #[tokio::test]
 #[ignore = "one independently backed-up isolated disposable EMPTY TiDB dev DB; lock observation capability required"]
 async fn admission_deactivation_holds_guard_cas_waits_then_denied_on_fresh_v3_tidb() {
     let db = common::required_fresh_identity_db().await;
     common::run_explicit_identity_test_command("upgrade");
     common::assert_fresh_v3_is_check_and_fk_free(&db).await;
+    // v3 夹具（迁移起点）就绪后、调用 v4-only 生产入口前，升到 v4。
+    common::upgrade_fixture_to_v4(&db).await;
     common::admission_deactivation_holds_guard_cas_waits_then_denied(
         &db,
         common::ExpectedIdentityEngine::TiDb,
@@ -97,12 +113,16 @@ async fn admission_deactivation_holds_guard_cas_waits_then_denied_on_fresh_v3_ti
     .await;
 }
 
+// 夹具已升级到 v4（当前受支持版本），v3 仅作为显式 test migration 的迁移起点；
+// 用例名保留历史名称（如 fresh_v3），避免破坏 --exact 调用与既有文档。
 #[tokio::test]
 #[ignore = "one independently backed-up isolated disposable EMPTY TiDB dev DB; lock observation capability required"]
 async fn admission_cas_commits_before_deactivation_then_new_cas_denied_on_fresh_v3_tidb() {
     let db = common::required_fresh_identity_db().await;
     common::run_explicit_identity_test_command("upgrade");
     common::assert_fresh_v3_is_check_and_fk_free(&db).await;
+    // v3 夹具（迁移起点）就绪后、调用 v4-only 生产入口前，升到 v4。
+    common::upgrade_fixture_to_v4(&db).await;
     common::admission_cas_commits_before_deactivation_then_new_cas_denied(
         &db,
         common::ExpectedIdentityEngine::TiDb,
@@ -112,12 +132,25 @@ async fn admission_cas_commits_before_deactivation_then_new_cas_denied_on_fresh_
 
 mod common;
 use common::{RecordingSecretSink, user_hash};
-use rsetup_controller::{ControllerError, bootstrap_admin, check_identity_schema};
+use rsetup_controller::{ControllerError, bootstrap_admin, check_v3_ready};
 
+// 夹具入口：显式 test migration 的终态是 v3（11 张 identity 表，无 runtime 五表），
+// 因此收尾用 v3 终态门禁 check_v3_ready；v4 普通启动门禁 check_identity_schema 对
+// v3 库必然 SchemaNotReady { found: Some(3), required: 4 }。
 async fn fresh_v2() -> rsetup_controller::DbPool {
     let db = common::required_fresh_identity_db().await;
     common::run_explicit_identity_test_command("upgrade");
-    check_identity_schema(&db).await.unwrap();
+    check_v3_ready(&db).await.unwrap();
+    db
+}
+
+// v4 夹具入口：显式 test migration 的终态是 v3（迁移起点），v4（当前受支持版本）只能由
+// 生产迁移入口 rsetup_controller::db::run_schema_v4_migration 到达；bootstrap_admin 与
+// AdmissionStore::compare_and_set 的写事务 guard（integrity::lock_integrity_guard）期望
+// 版本取编译期 SUPPORTED_SCHEMA_VERSION=4，因此必须走本入口而非 fresh_v2。
+async fn fresh_v4() -> rsetup_controller::DbPool {
+    let db = fresh_v2().await;
+    common::upgrade_fixture_to_v4(&db).await;
     db
 }
 
@@ -131,7 +164,7 @@ async fn identity_contract_fresh_and_restart() {
             .await
             .unwrap();
     assert_eq!(version, 3);
-    check_identity_schema(&db).await.unwrap();
+    check_v3_ready(&db).await.unwrap();
     let _prepared = common::required_prepared_identity_db().await;
 }
 
@@ -140,15 +173,17 @@ async fn identity_contract_fresh_and_restart() {
 async fn legacy_v1_is_readonly_rejected_then_explicitly_upgraded() {
     let db = common::required_fresh_identity_db().await;
     common::run_explicit_identity_test_command("fixture-v1");
+    // 断言的是「v1 夹具尚未达到 v3」，期望版本必须锁定 required: 3，只能用 v3 终态门禁；
+    // 换成 v4 启动门禁会把 required 变成 4 并掩盖 v3 版本判定。
     assert!(matches!(
-        check_identity_schema(&db).await,
+        check_v3_ready(&db).await,
         Err(ControllerError::SchemaNotReady {
             found: Some(1),
             required: 3
         })
     ));
     common::run_explicit_identity_test_command("upgrade");
-    check_identity_schema(&db).await.unwrap();
+    check_v3_ready(&db).await.unwrap();
 }
 
 #[tokio::test]
@@ -157,21 +192,24 @@ async fn partial_v1_column_is_resumed_only_by_explicit_command() {
     let db = common::required_fresh_identity_db().await;
     common::run_explicit_identity_test_command("fixture-v1");
     common::run_explicit_identity_test_command("fixture-partial-v1");
+    // 同 legacy_v1：断言「部分升级的 v1 夹具仍未达 v3」，required 必须保持 3。
     assert!(matches!(
-        check_identity_schema(&db).await,
+        check_v3_ready(&db).await,
         Err(ControllerError::SchemaNotReady {
             found: Some(1),
             required: 3
         })
     ));
     common::run_explicit_identity_test_command("upgrade");
-    check_identity_schema(&db).await.unwrap();
+    check_v3_ready(&db).await.unwrap();
 }
 
+// 夹具已升级到 v4（当前受支持版本），v3 仅作为显式 test migration 的迁移起点；
+// 用例名保留历史名称（如 fresh_v3），避免破坏 --exact 调用与既有文档。
 #[tokio::test]
 #[ignore = "one independently backed-up isolated disposable empty test DB and operator authorization required"]
 async fn bootstrap_twice_preserves_password_and_emits_once() {
-    let db = fresh_v2().await;
+    let db = fresh_v4().await;
     let sink = RecordingSecretSink::default();
     bootstrap_admin(&db, &sink).await.unwrap();
     let first_hash = user_hash(&db, "admin").await;
@@ -180,19 +218,25 @@ async fn bootstrap_twice_preserves_password_and_emits_once() {
     assert_eq!(sink.emissions().len(), 1);
 }
 
+// 夹具已升级到 v4（当前受支持版本），v3 仅作为显式 test migration 的迁移起点；
+// 用例名保留历史名称（如 fresh_v3），避免破坏 --exact 调用与既有文档。
 #[tokio::test]
 #[ignore = "one independently backed-up isolated disposable empty test DB and operator authorization required"]
 async fn concurrent_bootstraps_create_one_admin_and_emit_once() {
     let db = common::required_fresh_identity_db().await;
     common::run_explicit_identity_test_command("upgrade");
     common::assert_fresh_v3_is_check_and_fk_free(&db).await;
+    // v3 夹具（迁移起点）就绪后、调用 v4-only 生产入口前，升到 v4。
+    common::upgrade_fixture_to_v4(&db).await;
     common::concurrent_bootstraps_emit_once(&db).await;
 }
 
+// 夹具已升级到 v4（当前受支持版本），v3 仅作为显式 test migration 的迁移起点；
+// 用例名保留历史名称（如 fresh_v3），避免破坏 --exact 调用与既有文档。
 #[tokio::test]
 #[ignore = "one independently backed-up isolated disposable empty test DB and operator authorization required"]
 async fn empty_users_do_not_reset_initialized_marker() {
-    let db = fresh_v2().await;
+    let db = fresh_v4().await;
     let sink = RecordingSecretSink::default();
     bootstrap_admin(&db, &sink).await.unwrap();
     sqlx::query("DELETE FROM users WHERE username = 'admin'")
@@ -208,12 +252,16 @@ async fn empty_users_do_not_reset_initialized_marker() {
     assert_eq!(sink.emissions().len(), 1);
 }
 
+// 夹具已升级到 v4（当前受支持版本），v3 仅作为显式 test migration 的迁移起点；
+// 用例名保留历史名称（如 fresh_v3），避免破坏 --exact 调用与既有文档。
 #[tokio::test]
 #[ignore = "one independently backed-up isolated disposable empty test DB and operator authorization required"]
 async fn bootstrap_failure_is_not_retried_after_commit() {
     let db = common::required_fresh_identity_db().await;
     common::run_explicit_identity_test_command("upgrade");
     common::assert_fresh_v3_is_check_and_fk_free(&db).await;
+    // v3 夹具（迁移起点）就绪后、调用 v4-only 生产入口前，升到 v4。
+    common::upgrade_fixture_to_v4(&db).await;
     common::bootstrap_failure_does_not_reinitialize(&db).await;
 }
 
@@ -225,7 +273,9 @@ async fn migration_does_not_repair_missing_table() {
         .execute(&db.0)
         .await
         .unwrap();
-    assert!(check_identity_schema(&db).await.is_err());
+    // 被破坏的 v3 夹具必须由 v3 终态门禁的表集合/列形状校验拒绝；若沿用 v4 启动
+    // 门禁，它只凭版本号就 fail-closed，断言会以错误的理由通过。
+    assert!(check_v3_ready(&db).await.is_err());
     let status = std::process::Command::new(env!("CARGO_BIN_EXE_migrate-identity-test"))
         .args(["--mode", "upgrade"])
         .status()
@@ -244,7 +294,9 @@ async fn migration_rejects_wrong_named_table_before_bootstrap() {
         .execute(&db.0)
         .await
         .unwrap();
-    assert!(check_identity_schema(&db).await.is_err());
+    // 被破坏的 v3 夹具必须由 v3 终态门禁的表集合/列形状校验拒绝；若沿用 v4 启动
+    // 门禁，它只凭版本号就 fail-closed，断言会以错误的理由通过。
+    assert!(check_v3_ready(&db).await.is_err());
     let status = std::process::Command::new(env!("CARGO_BIN_EXE_migrate-identity-test"))
         .args(["--mode", "upgrade"])
         .status()
@@ -315,20 +367,29 @@ async fn later_column_interruption_then_explicit_retry() {
     common::later_column_interruption_is_resumable().await;
 }
 
+// 夹具已升级到 v4（当前受支持版本），v3 仅作为显式 test migration 的迁移起点；
+// 用例名保留历史名称（如 fresh_v3），避免破坏 --exact 调用与既有文档。
 #[tokio::test]
 #[ignore = "one independently backed-up isolated disposable empty test DB and operator authorization required"]
 async fn identity_unsigned_high_half_round_trip() {
     let db = common::required_fresh_identity_db().await;
     common::run_explicit_identity_test_command("upgrade");
-    check_identity_schema(&db).await.unwrap();
+    // 显式升级的终态是 v3，用 v3 终态门禁确认夹具就绪。
+    check_v3_ready(&db).await.unwrap();
+    // v3 夹具（迁移起点）就绪后、调用 v4-only 生产入口前，升到 v4。
+    common::upgrade_fixture_to_v4(&db).await;
     common::identity_unsigned_high_half_round_trip(&db).await;
 }
 
+// 夹具已升级到 v4（当前受支持版本），v3 仅作为显式 test migration 的迁移起点；
+// 用例名保留历史名称（如 fresh_v3），避免破坏 --exact 调用与既有文档。
 #[tokio::test]
 #[ignore = "one independently backed-up isolated disposable empty test DB and operator authorization required"]
 async fn admission_cas_persists_history_and_audit_atomically() {
     let db = common::required_fresh_identity_db().await;
     common::run_explicit_identity_test_command("upgrade");
     common::assert_fresh_v3_is_check_and_fk_free(&db).await;
+    // v3 夹具（迁移起点）就绪后、调用 v4-only 生产入口前，升到 v4。
+    common::upgrade_fixture_to_v4(&db).await;
     common::admission_cas_scenarios(&db).await;
 }

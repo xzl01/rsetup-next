@@ -92,6 +92,66 @@ pub async fn assert_actor_fixture_v3_without_check_or_fk(db: &DbPool) {
         .unwrap_or_else(|_| panic!("task4_fixture_operation_failed"));
 }
 
+/// 夹具升级辅助：把显式 test migration 建成的 v3 终态库升级到 **v4（当前受支持版本）**。
+///
+/// 为什么必须升级：显式 `migrate-identity-test --mode upgrade` 的终态只有 v3，
+/// 而当前生产代码只支持 v4 —— `bootstrap_admin` 与 `AdmissionStore::compare_and_set`
+/// 在同一写事务内先取 `integrity::lock_integrity_guard`，其期望版本取自编译期
+/// `SUPPORTED_SCHEMA_VERSION`（=4），v3 库必然 `Config("identity data meta.guard")`；
+/// 普通启动门禁 `check_identity_schema` 也会先 `SchemaNotReady { required: 4 }`。
+/// 因此凡调用 v4-only 生产入口的用例都必须先经本函数升级；v3 只作为**迁移起点**
+/// 保留，并在此显式校验后才放行 v4 迁移。
+pub async fn upgrade_fixture_to_v4(db: &DbPool) {
+    // 1. 起点：显式 test migration 幂等续跑，确认库确实处于 v3 终态。
+    run_explicit_identity_test_command("upgrade");
+    let v3_version: i32 =
+        sqlx::query_scalar("SELECT schema_version FROM schema_meta WHERE singleton = 1")
+            .fetch_one(&db.0)
+            .await
+            .unwrap_or_else(|_| panic!("task4_fixture_v3_baseline_failed"));
+    assert_eq!(
+        v3_version, 3,
+        "fixture must be at v3 before the explicit v4 migration"
+    );
+    rsetup_controller::check_v3_ready(db)
+        .await
+        .unwrap_or_else(|_| panic!("task4_fixture_v3_baseline_failed"));
+    // 2. 生产 v3 → v4 迁移入口（普通启动路径绝不隐式调用，只能显式触发）。
+    rsetup_controller::db::run_schema_v4_migration(db)
+        .await
+        .unwrap_or_else(|_| panic!("task4_fixture_v4_migration_failed"));
+    // 3. 终态：v4 普通启动门禁确认真实到达 v4（版本 + identity 结构 + runtime 五表
+    //    + identity 数据 + runtime 数据 + 无 FK），随后沿用既有断言口径复核结构。
+    rsetup_controller::check_identity_schema(db)
+        .await
+        .unwrap_or_else(|_| panic!("task4_fixture_v4_gate_failed"));
+    let v4_version: i32 =
+        sqlx::query_scalar("SELECT schema_version FROM schema_meta WHERE singleton = 1")
+            .fetch_one(&db.0)
+            .await
+            .unwrap_or_else(|_| panic!("task4_fixture_v4_gate_failed"));
+    assert_eq!(v4_version, 4, "fixture must be at v4 after the migration");
+    let tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE()",
+    )
+    .fetch_one(&db.0)
+    .await
+    .unwrap_or_else(|_| panic!("task4_fixture_v4_gate_failed"));
+    assert_eq!(tables, 16, "v4 fixture must have exactly 16 tables");
+    let constraints: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.table_constraints WHERE table_schema = DATABASE() AND constraint_type IN ('CHECK', 'FOREIGN KEY')")
+        .fetch_one(&db.0).await.unwrap_or_else(|_| panic!("task4_fixture_v4_gate_failed"));
+    assert_eq!(constraints, 0, "v4 fixture must have no CHECK or FK");
+}
+
+/// 夹具健康检查（v4 口径）：夹具已由 `upgrade_fixture_to_v4` 升到 v4 后，任何
+/// 「夹具仍然健康」的中途复核都必须用 v4 普通启动门禁；沿用 v3 终态门禁
+/// `check_v3_ready` 会在 v4 库上必然 `SchemaNotReady { required: 3 }` 而误报。
+pub async fn assert_v4_fixture_healthy(db: &DbPool) {
+    rsetup_controller::check_identity_schema(db)
+        .await
+        .unwrap_or_else(|_| panic!("task4_fixture_operation_failed"));
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum ExpectedIdentityEngine {
     MySql,
@@ -169,12 +229,17 @@ pub async fn assert_legacy_fixture_upgrades_to_v3(mode: &str, expected: Expected
         .execute(&db.0)
         .await
         .unwrap();
+    // 这里断言的是「尚未达到 v3」，期望版本必须锁定为 3，因此只能用 v3 终态
+    // 门禁；v4 启动门禁 check_identity_schema 会先按 required=4 fail-closed，
+    // 掩盖真正的 v3 版本判定。
     assert!(matches!(
-        rsetup_controller::check_identity_schema(&db).await,
+        rsetup_controller::check_v3_ready(&db).await,
         Err(rsetup_controller::ControllerError::SchemaNotReady { found: Some(found), required: 3 }) if found == original_version
     ));
     run_explicit_identity_test_command("upgrade");
-    rsetup_controller::check_identity_schema(&db).await.unwrap();
+    // 显式 test migration 的终态是 v3（仅 11 张 identity 表，无 runtime 五表），
+    // 收尾校验必须用 v3 终态门禁，而不是 v4 普通启动门禁。
+    rsetup_controller::check_v3_ready(&db).await.unwrap();
     let meta: (i32, Vec<u8>, bool) = sqlx::query_as(
         "SELECT schema_version,instance_id,initialized FROM schema_meta WHERE singleton=1",
     )
@@ -205,7 +270,8 @@ pub async fn assert_legacy_fixture_upgrades_to_v3(mode: &str, expected: Expected
 
 pub async fn required_prepared_identity_db() -> DbPool {
     let db = required_test_db().await;
-    rsetup_controller::check_identity_schema(&db)
+    // 夹具库由 test migration 建到 v3 终态，门禁必须同为 v3 终态门禁。
+    rsetup_controller::check_v3_ready(&db)
         .await
         .expect("existing v3 identity schema");
     db
@@ -453,15 +519,17 @@ pub async fn later_column_interruption_is_resumable() {
             .await
             .unwrap();
     assert_eq!(version, 1);
+    // 断言的是「部分 ALTER 后仍未达 v3」，期望版本锁定为 3，必须用 v3 终态门禁。
     assert!(matches!(
-        rsetup_controller::check_identity_schema(&db).await,
+        rsetup_controller::check_v3_ready(&db).await,
         Err(rsetup_controller::ControllerError::SchemaNotReady {
             found: Some(1),
             required: 3
         })
     ));
     run_explicit_identity_test_command("upgrade");
-    rsetup_controller::check_identity_schema(&db).await.unwrap();
+    // 续跑后的终态是 v3，用 v3 终态门禁收尾。
+    rsetup_controller::check_v3_ready(&db).await.unwrap();
     let version: i32 =
         sqlx::query_scalar("SELECT schema_version FROM schema_meta WHERE singleton = 1")
             .fetch_one(&db.0)
@@ -863,7 +931,9 @@ pub async fn admission_actor_permissions_are_atomic(db: &DbPool) {
         fixture_ok(sqlx::query("INSERT INTO users (id,username,display_name,password_hash,active,is_admin,must_change_password,revision,created_time) VALUES (?,?,'task4 fixture','fixture-placeholder',?,?,?,0,NOW(6))")
             .bind(actor.as_slice()).bind(name).bind(active).bind(admin).bind(change).execute(&db.0).await);
         let key = task4_device(db).await;
-        fixture_ok(rsetup_controller::check_identity_schema(db).await);
+        // v4 夹具健康检查：夹具已由 upgrade_fixture_to_v4 升到 v4（当前受支持版本），
+        // 必须用 v4 普通启动门禁；v3 终态门禁对 v4 库必然 required:3 fail-closed。
+        assert_v4_fixture_healthy(db).await;
         let before = fixture_ok(db.load(key).await);
         assert!(
             before
@@ -921,7 +991,7 @@ pub async fn admission_actor_permissions_are_atomic(db: &DbPool) {
     }
     // None remains the trusted internal system path, not a missing user identity.
     let key = task4_device(db).await;
-    fixture_ok(rsetup_controller::check_identity_schema(db).await);
+    assert_v4_fixture_healthy(db).await;
     let after = fixture_ok(
         db.compare_and_set(
             key,
@@ -947,7 +1017,7 @@ pub async fn admission_actor_permissions_are_atomic(db: &DbPool) {
         "task4_system_persisted_snapshot"
     );
     assert_admission_actor(db, &key, None).await;
-    fixture_ok(rsetup_controller::check_identity_schema(db).await);
+    assert_v4_fixture_healthy(db).await;
 }
 
 // Fixed casts avoid depending on AdmissionStore decoding to observe corrupt rows.
@@ -956,6 +1026,11 @@ async fn raw_admission(db: &DbPool, key: &[u8; 32]) -> (String, String, u64, i64
         .bind(key.as_slice()).fetch_one(&db.0).await)
 }
 
+/// 污染组合的只读拒绝：夹具已由 `upgrade_fixture_to_v4` 升到 v4（当前受支持版本）。
+/// 污染注入必须发生在 v4 夹具之上——v4 门禁对 v3 库会在版本/结构阶段就
+/// `SchemaNotReady{required:4}` 或结构 fail-closed，根本到不了 identity 数据扫描，
+/// 「污染必须被拒绝」就无从断言。在 v4 夹具上注入污染后，load / CAS / 就绪门禁
+/// 三条路径仍必须逐条拒绝且不写库（readonly 语义完全保留）。
 pub async fn admission_polluted_combinations_are_readonly_rejected(db: &DbPool) {
     use rsetup_controller::{AdmissionState, AdmissionStore, ReviewDecision};
     // All eight invalid tuples whose two enum values are individually legal.
@@ -970,7 +1045,8 @@ pub async fn admission_polluted_combinations_are_readonly_rejected(db: &DbPool) 
         ("REVOKED", "denied", AdmissionState::Revoked),
     ] {
         let key = task4_device(db).await;
-        fixture_ok(rsetup_controller::check_identity_schema(db).await);
+        // 每轮起点仍是干净的 v4 夹具，用 v4 启动门禁确认夹具未被上一轮污染。
+        assert_v4_fixture_healthy(db).await;
         let legal = fixture_ok(db.load(key).await);
         assert!(
             legal.admission_state == AdmissionState::Pending
@@ -1030,6 +1106,19 @@ pub async fn admission_polluted_combinations_are_readonly_rejected(db: &DbPool) 
             "task4_cas_changed_event_rows"
         );
         assert_admission_failure(
+            // 污染行必须被就绪门禁拒绝为 `identity data devices.state`。
+            // v3→v4 校验链路差异：v4 普通启动门禁 check_identity_schema 依次执行
+            // 版本决策（identity_schema_decision，required=4）→ identity 结构
+            // （validate_v2_shape）→ runtime 五表齐备 → identity 数据
+            // （validate_data = integrity::check_identity_data，期望版本 4）→
+            // runtime 数据 → 无 FK；v3 终态门禁 check_v3_ready 只到
+            // validate_data_at_v3。两条链路对 devices 的 state/decision 组合复用
+            // 同一个 validate_device_fields + scan_error("devices.state")，因此
+            // 错误串完全等价，仍是 Config("identity data devices.state")，断言
+            // 强度不降。唯一差异是到达数据扫描之前的前置阶段：v3 夹具会被 v4 门禁
+            // 在版本决策处 SchemaNotReady{required:4} 直接挡掉，永远走不到数据
+            // 扫描，因此本用例必须先把夹具升到 v4，才能在 v4 门禁上真正复现
+            // 「污染被拒绝且零写入」的语义。
             rsetup_controller::check_identity_schema(db).await,
             AdmissionFailure::ReadinessCombination,
         );
@@ -1058,7 +1147,7 @@ pub async fn admission_polluted_combinations_are_readonly_rejected(db: &DbPool) 
             1,
             "task4_pollution_cleanup_count"
         );
-        fixture_ok(rsetup_controller::check_identity_schema(db).await);
+        assert_v4_fixture_healthy(db).await;
     }
 }
 
@@ -1165,7 +1254,11 @@ async fn task4_deactivate_actor(tx: &mut sqlx::Transaction<'_, sqlx::MySql>, act
         .fetch_all(&mut **tx)
         .await,
     );
-    assert!(guard == [(1, 3)], "task4_deactivation_guard_invalid");
+    // v3→v4 校验链路差异：夹具已升级到 v4（当前受支持版本），持锁方复核的 guard
+    // 行版本随之等价更新为 (singleton=1, schema_version=4)；断言本身仍是精确的
+    // 两列等值比较，未放宽。v4-only 的写事务 guard（lock_integrity_guard）期望
+    // 版本正是编译期 SUPPORTED_SCHEMA_VERSION=4，若这里仍是 3 则 CAS 早已失败。
+    assert!(guard == [(1, 4)], "task4_deactivation_guard_invalid");
     let user: (bool, bool, bool, u64) = fixture_ok(
         sqlx::query_as(
             "SELECT active,is_admin,must_change_password,revision FROM users WHERE id=? FOR UPDATE",
@@ -1229,7 +1322,7 @@ async fn task4_concurrency_fixture(db: &DbPool) -> ([u8; 16], [u8; 32]) {
     let actor = *uuid::Uuid::new_v4().as_bytes();
     fixture_ok(sqlx::query("INSERT INTO users (id,username,display_name,password_hash,active,is_admin,must_change_password,revision,created_time) VALUES (?,'concurrency_actor','task4 fixture','fixture-placeholder',TRUE,TRUE,FALSE,7,NOW(6))").bind(actor.as_slice()).execute(&db.0).await);
     let key = task4_device(db).await;
-    fixture_ok(rsetup_controller::check_identity_schema(db).await);
+    assert_v4_fixture_healthy(db).await;
     (actor, key)
 }
 
@@ -1805,7 +1898,7 @@ pub async fn bootstrap_failure_does_not_reinitialize(db: &DbPool) {
         task4_bootstrap_rows(db).await == committed,
         "task4_bootstrap_commit_changed"
     );
-    fixture_ok(rsetup_controller::check_identity_schema(db).await);
+    assert_v4_fixture_healthy(db).await;
 }
 
 async fn task4_bootstrap_rows(db: &DbPool) -> (Vec<String>, Vec<String>) {
@@ -1857,5 +1950,5 @@ pub async fn concurrent_bootstraps_emit_once(db: &DbPool) {
         task4_bootstrap_rows(db).await == committed,
         "task4_bootstrap_repeat_changed_rows"
     );
-    fixture_ok(rsetup_controller::check_identity_schema(db).await);
+    assert_v4_fixture_healthy(db).await;
 }
