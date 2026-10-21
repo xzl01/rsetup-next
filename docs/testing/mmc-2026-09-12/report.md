@@ -221,3 +221,123 @@ node scripts/capture-web-screenshot.mjs --url "http://127.0.0.1:19088/#hardware"
 - **自动化**：`cargo test --workspace --locked` 全绿（core 122 passed（124 run，其中 2 ignored）/ app 39 / helper 1）、`node --test ui/*.test.mjs` 全绿（含 `ui/storage.test.mjs` 6 项与 `ui/i18n.test.mjs` 16 项）、`cargo clippy --workspace --all-targets -- -D warnings` 无告警。`cargo fmt --all -- --check` 在本仓库基线上即为红（未改动树实测 61 处 `Diff in`，全在未触碰文件；本次改动的两个 Rust 文件为 0 处），属既有 rustfmt 版本漂移，未纳入本次范围；后续以一次纯机械的 `style:` 提交（`cargo fmt --all`，经 token 级比对确认无语义变化——仅含空白/换行重排、`reorder_imports`/`reorder_modules` 造成的顺序调整，以及 Rust 可忽略的尾随逗号增删和单表达式 match arm 去块，无任何标识符或表达式改动）使该门禁恢复为绿（`cargo fmt --all -- --check` 退出码 0、无输出），并注明该漂移早于本次工作即已存在（`7618471` 处实测 34 处），其余大部分由 MMC 存储 TUI 实现链引入（该链结束时 62 处 / 10 文件）。
 - **W1/W2 的失败态已独立复现**：在一次性 worktree 中分别把两处修复还原后，对应用例失败（`storage drawer copy …` 1/6 失败、`storage capability card …` 1/16 失败），确认两个用例真正锁定了缺陷，而非事后补写。
 - **实机证据**：两机 REST（200/404 + capability detail）、W1/W2 文案（中英）、MMC 卡片字段、`consoleErrors: []`、11 张已打码截图，均见第 3、4、8 节。
+
+## 12. 第 5 节 T1 修复（`26fab4b`）的实现级复审与修复（2026-10-21 补记）
+
+本次补记只覆盖 **T1 修复自身引入的 P2 回归**与同一区域的 **P3 健壮性项**；证据全部来自代码与 `TestBackend` 的最终 `Buffer`。
+
+- **P2（回归）**：`26fab4b` 新增的 `wrapped_rows` 以 `ceil(行宽 / 卡片内宽)` 估算行数，而 ratatui 的 `Paragraph` + `Wrap { trim: true }` 按**词**断行（词不可分、断点空白丢弃），估算与真实行数在两个方向都可能不符。低估时卡片比内容矮一行，第 5 节想保住的容量/告警仍被裁——评审给出的 Rock 3A eMMC fixture（内宽 31、`pre_eol_info=2`、健康 `Warning`、SLC/MLC 10%）在 33 列视口下实际渲染为
+
+  ```
+  │[eMMC] mmcblk0 · 58.24 GiB     │
+  │Health: Warning · SLC: 10% ·   │
+  │MLC: 10% · Pre-EOL:            │      ← Warning(80%) 整段丢失
+  ```
+
+  扫描 16..61 列 × 中英 × 预警 2/3 × 寿命缺失/10/100/101 共 19 种组合复现。**未固定增高、未删告警**：`wrapped_rows` 改为渲染同一个 `Paragraph` 到 scratch `Buffer` 后数非空行（`crates/rsetup-app/src/tui.rs`），`render_mission` 与 `render_storage_summary` 因此共用同一个度量；高度受限时健康块按「危险优先」显式降级（寿命值先让位，`pre_eol_info ∈ {2,3}` 时预警值永不丢弃），连身份+预警都放不下的宽度则整台设备计入「更多设备」而不画半截值。修复后 31 列 5 行卡片渲染为
+
+  ```
+  │[eMMC] mmcblk0 · 58.24 GiB     │
+  │Health: Warning · Pre-EOL:     │
+  │Warning(80%)                   │
+  ```
+
+  6 行时四个值全在。（**第二轮更正，见 §13**：本行原写「59 列仍保持单行短标签」，但该单行示例丢了两条寿命估算值；第二轮按有效字段统一评分后，卡片足够高时 59 列会保留寿命估算（紧凑拼写可落单行，否则让到第二行），由 `test_render_mission_card_keeps_the_life_estimates_while_they_fit` 钉住，不再出现「单行却少一个值」。）
+- **P3（健壮性）**：同区域 `ellipsize` 逐字符累加宽度，对 VS16/ZWJ 等非可加情形会超出预算（`ellipsize("❤️❤️❤️", 2)` 实测返回 3 列宽）；改为按用户可感字符簇前进、对**完整候选串**测宽。（**第二轮更正，见 §13**：第一轮手写字符簇白名单 + 裁口回退基字符，复审证明 `A`+ZWJ+ZWJ 后仍留下孤立连接符、印地文连字被从随音符号处切开；第二轮改用 ratatui 公开的 `Span::styled_graphemes`（内部真 `UnicodeSegmentation`，无新依赖），不再手写启发式、也不再「回退基字符」。）正常 Linux `block_path` 为 ASCII，故该项是实现健壮性补强，不主张为实机缺陷。
+- **新增/改动测试**（均在 `crates/rsetup-app/src/tui.rs`）：`test_wrapped_rows_matches_the_paragraph_word_wrap`（以独立 `TestBackend` 渲染作 oracle 的全矩阵差分）、`test_render_mission_gives_the_mmc_card_the_rows_it_needs`、`test_render_mission_prefers_the_danger_row_when_the_card_is_short`、`test_mmc_warning_survives_every_card_width`、`test_render_mission_card_keeps_the_life_estimates_while_they_fit`、`test_render_mission_narrow_card_drops_life_before_the_warning`、`test_mmc_warning_degrades_by_decision_not_by_clipping`、`test_mmc_card_without_room_counts_the_device_out_instead_of_halving_it`、`test_ellipsize_never_splits_a_grapheme`、`test_mmc_identity_line_cuts_a_wide_identity_on_a_cluster_boundary`。（**第二轮更正，见 §13；第三轮更正过滤名称，见 §14**：并非所列十例改前均为红——只有 6 例随扫描矩阵红。那次 RED 运行的命令是 `cargo test -p rsetup-next --bin rsetup-next tui::tests::test_`（**不是**按 `test_wrapped_rows_matches_the_paragraph_word_wrap` 单例过滤——该过滤器只命中 1 例，报不出 24 例的合计），结果 `18 passed; 6 failed`；`test_ellipsize_never_splits_a_grapheme` 则是在还原旧 `ellipsize` 后按 `tui::tests::test_ellipsize` 过滤运行、报 `0 passed; 1 failed`。`test_mmc_warning_degrades_by_decision_not_by_clipping`、`test_mmc_card_without_room_...`、`test_mmc_identity_line_cuts_...` 是排版/健壮性钉桩，旧实现亦通过。`18 passed; 6 failed` 只反映那次过滤运行，不代表十例全红。数据来源：`.superpowers/sdd/all-remaining-2026-10-20/mmc-wrap-fix-report.md` 第 3 节。）
+- **门禁**：（**第三轮更正，见 §14**：本行的 `102 passed` 是**首轮**末态数字。）首轮：`cargo test -p rsetup-next --bin rsetup-next` → `102 passed; 0 failed`，退出码 0；`cargo clippy --package rsetup-next --all-targets -- -D warnings` 退出码 0；`cargo fmt --package rsetup-next -- --check` 退出码 0（未执行 `cargo fmt --all`，理由见 `AGENTS.md`）。第二轮末态同一命令为 `107 passed; 0 failed`（§13），第三轮末态为 `112 passed; 0 failed`（§14）。第 11 节记录的 workspace 级全量门禁在第二轮、第三轮均未重跑（共享工作树同时有其他改动在写）；第三轮改跑的是任务指定的三条包级门禁，见 §14。
+- **未做**：**Rock3A 实机复检未做**——本次未连接真机、未构建 aarch64 产物、未部署、未重采截图；第 10 节第 1 项「实机复检待做」的状态不变。本次亦未提交、未暂存、未推送。逐项细节见 `.superpowers/sdd/all-remaining-2026-10-20/mmc-wrap-fix-report.md`。
+
+## 13. 第二轮复审（P2×2 + P3×2）的整改与首轮数据更正（2026-10-21 补记，第三轮补写）
+
+本节是补写的：第 12 节三处「见 §13」的引用在第二轮并没有落成章节（第三轮复审把它列为文档项之一），历史链条因此断了一节。以下内容按第二轮留在工作树中的实现（`git diff` 现状）与其测试名单还原，不追加第二轮未做过的实现主张。
+
+- **范围**：第二轮处理第 12 节实现被复审出的四项——P2-1 空块被计一行（健康单设备卡片多出幽灵空行）、P2-2 第二台告警设备既不显示也不被计数、P3-3 scratch 上界不是上界且截断行数被当作精确行数、P3-4 手写字符簇白名单加「裁口回退基字符」。
+- **实现改动**（均在 `crates/rsetup-app/src/tui.rs`）：
+  - `wrapped_rows` 返回 `RowFit::{Fits,Overflow}`：只有 scratch 渲染未被截断时 `Fits` 才是精确行数，被截断就如实报 `Overflow`；新增常量 `MAX_WRAP_ROWS = 512` 只用于封住病态输入（超长单行）的 scratch 规模；`wrapped_rows_capped` 在溢出时返回 `cap + 1`，让上层「一定放不下」；
+  - 在第一轮「按剩余行索取」（`max_rows`）的设备块之上，候选健康块改为按**有效字段数**评分（`fit_block`：`pre_eol_info == 1` 的 `Normal` 不计字段，同字段数内再取行数最少），且连身份 + 危险值都放不下的设备整块返回 `None`，由调用方计入「更多设备」而不是画半台；
+  - `ellipsize` 改用 ratatui 公开的 `Span::styled_graphemes`（内部即 `UnicodeSegmentation`），删除手写白名单与「回退基字符」；
+  - `render_mission` 把 `headroom` 的计算上提到行数估算之前，同时作为所有度量的上限。
+- **第二轮新增 5 例**（均在同一文件）：
+  1. `test_wrapped_rows_of_an_empty_block_is_zero` — 空块（含 0 内宽）为 0 行、单个显式空行是 1 行；`render_mission` 排出的 33×30 健康单设备卡片内不得出现空内容行（P2-1）；
+  2. `test_second_warning_device_is_accounted_for` — 两台告警 eMMC 挤不进一张 33×5 卡片时（中英）：要么两台都在屏，要么提示中出现「更多设备」；在屏设备的 pre-EOL 预警值必须整条在屏，不许留残缺片段（P2-2）；
+  3. `test_wrapped_rows_tracks_ratatui_on_adversarial_content` — 前后带双空格的行、31 个 CJK 字符、`"x "` × 40、六个双字母词，这 4 个对抗块在 3/5 内宽（预算 511）下的度量与独立渲染 oracle 逐块一致（P3-3）；
+  4. `test_wrapped_rows_is_resource_bounded` — `"x "` × 65535 在 59 内宽、5 行预算下必须 `Overflow`（不得返回被截断的计数）、空块在 `usize::MAX` 预算下 0 行、20 字符长词在 3 列按 oracle 精确 `Fits`；
+  5. `test_ellipsize_cuts_on_a_real_grapheme_boundary` — `A`+ZWJ+ZWJ、VS16 心形、区域指示符国旗、组合重音、残缺 ZWJ 家庭、印地文连字共 6 个 fixture × `max ∈ 0..=w+2`，裁口必须是 oracle 字符簇序列的整簇前缀（P3-4）。
+- **门禁（第二轮末态）**：`cargo test -p rsetup-next --bin rsetup-next` → `107 passed; 0 failed`，退出码 0（第三轮开工前重跑基线复现该数字）。第二轮未重跑第 11 节的 workspace 级全量门禁，亦未做 Rock3A 实机复检。
+- **第二轮之后仍存在的缺陷（由第三轮处理，见 §14）**：错误行可独占全部内容行使设备静默丢失；「更多设备」提示固定按 1 行预留并按 1 行渲染；`wrapped_rows` 以 scratch 最后一行是否空白判断段落结束；以及本节缺失。
+
+## 14. 第三轮复审（P2×2 + P3×2）的整改（2026-10-21 补记）
+
+起跑线是第二轮末态的 `107 passed; 0 failed`（本次开工前重跑复现）。改动只落在 `crates/rsetup-app/src/tui.rs` 与本文档；证据为 `TestBackend` 的最终 `Buffer`，以及「把被修掉的行为原样还原回去」的变异运行。
+
+### 14.1 P2：错误行不再独占内容行，设备不会静默丢失
+
+第二轮的顺序是「错误行先吃，吃满为止；设备用剩下的；提示用错误行没吃到的最后一行」。当错误行的行数恰好等于预算时，设备拿到 0 预算、提示也拿到 0 行，**两台告警 eMMC 既不显示也不计数**（评审 P2-1；实测复现于 `En 33×5`、`En 18×9`）：
+
+```
+修复前 En 33×5（3 个内容行）              修复后 En 33×5
+┌ Storage Devices ──────────────┐        ┌ Storage Devices ──────────────┐
+│NVMe device enumeration failed:│        │NVMe device enumeration failed:│
+│unable to manage hardware:     │        │unable to manage hardware: nv… │
+│nvme-enumeration-eio           │        │... 2 more device(s)           │
+└───────────────────────────────┘        └───────────────────────────────┘
+  ↑ 3 个内容行全归错误行，无提示行          ↑ 错误少说一截，设备数仍在
+```
+
+- 提示所需的行在**分配任何内容行之前**扣出：`storage_more_hint_floor` 用最紧凑拼写（`+N`）在该卡片内宽下的真实行数作为预留额度；错误行的预算是 `budget - 额度`，设备之间的保留额也按同一额度计算（第二轮固定为 1）。卡片没有设备时不扣——没有可数的东西。
+- 错误行放不进剩余额度时不再整条丢弃：`fit_line_in_rows` 保留行首、按 `ellipsize` 的省略号交出尾部（跨 span 时各 span 保样式，是否放得下仍由 `wrapped_rows` 实测），短卡片上是「错误少说一点 + 设备数还在」，而不是二选一。
+- 单内容行卡片（`budget == 1`）且存在设备时，这一行给设备计数——按评审「一台都显示不下也必须把总数呈现在提示里」的硬要求，此时由错误行让位（`En 33×3` 只有 `... 2 more device(s)`）。
+- 不变量：`test_error_rows_leave_the_device_count_visible` 在 18/25/33/45/61 列 × 3..=16 行 × 中英共 140 个卡片形状上断言「在屏台数 + 提示数字 == 实际台数」，且显示出的设备不得被重复计数；在屏台数以身份行的 `[eMMC]` 徽标计数（内宽 16 时块设备名本身会被收缩，数字名不可靠）。
+- `test_error_and_device_count_share_a_short_card` 钉住评审的 33×4：第一行是被省略号标注过短的错误（其去空白文本必须是原错误文本的前缀，不允许无故省略号、也不允许切成半截标签），第二行必须是完整的一条提示。
+- `test_mission_counts_the_devices_a_narrow_card_cannot_show` 走 `render_mission` 自己排布的 18/21 列 × 19 行视口：存储卡片被夹到 3 行，其下服务卡片仍在，那 1 行内容必须是完整提示。
+
+### 14.2 P2：「更多设备」提示按真实度量取形，绝不画残缺单词
+
+第二轮把提示固定按 1 行预留、也只准备 1 行的文案。18 列卡片内宽只有 16，英文 `... 2 more device(s)` 需要 2 行，于是那唯一一行被画成 `... 2 more`，`device(s)` 掉出卡片（评审 P2-2，修复前实测）：
+
+```
+修复前 En 18×3        修复后 En 18×3        修复后 ZhCn 18×3
+┌ Storage Devices┐    ┌ Storage Devices┐    ┌ 存 储 状 态  ──────┐
+│... 2 more      │    │... +2          │    │... 更 多 设 备  2  │
+└────────────────┘    └────────────────┘    └────────────────┘
+```
+
+- `storage_more_hints` 给出三级文案阶梯（富→简）：`... N more device(s)` / `... +更多设备 N`（中文语序）、`... +N`、`+N`；`storage_more_hint` 用 `wrapped_rows` 逐级实测，取**能在剩余行内整条画完**的最富形态；连最简的一级都放不下时宁可不画，也绝不画残缺单词。
+- 预留额度（14.1）取阶梯最末一级 `+N` 的真实行数：英文在 16 内宽下不再按 1 行误算，因而设备循环不会把提示要用的行花掉。
+- `test_more_devices_hint_is_painted_whole_at_every_width` 在 18..=61 列（内宽 16..=59）× 中英、单内容行卡片上断言：那一行去空白文本必须**恰好等于**三级文案之一，且必须是「放得下的最富一级」——把紧凑形态删掉的变异运行会直接报 `painted ""`。
+
+### 14.3 P3：`wrapped_rows` 不再以空白行判断段落结束
+
+旧实现读 scratch buffer 的最后一个非空行来同时回答两个问题（要几行、有没有超出预算），而 ratatui 的 `Paragraph` 对**空行与「空白被折出的行」不写任何单元格**：`wrapped_rows(["abcde", "", "WARNING"], 3, 2)` 里 `WARNING` 已在缓冲之外，缓冲的最后一行却是空行的空白，于是报出 `Fits(2)`（评审 P3-3 的逐字反例）。
+
+- 现在探针块在预算之外多备两行：一行区分「填满缓冲 / 在缓冲内结束」，一行是 `ROW_PROBE`（`#`，必画）。渲染两次——原块与「原块 + 探针行」——**探针是否出现**才是「是否越界」的判据：出现则行数即探针所在行（精确，且把纯空白行也算进去），没出现则确定越界（`Overflow`）。空白行不再可能被误读成段落结束。
+- 探针高度上限仍是 `MAX_WRAP_ROWS`（512），资源上界测试不变。
+- `test_wrapped_rows_never_reads_a_blank_row_as_the_end_of_a_block`：评审反例在预算 0..=5 下一律 `Overflow`，预算 6 时精确 `Fits(6)`；补上「以空白行结尾」的同源盲区（`["abcdef", ""]` 在 3 列是 3 行，预算 2 时 `Overflow`、预算 3 时 `Fits(3)`）；并钉住空块 0 行、显式空行照旧各占 1 行。
+- 既有的四组度量/边界差分——第一轮的 `test_wrapped_rows_matches_the_paragraph_word_wrap`，第二轮的 `..._tracks_ratatui_on_adversarial_content`、`..._is_resource_bounded`、`..._of_an_empty_block_is_zero`——在新的判据下全部保持绿。
+
+### 14.4 新增测试与 RED 证据
+
+本轮新增 5 例（均在 `crates/rsetup-app/src/tui.rs`）：`test_wrapped_rows_never_reads_a_blank_row_as_the_end_of_a_block`、`test_more_devices_hint_is_painted_whole_at_every_width`、`test_error_rows_leave_the_device_count_visible`、`test_error_and_device_count_share_a_short_card`、`test_mission_counts_the_devices_a_narrow_card_cannot_show`。
+
+把被修的行为单独还原回去（只改生产代码，不动测试），对应测试变红、其余保持绿——证明锁定的是本轮缺陷，而非顺带改到的排版：
+
+| 变异（只还原被修的那一处行为） | 结果 |
+| --- | --- |
+| `wrapped_rows` 还原为「探针 = cap+1 且读最后非空行」 | `cargo test -p rsetup-next --bin rsetup-next wrapped_rows` → `4 passed; 1 failed`，失败断言 `left: Fits(2)`、`right: Overflow`（评审反例本身） |
+| 错误行重新可独占内容行（去掉提示预留与缩短） | 全量 → `110 passed; 2 failed`：`test_error_rows_leave_the_device_count_visible`（`En at a 18x9 card: 0 of 2 device(s) are on screen and the card counts []`）、`test_error_and_device_count_share_a_short_card` |
+| 提示只保留完整拼写（删除 `... +N` / `+N`） | 全量 → `109 passed; 3 failed`：`test_more_devices_hint_is_painted_whole_at_every_width`（`En at a 18x3 card painted ""`）、`test_error_rows_leave_the_device_count_visible`（`En at a 18x3 card: ... counts []`）、`test_mission_counts_the_devices_a_narrow_card_cannot_show` |
+
+三组变异均只用于取证，运行后从备份原样还原文件，最终树与 GREEN 运行同一份代码。
+
+### 14.5 门禁（本轮末态）
+
+- `cargo test -p rsetup-next --bin rsetup-next` → `test result: ok. 112 passed; 0 failed; 0 ignored`，退出码 0（第二轮 107 + 本轮 5）。
+- `cargo clippy -p rsetup-next --all-targets -- -D warnings` → 退出码 0，无告警。
+- `make fmt-check` → 退出码 0、无差异输出（按 `FMT_PACKAGES` 逐包 `cargo fmt -- --check`；未执行 `cargo fmt --all`，理由见 `AGENTS.md`）。
+
+### 14.6 未做
+
+- **Rock3A 实机复检仍未做**：未连接真机、未构建 aarch64 产物、未部署、未重采截图，第 10 节第 1 项状态不变。
+- 第 11 节的 workspace 级全量门禁（`cargo test --workspace --locked`、`cargo clippy --workspace`、`node --test ui/*.test.mjs`）未重跑：共享工作树同时有其他改动在写，本轮只跑任务指定的三条包级门禁。
+- 未提交、未暂存、未推送。
