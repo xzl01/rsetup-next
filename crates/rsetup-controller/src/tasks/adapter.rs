@@ -15,12 +15,18 @@
 //! actor（`is_current_admin`）为唯一权威：会话 `Session.is_admin` 只是廉价前置
 //! 过滤，快照取得后必须二次门控（并发降级重验，M2）。
 //!
-//! 时钟口径（RT-N5，fail-closed）：本适配器按简报固定结构不持有 `TimeGateHandle`；
-//! `submit` 的创建时证据与 `time_review` 的比对时钟取进程内墙钟快照
-//! （`SystemFallback`，纪元进程内稳定）。后果是确定且安全的：`time_review` 因
-//! 「非 `NtpValid` 无法证明原期限有效」恒 `Inconclusive`（零状态变更、返回当前
-//! 视图），绝不伪造 `NtpValid` 证据、绝不延长任何期限。真实可信时钟注入归顶层
-//! 集成装配 owner（届时扩展构造入参即可，本模块纯函数不受影响）。
+//! 时钟口径（RT-N5 缺口闭环）：本适配器通过 [`TaskTimeSource`] **显式注入**时间证据源，
+//! `submit` 的创建时证据与 `time_review` 的比对时钟都取自**同一个注入源**的**当前**
+//! 快照（每次入口调用各读一次，绝不缓存、绝不复用上一次读到的证据）。生产顶层装配
+//! （`main.rs` 的 `production_inputs`）注入与启动门禁共享的同一个 `TimeGateHandle`，
+//! 其 `current()` 按样本年龄/跳钟动态派生质量，因此「一次 `NtpValid`」不会被当成永久
+//! 可信；证据字段（`quality`/`clock_epoch`/`source`/`sample_age_ms`/`offset_ms`/
+//! `uncertainty_ms`/`reference_utc`）一律原样透传，本模块不抬高质量、不抹除字段，也
+//! 绝不伪造 `NtpValid`。源处于 `SystemFallback`/`Stale`、样本超龄、墙钟跳钟换代或纪元
+//! 不连续时，下游 `TaskService::time_review` 依既定纯策略落 `Inconclusive`（零状态
+//! 变更），绝不延长任何原期限。四入参 [`SqlxTaskApi::new`] 保留为兼容构造，等价于注入
+//! [`SystemFallbackTimeSource`]（进程内墙钟，恒不可信），既有 fail-closed 行为不变；
+//! 注入门禁时钟的新构造是 [`SqlxTaskApi::with_time_source`]。
 //!
 //! 游标纪律：`/tasks` 与 `/tasks/{id}/children` 的下一页游标一律经
 //! `encode_task_cursor`（HMAC 签名，密钥由本结构构造入参显式注入，HTTP 层不经手）
@@ -29,6 +35,8 @@
 //! 毫秒截断同轴，同毫秒行由 `id` 决胜），保证跨页不重复、不丢行、不死循环。
 
 use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
@@ -61,6 +69,7 @@ use crate::tasks::service::{
     SubmitError, SubmitOutcome, SubmitRequest, TaskService, TimeReviewDecision, TimeReviewRequest,
     parse_created_time_evidence, snapshot_effective_permissions,
 };
+use crate::time::TimeGateHandle;
 use crate::time::evidence::{TimeEvidence, TimeQuality};
 
 /// 生产 `TaskApi` 实现：服务编排 + 仓储读 + 权威授权快照 + 游标签名密钥。
@@ -73,6 +82,8 @@ pub struct SqlxTaskApi {
     repo: Arc<SqlxTaskRepository>,
     snapshots: Arc<SqlxAuthorizationSnapshotRepository>,
     cursor_secret: [u8; 32],
+    /// 时间证据源（`submit` 创建证据与 `time_review` 比对时钟的唯一来源）。
+    time: Arc<dyn TaskTimeSource>,
 }
 
 /// 本任务唯一 operation 的持久化派生（裁定已定稿）：当前 `TaskOperation` 只有
@@ -249,6 +260,87 @@ pub(crate) fn fallback_clock() -> TimeEvidence {
     }
 }
 
+/// 任务线时间证据 future（对象安全签名，与 `TaskFuture` 同风格但不携带错误通道：
+/// 读时钟本身不产生业务错误，不可信由证据质量表达）。
+pub type TimeEvidenceFuture<'a> = Pin<Box<dyn Future<Output = TimeEvidence> + Send + 'a>>;
+
+/// 任务线时间证据源：`submit` 的创建时证据与 `time_review` 的比对时钟的**唯一**读取契约。
+///
+/// 实现方契约（消费侧据此起见 fail-closed，本模块不复写任何时钟算法）：
+/// - 每次调用返回**当前**快照，并按断裂性质分别「降级」与「换代」，两者不等价：
+///   **样本超龄**只即时把质量从 `NtpValid` 降级为不可信（`SystemFallback`），**不**更换
+///   `clock_epoch`（同一参考系只是变旧，超龄证据与同纪元创建的期限仍可对照）；只有
+///   **跳钟失效或连续性断裂**（墙钟跳变、来源切换、同源阶跃超阈值、失效后重新取得样本）
+///   才更换 `clock_epoch`——旧纪元上的一切期限/寿命比较不得跨纪元继续信任；
+///   绝不把一次 `NtpValid` 缓存成永久可信；
+/// - 字段（`system_wall_utc`/`reference_utc`/`quality`/`clock_epoch`/`source`/
+///   `sample_age_ms`/`offset_ms`/`uncertainty_ms`）由源自身给出，消费侧原样透传，
+///   既不抬高质量也不抹除字段（未知不是 0，不可信不是伪造的理由）。
+pub trait TaskTimeSource: Send + Sync {
+    fn current_evidence(&self) -> TimeEvidenceFuture<'_>;
+}
+
+/// 生产装配：时间门禁句柄**本身**就是任务线时间源。
+///
+/// `TimeGateHandle::current()` 已在读取侧按 `config.max_evidence_age_ms` 动态降级、
+/// 并在 `SystemFallback`/`Stale` 时刷新为当前墙钟，因此把它直接当作源不会引入第二套
+/// 时钟口径，也不会冻结时间。
+impl TaskTimeSource for TimeGateHandle {
+    fn current_evidence(&self) -> TimeEvidenceFuture<'_> {
+        Box::pin(self.current())
+    }
+}
+
+/// 兼容装配的默认源（无门禁注入时唯一诚实时钟）：进程内墙钟 `SystemFallback`。
+///
+/// 与 [`fallback_clock`] 逐个快照等价：质量如实标注不可信、纪元进程内稳定、无来源/
+/// 无偏差/无样本年龄，下游 `time_review` 据此恒 fail-closed（`Inconclusive`）。
+pub struct SystemFallbackTimeSource;
+
+impl TaskTimeSource for SystemFallbackTimeSource {
+    fn current_evidence(&self) -> TimeEvidenceFuture<'_> {
+        Box::pin(async { fallback_clock() })
+    }
+}
+
+/// `submit` 消费入口的时钟前置段：从注入源读**当前**证据并组装 [`SubmitRequest`]。
+///
+/// 唯一读取点（一次调用读一次）：观察窗口与创建证据必须来自**同一**快照，否则同一
+/// 次提交内部就会跨参考系。本函数不抬高质量、不重算字段，也不延长任何期限。
+///
+/// `raw_preview_token` 是 `preview_token_bytes` 的产物；该解码器只接受 64 位**小写**
+/// hex，故 `hex::encode(raw_preview_token)` 与调用方手里的原始令牌字符串逐字节相等，
+/// 幂等摘要与重构前完全同源（由单测
+/// `submit_request_binds_evidence_and_keeps_token_derived_digests` 逐字段钉死）。
+pub async fn prepare_submit_request(
+    time: &dyn TaskTimeSource,
+    raw_preview_token: &[u8; 32],
+    idempotency_key: &str,
+) -> Result<SubmitRequest, ControllerError> {
+    let time_evidence = time.current_evidence().await;
+    let window = chrono::Duration::try_milliseconds(OBSERVE_WINDOW_MS)
+        .ok_or_else(|| ControllerError::Config("observe window out of range".into()))?;
+    let observe_deadline = time_evidence
+        .reference_utc
+        .checked_add_signed(window)
+        .ok_or_else(|| ControllerError::Config("observe deadline out of range".into()))?;
+    Ok(SubmitRequest {
+        idempotency_key: idempotency_key.to_owned(),
+        // 请求体只携带预览令牌：幂等摘要绑定令牌本身，目标清单以服务端
+        // 预览快照为唯一真相源（客户端永不携带目标/摘要/counts）。
+        request_hash: preview_request_hash(&hex::encode(raw_preview_token), &[], &[]),
+        preview_token_hash: preview_token_digest(raw_preview_token),
+        preview_token_nonce: preview_token_nonce(raw_preview_token),
+        observe_deadline,
+        time_evidence,
+    })
+}
+
+/// `time_review` 消费入口的时钟前置段：从注入源读**当前**证据作为比对时钟。
+pub async fn prepare_time_review_clock(time: &dyn TaskTimeSource) -> TimeEvidence {
+    time.current_evidence().await
+}
+
 /// 去重并升序（`[u8; 32]` 字节序）：`load_snapshot` 入参的稳定形状。
 fn unique_device_ids(device_ids: impl Iterator<Item = [u8; 32]>) -> Vec<[u8; 32]> {
     device_ids.collect::<BTreeSet<_>>().into_iter().collect()
@@ -299,19 +391,43 @@ pub(crate) fn assemble_detail(
 }
 
 impl SqlxTaskApi {
-    /// 构造入参全部显式注入；`cursor_secret` 由装配方从环境链载入并校验
-    /// （缺失/长度不符即装配失败），本类型不设默认密钥。
+    /// 兼容构造（四入参）：时间证据源固定为 [`SystemFallbackTimeSource`]（进程内墙钟，
+    /// 恒不可信），既有调用点与 fail-closed 行为逐字节不变。生产进程应改用
+    /// [`Self::with_time_source`] 注入门禁时钟。
     pub fn new(
         service: Arc<TaskService<SqlxTaskRepository>>,
         repo: Arc<SqlxTaskRepository>,
         snapshots: Arc<SqlxAuthorizationSnapshotRepository>,
         cursor_secret: [u8; 32],
     ) -> Self {
+        Self::with_time_source(
+            service,
+            repo,
+            snapshots,
+            cursor_secret,
+            Arc::new(SystemFallbackTimeSource),
+        )
+    }
+
+    /// 构造入参全部显式注入；`cursor_secret` 由装配方从环境链载入并校验
+    /// （缺失/长度不符即装配失败），本类型不设默认密钥。
+    ///
+    /// `time` 是 `submit` 创建证据与 `time_review` 比对时钟的**同一**注入源：生产顶层
+    /// 装配传入与启动门禁共享的 `TimeGateHandle`（`Arc` 克隆共享同一权威快照，不是
+    /// 第二个采样器）；本类型不自行取墙钟、不缓存读到的证据。
+    pub fn with_time_source(
+        service: Arc<TaskService<SqlxTaskRepository>>,
+        repo: Arc<SqlxTaskRepository>,
+        snapshots: Arc<SqlxAuthorizationSnapshotRepository>,
+        cursor_secret: [u8; 32],
+        time: Arc<dyn TaskTimeSource>,
+    ) -> Self {
         Self {
             service,
             repo,
             snapshots,
             cursor_secret,
+            time,
         }
     }
 
@@ -409,23 +525,9 @@ impl SqlxTaskApi {
     ) -> Result<SubmitOutcome, ControllerError> {
         let raw_token =
             preview_token_bytes(preview_token).ok_or(ControllerError::InvalidArgument)?;
-        let time_evidence = fallback_clock();
-        let window = chrono::Duration::try_milliseconds(OBSERVE_WINDOW_MS)
-            .ok_or_else(|| ControllerError::Config("observe window out of range".into()))?;
-        let observe_deadline = time_evidence
-            .reference_utc
-            .checked_add_signed(window)
-            .ok_or_else(|| ControllerError::Config("observe deadline out of range".into()))?;
-        let request = SubmitRequest {
-            idempotency_key: idempotency_key.to_owned(),
-            // 请求体只携带预览令牌：幂等摘要绑定令牌本身，目标清单以服务端
-            // 预览快照为唯一真相源（客户端永不携带目标/摘要/counts）。
-            request_hash: preview_request_hash(preview_token, &[], &[]),
-            preview_token_hash: preview_token_digest(&raw_token),
-            preview_token_nonce: preview_token_nonce(&raw_token),
-            observe_deadline,
-            time_evidence,
-        };
+        // 时钟前置段：从注入源读一次当前证据（与 time_review 同源），随后才触达存储。
+        let request =
+            prepare_submit_request(self.time.as_ref(), &raw_token, idempotency_key).await?;
         let ctx = self.auth_ctx(actor);
         self.service
             .submit(&request, &ctx)
@@ -683,7 +785,8 @@ impl SqlxTaskApi {
             }
             crate::tasks::http::TimeReviewDecision::Expire => TimeReviewDecision::Expire,
         };
-        let clock = fallback_clock();
+        // 时钟前置段：与 submit 共用同一个注入源，比对时钟即该源的**当前**快照。
+        let clock = prepare_time_review_clock(self.time.as_ref()).await;
         let ctx = self.auth_ctx(actor);
         let request = TimeReviewRequest {
             main_task_id: task_id,
@@ -803,6 +906,7 @@ mod tests {
     use crate::devices::repository::DeviceAdminView;
     use crate::model::{AdmissionState, ReviewDecision};
     use crate::tasks::model::MainTaskOutcome;
+    use crate::tasks::preview::new_preview_token;
 
     const ACTOR_ID: [u8; 16] = [0x11; 16];
     const DEVICE_A: [u8; 32] = [0xA1; 32];
@@ -1118,6 +1222,87 @@ mod tests {
         assert!(first.offset_ms.is_none());
         assert!(first.uncertainty_ms.is_none());
         assert!(first.reference_utc <= second.reference_utc);
+    }
+
+    /// 固定证据的注入源替身：用于断言两个消费入口的前置段**原样透传**证据字段。
+    struct FixedTimeSource {
+        evidence: TimeEvidence,
+    }
+
+    impl TaskTimeSource for FixedTimeSource {
+        fn current_evidence(&self) -> TimeEvidenceFuture<'_> {
+            let evidence = self.evidence.clone();
+            Box::pin(async move { evidence })
+        }
+    }
+
+    fn injected_evidence() -> TimeEvidence {
+        TimeEvidence {
+            system_wall_utc: fixed_time(),
+            reference_utc: fixed_time(),
+            quality: TimeQuality::NtpValid,
+            clock_epoch: Uuid::from_u128(0xE7),
+            source: Some("fake.adapter-unit.local".to_owned()),
+            sample_age_ms: Some(123),
+            offset_ms: Some(-42),
+            uncertainty_ms: Some(7),
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_clock_passes_every_evidence_field_through() {
+        // 消费入口前置段绝不改写证据：逐字段等值（不抬质量、不抹 source/偏差/年龄）。
+        let source = FixedTimeSource {
+            evidence: injected_evidence(),
+        };
+        assert_eq!(
+            prepare_time_review_clock(&source).await,
+            injected_evidence()
+        );
+    }
+
+    #[tokio::test]
+    async fn system_fallback_source_is_the_untrusted_process_wall_clock() {
+        // 兼容构造 `SqlxTaskApi::new` 的默认源：与 fallback_clock 同口径（不可信、
+        // 纪元稳定、无来源/偏差/年龄），保持既有 Inconclusive 语义。
+        let first = SystemFallbackTimeSource.current_evidence().await;
+        let second = SystemFallbackTimeSource.current_evidence().await;
+        assert_eq!(first.quality, TimeQuality::SystemFallback);
+        assert_eq!(first.clock_epoch, fallback_clock().clock_epoch);
+        assert_eq!(first.clock_epoch, second.clock_epoch);
+        assert!(first.source.is_none());
+        assert!(first.sample_age_ms.is_none());
+        assert!(first.offset_ms.is_none());
+        assert!(first.uncertainty_ms.is_none());
+        assert!(first.reference_utc <= second.reference_utc);
+    }
+
+    #[tokio::test]
+    async fn submit_request_binds_evidence_and_keeps_token_derived_digests() {
+        // 幂等摘要/令牌派生值与重构前的内联写法完全同源（小写 hex 的往返等值）。
+        let token = new_preview_token();
+        let raw = preview_token_bytes(&token).expect("canonical token");
+        let source = FixedTimeSource {
+            evidence: injected_evidence(),
+        };
+        let request = prepare_submit_request(&source, &raw, "time-consumption-key")
+            .await
+            .expect("组装 SubmitRequest");
+        assert_eq!(request.time_evidence, injected_evidence());
+        assert_eq!(request.idempotency_key, "time-consumption-key");
+        assert_eq!(
+            request.request_hash,
+            preview_request_hash(&token, &[], &[]),
+            "hex::encode(raw) 必须与调用方原始令牌字符串逐字节一致"
+        );
+        assert_eq!(request.preview_token_hash, preview_token_digest(&raw));
+        assert_eq!(request.preview_token_nonce, preview_token_nonce(&raw));
+        assert_eq!(
+            request.observe_deadline,
+            fixed_time()
+                + chrono::Duration::try_milliseconds(OBSERVE_WINDOW_MS).expect("window in range"),
+            "观察窗口必须由同一份注入证据派生"
+        );
     }
 
     #[test]

@@ -180,6 +180,14 @@ impl TimeGateHandle {
     }
 
     /// 已 ready 立即返回快照；否则等待 ready 通知，最长 `ready_timeout`（默认 30s）超时兜底返回当前快照。
+    ///
+    /// **计时起点**：`ready_timeout` 从本方法**首次被 poll 的一刻**起算，**不是**从
+    /// `start_time_gate` 起算。要在启动阶段让这段预算与其它准备工作（建池、schema 检查、
+    /// admin bootstrap、启动恢复、生产装配）并行消耗，调用方必须在门禁启动后**立即**开始
+    /// 等待；在那些工作之后串行调用本方法，只会在它们的耗时之外**再叠加**一整段
+    /// `ready_timeout`——NTP 恒失败回退 `SystemFallback` 时尤其明显：fallback 既不置
+    /// `is_ready` 也不 `notify_waiters`，等待必然走满超时。生产装配见 `main.rs` 的
+    /// `StartupTimeGate`（紧跟 `start_time_gate` spawn 一次 `wait_ready`）。
     pub async fn wait_ready(&self) -> TimeEvidence {
         // RT-R7-4：修复检查-注册竞态——tokio 的 Notified 首次 poll 才入队，且 Notify 不为未来的
         // waiter 保留 permit；若 store(true) + notify_waiters() 恰在 load(false) 之后、监听器入队
