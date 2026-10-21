@@ -2150,6 +2150,39 @@ trait LegacyUpgradeProbe: LegacyPreflightProbe {
     async fn ready_v3(&self) -> Result<(), ControllerError>;
 }
 
+/// 迁移期元数据查询的边界保护：TiDB 在连续 `MODIFY COLUMN` 后可能让
+/// `information_schema` 读取短暂不可用，表现为查询长时间不返回而不是报错。
+/// 这里给每次 preflight 加单次超时与有限重试，把「无限挂起」变成可观察的成功或
+/// 明确失败，绝不把超时当成资产通过。
+async fn preflight_with_retry<P>(
+    probe: &P,
+    version: i32,
+) -> Result<LegacyPreflight, ControllerError>
+where
+    P: LegacyUpgradeProbe + Sized,
+{
+    // 探测式重试：TiDB 在 DDL 之后可能让单条 `information_schema` 查询长时间
+    // 不返回。用短超时反复探测（而不是一次长超时）可以在元数据一就绪时立刻继续，
+    // 同时保证总等待有硬上限：超过上限返回明确错误，绝不冒充成功。
+    const ATTEMPTS: usize = 120;
+    const PER_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(3);
+    const BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+    let mut last: Option<ControllerError> = None;
+    for attempt in 0..ATTEMPTS {
+        match tokio::time::timeout(PER_ATTEMPT, probe.preflight(version)).await {
+            Ok(Ok(snapshot)) => return Ok(snapshot),
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                last = Some(legacy_preflight_error("preflight timeout"));
+                if attempt + 1 < ATTEMPTS {
+                    tokio::time::sleep(BACKOFF).await;
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| legacy_preflight_error("preflight timeout")))
+}
+
 async fn upgrade_legacy_with_probe(
     probe: &impl LegacyUpgradeProbe,
     version: i32,
@@ -2159,12 +2192,12 @@ async fn upgrade_legacy_with_probe(
     }
     // Full version/shape/CHECK/FK/data/counter/username preflight precedes
     // *every* DDL, not just the first; independently recheck its outcome.
-    let mut trusted = probe.preflight(version).await?;
+    let mut trusted = preflight_with_retry(probe, version).await?;
     for (index, &(_, _, _, statement)) in IDENTITY_COLUMNS.iter().enumerate() {
         if !trusted.old_columns[index] {
             continue; // Nontransactional retry: this exact ALTER already landed.
         }
-        let before = probe.preflight(version).await?;
+        let before = preflight_with_retry(probe, version).await?;
         require_legacy_snapshot(&trusted, &before)?;
         if !before.old_columns[index] || version != 1 {
             return Err(legacy_preflight_error("alter precondition"));
@@ -2172,7 +2205,7 @@ async fn upgrade_legacy_with_probe(
         let ddl = probe.alter(statement).await;
         // Even an Err can have applied a nontransactional ALTER. Re-read for
         // diagnosis but never convert an uncertain result into success.
-        let after = probe.preflight(version).await;
+        let after = preflight_with_retry(probe, version).await;
         ddl?;
         let after = after?;
         let mut expected = before;
@@ -2184,13 +2217,13 @@ async fn upgrade_legacy_with_probe(
         if !trusted.observed_checks.contains(&(table, name)) {
             continue;
         }
-        let before = probe.preflight(version).await?;
+        let before = preflight_with_retry(probe, version).await?;
         require_legacy_snapshot(&trusted, &before)?;
         if !before.observed_checks.contains(&(table, name)) {
             return Err(legacy_preflight_error("drop precondition"));
         }
         let ddl = probe.drop_known_check(table, name).await;
-        let after = probe.preflight(version).await;
+        let after = preflight_with_retry(probe, version).await;
         ddl?;
         let after = after?;
         let mut expected = before;
@@ -2200,7 +2233,7 @@ async fn upgrade_legacy_with_probe(
         require_legacy_snapshot(&expected, &after)?;
         trusted = after;
     }
-    let final_read = probe.preflight(version).await?;
+    let final_read = preflight_with_retry(probe, version).await?;
     require_legacy_snapshot(&trusted, &final_read)?;
     if final_read.old_columns.iter().any(|old| *old) || !final_read.observed_checks.is_empty() {
         return Err(legacy_preflight_error("target not ready"));
