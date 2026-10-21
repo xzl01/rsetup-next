@@ -22,23 +22,27 @@
 //! 用超时护栏断言流是被服务端主动关掉的，而不是靠总线关闭收尾的。
 //! 这不改变生产语义（生产进程持续持有句柄，连接活到客户端断开为止）。
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderValue, Request, StatusCode, header};
+use futures_core::Stream as _;
 use rsetup_controller::ControllerError;
 use rsetup_controller::auth::service::{IdentityUser, Login, Session, SessionPage};
 use rsetup_controller::auth::session::token_digest;
 use rsetup_controller::events::{
-    EventAudience, EventBus, EventEnvelope, RESET_REASON_BUFFER_OVERFLOW,
+    EVENT_BUS_CAPACITY, EventBus, EventEnvelope, EventObjectAudience, RESET_REASON_BUFFER_OVERFLOW,
 };
 use rsetup_controller::http_auth::{AuthFuture, AuthServiceApi, HttpAuthState, SessionAuthority};
 use rsetup_controller::http_events::EventsState;
 use rsetup_controller::http_security::HttpSecurityConfig;
 use serde_json::Value;
+use tokio::time::sleep;
 use tower::ServiceExt;
 
 const HOST: &str = "controller.local";
@@ -50,6 +54,26 @@ const READ_BUDGET: Duration = Duration::from_secs(5);
 const SLOW_REVALIDATE: Duration = Duration::from_secs(3600);
 /// 周期复核算例用的短周期：远小于超时护栏，让空闲连接被主动切断。
 const FAST_REVALIDATE: Duration = Duration::from_millis(20);
+/// 活性用例注入的「权威读慢成功」耗时，**必须严格大于** [`STARVE_REVALIDATE`]：
+/// 只有「一次权威读的耗时 ≥ 复核周期」才构成本用例的前提（被审的饿死条件）。
+const SLOW_READ: Duration = Duration::from_millis(20);
+/// 活性用例的复核周期（刻意小于 [`SLOW_READ`]）。
+const STARVE_REVALIDATE: Duration = Duration::from_millis(5);
+/// 活性用例的整体预算：健康实现读一帧只需两次权威读（排队 + 复核）≈ 2×[`SLOW_READ`]，
+/// 本预算已是它的十几倍；被周期复核饿死时这段预算内会塞满几十次同样的读，
+/// 判定与 [`STARVE_MAX_READS`] 都不依赖时序抖动放大。
+const STARVE_BUDGET: Duration = Duration::from_millis(300);
+/// 空闲慢读用例的复核周期（同时用作该用例的读耗时：两者相等时被审路径的
+/// 读节奏是 40ms，修复后是 80ms，比例上界 2，见用例内推算）。
+const PERIODIC_REVALIDATE: Duration = Duration::from_millis(40);
+/// 空闲窗口的观察时长（真实时间）：健康实现约 4 次读，被审路径约 8 次。
+const IDLE_WINDOW: Duration = Duration::from_millis(320);
+/// 空闲窗口内允许的权威读次数上界（「复核完成后不得立刻再来一次」）。
+const IDLE_MAX_READS: usize = 6;
+/// 活性用例允许的权威读次数上界（同时是「没有忙轮询」的取证阈值）：健康实现的
+/// 读次数只由**帧数**决定（握手 1 次 + 每帧 1 次），与被审路径的
+/// 「预算 / 复核周期」量级（本用例 60 次）相差一个数量级。
+const STARVE_MAX_READS: usize = 8;
 
 const ALICE: [u8; 16] = [7u8; 16];
 const BOB: [u8; 16] = [8u8; 16];
@@ -81,6 +105,11 @@ struct StubAuth {
     session: Session,
     live: Arc<AtomicBool>,
     authority: Arc<Mutex<Authority>>,
+    /// 本连接的权威 `session_authority` 被调用次数（取证「有没有忙轮询」）。
+    reads: Arc<AtomicUsize>,
+    /// 权威读的**人为**延迟（微秒；0 = 不延迟）。握手完成后翻成非 0，就是在
+    /// 模拟「权威源确实有效，但这一次成功读很慢」。
+    read_delay_us: Arc<AtomicUsize>,
 }
 
 fn hex64(seed: u8) -> String {
@@ -139,9 +168,19 @@ impl AuthServiceApi for StubAuth {
     fn session_authority<'a>(&'a self, digest: &'a [u8; 32]) -> AuthFuture<'a, SessionAuthority> {
         // 权威侧结论**只**来自 `authority`：内存时钟的 `live` 开关在这里刻意
         // 不参与，两个失效通道才能被分别取证。
+        //
+        // 持锁范围**必须**止于 `async move` 之外：延迟（模拟慢权威源）是在 await
+        // 期间发生的，若把 `MutexGuard` 带进 future，同一连接的两条权威读
+        // （握手基准 + 流内复核）就会互锁——那会伪装成「权威读很慢」的故障。
         let authority = *self.authority.lock().unwrap();
         let mine = *digest == self.session.digest;
+        let reads = Arc::clone(&self.reads);
+        let delay = Duration::from_micros(self.read_delay_us.load(Ordering::SeqCst) as u64);
         Box::pin(async move {
+            reads.fetch_add(1, Ordering::SeqCst);
+            if !delay.is_zero() {
+                sleep(delay).await;
+            }
             if authority.read_failed {
                 return Err(ControllerError::Config(
                     "synthetic authority read fault".into(),
@@ -178,6 +217,11 @@ struct Conn {
     token: String,
     live: Arc<AtomicBool>,
     authority: Arc<Mutex<Authority>>,
+    /// 本连接的权威 `session_authority` 被调用次数（取证「有没有忙轮询」）。
+    reads: Arc<AtomicUsize>,
+    /// 本连接权威读的**人为**延迟（微秒；0 = 不延迟）。在握手完成后翻成非 0，
+    /// 就是在模拟「权威源此刻确实有效，但这一次读很慢」。
+    read_delay_us: Arc<AtomicUsize>,
 }
 
 impl Conn {
@@ -187,21 +231,54 @@ impl Conn {
         is_admin: bool,
         revalidate: Duration,
     ) -> Self {
+        Self::with_capacity_and_reader(bus, user_id, is_admin, revalidate, 0)
+    }
+
+    /// `read_delay_us` 非 0 时给权威读注入固定延迟（活性用例的注入点）。
+    fn with_capacity_and_reader(
+        bus: &EventBus,
+        user_id: [u8; 16],
+        is_admin: bool,
+        revalidate: Duration,
+        read_delay_us: usize,
+    ) -> Self {
         let token = hex64(user_id[0]);
         let digest = token_digest(token.as_bytes());
+        Self::with_session(
+            bus,
+            fixture_session(user_id, is_admin, digest),
+            revalidate,
+            read_delay_us,
+        )
+    }
+
+    /// 唯一构造点：会话形状由调用方给出（覆盖 `must_change_password` 这类特例），
+    /// 令牌按 `hex64(user.id[0])` 推导，权威侧的 live/authority/计数句柄在此集中
+    /// 装配。所有用例共用这里，新增桩字段不可能被某个复制件漏掉。
+    fn with_session(
+        bus: &EventBus,
+        session: Session,
+        revalidate: Duration,
+        read_delay_us: usize,
+    ) -> Self {
+        let token = hex64(session.user.id[0]);
         let live = Arc::new(AtomicBool::new(true));
         let authority = Arc::new(Mutex::new(Authority {
             revoked: false,
-            is_admin,
+            is_admin: session.user.is_admin,
             epoch: 0,
             read_failed: false,
         }));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let read_delay_us = Arc::new(AtomicUsize::new(read_delay_us));
         let auth = Arc::new(HttpAuthState::new(
             Arc::new(StubAuth {
                 token: token.clone(),
-                session: fixture_session(user_id, is_admin, digest),
+                session,
                 live: Arc::clone(&live),
                 authority: Arc::clone(&authority),
+                reads: Arc::clone(&reads),
+                read_delay_us: Arc::clone(&read_delay_us),
             }),
             HttpSecurityConfig::from_values(Some(HOST), Some(ORIGIN), None).unwrap(),
         ));
@@ -216,6 +293,8 @@ impl Conn {
             token,
             live,
             authority,
+            reads,
+            read_delay_us,
         }
     }
 
@@ -223,6 +302,12 @@ impl Conn {
     /// 之后 partial move 掉的 `conn` 不能再借用。
     fn authority(&self) -> Arc<Mutex<Authority>> {
         Arc::clone(&self.authority)
+    }
+
+    /// 同理取权威读计数句柄（`drop(conn.router)` 之后仍可读：router 释放不影响
+    /// `Arc<StubAuth>` 已被 router 持有的事实，句柄在测试侧）。
+    fn reads(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.reads)
     }
 }
 
@@ -264,9 +349,17 @@ fn events_request(conn: &Conn, cookie: bool, origin: Option<&str>) -> Request<Bo
 
 /// 读干响应体（测试侧必须先关闭总线或让服务端主动关流，否则本函数在预算内超时）。
 async fn drain(response: axum::response::Response) -> Vec<u8> {
-    let bytes = tokio::time::timeout(READ_BUDGET, to_bytes(response.into_body(), 1 << 20))
+    drain_within(response, READ_BUDGET).await
+}
+
+/// [`drain`] 的可指定预算版本：活性用例用**远小于** [`READ_BUDGET`] 的预算，
+/// 把「慢到什么程度算被饿死」写成显式契约，而不是靠放宽护栏蒙过去。
+async fn drain_within(response: axum::response::Response, budget: Duration) -> Vec<u8> {
+    let bytes = tokio::time::timeout(budget, to_bytes(response.into_body(), 1 << 20))
         .await
-        .expect("SSE 体必须在总线关闭或连接被主动关闭后有限时间内结束")
+        .unwrap_or_else(|_| {
+            panic!("SSE 体必须在 {budget:?} 内由服务端结束；读不出来即排队事件或总线关闭被饿死")
+        })
         .unwrap();
     bytes.to_vec()
 }
@@ -413,34 +506,7 @@ async fn temporary_password_session_is_refused_with_403() {
     let token = hex64(BOB[0]);
     let mut session = fixture_session(BOB, false, token_digest(token.as_bytes()));
     session.user.must_change_password = true;
-    let conn = Conn {
-        router: rsetup_controller::http_events::build_events_router(EventsState {
-            auth: Arc::new(HttpAuthState::new(
-                Arc::new(StubAuth {
-                    token: token.clone(),
-                    session,
-                    live: Arc::new(AtomicBool::new(true)),
-                    authority: Arc::new(Mutex::new(Authority {
-                        revoked: false,
-                        is_admin: false,
-                        epoch: 0,
-                        read_failed: false,
-                    })),
-                }),
-                HttpSecurityConfig::from_values(Some(HOST), Some(ORIGIN), None).unwrap(),
-            )),
-            bus: bus.clone(),
-            revalidate_interval: SLOW_REVALIDATE,
-        }),
-        token,
-        live: Arc::new(AtomicBool::new(true)),
-        authority: Arc::new(Mutex::new(Authority {
-            revoked: false,
-            is_admin: false,
-            epoch: 0,
-            read_failed: false,
-        })),
-    };
+    let conn = Conn::with_session(&bus, session, SLOW_REVALIDATE, 0);
     let response = conn
         .router
         .clone()
@@ -506,12 +572,15 @@ async fn five_named_events_arrive_as_named_frames_with_json_data() {
     drop(fixture.conn.router);
 
     let device_id = "ab".repeat(32);
+    // 本连接是管理员（`fixture(true, ..)` → ROOT）。两条对象事件取**管理员范围**
+    // 受众：对象事实已不存在「任何合法会话」这一档（`EventObjectAudience` 里没有
+    // 该变体），所以「五种命名事件都能收齐」这条契约只在受众覆盖本连接时成立。
     let published = [
-        EventEnvelope::device_updated(&device_id, 12, EventAudience::AnySession),
+        EventEnvelope::device_updated(&device_id, 12, EventObjectAudience::admins()),
         EventEnvelope::task_updated(
             "0e7f1c2e-0000-4000-8000-000000000001",
             7,
-            EventAudience::AnySession,
+            EventObjectAudience::admins(),
         ),
         // 授权投影事件的受众由构造钉死为本人（= 本连接的用户）。
         EventEnvelope::permissions_changed(ROOT, 41),
@@ -587,7 +656,7 @@ async fn lagged_subscription_gets_reset_then_keeps_streaming() {
         bus.publish(EventEnvelope::task_updated(
             "t",
             revision,
-            EventAudience::AnySession,
+            EventObjectAudience::user(BOB),
         ));
     }
     drop(bus);
@@ -642,7 +711,7 @@ async fn time_event_is_admin_only_on_a_shared_bus() {
     fixture.bus.publish(EventEnvelope::device_updated(
         &"cd".repeat(32),
         3,
-        EventAudience::AnySession,
+        EventObjectAudience::user(BOB),
     ));
     drop(fixture.bus);
     let frames = parse_frames(&drain(response).await);
@@ -664,7 +733,7 @@ async fn revoked_session_closes_stream_without_leaking_queued_events() {
     fixture.bus.publish(EventEnvelope::task_updated(
         "around-revoke",
         1,
-        EventAudience::AnySession,
+        EventObjectAudience::user(ROOT),
     ));
     fixture.conn.live.store(false, Ordering::SeqCst);
     fixture
@@ -715,7 +784,7 @@ async fn demoted_admin_connection_is_closed_and_sends_nothing_more() {
     bus.publish(EventEnvelope::device_updated(
         &"ee".repeat(32),
         1,
-        EventAudience::AnySession,
+        EventObjectAudience::admins(),
     ));
     let bytes = tokio::time::timeout(READ_BUDGET, to_bytes(response.into_body(), 1 << 20))
         .await
@@ -742,7 +811,7 @@ async fn authz_epoch_change_closes_connection_without_leaking_events() {
     bus.publish(EventEnvelope::task_updated(
         "after-epoch-bump",
         1,
-        EventAudience::AnySession,
+        EventObjectAudience::user(BOB),
     ));
     let bytes = tokio::time::timeout(READ_BUDGET, to_bytes(response.into_body(), 1 << 20))
         .await
@@ -773,7 +842,7 @@ async fn session_revoked_in_authority_store_closes_connection_without_leaking_ev
     bus.publish(EventEnvelope::task_updated(
         "after-revoke",
         1,
-        EventAudience::AnySession,
+        EventObjectAudience::user(BOB),
     ));
     let bytes = tokio::time::timeout(READ_BUDGET, to_bytes(response.into_body(), 1 << 20))
         .await
@@ -800,7 +869,7 @@ async fn authority_read_failure_fails_closed_instead_of_trusting_the_stale_strea
     bus.publish(EventEnvelope::device_updated(
         &"ff".repeat(32),
         1,
-        EventAudience::AnySession,
+        EventObjectAudience::user(BOB),
     ));
     let bytes = tokio::time::timeout(READ_BUDGET, to_bytes(response.into_body(), 1 << 20))
         .await
@@ -865,14 +934,14 @@ async fn private_event_reaches_only_its_target_user_on_a_shared_bus() {
     bus.publish(EventEnvelope::device_updated(
         &device_id,
         4,
-        EventAudience::User(ALICE),
+        EventObjectAudience::user(ALICE),
     ));
     bus.publish(EventEnvelope::permissions_changed(ALICE, 12));
     // 限定给 bob 的事件：alice 与 root 都必须零接收。
     bus.publish(EventEnvelope::task_updated(
         "bobs-task",
         5,
-        EventAudience::User(BOB),
+        EventObjectAudience::user(BOB),
     ));
 
     drop(alice.router);
@@ -911,9 +980,65 @@ async fn private_event_reaches_only_its_target_user_on_a_shared_bus() {
 }
 
 #[tokio::test]
-async fn admin_scoped_object_event_is_skipped_for_non_admin_connections() {
-    // 只有管理员可见的**对象级**事件（`EventAudience::Admins`）：管理员收到，
-    // 普通用户连接静默跳过且不占水位；同时管理员连接不会收到限定他人的事件。
+async fn foreign_permissions_change_is_invisible_to_the_wrong_user_and_admin_bystander() {
+    // 被审缺陷（P1）：`permissions.changed` 的载荷 `id` 与受众曾经是**两个可以
+    // 分别填写**的公开字段，「载荷写着 Alice、受众写着 Bob」的信封能把 Alice 的
+    // authz_epoch 投到 Bob 的流上。现在两者由同一份字节生成
+    // （`EventEnvelope::permissions_changed(user_id, epoch)`，受众参数根本不接受
+    // 调用方给出），本用例在真实 axum 流上钉住三点：
+    // 1. alice 收到的载荷 `id` **就是** alice 本人（受众与载荷同源，不错位）；
+    // 2. bob 与管理员旁观者零接收（受众不是装饰，管理员也不是对象级受众的旁路）；
+    // 3. 事件里那个 epoch 只属于 alice，别人读不到自己授权投影之外的任何事实。
+    let bus = EventBus::with_capacity(128);
+    let alice = Conn::with_capacity(&bus, ALICE, false, SLOW_REVALIDATE);
+    let bob = Conn::with_capacity(&bus, BOB, false, SLOW_REVALIDATE);
+    let root = Conn::with_capacity(&bus, ROOT, true, SLOW_REVALIDATE);
+    let alice_response = handshake(&alice, events_request(&alice, true, None)).await;
+    let bob_response = handshake(&bob, events_request(&bob, true, None)).await;
+    let root_response = handshake(&root, events_request(&root, true, None)).await;
+
+    bus.publish(EventEnvelope::permissions_changed(ALICE, 12));
+
+    drop(alice.router);
+    drop(bob.router);
+    drop(root.router);
+    drop(bus);
+
+    let alice_frames = parse_frames(&drain(alice_response).await);
+    let bob_frames = parse_frames(&drain(bob_response).await);
+    let root_frames = parse_frames(&drain(root_response).await);
+
+    assert_eq!(
+        alice_frames
+            .iter()
+            .map(|f| f.event.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("permissions.changed")],
+        "本人必须收到自己的授权投影事件"
+    );
+    let data = alice_frames[0].data.as_ref().unwrap();
+    assert_eq!(
+        data["id"],
+        Value::String(uuid::Uuid::from_bytes(ALICE).to_string()),
+        "载荷 id 必须就是受众本人（与受众同源，不存在被改写成他人的写法）"
+    );
+    assert_eq!(data["epoch"], Value::String("12".into()));
+    assert!(
+        bob_frames.is_empty(),
+        "Alice 的授权投影绝不允许出现在 Bob 的流上：{bob_frames:?}"
+    );
+    assert!(
+        root_frames.is_empty(),
+        "管理员旁观者同样不得收到他人的授权投影：{root_frames:?}"
+    );
+}
+
+#[tokio::test]
+async fn object_events_are_visible_only_to_their_own_audience_slice() {
+    // **对象级**事件的两条合法受众（管理员范围 / 某一个用户）各自只对自己的
+    // 连接可见。此前这条用例断言的是「AnySession 的对象事件对普通用户也可见」
+    // ——那是错的：对象事实没有「广播给所有连接」这一档（受众类型里根本没有），
+    // 普通用户连接只能看到明确指向自己的那一份，管理员也只能看到管理员范围那一份。
     let bus = EventBus::with_capacity(128);
     let admin = Conn::with_capacity(&bus, ROOT, true, SLOW_REVALIDATE);
     let user = Conn::with_capacity(&bus, BOB, false, SLOW_REVALIDATE);
@@ -923,12 +1048,12 @@ async fn admin_scoped_object_event_is_skipped_for_non_admin_connections() {
     bus.publish(EventEnvelope::device_updated(
         &"cd".repeat(32),
         9,
-        EventAudience::Admins,
+        EventObjectAudience::admins(),
     ));
     bus.publish(EventEnvelope::device_updated(
         &"cd".repeat(32),
         10,
-        EventAudience::AnySession,
+        EventObjectAudience::user(BOB),
     ));
 
     drop(admin.router);
@@ -942,8 +1067,13 @@ async fn admin_scoped_object_event_is_skipped_for_non_admin_connections() {
             .iter()
             .map(|f| f.event.as_deref())
             .collect::<Vec<_>>(),
-        vec![Some("device.updated"), Some("device.updated")],
-        "管理员连接两条都收得到"
+        vec![Some("device.updated")],
+        "管理员只收得到管理员范围那一条，指向他人的对象事件同样不得串过来：{admin_frames:?}"
+    );
+    assert_eq!(
+        admin_frames[0].data.as_ref().unwrap()["revision"],
+        Value::String("9".into()),
+        "跳过不得错位：留下的必须是管理员范围那一帧"
     );
     assert_eq!(
         user_frames
@@ -951,12 +1081,12 @@ async fn admin_scoped_object_event_is_skipped_for_non_admin_connections() {
             .map(|f| f.event.as_deref())
             .collect::<Vec<_>>(),
         vec![Some("device.updated")],
-        "普通用户只收得到 AnySession 那一条：{user_frames:?}"
+        "普通用户只收得到明确指向自己的那一条：{user_frames:?}"
     );
     assert_eq!(
         user_frames[0].data.as_ref().unwrap()["revision"],
         Value::String("10".into()),
-        "跳过不得错位：留下的必须是 AnySession 那一帧"
+        "跳过不得错位：留下的必须是指向本人那一帧"
     );
 }
 
@@ -972,7 +1102,7 @@ async fn publish_without_connection_is_dropped_without_error() {
         bus.publish(EventEnvelope::task_updated(
             "t",
             1,
-            EventAudience::AnySession
+            EventObjectAudience::user(BOB)
         )),
         0
     );
@@ -1000,4 +1130,344 @@ async fn header_map_helper_rejects_duplicated_origin() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(code, "CSRF_INVALID");
     assert_eq!(fixture.bus.subscriber_count(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// 活性：权威读耗时 ≥ 复核周期时，接收支路与总线关闭不得被饿死
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn slow_authority_reads_do_not_starve_queued_events_or_bus_shutdown() {
+    // 被审缺陷（P2）：一次**成功**的权威复核读耗时 ≥ 复核周期时，「周期复核优先
+    // 于 recv」的分支会在每次复核后立刻抢先发起下一次权威读，接收支路再也排不
+    // 到自己 —— 排队事件永不到达用户、总线关闭永不被发现（流挂死 + SQL 忙轮询）。
+    //
+    // 取证装置（不靠放大 timeout）：
+    // - `SLOW_READ` > `STARVE_REVALIDATE`，把被审的饿死前提钉成构造事实；
+    // - 读体只给 [`STARVE_BUDGET`] 预算（健康实现实测耗时的十几倍），到点即失败；
+    // - 权威读次数上界 [`STARVE_MAX_READS`]：健康实现的读次数只由**帧数**决定，
+    //   被饿死时读次数由「预算 / 复核周期」决定（本用例 60 次量级）。
+    let bus = EventBus::with_capacity(128);
+    let conn = Conn::with_capacity_and_reader(&bus, BOB, false, STARVE_REVALIDATE, 0);
+    let reads = conn.reads();
+    let response = handshake(&conn, events_request(&conn, true, None)).await;
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "握手必须恰好一次权威基准读"
+    );
+    // 握手完成后才注入慢读：握手期那次读属于握手门禁，不参与本用例。
+    conn.read_delay_us
+        .store(SLOW_READ.as_micros() as usize, Ordering::SeqCst);
+    let reads_after_handshake = reads.load(Ordering::SeqCst);
+
+    drop(conn.router);
+    // 两条**排队**事件（先进总线，再让接收支路去取），随后关闭总线。受众限定给
+    // 本连接用户，确保它们是真要发给这条连接的帧，而不是被受众过滤丢弃的噪声。
+    bus.publish(EventEnvelope::device_updated(
+        &"cd".repeat(32),
+        1,
+        EventObjectAudience::user(BOB),
+    ));
+    bus.publish(EventEnvelope::task_updated(
+        "queued-while-verifying",
+        2,
+        EventObjectAudience::user(BOB),
+    ));
+    drop(bus);
+
+    let frames = parse_frames(&drain_within(response, STARVE_BUDGET).await);
+    assert_eq!(
+        frames
+            .iter()
+            .map(|f| f.event.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("device.updated"), Some("task.updated")],
+        "两条排队事件都必须在「权威读慢于复核周期」下按序送达，一条都不得被饿死"
+    );
+    let total = reads.load(Ordering::SeqCst);
+    assert!(
+        total - reads_after_handshake <= STARVE_MAX_READS,
+        "两条帧只应做与帧数成正比的权威读，实测 {total} 次：周期复核正在抢先空转（忙轮询 SQL）"
+    );
+}
+
+#[tokio::test]
+async fn periodic_revalidation_waits_a_full_period_after_a_slow_read() {
+    // 被审缺陷的另一半：`poll_next` 在**成功**复核后直接 `continue`，而 `tick`
+    // 的下一个到期时刻是在它**被 poll 的那一刻**推进的，于是一次耗时 ≥ 周期的读
+    // 完成后，`tick` 当场又算「已到期」，立刻再发起一次权威读——刚被权威证明仍然
+    // 有效的连接在同一瞬间又被读一遍，读节奏退化成「权威源能多快就多快」。
+    // 修复：下一次周期从**本次读完成之后**起算（`tick.reset()`）。
+    //
+    // 取证不靠放大 timeout：读耗时与复核周期都取 40ms ⇒ 被审路径节奏 ≈ 40ms/次
+    // （320ms 观察窗约 8 次读），修复后 ≈ 80ms/次（约 4 次），阈值取 6 次；
+    // 下界 2 次是阳性对照（周期复核必须真的在跑，不是「干脆不读」蒙过断言）。
+    //
+    // 必须**并发**读体：SSE 是惰性的，没人 poll 响应体时整个流都不推进，也就
+    // 一次权威读都不会发生（那会让本用例退化成空断言）。
+    let bus = EventBus::with_capacity(128);
+    let conn = Conn::with_capacity_and_reader(
+        &bus,
+        BOB,
+        false,
+        PERIODIC_REVALIDATE,
+        // 读耗时 == 复核周期：这是被审路径节奏退化的**最坏比例**配置
+        // （见下面的次数推算），比例 = 1 + 周期 / 读耗时，此处取到上界 2。
+        PERIODIC_REVALIDATE.as_micros() as usize,
+    );
+    let reads = conn.reads();
+    let authority = conn.authority();
+    let response = handshake(&conn, events_request(&conn, true, None)).await;
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "握手必须恰好一次权威基准读"
+    );
+    drop(conn.router);
+
+    let drain = tokio::spawn(async move {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            to_bytes(response.into_body(), 1 << 20),
+        )
+        .await
+        .expect("空闲连接必须由周期复核切断")
+        .unwrap()
+    });
+    // 让读体先跑起来再计数。
+    sleep(Duration::from_millis(10)).await;
+    let baseline = reads.load(Ordering::SeqCst);
+    // 观察窗口：总线上不发任何事件，只让周期复核自己跑。
+    sleep(IDLE_WINDOW).await;
+    let observed = reads.load(Ordering::SeqCst) - baseline;
+    // 收口：权威侧撤销 → 下一次复核关流 → 读体结束。
+    authority.lock().unwrap().revoked = true;
+    let bytes = drain.await.expect("读体任务必须正常结束");
+    assert!(
+        parse_frames(&bytes).is_empty(),
+        "周期复核切断空闲连接时不得外发事件帧"
+    );
+
+    assert!(
+        observed >= 2,
+        "空闲连接必须持续做周期权威复核（阳性对照），观察窗内只读到 {observed} 次"
+    );
+
+    assert!(
+        observed <= IDLE_MAX_READS,
+        "观察窗 {IDLE_WINDOW:?}（周期与读耗时各 {:?}）内读到 {observed} 次：\
+         一次慢读完成后周期复核立刻又发起一次（下一次周期没有从复核完成后起算）",
+        PERIODIC_REVALIDATE
+    );
+}
+
+/// 洪流用例的复核周期：1ms，配合 [`FLOOD_SETTLE`] 保证「开始洪流的时刻周期早已
+/// 到期」，被审代码若真的跑了周期复核就必然看得见 `revoked = true`。
+const FLOOD_REVALIDATE: Duration = Duration::from_millis(1);
+/// 洪流用例在开始洪流前真实流逝的时间（**必须**远大于 [`FLOOD_REVALIDATE`]）：
+/// 让「周期到期」成为构造事实，而不是靠运气撞上时序。
+const FLOOD_SETTLE: Duration = Duration::from_millis(5);
+/// 洪流用例的 poll 轮数上界（有界！不靠无限等待判定失败）。
+const FLOOD_ROUNDS: usize = 48;
+/// 修复后允许的最大 poll 轮数：健康实现第一次带预算的 poll 就该跑周期复核。
+/// 4 轮是十几倍的余量（周期只有 1ms）。
+const FLOOD_MAX_ROUNDS_TO_CLOSE: usize = 4;
+/// 每轮 poll 之前发布的无关事件条数：`capacity - 1` —— 足以让 `recv()` 轮轮
+/// Ready（并耗尽 tokio 的 128 步 cooperative 预算），又刻意留 1 个空位不触发
+/// `Lagged`（`Lagged` 会经 `reset` 帧另开一条权威读路径，掩盖被审缺陷）。
+const FLOOD_PER_ROUND: usize = EVENT_BUS_CAPACITY - 1;
+/// 每轮之间的真实让出：刷新 cooperative 预算并推进定时器（模拟真实服务端
+/// 一轮 I/O 驱动的间隔，不是「放宽 timeout」——判定仍然只由 poll 轮数决定）。
+const FLOOD_ROUND_PAUSE: Duration = Duration::from_micros(200);
+/// 「同轮到期 tick 不得吞事件」用例的周期与读耗时（读耗时 > 周期 ⇒ 一条事件
+/// 的复核还没跑完，`tick` 就又到了下一个到期点）。
+const TICK_SWALLOW_PERIOD: Duration = Duration::from_millis(1);
+const TICK_SWALLOW_READ: Duration = Duration::from_millis(3);
+/// 同上用例投事件前真实流逝的时间（> 周期）：此间没人 poll 响应体（SSE 惰性），
+/// `tick` 的到期状态因此不会被提前消费 ⇒ 「第一次 poll 就同时遇到 `tick` 到期
+/// 与有待取事件」成为构造事实。
+const TICK_SWALLOW_SETTLE: Duration = Duration::from_millis(3);
+
+#[tokio::test]
+async fn foreign_event_flood_does_not_starve_periodic_revalidation() {
+    // 被审缺陷（P2）：被审原状的 `poll_next` 只在 `recv()` 返回 `Pending` 时才
+    // 轮到排在后面的周期复核（那里的编号是 `④`=recv、`⑤`=tick；现文件已改成
+    // `④` 问 tick、`⑤` 取事件、`⑥` 并联消费）。持续与本连接**无关**（受众不
+    // 覆盖本连接）的事件让接收支路轮轮 Ready 并 `continue`，`tick` 因此永不被
+    // poll；即使 cooperative 预算耗尽把 `recv` 逼成 `Pending`，同一批预算也让
+    // `Sleep::poll` 一起 `Pending`，下一轮（预算刷新后）依然先 `recv`。所以
+    // 「cooperative 最终会公平」不成立 —— 周期权威复核被无关洪流**无限期**推
+    // 迟：只在数据库里被撤销（内存会话时钟仍 live）的连接可以在洪流期间一直
+    // 挂着订阅不放。
+    //
+    // 取证装置（受控、非空洞，不靠放大 timeout）：
+    // - `EventBus::new()` 默认 128 容量（与生产同形），握手方是 **Bob**，洪水
+    //   指向 **Alice**（`permissions.changed` 受众钉死为 Alice ⇒ 对 Bob 不可见、
+    //   不发、不占水位，但每一条都会唤醒并占用 Bob 流的接收支路）；
+    // - 权威侧撤销 + 内存时钟保持 live：只有周期复核能切断这条连接；
+    // - 1ms 周期先真实流逝 5ms（`tick` 早已到期）才开始洪流，每轮之间只让出
+    //   200µs；判定上界是**轮数** [`FLOOD_ROUNDS`]，不是墙钟 timeout；
+    // - 每轮 poll 之前才发布洪水，因此「洪流仍在进行」与「已 poll 过 N 次」
+    //   同时成立 —— 不允许「停洪流之后再断言」。
+    let bus = EventBus::new();
+    let conn = Conn::with_capacity(&bus, BOB, false, FLOOD_REVALIDATE);
+    let reads = conn.reads();
+    let authority = conn.authority();
+    let response = handshake(&conn, events_request(&conn, true, None)).await;
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "握手必须恰好一次权威基准读"
+    );
+    drop(conn.router);
+
+    authority.lock().unwrap().revoked = true;
+    assert!(
+        conn.live.load(Ordering::SeqCst),
+        "内存时钟必须仍是 live：撤销只存在于权威源，只有权威复核能看见"
+    );
+
+    // 让 1ms 的周期真正到期（含调度余量），之后才灌入洪流。
+    sleep(FLOOD_SETTLE).await;
+
+    let mut body = Box::pin(response.into_body().into_data_stream());
+    // 空 waker：本用例自己决定何时再 poll（唤醒只意味着「可以再 poll 一次」），
+    // 因此不需要真实唤醒源。
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut closed_at: Option<usize> = None;
+    let mut published = 0usize;
+
+    for round in 1..=FLOOD_ROUNDS {
+        for n in 0..FLOOD_PER_ROUND {
+            published += 1;
+            bus.publish(EventEnvelope::permissions_changed(ALICE, n as u64));
+        }
+        match body.as_mut().poll_next(&mut cx) {
+            Poll::Ready(Some(Ok(chunk))) => bytes.extend_from_slice(&chunk),
+            Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
+                closed_at = Some(round);
+                break;
+            }
+            Poll::Pending => {}
+        }
+        // 真实让出执行权：刷新 cooperative 预算 + 推进定时器，下一轮再灌一批。
+        sleep(FLOOD_ROUND_PAUSE).await;
+    }
+
+    // 洪流期间的权威读次数快照：下面的「停洪流」诊断 poll 会把计数抬上去，
+    // 判定「洪流期间周期复核有没有跑」必须用这个快照。
+    let reads_during_flood = reads.load(Ordering::SeqCst);
+    // 诊断用（**不是**通过条件）：洪流停止后再 poll 一次。若「洪流中永不关、
+    // 洪流一停就立刻关」，即证明关流能力一直都在，只是被无关事件无限推迟。
+    let closes_only_after_flood_stops = closed_at.is_none()
+        && matches!(
+            body.as_mut().poll_next(&mut cx),
+            Poll::Ready(Some(Err(_))) | Poll::Ready(None)
+        );
+
+    let total_reads = reads.load(Ordering::SeqCst);
+    // 读侧先释放（订阅随响应体一起析构），再断言订阅数。
+    drop(body);
+    let frames = parse_frames(&bytes);
+    // 安全断言（与活性断言同样重要）：洪流里指向 Alice 的授权投影一帧都不许
+    // 出现在 Bob 的流上；这条连接也**没有**合法可发的事实 ⇒ 任何帧都是泄漏。
+    assert!(
+        frames.is_empty(),
+        "Bob 不得收到任何帧（尤其不得收到指向 Alice 的 permissions.changed）：{frames:?}"
+    );
+    match closed_at {
+        None => panic!(
+            "无关事件洪流把周期权威复核饿死了：发布 {published} 条指向 Alice 的事件、\
+             poll {FLOOD_ROUNDS} 轮（周期只有 {FLOOD_REVALIDATE:?}）之后仍未关流，\
+             洪流期间的权威读 {reads_during_flood} 次（只有握手那一次）、订阅仍未释放；\
+             停洪流后立刻关流：{closes_only_after_flood_stops}"
+        ),
+        Some(round) => assert!(
+            round <= FLOOD_MAX_ROUNDS_TO_CLOSE,
+            "周期复核到点后应在极少轮 poll 内切断（周期 {FLOOD_REVALIDATE:?}），实测第 {round} 轮"
+        ),
+    }
+    assert!(
+        total_reads > 1,
+        "关流必须由握手之后的权威复核做出，实测权威读 {total_reads} 次\
+         （洪流停后才关流：{closes_only_after_flood_stops}）"
+    );
+    assert_eq!(bus.subscriber_count(), 0, "关流必须释放订阅");
+}
+
+#[tokio::test]
+async fn expired_tick_does_not_swallow_events_pending_in_the_same_round() {
+    // 上一条的**对偶**守卫：修「周期复核被洪流饿死」时很容易把 `tick` 提前到
+    // `recv` 之前，若实现是「先 poll recv 取走事件、再因 `tick` 到期 while
+    // continue」，刚取走的那条事件就会被吞（或五条被合并成一帧）。本用例把
+    // 「每次权威复核回到循环顶部时 `tick` 必然又已到期」钉成构造事实
+    // （读耗时 3ms > 周期 1ms），然后要求 5 条命名事件**逐帧**按序送达。
+    let bus = EventBus::with_capacity(128);
+    let conn = Conn::with_capacity_and_reader(
+        &bus,
+        BOB,
+        false,
+        TICK_SWALLOW_PERIOD,
+        TICK_SWALLOW_READ.as_micros() as usize,
+    );
+    let reads = conn.reads();
+    let response = handshake(&conn, events_request(&conn, true, None)).await;
+    drop(conn.router);
+
+    // 关键时序：先让 `tick` **确确实实到期**（此间没人 poll 响应体，SSE 惰性 ⇒
+    // 到期状态不会被提前消费掉），再投事件。于是「第一次 poll 就同时遇到
+    // `tick` 到期 + 有新事件」成为构造事实 —— 坏修法（把「tick 优先」写成
+    // 「本轮吞掉刚取到的事件」）在这里就会少一帧。
+    sleep(TICK_SWALLOW_SETTLE).await;
+
+    // 五条**指向 Bob** 的对象事件（受众各不相同的 revision，便于证明没被合并）。
+    for revision in 1..=5u64 {
+        bus.publish(EventEnvelope::device_updated(
+            &"ab".repeat(32),
+            revision,
+            EventObjectAudience::user(BOB),
+        ));
+    }
+    drop(bus);
+
+    let frames = parse_frames(&drain_within(response, STARVE_BUDGET).await);
+    let revisions: Vec<Value> = frames
+        .iter()
+        .map(|f| {
+            f.data
+                .as_ref()
+                .unwrap_or_else(|| panic!("每帧必须带 data：{frames:?}"))["revision"]
+                .clone()
+        })
+        .collect();
+    assert_eq!(
+        frames
+            .iter()
+            .map(|f| f.event.as_deref())
+            .collect::<Vec<_>>(),
+        vec!["device.updated"; 5]
+            .into_iter()
+            .map(Some)
+            .collect::<Vec<_>>(),
+        "五条事件必须各自成帧，一条都不能被到期的周期复核吞掉或合并：{frames:?}"
+    );
+    assert_eq!(
+        revisions,
+        (1..=5u64)
+            .map(|n| Value::String(n.to_string()))
+            .collect::<Vec<_>>(),
+        "帧序与 revision 必须逐条对齐（不丢、不重、不错位）"
+    );
+    // 复核仍由慢读驱动（每帧一次），但没有退化成一个 tick 一次读的忙轮询。
+    let total = reads.load(Ordering::SeqCst);
+    assert!(
+        total >= 6,
+        "每条帧至少要一次权威复核（阳性对照），实测 {total} 次"
+    );
+    assert!(
+        total <= 24,
+        "到期的 tick 不得把每条事件放大成多次权威读（忙轮询 SQL），实测 {total} 次"
+    );
 }

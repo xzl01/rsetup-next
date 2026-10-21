@@ -42,7 +42,15 @@
 //!    非充分条件；
 //! 4. **周期性复核**（周期 [`EventsState::revalidate_interval`]，默认 5s）。
 //!    长时间无事件的空闲连接同样必须被切断，否则「数据库里已注销的会话」会
-//!    永远挂着订阅；
+//!    永远挂着订阅。两条活性界定（都被 `tests/events_sse.rs` 钉住）：
+//!    - **周期从复核完成之后起算**：一次成功权威读之后 `tick` 被重置，「读耗时
+//!      ≥ 周期」时不会同一条连接反复读 SQL（`②` 的 `tick.reset()`）；
+//!    - **到期的周期不被无关事件推迟**：每轮 poll 都在消费新事件**之前**问一次
+//!      `tick`，到期状态与「有待发帧」并联后才发起复核（`④`/`⑥`）。因此总线上
+//!      持续涌入与本连接无关的事件时，复核的推迟上界是**一次 cooperative 强制
+//!      让出**，与事件速率无关 —— 这不是「可接受的推迟」而是必须成立的前提：
+//!      只在数据库里被撤销（内存会话时钟仍 live）的连接，切断它的唯一路径就是
+//!      这条周期复核；
 //! 5. 订阅者落后于总线容量（`Lagged`，即 06 §4 的「每连接最多 128 条待发，
 //!    满时发送 reset」）时，把 `reset` 帧也走同一套核验后外发，并**继续**该
 //!    订阅：客户端据此清空对象水位、全量 GET 重取；服务端不补发丢失事件、
@@ -213,6 +221,12 @@ type PendingVerify =
 /// `'static` future，因此每次完成后把同一个 `Receiver` 连同结果一起取回，
 /// 立刻重建下一个 future（等价于 `tokio-stream` 的 `BroadcastStream`，
 /// 但不必为此引入 `tokio-stream`/`tokio-util` 两个新依赖）。
+///
+/// **一次只取一条**（刻意不连读）：06 §4 的契约是「每个事件一帧」，测试侧
+/// 也按帧序断言；在 future 里连读会把积压合并成一帧（已实测：五条命名事件
+/// 只剩最后一条，甚至因随后的 `Closed` 而一帧不发）。接收支路的活性不靠
+/// 连读，而靠 `poll_next` 每轮**既**问一次 `tick`（`④`）**又**取一条事件
+/// （`⑤`）——两条支路不再互斥，到期的周期在 `⑥` 与待发帧并联消费。
 async fn recv_frame(mut rx: Receiver<EventEnvelope>) -> RecvOutcome {
     let result = rx.recv().await;
     (result, rx)
@@ -274,13 +288,14 @@ impl SseEventStream {
         }
     }
 
-    /// 廉价受众过滤（02 §7「逐事件过滤」）：管理员事件名门禁与受众门禁
-    /// 并联，任一不满足即静默跳过——连权威读都不必发起。
+    /// 廉价受众过滤（02 §7「逐事件过滤」）：判定入口只有一个——
+    /// [`EventEnvelope::visible_to`]（管理员事件名门禁 + 受众覆盖 + 名称/受众/
+    /// 载荷一致性，三者并联）。任一不满足即静默跳过，连权威读都不必发起。
+    ///
+    /// 不在这里各写一遍 `admin_only`/`audience` 的读法：字段已是只读访问器，
+    /// 判定与构造配对同源，流侧再抄一份只会多出一个可能抄错的副本。
     fn may_view(&self, envelope: &EventEnvelope) -> bool {
-        if envelope.name.admin_only() && !self.viewer.is_admin {
-            return false;
-        }
-        envelope.audience.visible_to(self.viewer)
+        envelope.visible_to(self.viewer)
     }
 
     /// 权威快照是否仍然**完全**支持这条连接继续服务：
@@ -339,12 +354,18 @@ impl Stream for SseEventStream {
                             return this.close();
                         }
                         this.viewer.is_admin = authority.is_admin;
+                        // 周期复核重新计时：本连接**刚刚**被权威证明仍然有效，
+                        // 下一次周期复核必须从这次读**完成之后**起算。否则
+                        // 「一次权威读的耗时 ≥ 复核周期」时，`tick` 在被 poll 的
+                        // 那一刻又已到期，周期复核会一轮接一轮地抢先发起权威读，
+                        // 把接收支路（排队事件、总线关闭）永久饿死（活性）。
+                        this.tick.as_mut().reset();
                         if let Some(envelope) = this.queued.take() {
                             // 复核通过后再核一次受众（纵深防御）：不匹配即丢弃。
                             if this.may_view(&envelope) {
                                 return Poll::Ready(Some(Ok(sse_frame(
-                                    envelope.name,
-                                    &envelope.data,
+                                    envelope.name(),
+                                    envelope.data(),
                                 ))));
                             }
                         }
@@ -359,31 +380,70 @@ impl Stream for SseEventStream {
                 this.start_verify();
                 continue;
             }
-            // ④ 周期复核到点：空闲连接也必须被切断，不能等下一条事件。
-            if this.tick.as_mut().poll_tick(cx).is_ready() {
+            // ④ 周期复核到点了吗？**先问周期，再取事件，但两者都不落空**：
+            //    这里刻意只「问」不 `continue`。`Interval::poll_tick` 返回 Ready
+            //    的同时就把下一次到期时刻推后一个周期，若在 `⑤` 之前抢先
+            //    `continue`，到期的 tick 就被换成「一次立刻发起的权威复核」，慢
+            //    权威读期间接收支路再也轮不到 poll（排队事件永不送达、总线关闭
+            //    永不被发现，被审过的活性缺陷）；反过来，若把 `poll_tick` 整个挪
+            //    到 `⑤` 之后（本文件曾经的样子），`⑤` 的 `continue` 会让 `tick`
+            //    永不被 poll —— 持续涌入与本连接无关的事件即可把周期复核无限期
+            //    推迟下去，数据库里已撤销的会话在洪流期间一直挂着订阅。折中是把
+            //    到期状态存进 `periodic_due`，在 `⑥` 与「有待发帧」并联消费：每轮
+            //    poll 都给到期的 tick 一次机会（洪流的 `continue` 发生在 `⑤`，而
+            //    下一轮 `④` 仍然先问 `tick`），到期的那次 tick 又必定换来一次权威
+            //    复核，不会凭空消失。
+            let periodic_due = this.tick.as_mut().poll_tick(cx).is_ready();
+            // ⑤ 事件支路：一次只取一条（`recv_frame` 每次 poll 至多返回一个），
+            //    从根上杜绝「一次 poll 排入多条、多帧合并成一帧」。`queued` 非空
+            //    时 `③` 已经把控制流截走，本支路的赋值因此不可能覆盖掉尚未发送
+            //    的待发帧；取到事件后也**不**在此处 `continue` 之前丢掉 `④` 的
+            //    到期状态（见 `⑥`）。
+            let mut took_event = false;
+            if let Poll::Ready((result, rx)) = this.pending.as_mut().poll(cx) {
+                // 取走一条之后必须换上新 `pending`，否则已取走的 `&mut Receiver`
+                // 借用无法结束（`poll` 的入参是 `&mut Receiver`，借用同时结束）。
+                this.pending = Box::pin(recv_frame(rx));
+                match result {
+                    Ok(envelope) => {
+                        // 受众不是权限证明：属于别人的事件在这里被**静默跳过**
+                        // （不发送、不占水位、不关流），但受众过滤绝不意味着可以
+                        // 放松权威复核 —— 发送资格只由 `②` 决定。
+                        if this.may_view(&envelope) {
+                            this.queued = Some(envelope);
+                        }
+                    }
+                    // 背压/缓冲区溢出：reset 帧同样只有权威复核通过才外发，之后
+                    // 订阅继续（不补发丢失的事件，06 §4）。
+                    Err(RecvError::Lagged(_)) => {
+                        this.queued = Some(EventEnvelope::reset(RESET_REASON_BUFFER_OVERFLOW));
+                    }
+                    Err(RecvError::Closed) => {
+                        return this.close();
+                    }
+                }
+                took_event = true;
+            }
+            // ⑥ 唯一的发送前置：有待发帧（含 `reset`）**或**周期复核到期，就立刻
+            //    发起一次权威复核；出口只在 `②`。两条支路并联在这里是刻意的：
+            //    - 有待发帧 → 发送前必须过一次权威复核（宁断不泄）；
+            //    - 周期到期 → 本轮就发起复核，空闲连接、以及总线上持续涌入与本
+            //      连接无关事件的连接，都靠这一支被切断。无关事件每轮至多让 `⑤`
+            //      多取一条，抢不走 `④` 每轮对 `tick` 的那一次 poll；cooperative
+            //      预算耗尽时 `poll_tick` 与 `recv` 一起 `Pending`，强制让出之后
+            //      预算刷新、`④` 仍然第一个被 poll，因此推迟的上界是**一次让出**，
+            //      与事件速率无关。
+            if this.queued.is_some() || periodic_due {
                 this.start_verify();
                 continue;
             }
-            // ⑤ 等下一条事件。
-            let (result, rx) = ready!(this.pending.as_mut().poll(cx));
-            this.pending = Box::pin(recv_frame(rx));
-            match result {
-                Ok(envelope) => {
-                    if !this.may_view(&envelope) {
-                        // 非本连接受众：静默跳过，不发送、不占水位、不关流。
-                        continue;
-                    }
-                    this.queued = Some(envelope);
-                }
-                // 背压/缓冲区溢出：reset 帧同样只有权威复核通过才外发，之后
-                // 订阅继续（不补发丢失的事件，06 §4）。
-                Err(RecvError::Lagged(_)) => {
-                    this.queued = Some(EventEnvelope::reset(RESET_REASON_BUFFER_OVERFLOW));
-                }
-                Err(RecvError::Closed) => {
-                    return this.close();
-                }
+            if took_event {
+                // 取到的是与本连接无关的帧：静默跳过，继续消费下一条。
+                continue;
             }
+            // 两条支路都挂了唤醒（`pending` 的广播唤醒 / `tick` 的定时器），
+            // 交回 `Pending`；任何一条就绪都会重新驱动本流。
+            return Poll::Pending;
         }
     }
 }

@@ -20,9 +20,27 @@
 //! 受众语义（02 §7「逐事件过滤」、06 §48）：一条总线通道 **不等于** 一个受众。
 //! 每个 [`EventEnvelope`] 必须携带 [`EventAudience`]（全局提示 / 仅管理员 /
 //! 指定用户），总线本身**不做**受众路由；投递侧（[`crate::http_events`]）在
-//! 每一帧发送之前用连接自身的权威身份视角做 [`EventAudience::visible_to`]
+//! 每一帧发送之前用连接自身的权威身份视角做 [`EventEnvelope::visible_to`]
 //! 严格匹配，不匹配即静默跳过。因此「谁能看到什么」的判定只有一个归属地
 //! （投递侧），发布侧的职责是**如实标注受众**，两者都不许把事件当成全局广播。
+//!
+//! 「如实标注」在这里不是约定而是**类型约束**（06 §4 受众隔离、02 §7 逐事件
+//! 过滤的构造级保证）：
+//!
+//! 1. [`EventEnvelope`] 的字段是私有的，模块外**不存在**任意 `(name, data,
+//!    audience)` 组合的构造点，也不存在事后改写受众的入口——「Alice 的授权
+//!    投影被标成 Bob 的受众」这种对象在本 crate 的对外 API 上不可书写；
+//! 2. 对象级事件（`device.updated`/`task.updated`）的受众参数是
+//!    [`EventObjectAudience`]，它的变体里**没有**「任何会话」：对象事实要么
+//!    限定管理员范围，要么限定某一个用户，不接受「广播给所有连接」；
+//! 3. `permissions.changed` 的 `data.id` 与受众由**同一份字节**生成，
+//!    `system.time.changed` 钉死仅管理员，只有不携带任何对象事实的 `reset`
+//!    携带 [`EventAudience::AnySession`]；
+//! 4. 作为纵深防御，投递判定 [`EventEnvelope::visible_to`] 会重新核对名称、
+//!    受众与载荷的一致性（`permissions.changed` 的载荷 `id` 必须就是受众本人；
+//!    非 `reset` 事件哪怕带着 `AnySession` 也一律不可见），任一不一致即
+//!    **失败关闭**。第 1 条保证模块内构造不出这种对象，第 4 条保证即便将来
+//!    新增构造点写错，也只会静默丢弃而不会漏给他人。
 
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
@@ -78,23 +96,32 @@ impl EventName {
     pub const fn admin_only(self) -> bool {
         matches!(self, Self::SystemTimeChanged)
     }
+
+    /// 该名称的事件是否**允许**全局受众（任何合法会话）。
+    ///
+    /// 全集里只有 `reset` 不携带任何对象事实（只有一个稳定原因码），因此只有
+    /// 它可以全局；其余四种都携带对象 ID、revision/epoch 或权限事实，必须
+    /// 限定受众。这是 [`EventEnvelope::visible_to`] 的失败关闭依据之一。
+    pub const fn allows_global_audience(self) -> bool {
+        matches!(self, Self::Reset)
+    }
 }
 
 /// 事件的**受众范围**：谁可以在自己的 SSE 连接上看到这条事件
 /// （02 §7 `GET /events`「逐事件过滤」、06 §4「对象更新携带……可见字段」）。
 ///
 /// 总线只有一条通道，但**通道共用不等于受众共用**：流侧在投递每一帧之前用
-/// [`EventAudience::visible_to`] 与该连接的身份视角做严格匹配，不匹配即
+/// [`EventEnvelope::visible_to`] 与该连接的身份视角做严格匹配，不匹配即
 /// **静默跳过**（fail-closed，绝不无差别广播）。
 ///
-/// 这里刻意**不**提供「未指定受众」的第三种取值：受众是发布方的必填项，
-/// 漏掉受众在类型上就不成立。对象级事件（设备/任务/授权投影）必须由发布方
-/// 明确落到具体用户或管理员范围，只有**不携带任何对象事实**的全局提示
-/// （`reset`）才允许 [`EventAudience::AnySession`]。
+/// 这个类型是**投递侧的判定结果表示**，不是发布方的自由填写项：它的构造点全部
+/// 在 [`EventEnvelope`] 的类型化构造里（模块头第 1/2/3 条），其中
+/// [`EventAudience::AnySession`] 只能由 [`EventEnvelope::reset`] 产生。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventAudience {
     /// 对任何已改密的合法会话都可公开：仅限不含对象 ID、字段或权限事实的
-    /// 全局提示（五种命名事件里只有 `reset` 属于这一类）。
+    /// 全局提示（五种命名事件里只有 `reset` 属于这一类，见
+    /// [`EventName::allows_global_audience`]）。
     AnySession,
     /// 仅管理员会话可见（06 §4「时间事件仅管理员」）。
     Admins,
@@ -111,9 +138,47 @@ pub struct EventViewer {
     pub is_admin: bool,
 }
 
+/// **对象级**事件可选的受众：要么限定某一个用户，要么限定管理员范围。
+///
+/// 这里刻意**没有**「任何合法会话」这一档，也刻意不提供从任意
+/// [`EventAudience`] 转换的入口：`device.updated`/`task.updated`/
+/// `permissions.changed` 携带对象 ID 与 revision/epoch，是对象级事实，
+/// 「未明确授权即广播」在类型上不成立（02 §7「逐事件过滤」）。发布方要表达
+/// 「这条对象事件谁都没资格看」不存在合法写法，只能不发。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventObjectAudience {
+    /// 仅管理员会话（用于「这条对象事实只投递给管理员范围」的发布方）。
+    Admins,
+    /// 仅该用户本人的会话。
+    User([u8; 16]),
+}
+
+impl EventObjectAudience {
+    /// 限定给某一个用户。
+    pub const fn user(user_id: [u8; 16]) -> Self {
+        Self::User(user_id)
+    }
+
+    /// 限定给管理员范围。
+    pub const fn admins() -> Self {
+        Self::Admins
+    }
+
+    /// 投影成投递侧的受众判定值。私有：模块外拿不到「第三个受众」的入口。
+    const fn to_event_audience(self) -> EventAudience {
+        match self {
+            Self::Admins => EventAudience::Admins,
+            Self::User(user_id) => EventAudience::User(user_id),
+        }
+    }
+}
+
 impl EventAudience {
-    /// 该连接是否属于本事件的受众。**fail-closed**：非目标用户看到私有事件、
-    /// 非管理员看到管理员事件一律 `false`；调用方必须丢弃事件而不是降级广播。
+    /// 该受众是否覆盖这个连接。**fail-closed**：非目标用户命中私有受众、
+    /// 非管理员命中管理员受众一律 `false`；调用方必须丢弃事件而不是降级广播。
+    ///
+    /// 这是**受众本身**的判定，不含名称/载荷一致性——发布方要用的判定入口是
+    /// [`EventEnvelope::visible_to`]（并联门禁），不要只调这个函数。
     pub fn visible_to(self, viewer: EventViewer) -> bool {
         match self {
             Self::AnySession => true,
@@ -123,22 +188,27 @@ impl EventAudience {
     }
 }
 
-/// 一次总线投递的载荷：命名事件 + `data:` 的 JSON 对象 + 受众范围。
+/// 一次总线投递的载荷：命名事件 + `data:` JSON 对象 + 受众范围。
 ///
 /// `Clone` 是 `tokio::sync::broadcast` 的硬要求；载荷只允许出现对象 ID、
 /// revision/epoch 与**已授权可见**的字段，禁止携带任何凭据、会话令牌或未脱敏
 /// 的原始错误。`audience` 是投递前的**硬过滤**依据：总线不做受众路由，
 /// 由每条连接在发送循环里逐事件自查（[`crate::http_events`]）。
+///
+/// 字段私有 + 只有类型化构造（见模块头）：模块外既构造不出「名称/载荷/受众
+/// 互相矛盾」的信封，也改写不了已构造信封的受众。
 #[derive(Clone, Debug, PartialEq)]
 pub struct EventEnvelope {
-    pub name: EventName,
-    pub data: Value,
-    pub audience: EventAudience,
+    name: EventName,
+    data: Value,
+    audience: EventAudience,
 }
 
 impl EventEnvelope {
-    /// 通用构造：发布方自行保证 `data` 的形状与可见性合规，并**必须**给出受众。
-    pub fn new(name: EventName, data: Value, audience: EventAudience) -> Self {
+    /// 唯一的落库构造点，**私有**：把「名称 ↔ 载荷形状 ↔ 受众」三者的配对
+    /// 封闭在本模块的类型化构造里（[`EventEnvelope::device_updated`] 等），
+    /// 不对外提供任意组合的通用构造。
+    fn assembled(name: EventName, data: Value, audience: EventAudience) -> Self {
         Self {
             name,
             data,
@@ -146,35 +216,108 @@ impl EventEnvelope {
         }
     }
 
+    /// 命名事件（SSE `event:` 字段取自 [`EventName::as_str`]）。
+    pub fn name(&self) -> EventName {
+        self.name
+    }
+
+    /// `data:` 的 JSON 载荷（只读借用：投递侧不得改写后转发）。
+    pub fn data(&self) -> &Value {
+        &self.data
+    }
+
+    /// 该事件的受众（只读）。
+    pub fn audience(&self) -> EventAudience {
+        self.audience
+    }
+
+    /// 这条事件对该连接是否可投递：受众匹配 **且** 名称门禁 **且** 名称/受众/
+    /// 载荷三者一致，任一不满足都返回 `false`（静默跳过，不发送、不占水位）。
+    ///
+    /// 三道门禁是**并联**的（缺一条都可能被某一侧的疏漏绕过）：
+    /// 1. [`EventName::admin_only`]：管理员专属事件名，非管理员一律不可见；
+    /// 2. 受众是否覆盖该连接（[`EventAudience::visible_to`]）；
+    /// 3. 一致性：非 `reset` 事件哪怕带 `AnySession` 也不可见；
+    ///    `permissions.changed` 的载荷 `id` 必须就是受众本人（否则宁可丢弃，
+    ///    也不把「写着 Alice、发给 Bob」的帧发到线上）。
+    pub fn visible_to(&self, viewer: EventViewer) -> bool {
+        if self.name.admin_only() && !viewer.is_admin {
+            return false;
+        }
+        if !self.audience_matches_payload() {
+            return false;
+        }
+        self.audience.visible_to(viewer)
+    }
+
+    /// 名称、受众与载荷是否自洽（见 [`EventEnvelope::visible_to`] 第 3 条）。
+    fn audience_matches_payload(&self) -> bool {
+        match self.audience {
+            // 全局提示只允许 `reset`：其余四种都携带对象事实，出现这种配对
+            // 说明构造点写错了，失败关闭。
+            EventAudience::AnySession => self.name.allows_global_audience(),
+            // 管理员受众采用**严格白名单**：只有 `device.updated`、
+            // `task.updated`、`system.time.changed` 三种事件才允许挂在管理员
+            // 受众上。`PermissionsChanged` 是**用户私有事实**（06 §4），只有
+            // 目标用户本人受众（`EventAudience::User(user_id)`）才与它自洽，
+            // 管理员受众绝不能接收 `PermissionsChanged`——否则「Alice 的授权
+            // 投影被错标成管理员受众」会让管理员旁观者看到别人的私有授权变化；
+            // `Reset` 不携带任何对象事实，只允许全局受众（`AnySession`），带
+            // 管理员受众同样不自洽。
+            EventAudience::Admins => matches!(
+                self.name,
+                EventName::DeviceUpdated | EventName::TaskUpdated | EventName::SystemTimeChanged
+            ),
+            // 授权投影事件的载荷 `id` 必须就是受众本人：受众与载荷 id 来自同一
+            // 份字节，写错即整条丢弃（宁可不发也不串人）。
+            EventAudience::User(user_id) => match self.name {
+                EventName::PermissionsChanged => {
+                    let expected = uuid::Uuid::from_bytes(user_id).to_string();
+                    self.data
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| id == expected)
+                }
+                // 设备/任务的载荷 id 是**对象** id，与受众本人没有等式可依；
+                // 受众本身就是授权判定，由构造点保证不是全局。
+                EventName::DeviceUpdated | EventName::TaskUpdated => {
+                    !matches!(self.name, EventName::Reset)
+                }
+                // 时间事件钉死管理员受众，带用户受众即不自洽；`reset` 不带对象
+                // 事实，出现用户受众同样不自洽。
+                EventName::SystemTimeChanged | EventName::Reset => false,
+            },
+        }
+    }
+
     /// `device.updated`：`{"kind":"device","id":<64hex>,"revision":<十进制字符串>}`。
     ///
-    /// 受众由发布方给出：设备事件是对象级事实，只有确证「对任何合法会话都
-    /// 可见」时才可传 [`EventAudience::AnySession`]，否则必须限定到目标用户或
-    /// 管理员范围。
-    pub fn device_updated(device_id: &str, revision: u64, audience: EventAudience) -> Self {
-        Self::new(
+    /// 受众是**对象级**受众（[`EventObjectAudience`]）：类型上不存在
+    /// 「任何合法会话」这一档，设备事实要么发给管理员范围、要么发给某一个用户。
+    pub fn device_updated(device_id: &str, revision: u64, audience: EventObjectAudience) -> Self {
+        Self::assembled(
             EventName::DeviceUpdated,
             json!({
                 "kind": "device",
                 "id": device_id,
                 "revision": decimal_u64_json(revision),
             }),
-            audience,
+            audience.to_event_audience(),
         )
     }
 
     /// `task.updated`：`{"kind":"task","id":<uuid>,"revision":<十进制字符串>}`。
     ///
     /// 受众限定规则同 [`EventEnvelope::device_updated`]。
-    pub fn task_updated(task_id: &str, revision: u64, audience: EventAudience) -> Self {
-        Self::new(
+    pub fn task_updated(task_id: &str, revision: u64, audience: EventObjectAudience) -> Self {
+        Self::assembled(
             EventName::TaskUpdated,
             json!({
                 "kind": "task",
                 "id": task_id,
                 "revision": decimal_u64_json(revision),
             }),
-            audience,
+            audience.to_event_audience(),
         )
     }
 
@@ -183,10 +326,12 @@ impl EventEnvelope {
     /// `epoch` 是授权 epoch（authz_epoch）：客户端据此判定旧授权投影失效，
     /// 清缓存并重新鉴权，而不是继续展示撤权前的数据（06 §4）。
     ///
-    /// 授权投影是**用户私有**事实：受众由构造钉死为 [`EventAudience::User`]，
-    /// 并且 `data.id` 与受众来自同一份字节，杜绝「载荷与受众不一致」。
+    /// 授权投影是**用户私有**事实：受众不接受调用方给出，由本构造用
+    /// `user_id` 这一份字节**同时**生成载荷 `id` 与 [`EventAudience::User`]，
+    /// 两者不可能分别被改写（`permissions_changed(ALICE, n)` 在 API 上
+    /// 不存在「受众写成 BOB」的写法）。
     pub fn permissions_changed(user_id: [u8; 16], authz_epoch: u64) -> Self {
-        Self::new(
+        Self::assembled(
             EventName::PermissionsChanged,
             json!({
                 "kind": "permissions",
@@ -200,15 +345,15 @@ impl EventEnvelope {
     /// `system.time.changed`：`{"kind":"system_time","evidence":<TimeEvidence>}`。
     ///
     /// 载荷就是既有的 `TimeEvidence` 对象（02 §7 `/system/time` 同源形状），
-    /// 不新增第二套时间字段；受众由构造钉死为 [`EventAudience::Admins`]
-    /// （06 §4「时间事件仅管理员」，与 [`EventName::admin_only`] 构成双重门禁）。
+    /// 不新增第二套时间字段；受众不接受调用方给出，由本构造钉死为
+    /// [`EventAudience::Admins`]（06 §4「时间事件仅管理员」，与
+    /// [`EventName::admin_only`] 构成双重门禁）。
     pub fn system_time_changed(evidence: &TimeEvidence) -> Self {
-        Self::new(
+        Self::assembled(
             EventName::SystemTimeChanged,
             json!({
                 "kind": "system_time",
-                "evidence": serde_json::to_value(evidence)
-                    .unwrap_or(Value::Null),
+                "evidence": serde_json::to_value(evidence).unwrap_or(Value::Null),
             }),
             EventAudience::Admins,
         )
@@ -216,9 +361,10 @@ impl EventEnvelope {
 
     /// `reset`：`{"kind":"reset","reason":<稳定去敏原因码>}`。
     ///
-    /// 只含一个稳定原因码、不含任何对象事实，因此受众是「任何合法会话」。
+    /// 只含一个稳定原因码、不含任何对象事实，因此它是唯一允许「任何合法会话」
+    /// 受众的事件（见 [`EventName::allows_global_audience`]）。
     pub fn reset(reason: &str) -> Self {
-        Self::new(
+        Self::assembled(
             EventName::Reset,
             json!({ "kind": "reset", "reason": reason }),
             EventAudience::AnySession,
@@ -258,6 +404,10 @@ impl EventBus {
     ///
     /// **永不阻塞、永不上抛**：无订阅者（`broadcast` 报 `SendError`）即丢弃并返回 0，
     /// 这是「事件只是变化提示」的契约内行为，不是失败，也不得改成排队重放。
+    ///
+    /// 受众不是这里的运行期判断点：非法受众组合在类型上构造不出来（见
+    /// [`EventEnvelope`]），而任何漏网的不一致都由投递侧
+    /// [`EventEnvelope::visible_to`] 失败关闭，绝不进入任何用户的流。
     pub fn publish(&self, event: EventEnvelope) -> usize {
         self.sender.send(event).unwrap_or(0)
     }
@@ -311,43 +461,53 @@ mod tests {
     }
 
     #[test]
+    fn only_reset_may_carry_a_global_audience() {
+        // 全局受众的白名单是单一事实来源：五种名称里只有 `reset`。
+        assert!(EventName::Reset.allows_global_audience());
+        assert!(!EventName::DeviceUpdated.allows_global_audience());
+        assert!(!EventName::TaskUpdated.allows_global_audience());
+        assert!(!EventName::PermissionsChanged.allows_global_audience());
+        assert!(!EventName::SystemTimeChanged.allows_global_audience());
+    }
+
+    #[test]
     fn payloads_carry_kind_id_and_decimal_revision() {
         let alice = [7u8; 16];
         let device =
-            EventEnvelope::device_updated(&"ab".repeat(32), 12, EventAudience::User(alice));
-        assert_eq!(device.name, EventName::DeviceUpdated);
-        assert_eq!(device.audience, EventAudience::User(alice));
-        assert_eq!(device.data["kind"], json!("device"));
-        assert_eq!(device.data["id"], json!("ab".repeat(32)));
-        assert_eq!(device.data["revision"], json!("12"));
+            EventEnvelope::device_updated(&"ab".repeat(32), 12, EventObjectAudience::user(alice));
+        assert_eq!(device.name(), EventName::DeviceUpdated);
+        assert_eq!(device.audience(), EventAudience::User(alice));
+        assert_eq!(device.data()["kind"], json!("device"));
+        assert_eq!(device.data()["id"], json!("ab".repeat(32)));
+        assert_eq!(device.data()["revision"], json!("12"));
 
         let task = EventEnvelope::task_updated(
             "0e7f1c2e-0000-4000-8000-000000000001",
             7,
-            EventAudience::Admins,
+            EventObjectAudience::admins(),
         );
-        assert_eq!(task.data["kind"], json!("task"));
-        assert_eq!(task.data["revision"], json!("7"));
-        assert_eq!(task.audience, EventAudience::Admins);
+        assert_eq!(task.data()["kind"], json!("task"));
+        assert_eq!(task.data()["revision"], json!("7"));
+        assert_eq!(task.audience(), EventAudience::Admins);
 
         let perms = EventEnvelope::permissions_changed(alice, u64::MAX);
-        assert_eq!(perms.data["kind"], json!("permissions"));
+        assert_eq!(perms.data()["kind"], json!("permissions"));
         // 载荷 id 就是受众本人：canonical 小写 UUID。
         assert_eq!(
-            perms.data["id"],
+            perms.data()["id"],
             json!(uuid::Uuid::from_bytes(alice).to_string())
         );
         // 十进制字符串，不经 JS number，u64 上界不丢精度。
-        assert_eq!(perms.data["epoch"], json!(u64::MAX.to_string()));
+        assert_eq!(perms.data()["epoch"], json!(u64::MAX.to_string()));
 
         let time = EventEnvelope::system_time_changed(&fixture_evidence());
-        assert_eq!(time.data["kind"], json!("system_time"));
-        assert_eq!(time.data["evidence"]["quality"], json!("ntp_valid"));
-        assert_eq!(time.data["evidence"]["sample_age_ms"], json!("1500"));
+        assert_eq!(time.data()["kind"], json!("system_time"));
+        assert_eq!(time.data()["evidence"]["quality"], json!("ntp_valid"));
+        assert_eq!(time.data()["evidence"]["sample_age_ms"], json!("1500"));
 
         let reset = EventEnvelope::reset(RESET_REASON_BUFFER_OVERFLOW);
-        assert_eq!(reset.name, EventName::Reset);
-        assert_eq!(reset.data["reason"], json!("buffer_overflow"));
+        assert_eq!(reset.name(), EventName::Reset);
+        assert_eq!(reset.data()["reason"], json!("buffer_overflow"));
     }
 
     #[test]
@@ -355,18 +515,160 @@ mod tests {
         let alice = [7u8; 16];
         // 授权投影事件的受众由构造钉死为本人，发布方无法把它发成全局事件。
         assert_eq!(
-            EventEnvelope::permissions_changed(alice, 1).audience,
+            EventEnvelope::permissions_changed(alice, 1).audience(),
             EventAudience::User(alice)
         );
         // 时间事件的受众钉死为管理员，与 EventName::admin_only 构成双重门禁。
         assert_eq!(
-            EventEnvelope::system_time_changed(&fixture_evidence()).audience,
+            EventEnvelope::system_time_changed(&fixture_evidence()).audience(),
             EventAudience::Admins
         );
         // 唯一免受众构造是 reset：它不含任何对象事实。
         assert_eq!(
-            EventEnvelope::reset(RESET_REASON_BUFFER_OVERFLOW).audience,
+            EventEnvelope::reset(RESET_REASON_BUFFER_OVERFLOW).audience(),
             EventAudience::AnySession
+        );
+    }
+
+    #[test]
+    fn object_audience_has_no_global_variant_so_object_events_are_never_broadcast() {
+        // 对象级受众的两个取值都必须投影成**非全局**受众：类型里没有
+        // 「任何合法会话」，所以设备/任务事件在任何构造下都不可能全局可见。
+        let alice = [7u8; 16];
+        for audience in [
+            EventObjectAudience::admins(),
+            EventObjectAudience::user(alice),
+        ] {
+            let device = EventEnvelope::device_updated(&"ab".repeat(32), 1, audience);
+            let task = EventEnvelope::task_updated("t-1", 1, audience);
+            assert_ne!(device.audience(), EventAudience::AnySession);
+            assert_ne!(task.audience(), EventAudience::AnySession);
+        }
+        // 反向证据：连「任何合法会话」这个受众值本身，对普通连接也只允许
+        // `reset` 出现在流上（见 forged_pairing_* 与 visible_to）。
+        let viewer = EventViewer {
+            user_id: alice,
+            is_admin: false,
+        };
+        assert!(EventEnvelope::reset(RESET_REASON_BUFFER_OVERFLOW).visible_to(viewer));
+    }
+
+    #[test]
+    fn permissions_payload_and_audience_share_one_source() {
+        // 载荷 id 与受众由同一份字节生成：二者永远指同一个人。
+        let alice = [7u8; 16];
+        let envelope = EventEnvelope::permissions_changed(alice, 12);
+        let EventAudience::User(audience) = envelope.audience() else {
+            panic!(
+                "授权投影事件的受众必须是用户本人：{:?}",
+                envelope.audience()
+            );
+        };
+        assert_eq!(audience, alice);
+        assert_eq!(
+            envelope.data()["id"]
+                .as_str()
+                .expect("载荷 id 必须是字符串"),
+            uuid::Uuid::from_bytes(audience).to_string()
+        );
+        // 一致性自洽：这条事件对 alice 可见、对 bob 不可见。
+        assert!(envelope.visible_to(EventViewer {
+            user_id: alice,
+            is_admin: false
+        }));
+        assert!(!envelope.visible_to(EventViewer {
+            user_id: [8u8; 16],
+            is_admin: false
+        }));
+    }
+
+    #[test]
+    fn forged_pairings_are_never_deliverable() {
+        // 模块**内**用私有构造点伪造「名称/载荷/受众互相矛盾」的信封：证明
+        // 即便将来新增构造点写错配对，投递判定也只会被静默丢弃，不会漏给任何人
+        // （本模块外根本写不出这些对象，见 EventEnvelope 的私有字段）。
+        let alice = [7u8; 16];
+        let bob = [8u8; 16];
+        let alice_viewer = EventViewer {
+            user_id: alice,
+            is_admin: false,
+        };
+        let bob_viewer = EventViewer {
+            user_id: bob,
+            is_admin: false,
+        };
+        let admin_viewer = EventViewer {
+            user_id: bob,
+            is_admin: true,
+        };
+
+        // 1) 载荷写着 alice、受众却是 bob：两个人都必须收不到。
+        let mismatched = EventEnvelope {
+            name: EventName::PermissionsChanged,
+            data: json!({
+                "kind": "permissions",
+                "id": uuid::Uuid::from_bytes(alice).to_string(),
+                "epoch": "12",
+            }),
+            audience: EventAudience::User(bob),
+        };
+        assert!(
+            !mismatched.visible_to(bob_viewer),
+            "载荷/受众不一致不得发送"
+        );
+        assert!(!mismatched.visible_to(alice_viewer));
+        assert!(!mismatched.visible_to(admin_viewer));
+
+        // 2) 对象事件带全局受众：三个视角都不可见（不是「广播放行」）。
+        for name in [
+            EventName::DeviceUpdated,
+            EventName::TaskUpdated,
+            EventName::PermissionsChanged,
+        ] {
+            let forged = EventEnvelope {
+                name,
+                data: json!({"kind": "forged", "id": "obj-1", "revision": "1"}),
+                audience: EventAudience::AnySession,
+            };
+            assert!(
+                !forged.visible_to(alice_viewer) && !forged.visible_to(admin_viewer),
+                "{name:?} 携带全局受众必须失败关闭"
+            );
+        }
+
+        // 3) 时间事件带用户受众（绕开 admin_only 的写法）：同样不可见。
+        let forged_time = EventEnvelope {
+            name: EventName::SystemTimeChanged,
+            data: json!({"kind": "system_time"}),
+            audience: EventAudience::User(bob),
+        };
+        assert!(!forged_time.visible_to(bob_viewer));
+        assert!(!forged_time.visible_to(admin_viewer));
+
+        // 4) 授权投影是用户私有事实：哪怕被错标成管理员受众（`PermissionsChanged
+        //    + EventAudience::Admins`），管理员受众的严格白名单也必须把它失败
+        //    关闭——Alice 的授权投影绝不能被管理员旁观者看到，本人及其他普通
+        //    用户同样收不到（宁可不发也不串人、不旁落）。
+        let forged_perms_to_admins = EventEnvelope {
+            name: EventName::PermissionsChanged,
+            data: json!({
+                "kind": "permissions",
+                "id": uuid::Uuid::from_bytes(alice).to_string(),
+                "epoch": "12",
+            }),
+            audience: EventAudience::Admins,
+        };
+        assert!(
+            !forged_perms_to_admins.visible_to(alice_viewer),
+            "授权投影即便被标成管理员受众也不得对本人可见（管理员受众不含 PermissionsChanged）"
+        );
+        assert!(
+            !forged_perms_to_admins.visible_to(bob_viewer),
+            "授权投影即便被标成管理员受众也不得对他人可见"
+        );
+        assert!(
+            !forged_perms_to_admins.visible_to(admin_viewer),
+            "授权投影即便被标成管理员受众也绝不能被管理员旁观者看到"
         );
     }
 
@@ -399,6 +701,31 @@ mod tests {
     }
 
     #[test]
+    fn envelope_visible_to_pins_the_admin_only_name_gate() {
+        let alice = [7u8; 16];
+        let admin_viewer = EventViewer {
+            user_id: alice,
+            is_admin: true,
+        };
+        // 管理员范围的对象事件：管理员可见，普通用户不可见（受众与名称两道门禁
+        // 都不构成旁路）。
+        let admins_only =
+            EventEnvelope::device_updated(&"cd".repeat(32), 1, EventObjectAudience::admins());
+        assert!(admins_only.visible_to(admin_viewer));
+        assert!(!admins_only.visible_to(EventViewer {
+            user_id: alice,
+            is_admin: false
+        }));
+        // 时间事件由构造钉死管理员受众：管理员视角可见、普通用户不可见。
+        let time = EventEnvelope::system_time_changed(&fixture_evidence());
+        assert!(time.visible_to(admin_viewer));
+        assert!(!time.visible_to(EventViewer {
+            user_id: alice,
+            is_admin: false
+        }));
+    }
+
+    #[test]
     fn publish_without_subscribers_is_dropped_not_buffered() {
         let bus = EventBus::new();
         assert_eq!(bus.subscriber_count(), 0);
@@ -418,17 +745,17 @@ mod tests {
         let delivered = bus.publish(EventEnvelope::task_updated(
             "t-1",
             1,
-            EventAudience::AnySession,
+            EventObjectAudience::user([7u8; 16]),
         ));
         assert_eq!(delivered, 2);
-        assert_eq!(first.try_recv().unwrap().name, EventName::TaskUpdated);
-        assert_eq!(second.try_recv().unwrap().name, EventName::TaskUpdated);
+        assert_eq!(first.try_recv().unwrap().name(), EventName::TaskUpdated);
+        assert_eq!(second.try_recv().unwrap().name(), EventName::TaskUpdated);
         // 订阅只收「之后」的事件，不回放历史。
         assert_eq!(
             bus.publish(EventEnvelope::task_updated(
                 "t-2",
                 2,
-                EventAudience::AnySession
+                EventObjectAudience::user([7u8; 16])
             )),
             2
         );
@@ -444,7 +771,7 @@ mod tests {
                 bus.publish(EventEnvelope::task_updated(
                     "t",
                     revision,
-                    EventAudience::AnySession
+                    EventObjectAudience::user([7u8; 16])
                 )),
                 1,
                 "慢订阅者绝不得阻塞或拒绝发送方"
@@ -466,10 +793,10 @@ mod tests {
             bus.publish(EventEnvelope::device_updated(
                 &"cd".repeat(32),
                 3,
-                EventAudience::AnySession
+                EventObjectAudience::user([7u8; 16])
             )),
             1
         );
-        assert_eq!(rx.try_recv().unwrap().name, EventName::DeviceUpdated);
+        assert_eq!(rx.try_recv().unwrap().name(), EventName::DeviceUpdated);
     }
 }
