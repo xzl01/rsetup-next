@@ -92,6 +92,10 @@ jobs:
       # 先于 --test web_assets」的顺序——本作业被自己的合同检查，改坏接线即红。
       - name: Test CI configuration contracts
         run: node --test scripts/tests/*.test.mjs
+      # 中控验收账本（docs/testing/controller-v1-acceptance.md）的合同校验：只验报告
+      # 格式与行完整性（ID 集合、状态取值、PASS 行必填字段），不证明外部证据真实。
+      - name: Check controller acceptance ledger
+        run: python3 scripts/check_controller_acceptance.py docs/testing/controller-v1-acceptance.md
 
   # 架构口径：本项目仅维护 64 位目标 aarch64（arm64）与 x86_64（amd64），
   # 与 debian/control 的 `Architecture: amd64 arm64` 保持一致。
@@ -214,12 +218,12 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-      # 本作业不构建前端：rsetup-controller 不进入 Debian 软件包，debian/rules 的
-      # dh_auto_test 已用 `--exclude rsetup-controller` 把它排除在编译与测试之外，
-      # 因此这里既不需要 controller 的前端 dist 产物，也不需要 npm——装 nodejs 只是为了
-      # dh_auto_test 的 `node --test ui/*.test.mjs`。若将来把 controller 纳入本包，
-      # 必须先补回 Node 22 + npm 的前端构建，并同步 debian/control 与 debian/rules；
-      # 这一步回归会被 scripts/tests/controller-ci-contract.test.mjs 判红。
+      # 本作业不构建前端：dist 已入库，rsetup-controller 与主程序均使用内置离线产物
+      # （crates/rsetup-controller/build.rs 在编译期读入库产物，缺失即失败关闭），源码包
+      # 因此可全程离线构建；装 nodejs 只是为了 dh_auto_test 的
+      # `node --test ui/*.test.mjs`，与前端构建无关。
+      # 这条边界由 scripts/tests/controller-ci-contract.test.mjs 钉住：在本作业里引回前端
+      # 构建（连注释留下前端目录路径或相应的依赖安装命令字样都算）都会让该合同测试判红。
       - name: Prepare offline Cargo cache
         run: CARGO_HOME="$GITHUB_WORKSPACE/debian/cargo-home" cargo fetch --locked
       - name: Build Debian package
@@ -228,6 +232,8 @@ jobs:
         run: |
           dpkg-deb --info ../rsetup-next_*.deb
           dpkg-deb --contents ../rsetup-next_*.deb
+          dpkg-deb --info ../rsetup-controller_*.deb
+          dpkg-deb --contents ../rsetup-controller_*.deb
           if readelf -d target/release/rsetup-next | grep -q '(NEEDED)'; then
             echo "rsetup-next unexpectedly has dynamic library dependencies"
             exit 1
@@ -236,11 +242,24 @@ jobs:
             echo "rsetup-next-helper unexpectedly has dynamic library dependencies"
             exit 1
           fi
-          lintian --fail-on error ../rsetup-next_*.changes
+          if readelf -d target/release/rsetup-controller | grep -q '(NEEDED)'; then
+            echo "rsetup-controller unexpectedly has dynamic library dependencies"
+            exit 1
+          fi
+          if readelf -d target/release/migrate-controller | grep -q '(NEEDED)'; then
+            echo "migrate-controller unexpectedly has dynamic library dependencies"
+            exit 1
+          fi
+          if readelf -d target/release/reset-admin | grep -q '(NEEDED)'; then
+            echo "reset-admin unexpectedly has dynamic library dependencies"
+            exit 1
+          fi
+          lintian --fail-on error ../*.changes
       - name: Export Debian package
         run: |
           mkdir -p artifacts
           cp ../rsetup-next_*_${{ matrix.architecture }}.deb artifacts/
+          cp ../rsetup-controller_*_${{ matrix.architecture }}.deb artifacts/
       - uses: actions/upload-artifact@v7
         with:
           name: rsetup-next-debian-${{ matrix.architecture }}
@@ -266,7 +285,7 @@ jobs:
       - name: Install on Debian 12
         run: |
           apt-get update
-          apt-get install -y ./artifacts/rsetup-next_*_${{ matrix.architecture }}.deb
+          apt-get install -y ./artifacts/rsetup-next_*_${{ matrix.architecture }}.deb ./artifacts/rsetup-controller_*_${{ matrix.architecture }}.deb
       - name: Smoke test on Debian 12
         run: |
           rsetup-next --demo status --json | grep -q '"identity"'
@@ -276,3 +295,10 @@ jobs:
           test -f /usr/share/polkit-1/actions/com.radxa.rsetup-next.policy
           test -f /usr/lib/systemd/system/rsetup-next-thermal-policy.service
           /usr/libexec/rsetup-next-helper action system.inspect --confirmed | grep -q '"actionId":"system.inspect"'
+          test -x /usr/bin/rsetup-controller
+          test -x /usr/bin/rsetup-controller-migrate
+          test -x /usr/bin/rsetup-controller-reset-admin
+          test -f /usr/lib/systemd/system/rsetup-controller.service
+          test -f /etc/default/rsetup-controller
+          /usr/bin/rsetup-controller-migrate --help | grep -q "migrate-controller"
+          /usr/bin/rsetup-controller-reset-admin --help | grep -q "reset-admin"

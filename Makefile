@@ -244,6 +244,31 @@ tui:
 serve:
 	cargo run -p $(PROJECT) -- serve
 
+# 板端测试代理与双端本地联调的便捷入口。
+# board-agent/board-agent-once 对应 crates/rsetup-board-agent 的独立二进制
+# src/bin/rsetup-board-agent.rs：前者产出可直接拷到板卡上运行的产物，后者只跑
+# 一轮状态采集即退出，用于板端冒烟。
+# controller-migrate 是中控数据库迁移 CLI（src/bin/migrate-controller.rs），与
+# 服务主二进制分离；controller-bin 编译中控主二进制，它同样在编译期读取
+# apps/controller-web/dist，因此与 build/test/lint 等入口目标一致，先决于
+# web-dist-check（dist 已入库，该先决条件只做存在性检查，不触发 npm）。
+# dual-test 运行本地主控与板端的联合连通性与功能测试脚本。
+.PHONY: board-agent board-agent-once controller-migrate controller-bin dual-test
+board-agent:
+	cargo build -p rsetup-board-agent --bin rsetup-board-agent
+
+board-agent-once:
+	cargo run -p rsetup-board-agent --bin rsetup-board-agent -- --once
+
+controller-migrate:
+	cargo build -p rsetup-controller --bin migrate-controller
+
+controller-bin: web-dist-check
+	cargo build -p rsetup-controller --bin rsetup-controller
+
+dual-test:
+	python3 scripts/test_local_dual_run.py
+
 # The desktop crate is workspace-excluded, so `--package` cannot select it; go
 # through its own manifest instead. These mirror the desktop-tauri-ipc CI job.
 desktop-test:
