@@ -1083,15 +1083,28 @@ mod tests {
 
     #[test]
     fn transaction_keeps_lock_during_erase_and_rollback() {
+        // The marker files are created by child processes spawned from the
+        // worker thread. A fully loaded `cargo test --workspace` run can delay
+        // scheduling of both the thread and the `sh` child by seconds, so poll
+        // against a generous deadline; the 10ms poll interval still lets the
+        // uncontended case return within milliseconds.
+        const MARKER_POLL_DEADLINE_SECS: u64 = 20;
+        // The fake tools keep a bounded wait loop purely so a failing test
+        // cannot leave them spinning forever. Keep it above the marker
+        // deadline so a stalled test body never makes a tool bail out early.
+        const RELEASE_LEAK_GUARD_SECS: u64 = 40;
         let root = fixture_root();
         add_mtd(&root, "mtd0", "nor", 4096);
         fs::create_dir_all(root.join("usr/sbin")).unwrap();
         // Regular-file fixtures only. Each fake tool waits until the test has
-        // attempted another apply while the first transaction is still active.
+        // attempted another apply while the first transaction is still active,
+        // bounded only by the leak guard so a stalled test body can never make
+        // a tool exit early.
         for (tool, marker, exit_code) in [(FLASH_ERASE, "erase", 1), (FLASHCP, "rollback", 0)] {
             let path = rooted_path(&root, tool);
             fs::write(&path, format!(
-                "#!/bin/sh\nset -eu\ntouch \"$0.{marker}\"\ni=0\nwhile [ ! -f \"$0.release\" ]; do\n  i=$((i+1))\n  [ \"$i\" -lt 1000 ] || exit 2\n  sleep 0.01\ndone\nexit {exit_code}\n"
+                "#!/bin/sh\nset -eu\ntouch \"$0.{marker}\"\ni=0\nwhile [ ! -f \"$0.release\" ]; do\n  i=$((i+1))\n  [ \"$i\" -lt {leak_guard_loops} ] || exit 2\n  sleep 0.01\ndone\nexit {exit_code}\n",
+                leak_guard_loops = RELEASE_LEAK_GUARD_SECS * 100,
             )).unwrap();
             fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
         }
@@ -1110,7 +1123,8 @@ mod tests {
         };
         for (tool, marker) in [(FLASH_ERASE, "erase"), (FLASHCP, "rollback")] {
             let marker_path = rooted_path(&root, &format!("{tool}.{marker}"));
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_secs(MARKER_POLL_DEADLINE_SECS);
             while !marker_path.exists() && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }

@@ -373,6 +373,7 @@ pub fn fixture(must_change: bool) -> (Router<()>, SpyCounters) {
         notification_sink: Arc::new(TestProbe),
         // 本 fixture 只证路由表面与门禁计数，不装配事件线：写端点行为与接入总线前一致。
         events: None,
+        time_source: None,
     };
     (build_management_router(state), counters)
 }

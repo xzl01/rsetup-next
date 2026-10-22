@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use rsetup_controller::api::adapters::build_sqlx_management_state_with_events;
+use rsetup_controller::api::adapters::build_sqlx_management_state_full;
 use rsetup_controller::api::approvals::ManagementNotificationSink;
 use rsetup_controller::api::devices::{DeviceLiveProbe, DeviceLiveView};
 use rsetup_controller::api::system::{RecoveryModeProbe, RecoveryView};
@@ -224,13 +224,14 @@ fn production_inputs(
     };
 
     let transport = Arc::new(UnwiredTransportSources);
-    let management = build_sqlx_management_state_with_events(
+    let management = build_sqlx_management_state_full(
         db.clone(),
         auth.clone(),
         transport.clone(),
         transport.clone(),
         transport,
         Some(events.bus.clone()),
+        Some(time_gate.clone()),
     );
 
     // 授权快照仓储：任务线与设备状态读线共用同一个只读快照入口（同一个 DbPool，

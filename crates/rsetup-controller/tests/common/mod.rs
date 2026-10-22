@@ -1341,10 +1341,87 @@ async fn task4_assert_deactivated(db: &DbPool, actor: [u8; 16]) {
     );
 }
 
+/// 锁观测权限前置探测。
+///
+/// 两个锁等待观测用例依赖 MySQL `performance_schema.threads` / `data_locks` /
+/// `data_lock_waits` 的查询权限，或 TiDB `information_schema.DATA_LOCK_WAITS` /
+/// `CLUSTER_TIDB_TRX` 的 PROCESS 权限。账号未被授予这些权限时，探测语句会直接
+/// 报错（1142 Command denied / 1227 Access denied）；若留给
+/// [`task4_participant_pool`] 的 `after_connect` 触发，连接池 `acquire` 会反复
+/// 重建连接并失败直到 acquire 超时。此处在建参与者池之前显式探测一次：任一探测
+/// 报错或相关开关未开启即返回 `false`，由调用方打印说明并跳过用例。
+pub async fn has_lock_observation_privileges(db: &DbPool, engine: ExpectedIdentityEngine) -> bool {
+    let mut connection = match db.0.acquire().await {
+        Ok(connection) => connection,
+        Err(_) => return false,
+    };
+    let probed = async {
+        match engine {
+            ExpectedIdentityEngine::MySql => {
+                let enabled: i64 =
+                    sqlx::query_scalar("SELECT CAST(@@performance_schema AS SIGNED)")
+                        .fetch_one(&mut *connection)
+                        .await?;
+                if enabled != 1 {
+                    return Err(sqlx::Error::Protocol("task4_probe_switch_off".into()));
+                }
+                // 真实扫描；LIMIT 0 / WHERE false 可能绕过权限检查。
+                sqlx::query(
+                    "SELECT THREAD_ID,PROCESSLIST_ID FROM performance_schema.threads WHERE PROCESSLIST_ID=CONNECTION_ID()",
+                )
+                .fetch_all(&mut *connection)
+                .await?;
+                sqlx::query(
+                    "SELECT REQUESTING_THREAD_ID,BLOCKING_THREAD_ID,REQUESTING_ENGINE_LOCK_ID,ENGINE FROM performance_schema.data_lock_waits LIMIT 1",
+                )
+                .fetch_optional(&mut *connection)
+                .await?;
+                sqlx::query(
+                    "SELECT ENGINE_LOCK_ID,ENGINE,OBJECT_SCHEMA,OBJECT_NAME,LOCK_STATUS FROM performance_schema.data_locks LIMIT 1",
+                )
+                .fetch_optional(&mut *connection)
+                .await?;
+            }
+            ExpectedIdentityEngine::TiDb => {
+                // v8.5.8 TiDBConfig GetGlobal 返回 config.GetJSONConfig()；只取该
+                // 布尔项，不读取完整配置。读取 @@GLOBAL.tidb_config 本身需要权限。
+                let (mode, global_kill): (String, Option<String>) = sqlx::query_as(
+                    "SELECT CAST(@@SESSION.tidb_txn_mode AS CHAR),JSON_UNQUOTE(JSON_EXTRACT(@@GLOBAL.tidb_config,'$.\"enable-global-kill\"'))",
+                )
+                .fetch_one(&mut *connection)
+                .await?;
+                if mode != "pessimistic" || global_kill.as_deref() != Some("true") {
+                    return Err(sqlx::Error::Protocol("task4_probe_switch_off".into()));
+                }
+                sqlx::query(
+                    "SELECT TRX_ID,CURRENT_HOLDING_TRX_ID,KEY_INFO FROM information_schema.DATA_LOCK_WAITS LIMIT 1",
+                )
+                .fetch_optional(&mut *connection)
+                .await?;
+                sqlx::query(
+                    "SELECT ID,SESSION_ID FROM information_schema.CLUSTER_TIDB_TRX WHERE SESSION_ID=CONNECTION_ID()",
+                )
+                .fetch_all(&mut *connection)
+                .await?;
+            }
+        }
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+    // 探测失败原因可能是权限不足、开关未开启或连接不可用，一律按不可观测处理。
+    probed.is_ok()
+}
+
 pub async fn admission_deactivation_holds_guard_cas_waits_then_denied(
     db: &DbPool,
     engine: ExpectedIdentityEngine,
 ) {
+    if !has_lock_observation_privileges(db, engine).await {
+        eprintln!(
+            "SKIPPED: lock observation capability not available (requires performance_schema or PROCESS privileges)"
+        );
+        return;
+    }
     use rsetup_controller::{AdmissionSnapshot, AdmissionState, AdmissionStore, ReviewDecision};
     use std::time::Duration;
     use tokio::sync::{Barrier, oneshot};
@@ -1462,6 +1539,12 @@ pub async fn admission_cas_commits_before_deactivation_then_new_cas_denied(
     db: &DbPool,
     engine: ExpectedIdentityEngine,
 ) {
+    if !has_lock_observation_privileges(db, engine).await {
+        eprintln!(
+            "SKIPPED: lock observation capability not available (requires performance_schema or PROCESS privileges)"
+        );
+        return;
+    }
     use rsetup_controller::{AdmissionSnapshot, AdmissionState, AdmissionStore, ReviewDecision};
     use std::time::Duration;
     use tokio::sync::{Barrier, oneshot};

@@ -67,6 +67,8 @@ pub struct ManagementState {
     /// 不得据此改变响应。由 [`build_management_router`] 分发给需要发布的那几个子
     /// router state（`AuditApiState` 无发布职责，故不持有）。
     pub events: Option<EventBus>,
+    /// 时间门禁句柄：`GET /api/v1/system/time` 读取真实时间证据与重试状态的来源。
+    pub time_source: Option<crate::time::TimeGateHandle>,
 }
 
 /// 生产装配签名（Task 13 打通真实仓储 adapter）。骨架阶段 8 个子 router 各挂载 0 条
@@ -118,6 +120,7 @@ pub fn build_management_router(state: ManagementState) -> axum::Router<()> {
         gateway: state.system,
         recovery_probe: state.recovery_probe,
         events: state.events,
+        time_source: state.time_source,
     }))
 }
 

@@ -1,12 +1,13 @@
 # 中控 V1 当前已知缺口（Known Gaps）
 
-日期：2026-10-22
+日期：2026-10-23（本轮主代理与双模型复核后对齐；首版 2026-10-22）
 
 ## 0. 范围声明
 
 - 本文**只记录当前代码与验收证据中客观存在的缺口**：每一条都是「尚未做到什么」，不是「已通过什么」。
 - 本文**不改变** [`controller-v1-acceptance.md`](<controller-v1-acceptance.md>) 中任何账本行的 `status`/`executed_at`/`layer`/`command_or_steps`/`evidence`，也不新增或删除账本行；账本行仍是唯一的状态登记处。
 - 缺口项一律不得被引用为 PASS 依据；补齐后须在验收账本按行合同另记执行时间、层级、命令与可持久复核的证据路径。
+- 本文中标注「**正在落地**」的条目描述的是本轮**进行中**的工作，只说明「准备补什么」，**不构成**该缺口已闭合或任何验收行通过的证据。
 - 本文不含凭据、真实主机地址、连接串或备份引用具体值；涉及真实库/真实设备的操作一律引用去敏报告。
 
 本文链接均为仓库内位置；涉及代码的条目一律以**符号名**定位，不引用会随提交漂移的行号。
@@ -58,29 +59,49 @@
   3. 授权变更在目标用户明确（`users.rs` 触及 active/is_admin、密码重置，以及 `grants.rs` `create_grant`）成功时，已接入 `permissions_changed` 发布；
   4. 以上写操作与受众隔离在 [`tests/sse_business_events.rs`](<../../crates/rsetup-controller/tests/sse_business_events.rs>) 中通过 11 项进程内端到端测试。
 - **仍存在的边界与未闭环项**：
-  - **系统时间变更发布方未在业务消费侧接线**：[`SystemApiState::publish_system_time_changed`](<../../crates/rsetup-controller/src/api/system.rs>) 已提供类型化入口，但当前时间采样与时间门未在生产循环中持久调用；
+  - **系统时间变更的 SSE 发布方没有生产调用方**：[`SystemApiState::publish_system_time_changed`](<../../crates/rsetup-controller/src/api/system.rs>) 已提供类型化入口，事件线句柄在生产装配中已接入（`events = Some(bus)`），但时间门禁的后台 driver（`start_time_gate` 启动采样、周期复验、单调退避、跳钟换代）在证据变化处不调用它，因此事件流上当前不会出现 `system_time_changed`；同一条时间证据的 HTTP 读线缺口见 j 节；
   - **`authz_epoch` 变更与 SSE 读线复核关流的时序特性**：写事务内 `bump_authz_epoch` 后，已建立的旧连接在发送下一帧前权威复核发现 `epoch` 不等，按 06 §4「发送前验证 session 与 authz_epoch，撤权关闭旧订阅，排队旧权限数据不得发送」立即主动断开连接；受影响用户是通过断线重连拉取最新授权，而不是持续在旧连接上消费事件；
   - **受影响集合不确定的写操作不虚构受众**：角色修改、组修改、删除授权等无法单点回显具体目标用户的场景，为防止向错人广播虚假提示，遵循安全失败原则不发送 `permissions_changed`，由全局 `authz_epoch` 关流重连机制保证收敛；
   - **真实浏览器与跨网络传输端到端仍属未闭环**（AT-18 保持未验证）。
 - **下一步**：在时间门定时更新处接入 `system_time_changed` 发布；在真实网络与前端联合环境中按 AT-18 进行端到端复核。
 
-## d) 设备状态快照没有写入方
+## d) 设备状态快照：写入 API 已完备，缺的是生产调用方
 
 - **本节范围**：`device.status.read` 对象级权限与设备可见性门禁**已由本轮修复补齐**，不属于本节缺口；
-  本节**只**记录「快照数据源没有写入方」这一项，其余设备状态相关的缺口见 a) 节。
+  本节**只**记录「快照缓存没有生产写入方」这一项，其余设备状态相关的缺口见 a) 节。
 - **代码位置**：[`crates/rsetup-controller/src/main.rs`](<../../crates/rsetup-controller/src/main.rs>)
-  装配 `status: DeviceStatusState { snapshot: Arc::new(SnapshotStore::new()) }`；缓存实现见
+  装配 `status: DeviceStatusState { snapshot: Arc::new(SnapshotStore::new()) }`；缓存实现（含全部写入
+  API 与其单元测试）见
   [`crates/rsetup-controller/src/polling/snapshot.rs`](<../../crates/rsetup-controller/src/polling/snapshot.rs>)；
-  端点实现见 [`crates/rsetup-controller/src/http_device_status.rs`](<../../crates/rsetup-controller/src/http_device_status.rs>)。
-- **现状**：`SnapshotStore` 具备代际/序号校验与单调新鲜度判定，但当前生产装配里**没有任何写入方**
-  （transport 轮询与认证连接管理器尚未接入）。因此 `GET /devices/{id}/status` 对任何设备都真实地返回
-  「尚无样本」：`snapshot = null`、`freshness = unknown`、`age_ms = null`。端点的 `device.status.read`
-  对象级权限与设备可见性门禁已由本轮修复补齐（不可见设备 404 且不触碰缓存，无权限 403 且不读缓存），
-  该补齐只是使权限语义可验证，不改变上面「尚无样本」这一缺口。
+  错峰轮询排期见
+  [`crates/rsetup-controller/src/polling/scheduler.rs`](<../../crates/rsetup-controller/src/polling/scheduler.rs>)
+  的 `PollScheduler`；端点实现见 [`crates/rsetup-controller/src/http_device_status.rs`](<../../crates/rsetup-controller/src/http_device_status.rs>)。
+- **写入侧不是缺口**：[`SnapshotStore`](<../../crates/rsetup-controller/src/polling/snapshot.rs>)
+  的 **5 个写入 API 代码实现完备**，语义已由同模块单元测试逐条锁定：
+  1. `confirm_generation` — 代际的唯一推进入口，同代际重复确认幂等；
+  2. `update` — 样本写入；设备未经确认代际一律 `NoActiveGeneration` 拒绝，`sample_seq` 乱序/重复不覆盖
+     更新样本，payload 必须与其声称的代际一致；
+  3. `record_error` — 错误记录；保留 last-good 样本与其年龄，陈旧代际的错误不降级当前样本；
+  4. `disconnect_generation` — 断连标记；样本序号地板（seq floor）保留，断连后的晚到样本仍被拒；
+  5. `forget` — 彻底移除设备条目，后续写入必须重新确认代际。
+- **真正的缺口是生产装配里没有调用方**：
+  1. `main.rs` 只把**一个空的** `SnapshotStore::new()` 挂到设备状态读线，没有任何写入方持有同一个
+     `Arc<SnapshotStore>`；
+  2. 轮询驱动 `PollScheduler` **未在生产后台循环中运行**：该类型目前只在其模块自身的单元测试里被构造与
+     驱动，生产入口没有后台任务按 tick 调用 `due()` 并把采样结果回写缓存；
+  3. **认证连接管理器尚未接入**（见 a) 节：生产 transport 装配位是 fail-closed 的
+     `UnwiredTransportSources`），而 `confirm_generation` 是其余 4 个写入 API 的硬前置，因此当前任何路径
+     都无法合法写入。
+- **可观察结果**：`GET /devices/{id}/status` 对任何设备都真实地返回「尚无样本」：`snapshot = null`、
+  `freshness = unknown`、`age_ms = null`。端点的 `device.status.read` 对象级权限与设备可见性门禁已由本轮
+  修复补齐（不可见设备 404 且不触碰缓存，无权限 403 且不读缓存），该补齐只是使权限语义可验证，不改变
+  上面「尚无样本」这一缺口。
 - **影响**：设备状态读路径的权限与语义可验证，但「有真实样本、单调不回收、旧会话不覆盖」这一行为在
   真实环境不可观察；不得据此宣称 T4-06 的状态缓存链路整体可用。
-- **下一步**：接入轮询驱动共享同一个 `Arc<SnapshotStore>`；每条设备必须先由认证连接管理器
-  `confirm_generation`，未确认代际的 `update` 一律 `NoActiveGeneration` 拒绝，代际不由样本自行建立。
+- **下一步**：交付真实 transport 后，由轮询后台循环与认证连接管理器共享**同一个** `Arc<SnapshotStore>`；
+  每条设备必须先由认证连接管理器 `confirm_generation`，未确认代际的 `update` 一律
+  `NoActiveGeneration` 拒绝，代际不由样本自行建立；接线后按 T4-06 的行合同另记执行时间、层级、命令与
+  可持久复核的证据路径。
 
 ## e) 真实数据库验收未闭合
 
@@ -207,9 +228,55 @@
   codec 路线选型审定 → 外部专家复审；每条各自按行合同另记 `executed_at`/`layer`/`command_or_steps`/`evidence`，
   一条完成不推定其它条完成。
 
+## j) `GET /api/v1/system/time`：路由与证据返回正在落地，生产注入与验收证据仍缺
+
+- **规格依据**：[`docs/superpowers/specs/2026-09-23-controller-v1-02-data-api.md` §7「系统与事件入口」](<../superpowers/specs/2026-09-23-controller-v1-02-data-api.md>)
+  明确规划 `GET /system/time`：请求「无」，响应为 **`TimeEvidence` + NTP 状态/下次重试**，权限「管理员」，
+  且「响应不含凭据」。同节相邻的 `GET /system/status` 早已注册，`/system/time` 在此前所有生产路由表里
+  都不存在（历史计划亦把它显式列为未实施缺口，不冒充 Runtime Task 6 完整）。
+- **代码位置**：[`crates/rsetup-controller/src/api/system.rs`](<../../crates/rsetup-controller/src/api/system.rs>)
+  的 `system_router`（现为 `GET /api/v1/system/status` 与 `GET /api/v1/system/time` 两条路由的唯一注册
+  锚点）与其 `get_system_time` handler、`fallback_time_evidence`、`SystemApiState::time_source` 字段；
+  生产 `merge` 装配位见 [`crates/rsetup-controller/src/api/mod.rs`](<../../crates/rsetup-controller/src/api/mod.rs>)；
+  证据类型见 [`crates/rsetup-controller/src/time/evidence.rs`](<../../crates/rsetup-controller/src/time/evidence.rs>)
+  的 `TimeEvidence`/`TimeQuality`；门禁观测面见
+  [`crates/rsetup-controller/src/time/gate.rs`](<../../crates/rsetup-controller/src/time/gate.rs>)
+  的 `TimeGateHandle::current()`/`background_retry_active()`/`retry_attempt()` 与 `next_backoff`。
+- **本轮已落地（未提交的工作区改动，仅到源码为止）**：
+  1. `system_router` 注册 `GET /api/v1/system/time`，handler 调用顺序固定为
+     `authenticate_read(EndpointId::SystemStatusRead)`（与 `/system/status` **共用同一读桶限流**）→
+     `require_admin_session`（非管理员 403、未登录 401）→ 时间源分流；
+  2. 响应 `data` 恰为 `{ evidence, retry_active }`：`evidence` 是既有 `TimeEvidence` 的同一形状（不新增
+     第二套时间字段），`retry_active` 取自门禁 `background_retry_active()`；
+  3. `time_source` 为 `None` 时回退 `fallback_time_evidence()`：以当前系统墙钟给出
+     `quality = system_fallback`、`clock_epoch` 为 nil、无 `source`/`sample_age_ms`/`offset_ms`/
+     `uncertainty_ms` 的**诚实降级**证据，`retry_active: false`，不伪造 `NtpValid`；响应不含凭据；
+  4. 模块内已有 5 项进程内 HTTP 测试覆盖：门禁证据与重试态、后台重试激活、无时间源回退、非管理员 403、
+     未登录 401。
+- **仍存在的缺口**：
+  1. **生产装配尚未注入时间源**：`api/mod.rs` 的 `SystemApiState` 构造处与本轮新增的必填字段
+     `time_source` 属同一批未提交改动，**尚未把与任务线同一个 `TimeGateHandle` 传进去**（该装配位补齐前
+     crate 也编译不过，属进行中的装配补齐）；补齐前管理线拿不到真实门禁快照，线上语义只能是
+     `SystemFallback` 回退，不是「NTP 状态可观测」；
+  2. **「下次重试」只给了二值观测**：响应只有 `retry_active`（后台退避重试是否在跑），未给出下次重试的
+     时刻或退避时长（`retry_attempt()` 与 `next_backoff` 未进入响应），与 §7「NTP状态/下次重试」的字面要求
+     仍有差距；是否在响应中补一个由 `next_backoff(attempt)` 派生的可机读字段尚未审定；
+  3. **无任何验收账本证据**：上述行为目前只存在于模块内进程内测试，未记入验收账本，也不构成真实环境的
+     端到端结论；
+  4. **SSE 侧同源证据仍不发布**：`SystemApiState::publish_system_time_changed` 依旧没有生产调用方（见 c 节）。
+- **影响（不得据此推定的范围）**：本节只记录一条规划端点从「无路由」推进到「路由与证据返回正在落地」，
+  **不改变验收账本任何行的 `status`**：`T4-09` 仍为 `BLOCKED`；`AT-01`..`AT-18` 仍为「未验证」。在生产注入
+  补齐并取得按行登记的证据前，「系统时间可读」「NTP 状态可观测」「Runtime Task 6 完整」一律不得引用为已
+  实现或通过。
+- **下一步**：补齐 `api/mod.rs` 的 `time_source` 注入（复用进程内唯一 `TimeGateHandle`，不新建第二个采样器）
+  → 审定「下次重试」的响应字段口径 → 按行合同另记 `executed_at`/`layer`/`command_or_steps`/`evidence`，
+  至少覆盖：未登录 401、非管理员 403、响应形状与 `TimeEvidence` 一致且不含凭据、`SystemFallback`/`Stale`
+  两种质量下的真实降级值、以及与门禁 `background_retry_active()`/`retry_attempt()` 的一致性。
+
 ## 相关文档
 
 - [`docs/superpowers/reviews/2026-10-22-codec-owner-authorization.md`](<../superpowers/reviews/2026-10-22-codec-owner-authorization.md>) — 业务 codec 的所有者授权事实、范围与缺失证据
+- [`docs/superpowers/specs/2026-09-23-controller-v1-02-data-api.md`](<../superpowers/specs/2026-09-23-controller-v1-02-data-api.md>) — 02 §7 系统与事件入口（含 `GET /system/time` 的响应与权限口径）
 - [`crates/rsetup-protocol/README.md`](<../../crates/rsetup-protocol/README.md>) — 协议 crate 的 codec 边界与使用方式
 - [`apps/controller-web/README.md`](<../../apps/controller-web/README.md>) — 前端当前状态与安全边界
 - [`apps/controller-web/DEV-PROXY.md`](<../../apps/controller-web/DEV-PROXY.md>) — 开发代理规则与验证边界

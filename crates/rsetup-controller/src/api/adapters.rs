@@ -505,6 +505,27 @@ pub fn build_sqlx_management_state_with_events(
     notification_sink: Arc<dyn approvals::ManagementNotificationSink>,
     events: Option<EventBus>,
 ) -> ManagementState {
+    build_sqlx_management_state_full(
+        db,
+        auth,
+        device_probe,
+        recovery_probe,
+        notification_sink,
+        events,
+        None,
+    )
+}
+
+/// 生产全装配入口：同时注入事件总线与时间门禁句柄。
+pub fn build_sqlx_management_state_full(
+    db: DbPool,
+    auth: Arc<HttpAuthState>,
+    device_probe: Arc<dyn devices::DeviceLiveProbe>,
+    recovery_probe: Arc<dyn system::RecoveryModeProbe>,
+    notification_sink: Arc<dyn approvals::ManagementNotificationSink>,
+    events: Option<EventBus>,
+    time_source: Option<crate::time::TimeGateHandle>,
+) -> ManagementState {
     let repo = Arc::new(SqlxAuthzRepository::new(db.clone()));
     let snapshots = Arc::new(SqlxAuthorizationSnapshotRepository::new(db.clone()));
     let devices = Arc::new(SqlxDeviceRepository::new(db.clone()));
@@ -531,6 +552,7 @@ pub fn build_sqlx_management_state_with_events(
         recovery_probe,
         notification_sink,
         events,
+        time_source,
     }
 }
 

@@ -1,4 +1,12 @@
-//! system 资源管理路由：网关/恢复模式探针契约与 1 条管理端点（Identity Task 12）。
+//! system 资源管理路由：网关/恢复模式探针契约与 2 条管理端点（Identity Task 12）。
+//!
+//! `GET /api/v1/system/time`（spec 02 §7）：无请求体，管理员专属（先过
+//! `authenticate_read(SystemStatusRead)` 再 `require_admin_session`），响应 `data`
+//! 固定为 `{ evidence: TimeEvidence, retry_active: bool }`——证据来自装配注入的
+//! `TimeGateHandle::current()`（读取侧动态派生 age/stale 降级），`retry_active` 是
+//! 后台 NTP 退避重试是否激活（05 的「NTP 状态/下次重试」的机器可读形态）。
+//! 未装配时间源时返回当前系统墙钟的 `SystemFallback` 证据、`retry_active: false`，
+//! 不伪造 NTP 有效；响应不含任何凭据。
 //!
 //! 契约（spec 02 §3/§4）：`GET /api/v1/system/status` 先过 `http_gate` 会话门禁
 //! （`(EndpointId::SystemStatusRead, session.digest)` 读桶），再过
@@ -28,7 +36,8 @@ use crate::events::{EventBus, EventEnvelope};
 use crate::http_api::ok_response;
 use crate::http_auth::{EndpointId, HttpAuthState};
 use crate::http_gate::{authenticate_read, not_ready, require_admin_session};
-use crate::time::evidence::TimeEvidence;
+use crate::time::TimeGateHandle;
+use crate::time::evidence::{TimeEvidence, TimeQuality};
 
 use super::{ManagementFuture, map_error};
 
@@ -54,6 +63,10 @@ pub struct SystemApiState {
     /// 是同一通道句柄。`None` 表示本装配未开启事件线，[`Self::publish_system_time_changed`]
     /// 即空操作（不发布、不报错、不阻塞）。
     pub events: Option<EventBus>,
+    /// 时间门禁句柄（spec 02 §7 `GET /system/time`）：与任务线共用**同一个**
+    /// `TimeGateHandle`（内部状态全在 `Arc` 后，克隆共享同一权威快照）。`None` 表示本
+    /// 装配未接时间线，`GET /system/time` 回退为当前系统墙钟的 `SystemFallback` 证据。
+    pub time_source: Option<TimeGateHandle>,
 }
 
 impl SystemApiState {
@@ -155,12 +168,56 @@ async fn get_system_status(State(state): State<SystemApiState>, headers: HeaderM
     }))
 }
 
-/// 挂载 system 的 1 条管理路由：`GET /api/v1/system/status` 唯一注册锚点。
+/// 未装配时间源（`time_source: None`）时的缺省证据：以当前系统墙钟构造
+/// `SystemFallback`（对齐 `TimeGateHandle::new` 的初始证据形状：无采样来源、无
+/// age/offset/uncertainty、`clock_epoch` 取 nil 表示本装配无时钟换代纪元）。
+/// 这是对系统时钟的诚实回退，不伪造 NTP 有效，也不引入第二套时间源。
+fn fallback_time_evidence() -> TimeEvidence {
+    let now = chrono::Utc::now();
+    TimeEvidence {
+        system_wall_utc: now,
+        reference_utc: now,
+        quality: TimeQuality::SystemFallback,
+        clock_epoch: uuid::Uuid::nil(),
+        source: None,
+        sample_age_ms: None,
+        offset_ms: None,
+        uncertainty_ms: None,
+    }
+}
+
+/// `GET /api/v1/system/time` handler（spec 02 §7）：调用顺序固定为
+/// `authenticate_read(SystemStatusRead)` → `require_admin_session`（非管理员 403）→
+/// 时间源分流：装配了 `time_source` 时取 `gate.current()`（读取侧动态派生 age、
+/// stale 即时降级）与 `background_retry_active()`；未装配时回退当前系统墙钟的
+/// `SystemFallback` 证据、`retry_active: false`。响应 `data` 恰为
+/// `{ evidence, retry_active }`，不含任何凭据。
+async fn get_system_time(State(state): State<SystemApiState>, headers: HeaderMap) -> Response {
+    let actor = match authenticate_read(&state.auth, &headers, EndpointId::SystemStatusRead).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_admin_session(&actor) {
+        return response;
+    }
+    let (evidence, retry_active) = match &state.time_source {
+        Some(gate) => (gate.current().await, gate.background_retry_active()),
+        None => (fallback_time_evidence(), false),
+    };
+    ok_response(serde_json::json!({
+        "evidence": evidence,
+        "retry_active": retry_active,
+    }))
+}
+
+/// 挂载 system 的 2 条管理路由：`GET /api/v1/system/status` 与
+/// `GET /api/v1/system/time` 的唯一注册锚点。
 /// 恢复探针是 Runtime 真实控制器的可失败读取：未接线时不构造 probe、不挂载 router，
 /// 本函数只接受显式装配的 `SystemApiState`。
 pub fn system_router(state: SystemApiState) -> Router<()> {
     Router::new()
         .route("/api/v1/system/status", get(get_system_status))
+        .route("/api/v1/system/time", get(get_system_time))
         .with_state(state)
 }
 
@@ -169,7 +226,6 @@ mod tests {
     use super::*;
     use crate::api::users::test_fixture::*;
     use crate::events::{EventAudience, EventEnvelope, EventName, EventViewer};
-    use crate::time::evidence::TimeQuality;
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use tower::ServiceExt;
@@ -248,6 +304,7 @@ mod tests {
             gateway,
             recovery_probe: Arc::new(probe),
             events,
+            time_source: None,
         }
     }
 
@@ -364,6 +421,7 @@ mod tests {
             gateway: Arc::new(FixtureSystemGateway),
             recovery_probe: Arc::new(FixtureRecoveryProbe::Ok),
             events: None,
+            time_source: None,
         });
         let (status, code, _) = error_code(
             router
@@ -571,6 +629,169 @@ mod tests {
                 Err(tokio::sync::broadcast::error::TryRecvError::Empty)
             ),
             "读路径与未接事件线的装配都不得有任何事件进入通道"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // `GET /api/v1/system/time`（spec 02 §7：TimeEvidence + 后台重试状态，管理员专属）
+    // -----------------------------------------------------------------------
+
+    /// 门禁夹具：`TimeGateHandle::new` 不 spawn 任何采样任务，直接预置权威快照并显式
+    /// 指定后台重试状态；`sample_instant = None` 让 `current()` 原样返回预置证据
+    /// （不派生 age、不动态降级），断言完全确定。
+    async fn fixture_time_gate(evidence: TimeEvidence, retry_active: bool) -> TimeGateHandle {
+        let gate = TimeGateHandle::new(
+            &crate::time::TimeGateConfig::default(),
+            uuid::Uuid::new_v4(),
+        );
+        {
+            let mut snapshot = gate.snapshot.write().await;
+            snapshot.evidence = evidence;
+            snapshot.sample_instant = None;
+        }
+        gate.retry_active
+            .store(retry_active, std::sync::atomic::Ordering::SeqCst);
+        gate
+    }
+
+    fn system_state_with_time_source(time_source: Option<TimeGateHandle>) -> SystemApiState {
+        SystemApiState {
+            time_source,
+            ..fixture_system_state()
+        }
+    }
+
+    /// 正例：管理员 + 装配时间源 → 200，`data.evidence` 就是门禁权威快照（source /
+    /// quality / 十进制字符串 age / offset / uncertainty / 可解析 UUID 的 clock_epoch /
+    /// RFC3339 墙钟），`retry_active` 反映门禁状态；响应不含任何凭据字段。
+    #[tokio::test]
+    async fn system_time_returns_gate_evidence_and_retry_state() {
+        let evidence = fixture_time_evidence();
+        let gate = fixture_time_gate(evidence, false).await;
+        let router = system_router(system_state_with_time_source(Some(gate)));
+        let res = router
+            .oneshot(authenticated_get("/api/v1/system/time"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let value = body_json(res).await;
+        assert_eq!(value["data"]["retry_active"], serde_json::json!(false));
+        let ev = &value["data"]["evidence"];
+        assert_eq!(ev["quality"], "ntp_valid");
+        assert_eq!(ev["source"], "ntp.example");
+        assert_eq!(ev["sample_age_ms"], "1500");
+        assert_eq!(ev["offset_ms"], serde_json::json!(-5));
+        assert_eq!(ev["uncertainty_ms"], serde_json::json!(15));
+        assert!(ev["system_wall_utc"].is_string());
+        assert!(ev["reference_utc"].is_string());
+        assert!(
+            uuid::Uuid::parse_str(ev["clock_epoch"].as_str().expect("clock_epoch 字符串")).is_ok()
+        );
+        // data 恰为两字段；且响应不含任何凭据形态的字段。
+        assert_eq!(
+            value["data"]
+                .as_object()
+                .expect("data 对象")
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>()
+                .iter()
+                .copied()
+                .cloned()
+                .collect::<Vec<String>>(),
+            vec!["evidence".to_string(), "retry_active".to_string()],
+            "data 恰为 evidence + retry_active"
+        );
+        let text = value.to_string().to_lowercase();
+        for forbidden in ["digest", "token", "password", "cookie", "csrf", "secret"] {
+            assert!(
+                !text.contains(forbidden),
+                "响应不得出现凭据字段 {forbidden}"
+            );
+        }
+    }
+
+    /// 后台 NTP 退避重试激活时，`retry_active` 必须如实为 `true`（05「下次重试」状态）。
+    #[tokio::test]
+    async fn system_time_reports_background_retry_active() {
+        let gate = fixture_time_gate(fixture_time_evidence(), true).await;
+        let router = system_router(system_state_with_time_source(Some(gate)));
+        let res = router
+            .oneshot(authenticated_get("/api/v1/system/time"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let value = body_json(res).await;
+        assert_eq!(value["data"]["retry_active"], serde_json::json!(true));
+    }
+
+    /// 未装配时间源：回退为当前系统墙钟的 `SystemFallback` 证据（无 source/age/offset/
+    /// uncertainty，`retry_active: false`），不伪造 NTP 有效。
+    #[tokio::test]
+    async fn system_time_without_time_source_falls_back_to_system_clock() {
+        let router = system_router(system_state_with_time_source(None));
+        let res = router
+            .oneshot(authenticated_get("/api/v1/system/time"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let value = body_json(res).await;
+        let ev = &value["data"]["evidence"];
+        assert_eq!(ev["quality"], "system_fallback");
+        assert!(ev["source"].is_null());
+        assert!(ev["sample_age_ms"].is_null());
+        assert!(ev["offset_ms"].is_null());
+        assert!(ev["uncertainty_ms"].is_null());
+        assert!(ev["system_wall_utc"].is_string());
+        assert_eq!(value["data"]["retry_active"], serde_json::json!(false));
+    }
+
+    /// 非管理员：403 `PERMISSION_DENIED`，且不泄露任何时间证据。
+    #[tokio::test]
+    async fn system_time_rejects_non_admin_with_403() {
+        let router = system_router(SystemApiState {
+            auth: fixture_auth(fixture_session(false)),
+            gateway: Arc::new(FixtureSystemGateway),
+            recovery_probe: Arc::new(FixtureRecoveryProbe::Ok),
+            events: None,
+            time_source: Some(fixture_time_gate(fixture_time_evidence(), true).await),
+        });
+        let (status, code, text) = error_code(
+            router
+                .oneshot(authenticated_get("/api/v1/system/time"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(code, "PERMISSION_DENIED");
+        assert!(
+            !text.contains("evidence") && !text.contains("ntp.example"),
+            "403 响应不得携带时间证据投影"
+        );
+    }
+
+    /// 未认证：401 `AUTH_REQUIRED`，不泄露任何时间证据。
+    #[tokio::test]
+    async fn system_time_unauthenticated_is_rejected_with_401() {
+        let router = system_router(system_state_with_time_source(Some(
+            fixture_time_gate(fixture_time_evidence(), true).await,
+        )));
+        let res = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/system/time")
+                    .header(header::HOST, FIXTURE_HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let value = body_json(res).await;
+        assert_eq!(value["error"]["code"].as_str(), Some("AUTH_REQUIRED"));
+        assert!(
+            !value.to_string().contains("evidence"),
+            "401 响应不得携带时间证据投影"
         );
     }
 }

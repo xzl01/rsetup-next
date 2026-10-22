@@ -622,6 +622,7 @@ impl World {
             recovery_probe: probe.clone(),
             notification_sink: probe,
             events: Some(bus.clone()),
+            time_source: None,
         });
         let events = build_events_router(EventsState {
             auth,
