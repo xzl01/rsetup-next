@@ -11,9 +11,10 @@ use rsetup_board_agent::tickets::TicketManager;
 use rsetup_board_agent::tunnel_binding::{
     ApprovalGate, DualStreamBinding, StreamError, StreamState, StreamType,
 };
+use rsetup_protocol::BusinessCodec;
 use rsetup_protocol::wire::{
     BUSINESS_SCHEMA_VERSION, BusinessPayload, Capabilities, ClockSample, DeviceStatus, NoCodec,
-    Query, TaskQuery,
+    Query, TaskQuery, approved_codec_witness, encode_business,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23,14 +24,27 @@ const BOOT: &str = "6f8b1c2d-0000-4000-8000-000000000001";
 const SUB_TASK: &str = "9c858901-8a57-4791-81fe-4c455b099bc9";
 const AGENT_EPOCH: &str = "1b4e28ba-2fa1-4d4b-9c1a-2b6b9d0e0c11";
 const CLOCK_EPOCH: &str = "2c1f9d3a-5b6e-4f70-8a91-0d2e3f4a5b6c";
+/// 所有者授权记录的留档路径（与 `ApprovalGate::default()` 一致）。
+const OWNER_AUTHORIZATION: &str =
+    "docs/superpowers/reviews/2026-10-22-codec-owner-authorization.md";
 
-#[derive(Default)]
+/// 只读数据源替身：`reads` 记录业务读取被触达次数，`mutations` 记录写路径触达次数。
+/// 计数器放在 `Arc` 内，便于测试夹具在把替身交给 agent 后仍能观察。
+#[derive(Clone, Default)]
 struct Source {
-    mutations: AtomicUsize,
+    mutations: Arc<AtomicUsize>,
+    reads: Arc<AtomicUsize>,
+}
+
+impl Source {
+    fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
+    }
 }
 
 impl ReadOnlySource for Source {
     fn capabilities(&self) -> Capabilities {
+        self.reads.fetch_add(1, Ordering::SeqCst);
         Capabilities {
             schema_version: BUSINESS_SCHEMA_VERSION,
             boot_id: BOOT.to_string(),
@@ -42,6 +56,7 @@ impl ReadOnlySource for Source {
         }
     }
     fn status(&self) -> DeviceStatus {
+        self.reads.fetch_add(1, Ordering::SeqCst);
         DeviceStatus {
             schema_version: BUSINESS_SCHEMA_VERSION,
             boot_id: BOOT.to_string(),
@@ -55,6 +70,7 @@ impl ReadOnlySource for Source {
         }
     }
     fn clock(&self) -> ClockSample {
+        self.reads.fetch_add(1, Ordering::SeqCst);
         ClockSample {
             schema_version: BUSINESS_SCHEMA_VERSION,
             boot_id: BOOT.to_string(),
@@ -100,14 +116,16 @@ impl JournalEpochSource for FixedEpoch {
 struct Fixture {
     _dir: TempDir,
     journal: Arc<JournalStore<RealFs>>,
+    source: Source,
     binding: DualStreamBinding<Source, JournalReader, FixedEpoch, RecordingOs, RealFs>,
 }
 
 fn fixture(gate: ApprovalGate) -> Fixture {
     let dir = TempDir::new("dual");
     let journal = Arc::new(JournalStore::open(dir.path(), RealFs).expect("journal"));
+    let source = Source::default();
     let agent = BoardAgent::new(
-        Source::default(),
+        source.clone(),
         JournalReader(Arc::clone(&journal)),
         FixedEpoch(Arc::clone(&journal)),
     );
@@ -123,8 +141,39 @@ fn fixture(gate: ApprovalGate) -> Fixture {
     Fixture {
         _dir: dir,
         journal,
+        source,
         binding,
     }
+}
+
+fn peer(key: u8) -> PeerContext {
+    PeerContext {
+        authenticated_controller_key: [key; 32],
+    }
+}
+
+/// 用**所有者授权启用的** [`BusinessCodec`] 产出合法的 `Query` 业务字节。
+fn encoded_query() -> Vec<u8> {
+    encode_business(
+        &BusinessCodec,
+        Some(&approved_codec_witness()),
+        &BusinessPayload::Query(Query {
+            schema_version: BUSINESS_SCHEMA_VERSION,
+        }),
+    )
+    .expect("owner-approved codec must encode a valid Query")
+}
+
+/// 断言一次调用完全零触达：OS 重启入口、journal 记录、只读数据源读写。
+fn assert_zero_touch(f: &Fixture, os_calls: usize, journal_records: usize, source_reads: usize) {
+    assert_eq!(f.binding.os().call_count(), os_calls, "OS 调用次数不得变化");
+    assert_eq!(
+        f.journal.record_count(),
+        journal_records,
+        "journal 记录数不得变化"
+    );
+    assert_eq!(f.source.reads(), source_reads, "只读数据源不得被额外触达");
+    assert_eq!(f.source.mutation_calls(), 0, "只读数据源写路径不得被触达");
 }
 
 #[test]
@@ -293,9 +342,13 @@ fn typed_readonly_round_trip_uses_real_journal_and_zero_os_calls() {
         f.binding.gate().require_network_io(),
         Err(StreamError::NetworkApprovalRequired)
     );
+    // 默认门：codec 已按所有者 2026-10-22 授权启用，network 仍未批准
+    assert_eq!(f.binding.gate().require_codec(), Ok(()));
+    assert!(f.binding.gate().codec_approved);
+    assert!(!f.binding.gate().network_approved);
     assert_eq!(
-        f.binding.gate().require_codec(),
-        Err(StreamError::CodecApprovalRequired)
+        f.binding.gate().evidence_path,
+        "docs/superpowers/reviews/2026-10-22-codec-owner-authorization.md"
     );
     assert_eq!(
         f.binding.os().call_count(),
@@ -308,9 +361,7 @@ fn typed_readonly_round_trip_uses_real_journal_and_zero_os_calls() {
 fn not_allowlisted_action_is_rejected_before_any_stream_work() {
     let mut f = fixture(ApprovalGate::default());
     f.binding.open_control().expect("control");
-    let peer = PeerContext {
-        authenticated_controller_key: [1u8; 32],
-    };
+    let peer = peer(1);
     assert_eq!(
         f.binding.handle_typed(
             StreamType::Control,
@@ -324,7 +375,7 @@ fn not_allowlisted_action_is_rejected_before_any_stream_work() {
             BusinessStatus::UnsupportedAction
         ))
     );
-    // 白名单外动作不消耗 codec：即使没有获批 codec，也报告动作不被允许
+    // 白名单外动作不消耗 codec：agent 内先查白名单，codec 虽已授权启用也不被触达
     assert_eq!(
         f.binding
             .handle_wire(StreamType::Control, &peer, "device.fan.apply", &[]),
@@ -332,30 +383,174 @@ fn not_allowlisted_action_is_rejected_before_any_stream_work() {
             BusinessStatus::UnsupportedAction
         ))
     );
+    // 同样对**合法编码字节**成立：动作不在白名单时解码路径根本不会执行
+    assert_eq!(
+        f.binding.handle_wire(
+            StreamType::Control,
+            &peer,
+            "device.fan.apply",
+            &encoded_query()
+        ),
+        Err(StreamError::AgentRejected(
+            BusinessStatus::UnsupportedAction
+        ))
+    );
+    assert_zero_touch(&f, 0, 0, 0);
 }
 
 #[test]
-fn raw_wire_entries_fail_closed_without_an_approved_codec() {
+fn wire_round_trip_with_owner_approved_codec_matches_typed() {
+    let mut f = fixture(ApprovalGate::default());
+    let peer = peer(1);
+    let bytes = encoded_query();
+
+    // Open 之前：codec 门已开，但流守卫仍然先拒绝，绝不因 codec 启用而放行
+    assert_eq!(
+        f.binding.handle_wire(
+            StreamType::Control,
+            &peer,
+            "device.capabilities.get",
+            &bytes
+        ),
+        Err(StreamError::ControlStreamRequired)
+    );
+    assert_zero_touch(&f, 0, 0, 0);
+
+    f.binding.open_control().expect("control");
+    let via_wire = f
+        .binding
+        .handle_wire(
+            StreamType::Control,
+            &peer,
+            "device.capabilities.get",
+            &bytes,
+        )
+        .expect("owner-approved codec wire round trip");
+    match &via_wire {
+        BusinessResponse::Capabilities(caps) => assert_eq!(caps.journal_epoch, EPOCH),
+        other => panic!("expected capabilities, got {other:?}"),
+    }
+
+    // 与类型化入口逐字节等价：wire 入口没有第二条业务语义
+    let via_typed = f
+        .binding
+        .handle_typed(
+            StreamType::Control,
+            &peer,
+            "device.capabilities.get",
+            &BusinessPayload::Query(Query {
+                schema_version: BUSINESS_SCHEMA_VERSION,
+            }),
+        )
+        .expect("typed capabilities");
+    assert_eq!(via_wire, via_typed);
+
+    // 业务 action 落在 Data 流仍被拒（codec 启用不改变流归属）
+    f.binding.open_data().expect("data");
+    assert_eq!(
+        f.binding
+            .handle_wire(StreamType::Data, &peer, "device.capabilities.get", &bytes),
+        Err(StreamError::ActionNotAllowedOnStream)
+    );
+    // 只读路径不触达 OS/journal 写/数据源写
+    assert_eq!(f.binding.os().call_count(), 0);
+    assert_eq!(f.journal.record_count(), 0);
+    assert_eq!(f.source.mutation_calls(), 0);
+    assert_eq!(f.source.reads(), 2, "capabilities 只应被读两次");
+}
+
+#[test]
+fn malformed_bytes_are_invalid_argument_once_the_codec_is_enabled() {
     let mut f = fixture(ApprovalGate::default());
     f.binding.open_control().expect("control");
-    let peer = PeerContext {
-        authenticated_controller_key: [1u8; 32],
-    };
+    let peer = peer(1);
+    let valid = encoded_query();
 
-    for action in ["device.status.get", "device.clock.get", "device.task.get"] {
+    // canonical 编码非空；截去尾字节、字段号 0、错误 wire type 等都不是合法输入
+    assert!(!valid.is_empty());
+    let mut truncated = valid.clone();
+    truncated.pop();
+    for (label, bytes) in [
+        ("zero field number", vec![0x00u8]),
+        ("truncated varint", vec![0x08u8]),
+        ("non-minimal varint", vec![0x08u8, 0x81, 0x00]),
+        ("wrong wire type", vec![0x09u8, 0x00, 0x00]),
+        ("length beyond remainder", vec![0x0au8, 0x05, 0x01]),
+        ("truncated canonical encoding", truncated),
+    ] {
+        assert_eq!(
+            f.binding.handle_wire(
+                StreamType::Control,
+                &peer,
+                "device.capabilities.get",
+                &bytes,
+            ),
+            Err(StreamError::AgentRejected(BusinessStatus::InvalidArgument)),
+            "case={label}"
+        );
+    }
+    assert_zero_touch(&f, 0, 0, 0);
+}
+
+#[test]
+/// codec 门关闭态（显式构造，默认值已按所有者授权启用 codec）：
+/// 合法编码字节与 raw 字节都必须在门处被拒，绝不进入解码、流守卫与任何下层。
+fn raw_wire_entries_fail_closed_without_an_approved_codec() {
+    let mut f = fixture(ApprovalGate::new(false, false, OWNER_AUTHORIZATION));
+    f.binding.open_control().expect("control");
+    let peer = peer(1);
+    let valid = encoded_query();
+
+    // 合法编码 + 门关闭：门先于一切返回 CodecApprovalRequired
+    for action in [
+        "device.capabilities.get",
+        "device.status.get",
+        "device.clock.get",
+        "device.task.get",
+    ] {
+        assert_eq!(
+            f.binding
+                .handle_wire(StreamType::Control, &peer, action, &valid),
+            Err(StreamError::CodecApprovalRequired),
+            "action={action} must be refused while the codec gate is closed"
+        );
         assert_eq!(
             f.binding
                 .handle_wire(StreamType::Control, &peer, action, b"raw-bytes"),
-            Err(StreamError::AgentRejected(
-                BusinessStatus::UnsupportedVersion
-            )),
-            "action={action} must fail closed without an approved codec"
+            Err(StreamError::CodecApprovalRequired),
+            "action={action} must be refused before decoding raw bytes"
         );
     }
+    // codec 门先于 agent 内的动作白名单：白名单外动作同样返回 CodecApprovalRequired
+    assert_eq!(
+        f.binding
+            .handle_wire(StreamType::Control, &peer, "device.fan.apply", &valid),
+        Err(StreamError::CodecApprovalRequired)
+    );
     assert_eq!(
         f.binding.gate().require_codec(),
         Err(StreamError::CodecApprovalRequired)
     );
+    assert_eq!(
+        f.binding.gate().require_network_io(),
+        Err(StreamError::NetworkApprovalRequired)
+    );
+    // 类型化入口不经 codec：门关闭不影响只读查询（证明拒绝原因确属 codec 门）
+    assert!(
+        f.binding
+            .handle_typed(
+                StreamType::Control,
+                &peer,
+                "device.capabilities.get",
+                &BusinessPayload::Query(Query {
+                    schema_version: BUSINESS_SCHEMA_VERSION,
+                }),
+            )
+            .is_ok()
+    );
+    // 门关闭期间 codec 路径零触达：唯一一次 source 读取来自上面的类型化入口
+    assert_zero_touch(&f, 0, 0, 1);
+
     // 未获批 codec：解密/编码路径根本不可达，绝不产生「假 codec 通过」
     assert_eq!(
         rsetup_protocol::wire::decode_business(

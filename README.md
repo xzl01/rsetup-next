@@ -181,8 +181,10 @@ recursive clone for source builds. The submodule revision belongs to the parent
 repository, so updating Next also requires updating its submodules.
 
 ```bash
-cargo build --workspace
-cargo test --workspace
+# No Node, npm or network needed: the committed apps/controller-web/dist is what
+# rsetup-controller embeds at compile time.
+make build
+make test
 
 # Inspect the current host. macOS automatically returns demo telemetry.
 cargo run -p rsetup-next -- status
@@ -193,6 +195,60 @@ cargo run -p rsetup-next -- --demo serve
 ```
 
 Open `http://127.0.0.1:8788` after starting the server.
+
+`build` and `test` — like `lint`, `metrics-gates`, `msrv-check` and
+`controller-test-offline`, which also compile the workspace — depend on
+`web-dist-check`, a pure existence check of `apps/controller-web/dist/index.html`.
+The frontend build product is **committed to the repository**, so a clean checkout
+builds the whole workspace with cargo alone; nothing in those targets calls npm.
+
+The default toolchain is the current stable Rust (verified locally with rustc
+1.99.1). The MSRV remains 1.85: `make msrv-check` runs the workspace tests with the
+installed 1.85.0 toolchain, and 1.85.0 is not used as the default.
+
+What the committed `dist` costs is one piece of discipline: after changing anything
+under `apps/controller-web`, run `make web-build` and commit the regenerated `dist`
+together with your source change. CI rebuilds the frontend from source and turns red
+when `git diff --exit-code -- apps/controller-web/dist` is not empty, so a stale `dist`
+never survives a pull request. `make web-build` (an alias of `web-assets`) is the
+explicit rebuild entry point and works through **two** stamp files:
+
+| Stamp | Rebuilt when | Recipe |
+| --- | --- | --- |
+| `apps/controller-web/node_modules/.rsetup-npm-ci-stamp` | `package.json` or `package-lock.json` changes | `npm --prefix apps/controller-web ci $(NPM_CI_FLAGS)` |
+| `apps/controller-web/dist/.rsetup-build-stamp` | `index.html`, `vite.config.ts`, `tsconfig*.json`, a non-test file under `apps/controller-web/src/` — the directory itself is a prerequisite too, so added and deleted files count — or Vite's `public/` directory changes | `npm --prefix apps/controller-web run build` |
+
+The split is the point: editing a component re-runs only `vite build`, never `npm ci`.
+`*.test.ts` and `*.test.js` are not `vite build` inputs, so touching a spec does not
+rebuild `dist` either. The stamp files themselves are git-ignored; the `dist` files
+they stand for are not.
+
+`make web-build` is the only step that needs Node 22, npm and — on a first run with a
+cold cache — network access. Two ways to keep it offline:
+
+```bash
+# 1. npm cache already warm on this machine: the flag goes straight to `npm ci`.
+make web-build NPM_CI_FLAGS=--offline
+
+# 2. node_modules/ prepared some other way: write the stamps yourself so make stops
+#    trying to rebuild. make only compares stamp timestamps, never the directories.
+touch apps/controller-web/node_modules/.rsetup-npm-ci-stamp
+touch apps/controller-web/dist/.rsetup-build-stamp
+```
+
+Copying `node_modules` in without the stamp files does not help: make still sees the
+prerequisites as newer and runs `npm ci` again, which is exactly what fails offline.
+Neither route is needed to *build* the workspace any more — only to regenerate the
+frontend after a frontend change.
+
+`make metrics-static-gates` runs only the read-only Prometheus metric-line grep
+gates: no compilation, no network access and no frontend build, so CI can call it on
+its own. One of those gates rejects committed configuration or credential files, and it
+checks two lists — the staged index (`git diff --cached --name-only`) and the tracked
+file list (`git ls-files`) — because a CI checkout has an empty index, where a
+staged-only check would pass without ever looking at anything. `make metrics-gates`
+additionally runs `fmt-check`, the dist presence check, clippy and the controller test
+suites.
 
 For Rust format checks run `make fmt-check` rather than `cargo fmt --all`,
 because the latter also pulls the third-party `externals/devicesinfo` submodule
@@ -323,6 +379,145 @@ npm run dev
 Tauri packaging is intentionally outside the root Cargo workspace so normal
 CLI/TUI/server development does not download native desktop dependencies.
 
+## Controller
+
+`rsetup-controller` is a standalone HTTP control-plane binary, separate from the
+`rsetup-next` CLI/TUI/server and packaged on its own as `rsetup-controller` (built
+from this same source package; see "Install from the Debian package" below). Build it as
+part of the workspace — the frontend `dist` it embeds at compile time ships in the
+repository, so no extra build step is required (see "Build and run") — and start it with:
+
+```bash
+cargo run -p rsetup-controller
+```
+
+Required environment variables; the process exits instead of starting with any of
+them missing or empty:
+
+| Variable | Purpose |
+| --- | --- |
+| `CONTROLLER_DATABASE_URL` | MySQL/TiDB connection URL holding the controller schema. |
+| `CONTROLLER_ALLOWED_HOSTS` | Exact comma-separated `Host` allow-list. |
+| `CONTROLLER_ALLOWED_ORIGIN` | The single exact browser `Origin`. |
+| `CONTROLLER_MANAGEMENT_CURSOR_SECRET_HEX` | Hex-encoded management cursor secret. |
+
+Optional variables: `CONTROLLER_LISTEN_ADDRESS` (defaults to `127.0.0.1:8080`),
+`CONTROLLER_TRUST_TLS` (only the exact values `1` and `true` append `Secure` to the
+session cookie, for deployments whose reverse proxy terminates TLS; unset or empty
+leaves it off, any other value is a startup error),
+`CONTROLLER_BOOTSTRAP_SECRET_LOG` (path of the file that receives the one-time
+administrator credential, default `controller-bootstrap-secret.log` relative to the
+working directory), and `NTP_SERVERS` (comma- or whitespace-separated NTP sources for
+the startup time gate; without them the gate falls back to the system clock and the
+task line keeps reporting untrusted time evidence).
+
+The metric line reads three more: `CONTROLLER_CONFIG` (configuration file path, default
+`controller.toml`, which holds the scrape credentials and must stay out of the
+repository — the static gate rejects a tracked `controller.toml` or `secret/` entry),
+`PROMETHEUS_AUTH_USER` and `PROMETHEUS_AUTH_PASSWORD` (override of the Basic-auth
+identity, accepted only as a pair; setting one without the other is a startup error).
+The common variables are listed here; the full configuration contract is in the
+[metrics endpoint design document](docs/superpowers/specs/2026-10-19-prometheus-metrics-endpoint-design.md).
+
+The default bind address is loopback only, and the HTTP surface assumes a controlled,
+trusted management network: it is not designed for exposure to untrusted networks or
+for direct Internet access, and it does not terminate TLS itself. Nothing is
+pre-provisioned: on the first start against an uninitialized schema the process
+generates a one-time administrator credential and writes it to the private file above
+(created with `0600` and `O_EXCL`; the parent directory is not protected, so start the
+process from a private directory). Read that credential once, log in, change it, and
+delete the file.
+
+`reset-admin` is the local emergency path for that administrator account. It takes no
+arguments, issues a fresh one-time credential to the controlling terminal, and records
+an audit event. Its gate is the OS real and effective UID plus a real TTY on stdin,
+stdout and stderr and a writable `/dev/tty`. Non-interactive SSH command execution,
+cron and a pipe therefore cannot drive it; an interactive `ssh -t` session still works,
+because it allocates a pty and the same root-and-TTY checks then pass as they would at
+a local keyboard. The gate is about terminal attachment and privileges, not about
+physical locality.
+
+### Install from the Debian package
+
+The `rsetup-controller` binary package comes out of this same source package and needs
+no Node.js or npm to build: `apps/controller-web/dist`, which `build.rs` embeds, is
+committed, so `dpkg-buildpackage` stays fully offline. It installs
+
+| Path | Purpose |
+| --- | --- |
+| `/usr/bin/rsetup-controller` | the control-plane process (unit `rsetup-controller.service`) |
+| `/usr/bin/rsetup-controller-migrate` | explicit schema migration, `--check` / `--apply` |
+| `/usr/bin/rsetup-controller-reset-admin` | local root emergency admin recovery (source bin `reset-admin`) |
+| `/etc/default/rsetup-controller` | `EnvironmentFile` template, 0644, secret-free |
+| `/usr/lib/systemd/system/rsetup-controller.service` | unit: `DynamicUser=yes`, `StateDirectory=rsetup-controller` |
+| `/usr/share/doc/rsetup-controller/README.Debian` | the full post-install walkthrough |
+
+The package enables and starts nothing. `dh_installsystemd --no-enable` keeps the unit
+out of the boot path, and the unit also refuses to run while its `EnvironmentFile` is
+missing, so an unconfigured install is simply inactive. Completing the setup is an
+operator action, and nothing below has been run against a real database on your behalf:
+
+1. Fill in `/etc/default/rsetup-controller` — `CONTROLLER_DATABASE_URL`,
+   `CONTROLLER_ALLOWED_HOSTS`, `CONTROLLER_ALLOWED_ORIGIN`,
+   `CONTROLLER_MANAGEMENT_CURSOR_SECRET_HEX` — then `chmod 0600` it. The packaged
+   template is 0644 precisely because it holds no secrets.
+2. Take a real, restorable backup of the target database, then export the four
+   migration gates next to `CONTROLLER_DATABASE_URL`:
+   `CONTROLLER_MIGRATION_ALLOW_DESTRUCTIVE=1`,
+   `CONTROLLER_MIGRATION_EXPECTED_DATABASE` (the real connected database name),
+   `CONTROLLER_MIGRATION_BACKUP_REF` (a reference to that backup) and
+   `CONTROLLER_MIGRATION_ACK=isolated-exclusive-backed-up-disposable`. They are
+   attestation, not a guess the tool may fill in: the migration fails closed if the
+   declared database is not the one the server reports.
+3. `rsetup-controller-migrate --check` (read-only, prints only
+   `schema_version=<number>` or `schema_version=missing`), then
+   `rsetup-controller-migrate --apply`. Already-migrated databases only get the
+   read-only consistency pass; an empty, v1, v2 or v3 database is brought to v3 and then
+   to v4; an unknown version is refused. It needs no root — privileges come from the
+   database account — and never reads `/dev/tty`.
+4. `systemctl start rsetup-controller` (add `enable` once you want it at boot).
+5. On first boot the one-time administrator credential lands in
+   `/var/lib/rsetup-controller/bootstrap-secret.log` (`0600`, `O_EXCL`); read it, log in,
+   change the password, delete the file.
+6. `rsetup-controller-reset-admin` recovers a locked-out administrator account from a
+   local root interactive terminal.
+7. The listener stays on `127.0.0.1:8080` by default; reaching it beyond this host means
+   a reverse proxy with TLS and a trusted management network, plus matching
+   `CONTROLLER_ALLOWED_HOSTS`/`CONTROLLER_ALLOWED_ORIGIN` values.
+
+Not wired yet: the transport line (device live cache, recovery controller, admission
+notifications, board task client) is assembled as fail-closed placeholders that report
+"not wired" or device-offline instead of invented values, the SSE event bus has no
+business publisher beyond heartbeats and its own resets, and the device snapshot store
+has no writer yet. The endpoints behind those unwired sources answer 503 with
+`STORAGE_UNAVAILABLE` — the placeholder surfaces as a configuration error and its
+message is never echoed — or return a well-formed "no sample" body (`snapshot: null`,
+`freshness: "unknown"`, `age_ms: null`) rather than a fabricated reading. `NOT_READY`
+is the code for schema and crypto unreadiness, and the transport placeholders do not
+report it. See `docs/testing/controller-v1-known-gaps.md` for the full list before
+operating anything with real boards attached.
+
+### Board-agent local test harness
+
+`crates/rsetup-board-agent` now has an amd64-runnable test binary. It exercises the real
+typed dispatch path (capabilities/status/clock over `/proc`, journal lookup, error
+mapping) and a loopback JSON-lines console; it does **not** provide the production
+encrypted tunnel and never performs a real host reboot.
+
+```bash
+cargo build -p rsetup-board-agent --release --bin rsetup-board-agent
+./target/release/rsetup-board-agent --once --journal-dir /tmp/rsetup-board-agent-journal
+./target/release/rsetup-board-agent --watch --interval-secs 5 --journal-dir /tmp/rsetup-board-agent-journal
+./target/release/rsetup-board-agent --loopback-test-server --listen 127.0.0.1:39876 \
+  --journal-dir /tmp/rsetup-board-agent-journal
+```
+
+See [crates/rsetup-board-agent/README.md](crates/rsetup-board-agent/README.md) for the
+JSON-lines protocol and its scope limits.
+
+Supported and CI-verified architectures are `arm64` (aarch64) and `amd64` (x86_64);
+32-bit targets are no longer maintained.
+
 ## Project layout
 
 ```text
@@ -349,6 +544,16 @@ runs as `rsetup-next-fan-curve.service`. It does not install
 the removed Bash implementation or run the browser process as root. Optional
 `device-tree-compiler`, `gpiod`, `v4l-utils`, and `ffmpeg` packages enrich the
 corresponding hardware tools.
+
+The same source package also builds `rsetup-controller`: the control-centre process, its
+two operator CLIs, one systemd unit and the `/etc/default/rsetup-controller` template.
+What it installs, and the migration and configuration steps an operator still has to
+perform, are in "Install from the Debian package" under "Controller". Neither package
+needs Node.js or npm: the test step runs the whole workspace, controller included, with
+cargo offline against the committed `apps/controller-web/dist` that `build.rs` embeds.
+The controller unit is installed disabled (`dh_installsystemd --no-enable`) and refuses
+to run while its configuration file is missing, so installing the package starts nothing
+and touches no database.
 
 The package depends on `xz-utils` because writing a compressed `.img.xz` system
 image decompresses it with `xz -dc`. The choice of a hard dependency over

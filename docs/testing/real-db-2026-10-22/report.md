@@ -93,3 +93,22 @@ cargo test -p rsetup-controller --test metrics_real_db -- --ignored --test-threa
 - `make fmt-check`：通过；
 - `cargo clippy -p rsetup-controller --all-targets -- -D warnings`：通过；
 - `cargo test -p rsetup-controller --lib`：926 passed / 0 failed / 3 ignored。
+
+## 8. 修复后复测（2026-10-22 13:00 前后）
+
+本轮在双模型修复（设备状态鉴权、CSRF 容量、安全头、dist 入库、Debian 打包、迁移 CLI 等）之后，使用同一对已授权开发库重新执行真库用例；执行前对两个库各做了一次真实 `mysqldump` 备份（文件仅落在本机私有临时路径，报告不记录路径/凭据），全程未执行 `DROP DATABASE`，仅做表级 `DROP TABLE` 重置。
+
+| 套件 | MySQL 8.0.46 | TiDB（MySQL 兼容版本 8.0.11） |
+| --- | --- | --- |
+| `mysql_identity` / `tidb_identity`（各 32 项） | **30 PASS / 0 FAIL / 2 TIMEOUT** | 首轮工具链被打断，结果作废；重跑在 27/32 处停止：**13 PASS / 1 FAIL / 13 TIMEOUT** |
+| `migration_v4`（空库 → v3 → v4，16 表无 FK） | **PASS**（2.7s） | 未执行（identity 重跑后实例进入连续超时，未继续） |
+| `metrics_real_db`（3 项） | **3 PASS / 0 FAIL**（25.3s） | 未执行（同上） |
+
+**MySQL 两个 TIMEOUT** 仍是 `admission_cas_commits_before_deactivation_then_new_cas_denied_on_fresh_v3_mysql` 与 `admission_deactivation_holds_guard_cas_waits_then_denied_on_fresh_v3_mysql`，与 §4.1 的锁观测权限前置一致（本轮表现为 240s 超时，不是新增失败）。其余 30 项全部通过，未发现修复引入的回归。
+
+**TiDB 重跑未形成可采信结果**：第 14 项起连续出现 240s 级超时，且超时集中在 `information_schema`/DDL 相关用例；这与 §4.2 已记录的元数据查询挂起同源，但本轮现象更重，说明该实例在多次超时后进入了不稳定的锁/元数据状态。为避免把环境不稳定误报为代码失败，本轮在 27/32 处停止，**不把这 13 PASS 计为新的通过证据，也不据此宣称 TiDB 已通过**；TiDB 的正式结论仍以 §2 的 28 PASS / 2 挂起记录为准，待实例恢复后再按单 case 串行复测。
+
+本轮新增证据（去敏）：
+- MySQL `migration_v4` 用例断言 `schema_version = 4`、恰好 16 张表、0 外键；
+- MySQL `metrics_real_db` 3 项全绿，覆盖分布对账、字节级分组与慢查询不耗尽业务池；
+- 两次真库备份的 `CREATE TABLE` 计数均为 11（备份时两库均处于 v3），证明备份是实际结构而非空文件。

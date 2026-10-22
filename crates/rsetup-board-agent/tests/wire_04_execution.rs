@@ -1777,16 +1777,17 @@ fn board_agent_without_reboot_dispatcher_stays_capability_unavailable() {
 #[test]
 fn dispatch_wire_reboot_entry_fails_closed_without_approved_codec() {
     let fx = dispatch_fixture();
-    // 无获批 codec 见证：fail-closed，绝不解析、绝不签发票据、绝不触达 OS
+    // 无获批 codec 见证：fail-closed，绝不解析、绝不签发票据、绝不触达 OS；
+    // 本端 codec 不可用映射 1009 INTERNAL_ERROR，不是对端版本不匹配。
     assert_eq!(
         fx.agent
             .handle_wire(&NoCodec, &peer(&KEY), "device.reboot.prepare", b"bytes"),
-        Err(BusinessStatus::UnsupportedVersion)
+        Err(BusinessStatus::InternalError)
     );
     assert_eq!(
         fx.agent
             .handle_wire(&NoCodec, &peer(&KEY), "device.reboot.execute", b"bytes"),
-        Err(BusinessStatus::UnsupportedVersion)
+        Err(BusinessStatus::InternalError)
     );
     assert_eq!(fx.executor.tickets().active_ticket_count(), 0);
     assert_eq!(fx.executor.os().call_count(), 0);

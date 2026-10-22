@@ -31,6 +31,7 @@ use crate::devices::service::{
     AdmissionChangeEvent, AdmissionChangeSink, DecisionResult, DeviceService,
     MAX_ADMISSION_REASON_BYTES,
 };
+use crate::events::EventBus;
 use crate::http_auth::HttpAuthState;
 use crate::model::{AdmissionState, ReviewDecision};
 
@@ -469,6 +470,11 @@ impl system::SystemGateway for SqlxManagementGateway {
 /// **不读取环境变量、不安装 cursor 密钥**（密钥由集成 Task 0 在 build router 前
 /// 安装）；probe 与通知 sink 由集成 owner 显式传入真实源，本函数不造常量默认。
 ///
+/// 本入口是**未开启事件线**的形状（委托
+/// [`build_sqlx_management_state_with_events`] 并传 `events: None`）：各资源写端点
+/// 不发布任何事件，行为与接入事件总线之前完全一致。需要把 `permissions.changed` /
+/// `system.time.changed` 投进进程内总线时，调用方改用带句柄的那个入口。
+///
 /// 跨线衔接：审批 connection_state 的唯一消费通路是 `ApprovalsApiState.probe`
 /// （`build_management_router` 装配注入），本网关不持有 probe，避免双 probe。
 pub fn build_sqlx_management_state(
@@ -477,6 +483,27 @@ pub fn build_sqlx_management_state(
     device_probe: Arc<dyn devices::DeviceLiveProbe>,
     recovery_probe: Arc<dyn system::RecoveryModeProbe>,
     notification_sink: Arc<dyn approvals::ManagementNotificationSink>,
+) -> ManagementState {
+    build_sqlx_management_state_with_events(
+        db,
+        auth,
+        device_probe,
+        recovery_probe,
+        notification_sink,
+        None,
+    )
+}
+
+/// [`build_sqlx_management_state`] 的事件总线版本：唯一多出的入参是 `events`，即进程内
+/// 事件总线句柄（06 §4），必须与 SSE 读线 `EventsState.bus` 同源（[`EventBus::clone`]
+/// 不新建通道）。`None` 表示本装配未开启事件线；本函数不构造第二通道，也不伪造总线句柄。
+pub fn build_sqlx_management_state_with_events(
+    db: DbPool,
+    auth: Arc<HttpAuthState>,
+    device_probe: Arc<dyn devices::DeviceLiveProbe>,
+    recovery_probe: Arc<dyn system::RecoveryModeProbe>,
+    notification_sink: Arc<dyn approvals::ManagementNotificationSink>,
+    events: Option<EventBus>,
 ) -> ManagementState {
     let repo = Arc::new(SqlxAuthzRepository::new(db.clone()));
     let snapshots = Arc::new(SqlxAuthorizationSnapshotRepository::new(db.clone()));
@@ -503,6 +530,7 @@ pub fn build_sqlx_management_state(
         device_probe,
         recovery_probe,
         notification_sink,
+        events,
     }
 }
 

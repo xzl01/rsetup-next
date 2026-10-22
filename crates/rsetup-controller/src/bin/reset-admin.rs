@@ -27,7 +27,10 @@ reset-admin - local root emergency recovery for the built-in administrator accou
 
 Run this CLI directly on the controller host, as root, from an interactive terminal:
 
-  sudo /usr/bin/reset-admin
+  sudo rsetup-controller-reset-admin
+
+(Packaged binary name; when running from the build tree the binary is
+`target/debug/reset-admin`.)
 
 Constraints enforced fail-closed before any database access:
   * real and effective UID must both be root (as reported by the OS, not by env vars);

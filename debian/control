@@ -13,7 +13,10 @@ Vcs-Browser: https://github.com/xzl01/rsetup-next
 Vcs-Git: https://github.com/xzl01/rsetup-next.git
 
 Package: rsetup-next
-Architecture: any
+Priority: optional
+# 仅维护 64 位 amd64/arm64（用户既定口径）：不再使用 Architecture: any，
+# 32 位架构（armel/armhf/i386 等）不在本项目支持范围内。
+Architecture: amd64 arm64
 Depends:
  apt,
  btrfs-progs,
@@ -27,7 +30,6 @@ Depends:
  systemd,
  xz-utils,
  ${misc:Depends},
- ${shlibs:Depends},
 Suggests:
  docker.io,
  ffmpeg,
@@ -42,3 +44,26 @@ Description: local control center for Linux single-board computers
  .
  Mutating operations are dry-run by default and require explicit live execution
  and confirmation.
+
+Package: rsetup-controller
+Priority: optional
+# 与 rsetup-next 同一架构口径：仅维护 64 位 amd64/arm64，不做 Architecture: any。
+Architecture: amd64 arm64
+Depends:
+ ca-certificates,
+ systemd,
+ ${misc:Depends},
+Suggests:
+ mariadb-server,
+ nginx,
+Description: Web control center (controller) for rsetup-next
+ rsetup-controller is the standalone HTTP control-plane process of rsetup-next:
+ it serves the embedded web UI and its typed API from a loopback listener
+ (127.0.0.1:8080 by default) on top of a MySQL/MariaDB or TiDB database. It
+ terminates no TLS and is not designed for exposure to untrusted networks.
+ .
+ The package installs the binaries, one systemd unit and a configuration
+ template, and configures or enables nothing: an operator must fill in
+ /etc/default/rsetup-controller (database URL, allowed Host list, allowed
+ browser Origin, management cursor secret), migrate the target database with
+ rsetup-controller-migrate, and only then start the service.

@@ -265,7 +265,9 @@ pub struct HttpAuthState {
     pub auth: Arc<dyn AuthServiceApi>,
     pub config: HttpSecurityConfig,
     /// Session digest -> CSRF binding, bounded to `MAX_CSRF_ENTRIES` (fail
-    /// closed instead of evicting or overwriting live bindings).
+    /// closed instead of evicting or overwriting live bindings). Slots whose
+    /// session the process clock already reports dead are swept at
+    /// `CSRF_PRUNE_THRESHOLD` — see [`prune_dead_csrf`].
     pub csrf: Mutex<HashMap<[u8; 32], CsrfBinding>>,
     /// Login failure limiter (account + source dimensions), serialised by
     /// this `Mutex`; the limiter itself is lock-free.
@@ -952,7 +954,8 @@ async fn logout(
 /// EVERY request (the production `schema_meta` count, never the process
 /// `SessionClock` epoch), then the CSRF bound to `session.digest` is
 /// reused or issued under the 4096 cap, after a monotonic prune of
-/// past-`ABSOLUTE` bindings. No raw cookie, hash or DB error ever reaches
+/// past-`ABSOLUTE` bindings plus the threshold-gated dead-session sweep
+/// ([`prune_dead_csrf`]). No raw cookie, hash or DB error ever reaches
 /// the body or a log.
 async fn me(State(state): State<Arc<HttpAuthState>>, headers: HeaderMap) -> Response {
     // 1. Exact single allowed Host (missing/duplicated/wrong all fail).
@@ -1007,11 +1010,14 @@ async fn me(State(state): State<Arc<HttpAuthState>>, headers: HeaderMap) -> Resp
         Ok(epoch) => epoch,
         Err(error) => return backend_error(&error),
     };
-    // 6. Reuse or issue the CSRF bound to this digest. The prune runs
-    //    first under the same lock; an existing binding is reused WITHOUT
-    //    refreshing its issue instant.
+    // 6. Reuse or issue the CSRF bound to this digest. Both prunes run
+    //    first under the same lock (monotonic 12h, plus the dead-session
+    //    sweep once the table reaches the soft threshold); an existing
+    //    binding is reused WITHOUT refreshing its issue instant. A table
+    //    that is still at the cap after the sweep is full of LIVE bindings,
+    //    so a new digest keeps failing closed with 503.
     let mut csrf = state.csrf.lock().unwrap();
-    prune_expired_csrf(&mut csrf, now);
+    prune_csrf_table(&mut csrf, state.auth.as_ref(), now);
     let csrf_token = match csrf.get(&session.digest) {
         Some(binding) => binding.token.clone(),
         None => {
@@ -1046,15 +1052,75 @@ async fn me(State(state): State<Arc<HttpAuthState>>, headers: HeaderMap) -> Resp
 /// monotonic clock never moves backwards; only an adversarial construct
 /// through the public `CsrfBinding` fields could do this) and is treated
 /// as expired — fail closed, never a permanent resident of the map.
-/// Called at the login peek, the authoritative `login_success` insert and
-/// the `me` bind; live bindings (and their issue instants) are never
-/// touched.
+/// Called (through [`prune_csrf_table`]) at the login peek, the authoritative
+/// `login_success` insert and the `me` bind; live bindings (and their issue
+/// instants) are never touched.
 fn prune_expired_csrf(csrf: &mut HashMap<[u8; 32], CsrfBinding>, now: Instant) -> usize {
     let before = csrf.len();
     csrf.retain(|_, binding| {
         binding.issued_at <= now && now.saturating_duration_since(binding.issued_at) < ABSOLUTE
     });
     before - csrf.len()
+}
+
+/// Soft threshold that arms the dead-binding sweep
+/// ([`prune_dead_csrf`]): 3/4 of the hard cap. Below it the handlers never
+/// pay the O(n) per-entry clock probe; at or above it one sweep runs per
+/// request under the same lock that already guards the capacity check, so a
+/// table poisoned by revoked sessions still self-heals long before the
+/// 12-hour absolute lifetime would.
+pub const CSRF_PRUNE_THRESHOLD: usize = MAX_CSRF_ENTRIES * 3 / 4;
+
+/// Remove CSRF bindings whose session the current process session clock has
+/// ALREADY declared dead, i.e. every digest for which the synchronous,
+/// pure in-memory [`AuthServiceApi::is_live_session`] precheck returns
+/// `false` (idle-expired, absolute-expired, removed from the clock by this
+/// process's own logout, or belonging to a replaced epoch). Returns the
+/// number of removed bindings.
+///
+/// Semantics boundary — read this before extending it:
+/// - the only source of truth here is the in-memory clock. A binding whose
+///   digest is unknown to that clock is reported `false` and IS removed:
+///   `false` means "not live in this process", never "unknown, keep it".
+///   This can never evict a usable binding, because `SessionClock::is_live`
+///   (behind `is_live_session`) and `SessionClock::check` (inside the
+///   DB-authoritative `authenticate`) evaluate the SAME deadline predicate
+///   (`now < idle && now < absolute`, a missing entry is dead). A digest
+///   reported `false` therefore also fails `authenticate` with the fixed 401
+///   on every session-bound route, so its binding was already unreachable;
+/// - a session revoked on the database (revoke-others, admin password reset
+///   or deactivation) whose clock entry has NOT yet expired keeps its
+///   binding here — this sweep is NOT database-authoritative cleanup and
+///   must not be described as clearing every revoked session. Such a binding
+///   is dropped by the existing path on that session's next request: the
+///   pre-auth gate or the DB-authoritative `authenticate` returns the fixed
+///   401 and that branch removes the digest's binding;
+/// - live bindings and their issue instants are never touched, existing
+///   bindings are never overwritten, and the hard `MAX_CSRF_ENTRIES` cap
+///   stays enforced by the callers after this sweep returns.
+fn prune_dead_csrf(csrf: &mut HashMap<[u8; 32], CsrfBinding>, auth: &dyn AuthServiceApi) -> usize {
+    let before = csrf.len();
+    // `is_live_session` is contractually synchronous and in-memory (no
+    // async I/O, no DB round trip, no re-entry into `HttpAuthState`), so
+    // probing it while holding the CSRF lock cannot deadlock or stall.
+    csrf.retain(|digest, _binding| auth.is_live_session(digest));
+    before - csrf.len()
+}
+
+/// Sweep the CSRF table under an already-held lock: first the monotonic
+/// 12h prune, then — only once the table reaches [`CSRF_PRUNE_THRESHOLD`],
+/// so ordinary traffic never pays the O(n) clock probe — the dead-session
+/// sweep. Callers must still enforce `MAX_CSRF_ENTRIES` afterwards: a table
+/// full of live bindings keeps failing closed, it is never evicted from.
+fn prune_csrf_table(
+    csrf: &mut HashMap<[u8; 32], CsrfBinding>,
+    auth: &dyn AuthServiceApi,
+    now: Instant,
+) {
+    prune_expired_csrf(csrf, now);
+    if csrf.len() >= CSRF_PRUNE_THRESHOLD {
+        prune_dead_csrf(csrf, auth);
+    }
 }
 
 async fn login(
@@ -1117,12 +1183,14 @@ async fn login(
         }
     }
     // 6. CSRF capacity peek: first prune bindings past their absolute
-    //    lifetime, then fail closed if the map is still at the cap,
-    //    BEFORE any credential work (the authoritative check for the
-    //    concurrent case stays inside the insert lock in `login_success`).
+    //    lifetime, then — at the soft threshold — the bindings whose session
+    //    the process clock already reports dead, then fail closed if the map
+    //    is STILL at the cap, BEFORE any credential work (the authoritative
+    //    check for the concurrent case stays inside the insert lock in
+    //    `login_success`).
     {
         let mut csrf = state.csrf.lock().unwrap();
-        prune_expired_csrf(&mut csrf, now);
+        prune_csrf_table(&mut csrf, state.auth.as_ref(), now);
         if csrf.len() >= MAX_CSRF_ENTRIES {
             return exhausted();
         }
@@ -1295,10 +1363,13 @@ fn valid_username(username: &str) -> bool {
 
 /// Success: validate the raw session token FIRST (a failed validation
 /// must not leave a CSRF binding behind), then mint a 32-byte OsRng CSRF
-/// token, prune past-absolute bindings, bind the token to the session
-/// digest under the 4096 cap, and set the validated `rsc_session` cookie.
+/// token, prune past-absolute bindings (plus the threshold-gated
+/// dead-session sweep), bind the token to the session digest under the
+/// 4096 cap, and set the validated `rsc_session` cookie.
 /// The in-lock capacity check below stays authoritative for the concurrent
-/// case.
+/// case: after both prunes the table may still be full of LIVE bindings,
+/// and then a NEW digest keeps failing closed without evicting or
+/// overwriting anything.
 fn login_success(state: &HttpAuthState, login: Login) -> Response {
     let digest = login.session.digest;
     let cookie = match session_cookie_header(&login.raw_token, &state.config) {
@@ -1315,7 +1386,7 @@ fn login_success(state: &HttpAuthState, login: Login) -> Response {
     let issued_at = Instant::now();
     {
         let mut csrf = state.csrf.lock().unwrap();
-        prune_expired_csrf(&mut csrf, issued_at);
+        prune_csrf_table(&mut csrf, state.auth.as_ref(), issued_at);
         if csrf.len() >= MAX_CSRF_ENTRIES && !csrf.contains_key(&digest) {
             return exhausted();
         }
@@ -1840,6 +1911,35 @@ mod tests {
 
     fn router() -> Router {
         build_http_router(app_state(FakeAuth::new(FakeLogin::Ok)))
+    }
+
+    /// Seed `count` synthetic CSRF bindings whose digests the fake process
+    /// clock reports as LIVE (`set_digest_live(.., true)`).
+    ///
+    /// Capacity tests must fill the table with live bindings: the handlers
+    /// now sweep slots whose digest the in-memory clock already declares
+    /// dead, so seeding with plain unknown digests would no longer model a
+    /// table that genuinely cannot admit a new binding. The fake marks the
+    /// digests live explicitly and never defaults to `true` for unknown
+    /// digests, so a missing mark shows up as a pruned slot, not as a
+    /// silently passing test.
+    fn seed_live_csrf_bindings(
+        auth: &FakeAuth,
+        csrf: &mut HashMap<[u8; 32], CsrfBinding>,
+        count: usize,
+    ) {
+        for i in 0..count {
+            let mut digest = [0u8; 32];
+            digest[..4].copy_from_slice(&(i as u32).to_be_bytes());
+            auth.set_digest_live(digest, true);
+            csrf.insert(
+                digest,
+                CsrfBinding {
+                    token: "0".repeat(64),
+                    issued_at: Instant::now(),
+                },
+            );
+        }
     }
 
     fn login_request(
@@ -2513,20 +2613,13 @@ mod tests {
 
     #[tokio::test]
     async fn csrf_capacity_exhausted_is_503_retry_after_60() {
-        let state = app_state(FakeAuth::new(FakeLogin::Ok));
+        let auth = FakeAuth::new(FakeLogin::Ok);
+        let state = app_state(auth.clone());
         {
+            // Every slot is LIVE (see `seed_live_csrf_bindings`): the hard
+            // cap must fail closed even though dead slots would be swept.
             let mut csrf = state.auth.csrf.lock().unwrap();
-            for i in 0..MAX_CSRF_ENTRIES {
-                let mut digest = [0u8; 32];
-                digest[..4].copy_from_slice(&(i as u32).to_be_bytes());
-                csrf.insert(
-                    digest,
-                    CsrfBinding {
-                        token: "0".repeat(64),
-                        issued_at: Instant::now(),
-                    },
-                );
-            }
+            seed_live_csrf_bindings(&auth, &mut csrf, MAX_CSRF_ENTRIES);
         }
         let router = build_http_router(state);
         let (status, headers, _value, text) = call(&router, valid_request()).await;
@@ -2558,17 +2651,7 @@ mod tests {
         let auth_state = state.auth.clone();
         {
             let mut csrf = auth_state.csrf.lock().unwrap();
-            for i in 0..MAX_CSRF_ENTRIES {
-                let mut digest = [0u8; 32];
-                digest[..4].copy_from_slice(&(i as u32).to_be_bytes());
-                csrf.insert(
-                    digest,
-                    CsrfBinding {
-                        token: "0".repeat(64),
-                        issued_at: Instant::now(),
-                    },
-                );
-            }
+            seed_live_csrf_bindings(&auth, &mut csrf, MAX_CSRF_ENTRIES);
         }
         let router = build_http_router(state);
         let (status, headers, _value, text) = call(&router, valid_request()).await;
@@ -2606,21 +2689,13 @@ mod tests {
         // Regression guard for the concurrent case: even when the
         // handler-level peek is bypassed, the in-lock check inside
         // `login_success` must still fail closed for a NEW digest at the
-        // cap, without touching the map.
-        let state = app_state(FakeAuth::new(FakeLogin::Ok));
+        // cap, without touching the map. Every seeded slot is LIVE, so
+        // neither prune can free anything.
+        let auth = FakeAuth::new(FakeLogin::Ok);
+        let state = app_state(auth.clone());
         {
             let mut csrf = state.auth.csrf.lock().unwrap();
-            for i in 0..MAX_CSRF_ENTRIES {
-                let mut digest = [0u8; 32];
-                digest[..4].copy_from_slice(&(i as u32).to_be_bytes());
-                csrf.insert(
-                    digest,
-                    CsrfBinding {
-                        token: "0".repeat(64),
-                        issued_at: Instant::now(),
-                    },
-                );
-            }
+            seed_live_csrf_bindings(&auth, &mut csrf, MAX_CSRF_ENTRIES);
         }
         let response = login_success(state.auth.as_ref(), FakeAuth::fixed_login());
         let status = response.status();
@@ -3271,6 +3346,10 @@ mod tests {
         let auth_state = state.auth.clone();
         let digest = crate::auth::session::token_digest(fake_token().as_bytes());
         let live_digest = crate::auth::session::token_digest(b"still-live-binding");
+        // The scenario models a LIVE (not yet expired) binding, so the fake
+        // clock has to agree; otherwise this digest would just be another
+        // dead slot for the threshold sweep.
+        auth.set_digest_live(live_digest, true);
         {
             let mut csrf = auth_state.csrf.lock().unwrap();
             for i in 0..MAX_CSRF_ENTRIES - 1 {
@@ -3333,21 +3412,14 @@ mod tests {
 
     #[tokio::test]
     async fn me_at_live_capacity_for_new_digest_is_503_retry_after_60() {
-        let state = app_state(FakeAuth::new(FakeLogin::Ok));
+        let auth = FakeAuth::new(FakeLogin::Ok);
+        let state = app_state(auth.clone());
         let auth_state = state.auth.clone();
         {
+            // Every slot is LIVE, so neither the absolute prune nor the
+            // threshold dead prune can free anything for a new digest.
             let mut csrf = auth_state.csrf.lock().unwrap();
-            for i in 0..MAX_CSRF_ENTRIES {
-                let mut entry = [0u8; 32];
-                entry[..4].copy_from_slice(&(i as u32).to_be_bytes());
-                csrf.insert(
-                    entry,
-                    CsrfBinding {
-                        token: "0".repeat(64),
-                        issued_at: Instant::now(),
-                    },
-                );
-            }
+            seed_live_csrf_bindings(&auth, &mut csrf, MAX_CSRF_ENTRIES);
         }
         let router = build_http_router(state);
         let (status, headers, _value, text) =
@@ -3374,23 +3446,16 @@ mod tests {
 
     #[tokio::test]
     async fn me_at_live_capacity_reuses_existing_digest_binding() {
-        let state = app_state(FakeAuth::new(FakeLogin::Ok));
+        let auth = FakeAuth::new(FakeLogin::Ok);
+        let state = app_state(auth.clone());
         let auth_state = state.auth.clone();
         let digest = crate::auth::session::token_digest(fake_token().as_bytes());
         let seeded = "f".repeat(64);
         {
+            // MAX-1 LIVE filler slots + the caller's own binding: reuse must
+            // still work at the cap and must not touch any other slot.
             let mut csrf = auth_state.csrf.lock().unwrap();
-            for i in 0..MAX_CSRF_ENTRIES - 1 {
-                let mut entry = [0u8; 32];
-                entry[..4].copy_from_slice(&(i as u32).to_be_bytes());
-                csrf.insert(
-                    entry,
-                    CsrfBinding {
-                        token: "0".repeat(64),
-                        issued_at: Instant::now(),
-                    },
-                );
-            }
+            seed_live_csrf_bindings(&auth, &mut csrf, MAX_CSRF_ENTRIES - 1);
             csrf.insert(
                 digest,
                 CsrfBinding {
@@ -3499,6 +3564,260 @@ mod tests {
         assert!(
             csrf.is_empty(),
             "a future-issued binding must not survive the prune"
+        );
+    }
+
+    // ---------------- M3: dead-binding sweep (threshold, live protection) ----------------
+
+    /// `prune_dead_csrf` deletes exactly the bindings the in-memory clock
+    /// reports as not live — an explicitly revoked/expired one AND an
+    /// unknown digest (never "unknown, keep it") — while a live binding
+    /// survives untouched, token and issue instant included.
+    #[test]
+    fn prune_dead_csrf_removes_only_dead_bindings() {
+        let auth = FakeAuth::new(FakeLogin::Ok);
+        let live = [1u8; 32];
+        let revoked = [2u8; 32];
+        let unknown = [3u8; 32];
+        auth.set_digest_live(live, true);
+        auth.set_digest_live(revoked, false);
+        let now = Instant::now();
+        let mut csrf: HashMap<[u8; 32], CsrfBinding> = HashMap::new();
+        csrf.insert(
+            live,
+            CsrfBinding {
+                token: "1".repeat(64),
+                issued_at: now,
+            },
+        );
+        csrf.insert(
+            revoked,
+            CsrfBinding {
+                token: "2".repeat(64),
+                issued_at: now,
+            },
+        );
+        csrf.insert(
+            unknown,
+            CsrfBinding {
+                token: "3".repeat(64),
+                issued_at: now,
+            },
+        );
+        let removed = prune_dead_csrf(&mut csrf, auth.as_ref());
+        assert_eq!(
+            removed, 2,
+            "the revoked and the unknown binding must be reported as removed"
+        );
+        assert_eq!(csrf.len(), 1, "only the live binding may remain");
+        let binding = csrf.get(&live).expect("a live binding must never be swept");
+        assert_eq!(
+            binding.token,
+            "1".repeat(64),
+            "a live binding is never overwritten"
+        );
+        assert_eq!(
+            binding.issued_at, now,
+            "a live binding keeps its original issue instant"
+        );
+        assert!(
+            !csrf.contains_key(&revoked),
+            "the clock-dead binding must be deleted"
+        );
+        assert!(
+            !csrf.contains_key(&unknown),
+            "`false` means dead, not unknown-keep"
+        );
+    }
+
+    /// The poisoned-table scenario behind M3: every one of the 4096 slots is
+    /// held by a binding whose session the clock already dropped, and the
+    /// next login must NOT keep answering 503 (previously: until the 12h
+    /// absolute lifetime expired). The sweep runs under the same lock as the
+    /// capacity check, so the freed slots are visible to the insert.
+    #[tokio::test]
+    async fn csrf_table_full_of_dead_bindings_is_swept_and_login_succeeds() {
+        let auth = FakeAuth::new(FakeLogin::Ok);
+        let state = app_state(auth.clone());
+        let auth_state = state.auth.clone();
+        let dead: Vec<[u8; 32]> = (0..MAX_CSRF_ENTRIES as u32)
+            .map(|index| {
+                let mut digest = [0u8; 32];
+                digest[..4].copy_from_slice(&index.to_be_bytes());
+                digest
+            })
+            .collect();
+        {
+            let mut csrf = auth_state.csrf.lock().unwrap();
+            for digest in &dead {
+                // Explicitly `false`: the clock dropped this session.
+                auth.set_digest_live(*digest, false);
+                csrf.insert(
+                    *digest,
+                    CsrfBinding {
+                        token: "0".repeat(64),
+                        issued_at: Instant::now(),
+                    },
+                );
+            }
+            assert_eq!(csrf.len(), MAX_CSRF_ENTRIES);
+        }
+        let router = build_http_router(state);
+        let (status, _headers, value, text) = call(&router, valid_request()).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a table of dead bindings must be swept, not answered 503: {text}"
+        );
+        let csrf_token = value["data"]["csrf_token"]
+            .as_str()
+            .expect("login must carry a csrf_token")
+            .to_string();
+        assert_eq!(csrf_token.len(), 64, "the token stays a 32-byte hex");
+        let bound = auth_state.csrf.lock().unwrap();
+        assert_eq!(
+            bound.len(),
+            1,
+            "every dead slot must be reclaimed, leaving only the new binding"
+        );
+        let digest = crate::auth::session::token_digest(fake_token().as_bytes());
+        assert_eq!(
+            bound.get(&digest).map(|binding| binding.token.as_str()),
+            Some(csrf_token.as_str()),
+            "the new login must be bound to its own digest"
+        );
+        assert!(
+            dead.iter().all(|digest| !bound.contains_key(digest)),
+            "no swept digest may survive the login"
+        );
+    }
+
+    /// Half live + half dead at the hard cap: `me` reclaims only the dead
+    /// half, keeps every live binding (token and issue instant) and issues
+    /// its own binding instead of failing closed.
+    #[tokio::test]
+    async fn me_sweeps_dead_bindings_at_cap_and_keeps_every_live_one() {
+        let auth = FakeAuth::new(FakeLogin::Ok);
+        let state = app_state(auth.clone());
+        let auth_state = state.auth.clone();
+        let caller = crate::auth::session::token_digest(fake_token().as_bytes());
+        let half = MAX_CSRF_ENTRIES / 2;
+        let mut live_digests = Vec::with_capacity(half);
+        let mut dead_digests = Vec::with_capacity(half);
+        {
+            let mut csrf = auth_state.csrf.lock().unwrap();
+            for index in 0..half as u32 {
+                let mut digest = [0u8; 32];
+                digest[..4].copy_from_slice(&index.to_be_bytes());
+                auth.set_digest_live(digest, true);
+                csrf.insert(
+                    digest,
+                    CsrfBinding {
+                        token: "1".repeat(64),
+                        issued_at: Instant::now(),
+                    },
+                );
+                live_digests.push(digest);
+            }
+            for index in 0..(MAX_CSRF_ENTRIES - half) as u32 {
+                let mut digest = [0u8; 32];
+                digest[..4].copy_from_slice(&index.to_be_bytes());
+                // Disjoint keyspace from the live half.
+                digest[4] = 0x7f;
+                auth.set_digest_live(digest, false);
+                csrf.insert(
+                    digest,
+                    CsrfBinding {
+                        token: "0".repeat(64),
+                        issued_at: Instant::now(),
+                    },
+                );
+                dead_digests.push(digest);
+            }
+            assert_eq!(csrf.len(), MAX_CSRF_ENTRIES);
+        }
+        let router = build_http_router(state);
+        let (status, _headers, value, text) =
+            call(&router, me_request(Some(&valid_cookie()))).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the dead half must free room for the caller: {text}"
+        );
+        let csrf_token = value["data"]["csrf_token"]
+            .as_str()
+            .expect("me must carry a csrf_token")
+            .to_string();
+        let bound = auth_state.csrf.lock().unwrap();
+        assert_eq!(
+            bound.get(&caller).map(|binding| binding.token.as_str()),
+            Some(csrf_token.as_str()),
+            "me must bind its own digest"
+        );
+        assert_eq!(bound.len(), half + 1, "only the dead half may be reclaimed");
+        for digest in &live_digests {
+            let binding = bound
+                .get(digest)
+                .expect("a live binding must survive the sweep");
+            assert_eq!(binding.token, "1".repeat(64), "live token intact");
+        }
+        assert!(
+            dead_digests
+                .iter()
+                .all(|digest| !bound.contains_key(digest)),
+            "every dead binding must be gone"
+        );
+    }
+
+    /// The sweep is armed only at the soft threshold, never below it, so an
+    /// ordinary request never pays the O(n) clock probe: one dead slot under
+    /// the threshold stays put, and the same table at the threshold is
+    /// reclaimed in full while the same call under the threshold is a no-op.
+    #[test]
+    fn prune_csrf_table_sweeps_only_at_the_threshold() {
+        let auth = FakeAuth::new(FakeLogin::Ok);
+        let now = Instant::now();
+        let below = CSRF_PRUNE_THRESHOLD - 1;
+        let mut csrf: HashMap<[u8; 32], CsrfBinding> = HashMap::new();
+        for index in 0..below as u32 {
+            let mut digest = [0u8; 32];
+            digest[0] = 0xaa;
+            digest[1..5].copy_from_slice(&index.to_be_bytes());
+            auth.set_digest_live(digest, false);
+            csrf.insert(
+                digest,
+                CsrfBinding {
+                    token: "0".repeat(64),
+                    issued_at: now,
+                },
+            );
+        }
+        assert_eq!(csrf.len(), below);
+        prune_csrf_table(&mut csrf, auth.as_ref(), now);
+        assert_eq!(
+            csrf.len(),
+            below,
+            "below the soft threshold the sweep must stay disarmed"
+        );
+        let extra = {
+            let mut digest = [0u8; 32];
+            digest[0] = 0xaa;
+            digest[1..5].copy_from_slice(&(below as u32).to_be_bytes());
+            auth.set_digest_live(digest, false);
+            digest
+        };
+        csrf.insert(
+            extra,
+            CsrfBinding {
+                token: "0".repeat(64),
+                issued_at: now,
+            },
+        );
+        assert_eq!(csrf.len(), CSRF_PRUNE_THRESHOLD);
+        prune_csrf_table(&mut csrf, auth.as_ref(), now);
+        assert!(
+            csrf.is_empty(),
+            "at the soft threshold every dead slot must be reclaimed"
         );
     }
 

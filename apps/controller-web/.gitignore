@@ -1,4 +1,7 @@
 node_modules/
-dist/
 coverage/
 .npm-cache/
+# dist 的构建产物已随仓库提供（crates/rsetup-controller/build.rs 编译期读取），
+# 干净检出与离线 cargo 构建不再需要 Node/npm。唯一被忽略的是 make 的时间戳文件：
+# 它每次 `make web-build` 都会刷新，属本地噪声，不入库。
+dist/.rsetup-build-stamp

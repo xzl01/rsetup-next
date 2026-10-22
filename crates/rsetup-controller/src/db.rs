@@ -1769,6 +1769,177 @@ pub async fn run_identity_test_migration(
     .await
 }
 
+// --- Production migration entry point (`migrate-controller`) ----------------
+//
+// Everything below is the operator-facing production path. It deliberately
+// reuses the one existing authorization gate (reached through
+// `run_authorized_migration_with`) instead of inventing a second, weaker one,
+// and reuses the same primitives as the reviewed test path:
+// `upgrade_identity_schema(.., Upgrade)` for the v3 target and
+// `run_schema_v4_migration` for the explicit v3 → v4 step. Nothing here is
+// reachable from the service startup path, and `run_identity_test_migration`
+// above keeps its test-only behaviour and gates unchanged.
+
+/// The single accepted migration acknowledgement literal, published for
+/// operators and documentation. The shared authorizer hard-codes the very same
+/// value; the unit test
+/// `production_gate_and_shared_authorizer_accept_the_same_ack` keeps the two
+/// spellings from drifting apart. It states what the operator attests:
+/// exclusive access to the target database plus a verifiable backup reference.
+/// For a production target it must **not** be read as "the data may be
+/// discarded" — that is not part of what this entry point does.
+pub const MIGRATION_ACK_CONFIRMATION: &str = "isolated-exclusive-backed-up-disposable";
+
+/// Fixed production-migration diagnostic: a static code only, never a URL,
+/// database name, backup path or driver message.
+fn production_migration_error(code: &'static str) -> ControllerError {
+    ControllerError::Config(format!("production migration {code}"))
+}
+
+/// The one rejection message for every missing or malformed gate. Collapsing
+/// all failure branches onto it keeps the gate from revealing *which* variable
+/// was wrong, and keeps any of their values out of the message.
+fn production_migration_authorization_required() -> ControllerError {
+    ControllerError::Config("production migration authorization required".into())
+}
+
+/// Gate-parsing half of [`migration_config_from_env`], factored out so the
+/// logic is testable without mutating the process environment (which would race
+/// across parallel tests). `lookup` maps a variable name to its value; the
+/// production caller supplies `std::env::var`.
+fn production_migration_config_from(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<TestMigrationConfig, ControllerError> {
+    let config = TestMigrationConfig {
+        // The target is the service database itself: the same variable the
+        // service reads, so a deployment never stores one DSN in two places.
+        test_url: lookup("CONTROLLER_DATABASE_URL").unwrap_or_default(),
+        allow_destructive: lookup("CONTROLLER_MIGRATION_ALLOW_DESTRUCTIVE")
+            .is_some_and(|value| value == "1"),
+        expected_database: lookup("CONTROLLER_MIGRATION_EXPECTED_DATABASE").unwrap_or_default(),
+        backup_ref: lookup("CONTROLLER_MIGRATION_BACKUP_REF").unwrap_or_default(),
+        migration_ack: lookup("CONTROLLER_MIGRATION_ACK").unwrap_or_default(),
+    };
+    // Reusing the shared authorizer with the declared database name as the
+    // "actual" name checks exactly the shared criteria (non-empty DSN,
+    // destructive flag, database-name charset and length, non-blank backup
+    // reference, exact ack) instead of duplicating them.
+    // `run_authorized_migration_with` re-runs the same check against the name
+    // the server really reports, so a configuration pointing at another
+    // database still fails closed.
+    authorize_test_migration(&config, &config.expected_database)
+        .map_err(|_| production_migration_authorization_required())?;
+    Ok(config)
+}
+
+/// Reads the **production** migration configuration from the process
+/// environment.
+///
+/// Target: `CONTROLLER_DATABASE_URL` (the very variable the service uses).
+/// Gates: `CONTROLLER_MIGRATION_ALLOW_DESTRUCTIVE` (must be exactly `1`),
+/// `CONTROLLER_MIGRATION_EXPECTED_DATABASE`, `CONTROLLER_MIGRATION_BACKUP_REF`,
+/// `CONTROLLER_MIGRATION_ACK` (must equal [`MIGRATION_ACK_CONFIRMATION`]).
+///
+/// Every missing or illegal combination fails with one fixed, de-identified
+/// [`ControllerError::Config`]: no URL, database name or backup reference is
+/// ever echoed. `TestMigrationConfig` also redacts those fields in `Debug`.
+pub fn migration_config_from_env() -> Result<TestMigrationConfig, ControllerError> {
+    production_migration_config_from(|name| std::env::var(name).ok())
+}
+
+/// The fixed decision table of a production migration: a pure function of the
+/// observed schema version, so it is exhaustively unit-testable with no
+/// database in sight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProductionMigrationPlan {
+    /// Already the supported version: only the read-only
+    /// `check_identity_schema` pass runs, which makes re-running idempotent.
+    VerifyOnly,
+    /// Empty database, v1, v2 or v3: reach v3 through the reviewed `Upgrade`
+    /// path (fresh CREATE for an empty database, legacy upgrade for v1/v2,
+    /// read-only confirmation for v3), then run the explicit v3 → v4 migration.
+    UpgradeThenV4,
+}
+
+fn production_migration_plan(
+    version: Option<i32>,
+) -> Result<ProductionMigrationPlan, ControllerError> {
+    match version {
+        Some(crate::integrity::SUPPORTED_SCHEMA_VERSION) => Ok(ProductionMigrationPlan::VerifyOnly),
+        None | Some(IDENTITY_SCHEMA_VERSION) | Some(1 | 2) => {
+            Ok(ProductionMigrationPlan::UpgradeThenV4)
+        }
+        // Unknown or future versions are never migrated speculatively.
+        Some(_) => Err(production_migration_error("unsupported schema version")),
+    }
+}
+
+/// Executes the plan on an already authorized connection. Any failing step
+/// returns immediately: the DDL steps are non-transactional, so a partial
+/// schema is left for the operator instead of being auto-repaired, and no step
+/// counts as done without its own verification.
+async fn run_production_migration_at(db: &DbPool) -> Result<(), ControllerError> {
+    match production_migration_plan(read_version(db).await?)? {
+        ProductionMigrationPlan::VerifyOnly => check_identity_schema(db).await,
+        ProductionMigrationPlan::UpgradeThenV4 => {
+            upgrade_identity_schema(db, TestMigrationMode::Upgrade).await?;
+            run_schema_v4_migration(db).await
+        }
+    }
+}
+
+/// Operator-facing production migration: authorized exactly like the reviewed
+/// test migration (the declared database must equal the one the server reports,
+/// and the connecting account must really see its schema metadata), then applies
+/// [`production_migration_plan`].
+///
+/// Unlike `run_identity_test_migration` this entry point does **not** reject a
+/// target equal to the service URL — the service database is the point.
+/// Isolation and exclusivity are attested through the gates, never inferred
+/// from URL text.
+pub async fn run_production_migration(config: &TestMigrationConfig) -> Result<(), ControllerError> {
+    run_authorized_migration_with(
+        config,
+        || async {
+            let db = DbPool(
+                sqlx::MySqlPool::connect(&config.test_url)
+                    .await
+                    .map_err(|_| {
+                        ControllerError::Config(
+                            "production migration database connect failed".into(),
+                        )
+                    })?,
+            );
+            let mut connection = db.0.acquire().await.map_err(|_| {
+                ControllerError::Config("production migration database identity failed".into())
+            })?;
+            let actual: Option<String> = sqlx::query_scalar("SELECT DATABASE()")
+                .fetch_one(&mut *connection)
+                .await
+                .map_err(|_| {
+                    ControllerError::Config("production migration database identity failed".into())
+                })?;
+            let actual = actual.ok_or_else(|| {
+                ControllerError::Config("production migration database identity failed".into())
+            })?;
+            Ok(((db, connection), actual))
+        },
+        |(db, mut connection), actual| async move {
+            require_schema_metadata_privilege(&mut connection, &actual).await?;
+            Ok(db)
+        },
+        |db| async move { run_production_migration_at(&db).await },
+    )
+    .await
+}
+
+/// Read-only schema version probe for `migrate-controller --check`: the version
+/// number, or `None` for an uninitialized schema. The return type carries no
+/// database name, host or credentials.
+pub async fn read_schema_version(db: &DbPool) -> Result<Option<i32>, ControllerError> {
+    read_version(db).await
+}
+
 async fn scan_legacy_usernames(db: &DbPool) -> Result<(), ControllerError> {
     // Full UNIQUE(username) was verified in the shape gate; no unbounded name set.
     let mut stream = sqlx::query("SELECT username FROM users").fetch(&db.0);
@@ -5387,6 +5558,172 @@ mod tests {
             )
             .contains(target)
         );
+    }
+
+    /// 生产迁移决策表的穷举（纯函数，无数据库）：v4 只做只读校验；空库与 v1/v2/v3
+    /// 走 `Upgrade` + 显式 v4；其余版本一律 fail-closed，且错误固定去敏。
+    #[test]
+    fn production_migration_plan_is_fixed_per_version() {
+        assert_eq!(
+            production_migration_plan(Some(crate::integrity::SUPPORTED_SCHEMA_VERSION)).unwrap(),
+            ProductionMigrationPlan::VerifyOnly
+        );
+        for version in [None, Some(1), Some(2), Some(IDENTITY_SCHEMA_VERSION)] {
+            assert_eq!(
+                production_migration_plan(version).unwrap(),
+                ProductionMigrationPlan::UpgradeThenV4,
+                "版本 {version:?} 必须先 Upgrade 再 v4"
+            );
+        }
+        for version in [Some(0), Some(5), Some(-1), Some(i32::MAX)] {
+            let error = production_migration_plan(version).expect_err("未知版本必须拒绝");
+            let message = error.to_string();
+            // 固定诊断：纯 ASCII、静态码，不含连接标识。
+            assert!(message.is_ascii(), "固定诊断必须纯 ASCII，实际：{message}");
+            assert!(
+                !message.contains("mysql://") && !message.contains('@'),
+                "固定诊断不得含连接标识，实际：{message}"
+            );
+        }
+    }
+
+    /// 生产门禁的合成环境变量样本：取值全是合成值，唯一用途是断言它们绝不外泄。
+    fn production_gate_env(overrides: &[(&str, Option<&str>)]) -> Vec<(String, Option<String>)> {
+        let mut vars: Vec<(String, Option<String>)> = vec![
+            (
+                "CONTROLLER_DATABASE_URL".into(),
+                Some("mysql://svc:Fa1ePassw0rd@db.invalid:3306/rsc_prod_ctl".into()),
+            ),
+            (
+                "CONTROLLER_MIGRATION_ALLOW_DESTRUCTIVE".into(),
+                Some("1".into()),
+            ),
+            (
+                "CONTROLLER_MIGRATION_EXPECTED_DATABASE".into(),
+                Some("rsc_prod_ctl".into()),
+            ),
+            (
+                "CONTROLLER_MIGRATION_BACKUP_REF".into(),
+                Some("/srv/backup/FAKE-ref-hashes.sha256".into()),
+            ),
+            (
+                "CONTROLLER_MIGRATION_ACK".into(),
+                Some(MIGRATION_ACK_CONFIRMATION.into()),
+            ),
+        ];
+        for (name, value) in overrides {
+            match vars.iter_mut().find(|(seen, _)| seen == name) {
+                Some(item) => item.1 = (*value).map(str::to_owned),
+                None => vars.push(((*name).to_owned(), (*value).map(str::to_owned))),
+            }
+        }
+        vars
+    }
+
+    fn production_gate_from(
+        overrides: &[(&str, Option<&str>)],
+    ) -> Result<TestMigrationConfig, ControllerError> {
+        let vars = production_gate_env(overrides);
+        production_migration_config_from(|name| {
+            vars.iter()
+                .find(|(seen, _)| seen == name)
+                .and_then(|(_, value)| value.clone())
+        })
+    }
+
+    /// 所有门禁失败分支都塌缩到同一条固定去敏消息：既不含 DSN 任何片段，也不含库名或
+    /// 备份引用。
+    fn production_gate_error_is_fixed(message: &str) {
+        assert_eq!(
+            message, "configuration: production migration authorization required",
+            "门禁失败必须使用唯一固定文案"
+        );
+        for secret in [
+            "Fa1ePassw0rd",
+            "mysql://",
+            "db.invalid",
+            "3306",
+            "rsc_prod_ctl",
+            "/srv/backup/",
+            "FAKE-ref",
+        ] {
+            assert!(
+                !message.contains(secret),
+                "固定错误不得含 {secret}，实际：{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_migration_gate_rejects_every_incomplete_gate_set() {
+        // 完整门禁必须先被接受，否则下面的负例只是在测同一处笔误。
+        let config = production_gate_from(&[]).expect("完整门禁必须通过");
+        assert!(config.allow_destructive);
+        assert_eq!(config.expected_database, "rsc_prod_ctl");
+        for overrides in [
+            vec![("CONTROLLER_DATABASE_URL", None)],
+            vec![("CONTROLLER_DATABASE_URL", Some("   "))],
+            vec![("CONTROLLER_MIGRATION_ALLOW_DESTRUCTIVE", None)],
+            vec![("CONTROLLER_MIGRATION_ALLOW_DESTRUCTIVE", Some("0"))],
+            vec![("CONTROLLER_MIGRATION_ALLOW_DESTRUCTIVE", Some("true"))],
+            vec![("CONTROLLER_MIGRATION_EXPECTED_DATABASE", None)],
+            vec![("CONTROLLER_MIGRATION_EXPECTED_DATABASE", Some(""))],
+            vec![(
+                "CONTROLLER_MIGRATION_EXPECTED_DATABASE",
+                Some("rsc prod ctl"),
+            )],
+            vec![("CONTROLLER_MIGRATION_EXPECTED_DATABASE", Some("rsc`"))],
+            vec![(
+                "CONTROLLER_MIGRATION_EXPECTED_DATABASE",
+                Some("rsc_prod_ctl WITH INSERT INTO users"),
+            )],
+            vec![("CONTROLLER_MIGRATION_BACKUP_REF", None)],
+            vec![("CONTROLLER_MIGRATION_BACKUP_REF", Some(""))],
+            vec![("CONTROLLER_MIGRATION_BACKUP_REF", Some("   "))],
+            vec![("CONTROLLER_MIGRATION_ACK", None)],
+            vec![("CONTROLLER_MIGRATION_ACK", Some("isolated"))],
+            vec![(
+                "CONTROLLER_MIGRATION_ACK",
+                Some("ISOLATED-EXCLUSIVE-BACKED-UP-DISPOSABLE"),
+            )],
+            vec![
+                ("CONTROLLER_MIGRATION_ALLOW_DESTRUCTIVE", Some("0")),
+                ("CONTROLLER_MIGRATION_BACKUP_REF", None),
+            ],
+        ] {
+            let error = production_gate_from(&overrides).expect_err("不完整门禁必须拒绝");
+            production_gate_error_is_fixed(&error.to_string());
+        }
+    }
+
+    #[test]
+    fn production_gate_and_shared_authorizer_accept_the_same_ack() {
+        // 生产入口复用共享授权器，因此常量必须被它原样接受：两处字面量一旦漂移，
+        // 本用例即判红（生产入口不得悄悄拥有第二套更弱的确认语义）。
+        let config = TestMigrationConfig {
+            test_url: "mysql://svc:Fa1ePassw0rd@db.invalid:3306/rsc_prod_ctl".into(),
+            allow_destructive: true,
+            expected_database: "rsc_prod_ctl".into(),
+            backup_ref: "/srv/backup/FAKE-ref-hashes.sha256".into(),
+            migration_ack: MIGRATION_ACK_CONFIRMATION.into(),
+        };
+        authorize_test_migration(&config, "rsc_prod_ctl").expect("常量必须被共享授权器接受");
+        // 声明库名与真实连接返回的库名不一致仍然拒绝，且固定错误不回显任一名。
+        let message = authorize_test_migration(&config, "rsc_other_db")
+            .expect_err("库名不符必须拒绝")
+            .to_string();
+        assert!(
+            !message.contains("rsc_other_db") && !message.contains("rsc_prod_ctl"),
+            "固定错误不得含库名，实际：{message}"
+        );
+        // Debug 同样不得外泄 DSN、库名或备份引用。
+        let rendered = format!("{config:?}");
+        for secret in ["Fa1ePassw0rd", "rsc_prod_ctl", "/srv/backup/"] {
+            assert!(
+                !rendered.contains(secret),
+                "Debug 不得含 {secret}，实际：{rendered}"
+            );
+        }
     }
 
     #[test]

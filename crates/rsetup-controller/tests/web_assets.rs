@@ -770,9 +770,20 @@ fn rejects_missing_dist_directory() {
         err.contains("dist 目录不存在"),
         "错误说明应指出 dist 缺失，实际：{err}"
     );
+    // 下一步提示必须是本仓**唯一**的前端构建命令（`build/web_assets.rs::BUILD_HINT`）：
+    // 只断言含 "npm" 与 "run build" 会让旧的 pnpm 文案（`pnpm --filter … run build`）
+    // 一并蒙混过关，因此这里逐字钉住两条完整命令，并显式排除 pnpm。
     assert!(
-        err.contains("pnpm build"),
-        "错误说明应给出可执行的下一步（前端构建），实际：{err}"
+        err.contains("npm --prefix apps/controller-web ci"),
+        "错误说明应给出安装依赖的确切命令，实际：{err}"
+    );
+    assert!(
+        err.contains("npm --prefix apps/controller-web run build"),
+        "错误说明应给出构建前端的确切命令，实际：{err}"
+    );
+    assert!(
+        !err.to_lowercase().contains("pnpm"),
+        "错误说明不得再指向已弃用的 pnpm 工作流，实际：{err}"
     );
 }
 
@@ -2666,3 +2677,338 @@ async fn real_dist_build_is_served_byte_for_byte() {
     let res_post_spa = router.oneshot(req_post_spa).await.unwrap();
     assert_ne!(res_post_spa.status(), StatusCode::OK);
 }
+
+// ---------------------------------------------------------------------------
+// 2a. CSP 回归防护：真实 dist 入口不得有内联脚本 / 内联样式属性
+//
+// `web.rs::CSP_HTML` 的 `script-src 'self'` 与 `style-src 'self'` 只有在产物本身
+// 完全外联时才成立。本小节把这一前提钉成测试：真实构建一旦引入内联 `<script>`、
+// `<style>` 元素或 `style=` 属性，本用例立刻变红，提醒**显式评审**是否真的要
+// 放宽 CSP，并同时同步 `web.rs::CSP_HTML` 与本文件的 `SECURITY_CSP_HTML`。
+// ---------------------------------------------------------------------------
+
+/// 返回 HTML 中每一处以 `<name` 起始的标签头文本（到最近的 `>` 之前），已转小写。
+///
+/// `to_ascii_lowercase()` 不改变字节长度、只改 ASCII 字节，因此下标与原串一一对应；
+/// `needle` 是 ASCII，命中位置必落在字符边界上。
+fn tag_heads(html: &str, name: &str) -> Vec<String> {
+    let lower = html.to_ascii_lowercase();
+    let needle = format!("<{name}");
+    let mut heads = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(offset) = lower[cursor..].find(&needle) {
+        let start = cursor + offset;
+        let end = lower[start..]
+            .find('>')
+            .map(|index| start + index)
+            .unwrap_or(html.len());
+        heads.push(lower[start..end].to_string());
+        cursor = end;
+    }
+    heads
+}
+
+/// 找出 HTML 里作为**独立属性名**出现的 `style=`（属性名前一名须是空白、`<` 或引号），
+/// 避免把 `<link rel="stylesheet">` 之类误判成内联样式属性；返回命中的字节偏移。
+fn inline_style_attribute_offsets(html: &str) -> Vec<usize> {
+    let lower = html.to_ascii_lowercase();
+    let mut offsets = Vec::new();
+    for (offset, _) in lower.match_indices("style=") {
+        let at_attribute_boundary = offset.checked_sub(1).is_some_and(|previous| {
+            matches!(
+                lower.as_bytes()[previous],
+                b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'' | b'<'
+            )
+        });
+        if at_attribute_boundary {
+            offsets.push(offset);
+        }
+    }
+    offsets
+}
+
+#[test]
+fn real_dist_html_has_no_inline_script_or_style() {
+    let (html, references) = real_dist_references();
+
+    // 1. 每个 `<script` 标签都必须外联（带 `src=`）：内联脚本需要 `'unsafe-inline'`
+    //    或 nonce/hash，而本仓的 CSP 两者都不给。
+    let script_tags = tag_heads(&html, "script");
+    assert!(
+        !script_tags.is_empty(),
+        "真实 dist 入口必须引用脚本，否则本用例没有意义：{html}"
+    );
+    for tag in &script_tags {
+        assert!(
+            tag.contains("src="),
+            "真实 dist 入口出现内联 <script>（标签头没有 src=），与 CSP 的 \
+             `script-src 'self'` 冲突：{tag}"
+        );
+    }
+
+    // 2. 不得出现 `<style>` 元素：内联样式表同样需要 `style-src 'unsafe-inline'`。
+    let style_tags = tag_heads(&html, "style");
+    assert!(
+        style_tags.is_empty(),
+        "真实 dist 入口出现 <style> 元素，与 CSP 的 `style-src 'self'` 冲突：{style_tags:?}"
+    );
+
+    // 3. 不得出现 `style=` 内联属性（同样需要 `style-src 'unsafe-inline'`）。
+    let inline_styles = inline_style_attribute_offsets(&html);
+    assert!(
+        inline_styles.is_empty(),
+        "真实 dist 入口出现内联 style 属性，与 CSP 的 `style-src 'self'` 冲突：\
+         命中偏移 {inline_styles:?}，入口 HTML：{html}"
+    );
+
+    // 4. 产物侧全部外联成立，策略侧就不得再放开任何 inline 例外；本文件的预期串
+    //    与 `web.rs::CSP_HTML` 由 security_headers_on_html_assets_and_error_responses
+    //    逐字比对，这里只钉「不许出现 inline 例外」这一条方向。
+    for directive in ["script-src", "style-src"] {
+        assert!(
+            !SECURITY_CSP_HTML.contains("unsafe-inline"),
+            "`{directive}` 的产物侧证据是零内联，{SECURITY_CSP_HTML:?} 仍含 inline 例外"
+        );
+        assert!(
+            SECURITY_CSP_HTML.contains(&format!("{directive} 'self'")),
+            "`{directive}` 必须是 'self'，实际：{SECURITY_CSP_HTML:?}"
+        );
+    }
+    // 交付的样式确实只来自外部 CSS（外部 CSS 由 style-src 'self' 允许）。
+    assert!(
+        references
+            .iter()
+            .any(|reference| reference.ends_with(".css")),
+        "dist 入口应通过外部 CSS 引入样式，实际引用：{references:?}"
+    );
+}
+
+#[test]
+fn inline_script_or_style_detector_is_not_vacuous() {
+    // 自检：上面那条防护不得是恒真的。三种违规形态（内联脚本、`<style>` 元素、
+    // `style=` 属性）必须各自被检出，而真实 Vite 形态（外联 + 外链 CSS，含
+    // `rel="stylesheet"` 这种容易误判的拼写）必须零命中。
+    let violating = "<!doctype html><html><head><script>document.write(1)</script>\
+                     <style>body{margin:0}</style></head>\
+                     <body><div style=\"color:red\"></div></body></html>";
+    let scripts = tag_heads(violating, "script");
+    assert_eq!(scripts.len(), 1, "内联 <script> 必须被扫到：{scripts:?}");
+    assert!(
+        scripts.iter().all(|tag| !tag.contains("src=")),
+        "该样本里的 script 标签必须是无 src 的内联形态：{scripts:?}"
+    );
+    assert_eq!(tag_heads(violating, "style").len(), 1, "<style> 必须被扫到");
+    assert_eq!(
+        inline_style_attribute_offsets(violating),
+        vec![
+            violating
+                .to_ascii_lowercase()
+                .find("style=")
+                .expect("样本里必须有 style= 属性")
+        ],
+        "内联 style 属性必须被检出"
+    );
+
+    let compliant = "<!doctype html><script type=\"module\" crossorigin src=\"/assets/i-1.js\">\
+                     </script><link rel=\"stylesheet\" crossorigin href=\"/assets/i-2.css\">";
+    let scripts = tag_heads(compliant, "script");
+    assert_eq!(scripts.len(), 1);
+    assert!(
+        scripts.iter().all(|tag| tag.contains("src=")),
+        "外联脚本不得被判成内联：{scripts:?}"
+    );
+    assert!(tag_heads(compliant, "style").is_empty());
+    assert!(
+        inline_style_attribute_offsets(compliant).is_empty(),
+        "`rel=\"stylesheet\"` 不是内联 style 属性，不得误判"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3. L4 纵深防御：静态资产与 SPA 响应的安全响应头
+//
+// 预期源是 `web.rs` 的头契约（HTML 四项、非 HTML 与错误响应两项），走真实
+// `web_router()`（编译期嵌入的那一份 dist 构建），不引入第二套路由逻辑。
+// ---------------------------------------------------------------------------
+
+/// HTML 文档应有的 CSP（与 `web.rs::CSP_HTML` 逐字对齐，独立声明作为预期源）。
+///
+/// `style-src` 只有 `'self'`：当前构建产物的样式全部来自外部 CSS，脚本全部外联，
+/// 两侧都不需要 `'unsafe-inline'`。若产物真的引入内联样式而本常量被改回去，
+/// [`real_dist_html_has_no_inline_script_or_style`] 会先把产物侧的证据报红。
+const SECURITY_CSP_HTML: &str = "default-src 'self'; script-src 'self'; \
+                                 style-src 'self'; img-src 'self' data:; \
+                                 connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; \
+                                 form-action 'self'";
+
+/// 向 web 路由发一次空 body 请求，拿回完整响应（含头）。
+async fn web_request(router: &axum::Router, method: Method, uri: &str) -> axum::response::Response {
+    router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("web 路由不应产生服务错误")
+}
+
+/// 取响应头的字符串值（`None` = 该头不存在）。
+fn header_of(res: &axum::response::Response, name: &str) -> Option<String> {
+    res.headers()
+        .get(name)
+        .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
+}
+
+/// 断言响应头存在且取值逐字相等（带上下文，便于定位是哪个 URI 少了头）。
+fn assert_header(res: &axum::response::Response, uri: &str, name: &str, expected: &str) {
+    let actual = header_of(res, name)
+        .unwrap_or_else(|| panic!("{uri} 必须带响应头 {name}，实际头：{:?}", res.headers()));
+    assert_eq!(actual, expected, "{uri} 的 {name} 取值不符");
+}
+
+/// 断言响应头不存在（用于「CSP 只加给 HTML」这条边界）。
+fn assert_no_header(res: &axum::response::Response, uri: &str, name: &str) {
+    assert_eq!(
+        header_of(res, name),
+        None,
+        "{uri} 不是 HTML，不应带 {name}，实际：{:?}",
+        res.headers()
+    );
+}
+
+#[tokio::test]
+async fn security_headers_on_html_assets_and_error_responses() {
+    let router = rsetup_controller::web::web_router();
+    let (_html, references) = real_dist_references();
+    let asset_url = references
+        .iter()
+        .find(|reference| reference.ends_with(".js"))
+        .cloned()
+        .expect("真实 dist 入口必须引用 JS 资产");
+
+    // 1. SPA 页面（GET /）：200 + HTML 四个安全头全量，既有缓存/MIME 语义不变。
+    let res_page = web_request(&router, Method::GET, "/").await;
+    assert_eq!(res_page.status(), StatusCode::OK);
+    assert_header(&res_page, "/", "content-type", "text/html; charset=utf-8");
+    assert_header(&res_page, "/", "cache-control", "no-cache");
+    assert_header(&res_page, "/", "x-content-type-options", "nosniff");
+    assert_header(&res_page, "/", "referrer-policy", "no-referrer");
+    assert_header(&res_page, "/", "x-frame-options", "DENY");
+    assert_header(&res_page, "/", "content-security-policy", SECURITY_CSP_HTML);
+
+    // 2. 真实资产（GET）：nosniff + Referrer-Policy，但 CSP/X-Frame-Options 只给 HTML。
+    let res_asset = web_request(&router, Method::GET, &asset_url).await;
+    assert_eq!(res_asset.status(), StatusCode::OK, "GET {asset_url}");
+    assert_header(&res_asset, &asset_url, "x-content-type-options", "nosniff");
+    assert_header(&res_asset, &asset_url, "referrer-policy", "no-referrer");
+    assert_no_header(&res_asset, &asset_url, "content-security-policy");
+    assert_no_header(&res_asset, &asset_url, "x-frame-options");
+    // 加固不得改动资产自身的缓存与长度语义。
+    assert_header(
+        &res_asset,
+        &asset_url,
+        "cache-control",
+        "public, max-age=31536000, immutable",
+    );
+
+    // 3. HEAD：与 GET 同样的安全头，body 仍为空、Content-Length 仍是真实字节数。
+    let res_head_page = web_request(&router, Method::HEAD, "/").await;
+    assert_eq!(res_head_page.status(), StatusCode::OK);
+    assert_header(
+        &res_head_page,
+        "HEAD /",
+        "x-content-type-options",
+        "nosniff",
+    );
+    assert_header(&res_head_page, "HEAD /", "referrer-policy", "no-referrer");
+    assert_header(&res_head_page, "HEAD /", "x-frame-options", "DENY");
+    assert_header(
+        &res_head_page,
+        "HEAD /",
+        "content-security-policy",
+        SECURITY_CSP_HTML,
+    );
+    assert!(
+        to_bytes(res_head_page.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty(),
+        "HEAD / 响应不得带 body"
+    );
+
+    let res_head_asset = web_request(&router, Method::HEAD, &asset_url).await;
+    assert_eq!(res_head_asset.status(), StatusCode::OK);
+    assert_header(
+        &res_head_asset,
+        &format!("HEAD {asset_url}"),
+        "x-content-type-options",
+        "nosniff",
+    );
+    assert_header(
+        &res_head_asset,
+        &format!("HEAD {asset_url}"),
+        "referrer-policy",
+        "no-referrer",
+    );
+    assert_no_header(
+        &res_head_asset,
+        &format!("HEAD {asset_url}"),
+        "content-security-policy",
+    );
+    let on_disk = fs::read(real_dist_dir().join(asset_url.trim_start_matches('/')))
+        .expect("磁盘上应存在该资产");
+    assert_eq!(
+        header_of(&res_head_asset, "content-length").as_deref(),
+        Some(on_disk.len().to_string().as_str()),
+        "HEAD 的 Content-Length 必须仍是真实字节数"
+    );
+
+    // 4. 不存在的资产/未知页面路径：404 行为逐字节不变（坚决 404、绝不回退 HTML）。
+    //    实测这些路径**不匹配 `web_router` 的任何路由**，响应由 axum `Router` 的默认
+    //    404 服务产生（请求根本没进过 `serve_static`），因此当前**不可能**由 web 层给
+    //    它们加头。本用例锁定两条不变量（状态码 + 不回退 HTML）；web.rs 自己的错误
+    //    响应头契约由 `web::tests::error_responses_carry_base_headers_without_html_directives`
+    //    锁定，未匹配路径的头归属见文件末尾「已知边界」。
+    for uri in [
+        "/assets/does-not-exist-in-any-build.js",
+        "/api/v1/not-found",
+        "/nope",
+        "/admin/",
+        "/devices/1/2",
+    ] {
+        let res = web_request(&router, Method::GET, uri).await;
+        assert_eq!(
+            res.status(),
+            StatusCode::NOT_FOUND,
+            "GET {uri} 必须坚决 404"
+        );
+        assert!(
+            res.headers().get("content-type").is_none(),
+            "GET {uri} 不得被回退成 HTML 交付"
+        );
+    }
+
+    // 5. 非 GET/HEAD 命中白名单：405 由 web.rs 自己产出，必须带两个基础头，Allow 不变。
+    let res_post = web_request(&router, Method::POST, "/").await;
+    assert_eq!(res_post.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_header(&res_post, "POST /", "x-content-type-options", "nosniff");
+    assert_header(&res_post, "POST /", "referrer-policy", "no-referrer");
+    assert_header(&res_post, "POST /", "allow", "GET, HEAD");
+    assert_no_header(&res_post, "POST /", "content-security-policy");
+}
+
+// 已知边界（本测试刻意锁定的现状）：
+//
+// 第 4 段里的路径**不匹配 `web_router` 的任何路由**（含 `/admin/`、`/devices/1/2`
+// 这类「看起来在白名单附近」的拼写），响应由 axum `Router` 的默认 404 服务产生，
+// 裸 `web_router` 上实测零响应头——请求根本没进过 `web.rs::serve_static`，web 层
+// 无从给它加头。生产装配已在 `production.rs` 的 `compose_component_routers` 上挂
+// 统一后置头层，为这类响应补 `X-Content-Type-Options`/`Referrer-Policy`；该行为由
+// `production.rs` 与 `tests/production_composition.rs` 的 base_security_headers 测试
+// 锁定，本测试只覆盖**裸 web_router** 的边界，不能在 web_router 上注册全局 fallback
+// （会改变路由白名单与 404 语义）。web.rs 自己产出的错误响应（405 见第 5 段；
+// `not_found()` 见 `web.rs` 的单元测试，当前路由表下不可达）都已按同一契约带头。

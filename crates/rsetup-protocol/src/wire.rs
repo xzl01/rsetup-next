@@ -179,8 +179,11 @@ pub fn validate_packet(packet: &TunnelPacket) -> Result<(), WireError> {
 }
 
 // ====================================================================
-// 业务 DTO 契约（03 §2）：Rust 侧类型化业务载荷与无 codec 的 fail-closed 边界。
-// 本段只定义结构与校验，不预设任何字节格式（codec 未获批）。
+// 业务 DTO 契约（03 §2）：Rust 侧类型化业务载荷与 codec 边界。
+// 本段只定义结构与校验，不预设任何字节格式；字节格式由 `crate::codec` 实现。
+// 该 codec 已按项目所有者授权启用（见 [`approved_codec_witness`] 的性质说明），
+// 但外部评审证据（跨库固定测试向量、两进程互操作记录、库选型决定）尚未闭环，
+// 因此这里的「已启用」不等于「已通过外部审阅」。
 // ====================================================================
 
 // ---- 约束常量（03 §2 字段约束）----
@@ -684,28 +687,87 @@ pub fn validate_dto<T: BusinessMessage>(message: &T) -> Result<(), DtoError> {
     message.validate()
 }
 
-// ---- codec 边界：sealed trait + 不可伪造见证，无获批 codec 时 fail-closed ----
+// ---- codec 边界：sealed trait + 审批见证，无见证即 fail-closed ----
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum CodecError {
+    /// **只**表示「没有可用的获批 codec 见证」：`witness: None` 或 [`NoCodec`]。
+    /// DTO 校验失败、字节非法、超限等一律不得使用本变体——它表达的是部署/门禁
+    /// 层面「本次没有获批 codec」，与「这条请求自身的编码缺陷」必须可区分。
     #[error("business codec is not approved; decision record missing: {0}")]
     CodecUnapproved(&'static str),
-    #[error("unexpected trailing bytes: {0}")]
-    UnexpectedTrailingBytes(usize),
+    /// 字节流本身不合法（截断、非最短 varint、错误 wire type、长度越界、
+    /// 解码结果与声明的 `expected` kind 不一致等）。
+    /// 只携带固定的去敏原因标签，绝不回显 payload 内容。
+    #[error("malformed wire bytes: {0}")]
+    Malformed(&'static str),
+    /// schema 之外的字段号：首版不做 unknown-field 保留，直接拒绝。
+    #[error("unknown field number: {0}")]
+    UnknownField(u32),
+    /// singular / optional 字段出现第二次：canonical 编码不可能产生。
+    #[error("duplicate field number: {0}")]
+    DuplicateField(u32),
+    /// 规格明确要求 presence 的字段缺失（如顶层 `schema_version`）。
+    #[error("missing required field: {0}")]
+    MissingField(&'static str),
+    /// `string` 字段不是合法的 UTF-8。
+    #[error("string field is not valid UTF-8")]
+    InvalidUtf8,
+    /// **仅**表示消息（含嵌套子消息）字节数超过 512 KiB 整包上限；
+    /// 集合条目数量上限另见 [`CodecError::TooManyMetrics`]。
+    #[error("message exceeds the whole-message size limit")]
+    LengthLimit,
+    /// 重复字段 `metrics` 的条目数超过契约上限（`MAX_METRICS` = 128）。
+    /// 这是独立的**资源数量**约束：与整包长度无关（129 条完整合法的 metric
+    /// 远不到 512 KiB），不得与 512 KiB 长度上限混成同一个错误。
+    #[error("too many metrics entries (contract limit exceeded)")]
+    TooManyMetrics,
+    /// `schema_version` 不受支持：这是可协商的**版本**错误，上层应据此回「版本/能力
+    /// 不支持」（1001）而不是「参数非法」（1003）；取值只带版本号，不带 payload 内容。
+    #[error("unsupported business schema version: {0}")]
+    UnsupportedSchemaVersion(u32),
+    /// 结构解码成功但 DTO 自校验不通过；只带固定去敏标签，不回显取值。
+    /// 版本不受支持不属于本变体，见 [`CodecError::UnsupportedSchemaVersion`]。
+    #[error("decoded payload rejected by DTO contract: {0}")]
+    InvalidDto(&'static str),
 }
 
-mod sealed {
+pub(crate) mod sealed {
     pub trait Sealed {}
     impl Sealed for super::NoCodec {}
 }
 
-/// 不可伪造的审批见证类型：私有内部字段且无公开构造函数，
-/// 杜绝第三方通过公共 `is_approved()` 虚方法绕过未批准 codec。
+/// 审批见证类型：内部字段 `_private` 是私有的，crate 外部**无法直接写出这个结构体
+/// 字面量**；但 [`approved_codec_witness`] 是 `pub` 函数，任何依赖方都能调用它拿到
+/// 合法实例——所以它不是密码学凭证，也不提供跨 crate 的「不可伪造」保证。
+/// 真正阻止外部接入自制 codec 的是 [`Codec`] 的 sealed 约束（`sealed::Sealed` 是
+/// `pub(crate)`，crate 外无法实现）。本类型的作用只有一个：编解码入口必须显式携带它，
+/// 因而不存在「没有见证也能编解码」的代码路径。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ApprovedCodecWitness {
     _private: (),
 }
 
-/// 只负责 bytes <-> DTO；为 sealed trait 且要求提供不可伪造的见证实例。
+/// 产出「业务 codec 已获授权」的见证实例。
+///
+/// 授权性质（务必如实理解，不要当成外部评审结论）：
+/// * 这是**项目所有者于 2026-10-22 的明确授权**，直接启用
+///   [`crate::codec::BusinessCodec`]（手写 proto3 canonical 编解码）；
+/// * **不是**外部专家决议，也不构成对 03 规格「待审阅」状态的批准；
+/// * 生产启用后仍须补齐三类证据：与本仓实现无关的**跨库固定测试向量**、
+///   **两进程互操作**记录（板端 ↔ 中控，或与其他 Protobuf 实现互通）、
+///   以及最终的**库选型**决定（继续手写实现或改用经过 fuzz 的成熟库）。
+///
+/// 能力边界（不要高估）：本函数是 `pub`，因此**任何依赖方都能调用它拿到见证**；
+/// 见证的私有字段只保证外部无法绕过本函数手工拼出类型值，不构成防伪能力。
+/// 真正让外部自制 codec 接不进来的是 [`Codec`] 为 sealed trait 这一事实。
+/// 「无见证」（`witness: None`）与 [`NoCodec`] 两条 fail-closed 路径语义保持不变。
+pub fn approved_codec_witness() -> ApprovedCodecWitness {
+    ApprovedCodecWitness { _private: () }
+}
+
+/// 只负责 bytes <-> DTO。本 trait 是 sealed trait（`sealed::Sealed` 为 `pub(crate)`），
+/// crate 外无法实现，因此外部自制 codec 接不进来；两个方法都要求显式提供
+/// [`ApprovedCodecWitness`]，没有见证就没有编解码。
 pub trait Codec: sealed::Sealed {
     fn encode(
         &self,
@@ -752,12 +814,13 @@ pub fn validate_status_budget(bytes_hint: usize) -> Result<(), DtoError> {
     Ok(())
 }
 
-/// 编码前置：DTO 必须自校验通过，且必须携带不可伪造的获批 codec 见证。
+/// 编码前置：DTO 必须自校验通过，且必须携带获批 codec 见证。
 ///
-/// 语义说明：`CodecUnapproved` 在此兼表「无获批 codec 见证」与「DTO 本身不合法」
-/// 两种拒绝原因；两者的共同效果都是**原始字节不得被当作有效业务消息接受**，
-/// 这正是 fail-closed 的要求。没有有效 `ApprovedCodecWitness` 时，任何外部自制
-/// codec 均无法接入编解码。
+/// 错误分类：[`CodecError::CodecUnapproved`] **只**表示「本次没有获批 codec 见证」
+/// （`witness: None` 或 [`NoCodec`]）；DTO 自校验失败经
+/// [`crate::codec::dto_rejected`] 映射为 [`CodecError::UnsupportedSchemaVersion`]
+/// （版本不受支持）或 [`CodecError::InvalidDto`]（其余契约违规），
+/// 二者都是这条消息自身的缺陷，不是门禁状态。
 pub fn encode_business(
     codec: &dyn Codec,
     witness: Option<&ApprovedCodecWitness>,
@@ -765,7 +828,7 @@ pub fn encode_business(
 ) -> Result<Vec<u8>, CodecError> {
     message
         .validate()
-        .map_err(|_| CodecError::CodecUnapproved("invalid business payload"))?;
+        .map_err(|error| crate::codec::dto_rejected(&error))?;
     let witness = witness.ok_or(CodecError::CodecUnapproved("no approved business codec"))?;
     codec.encode(witness, message)
 }
@@ -773,10 +836,10 @@ pub fn encode_business(
 /// 解码前置：先做见证守卫，**在触碰 bytes 之前**失败关闭；解码结果还必须
 /// 与 `expected` 形状一致并再次自校验通过。
 ///
-/// 语义说明：`CodecUnapproved` 在此兼表「无获批 codec 见证」与「DTO 本身不合法」
-/// 两种拒绝原因；两者的共同效果都是**原始字节不得被当作有效业务消息接受**，
-/// 这正是 fail-closed 的要求。没有有效 `ApprovedCodecWitness` 时，任何外部自制
-/// codec 均无法接入解码。
+/// 错误分类同 [`encode_business`]：见证缺失 → [`CodecError::CodecUnapproved`]；
+/// 形状（kind）不符 → `CodecError::Malformed("payload kind mismatch")`（这是
+/// 「字节被按错误类型解释」，与尾部多余字节无关）；DTO 校验失败 →
+/// [`crate::codec::dto_rejected`] 的映射结果。
 pub fn decode_business(
     codec: &dyn Codec,
     witness: Option<&ApprovedCodecWitness>,
@@ -786,11 +849,11 @@ pub fn decode_business(
     let witness = witness.ok_or(CodecError::CodecUnapproved("no approved business codec"))?;
     let decoded = codec.decode(witness, expected, bytes)?;
     if decoded.kind() != expected {
-        return Err(CodecError::UnexpectedTrailingBytes(0));
+        return Err(CodecError::Malformed("payload kind mismatch"));
     }
     decoded
         .validate()
-        .map_err(|_| CodecError::CodecUnapproved("invalid business payload"))?;
+        .map_err(|error| crate::codec::dto_rejected(&error))?;
     Ok(decoded)
 }
 
@@ -816,4 +879,126 @@ pub fn is_canonical_uuid_v4(value: &str) -> bool {
     }
     // 版本位必须是 4；variant 位必须是 8/9/a/b
     bytes[14] == b'4' && matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
+}
+
+#[cfg(test)]
+mod codec_error_classification_tests {
+    use super::*;
+
+    const UUID: &str = "6f8b1c2d-0000-4000-8000-000000000001";
+
+    /// 只能在 crate 内实现的「越权 codec」：`sealed::Sealed` 是 `pub(crate)`，
+    /// crate 外无法复制它，因此它专门用来验证 `decode_business` 对 codec 输出的
+    /// 二次守卫（形状不符、DTO 再校验）返回哪个 `CodecError` 变体。
+    struct RogueCodec {
+        returns: BusinessPayload,
+    }
+
+    impl sealed::Sealed for RogueCodec {}
+
+    impl Codec for RogueCodec {
+        fn encode(
+            &self,
+            _witness: &ApprovedCodecWitness,
+            _message: &BusinessPayload,
+        ) -> Result<Vec<u8>, CodecError> {
+            Ok(Vec::new())
+        }
+
+        fn decode(
+            &self,
+            _witness: &ApprovedCodecWitness,
+            _expected: BusinessPayloadKind,
+            _bytes: &[u8],
+        ) -> Result<BusinessPayload, CodecError> {
+            Ok(self.returns.clone())
+        }
+    }
+
+    fn decode_with(returns: BusinessPayload, expected: BusinessPayloadKind) -> CodecError {
+        let codec = RogueCodec { returns };
+        decode_business(
+            &codec,
+            Some(&approved_codec_witness()),
+            expected,
+            b"ignored-by-rogue-codec",
+        )
+        .expect_err("越权 codec 必须被守卫拒绝")
+    }
+
+    /// 形状不符必须是 `Malformed("payload kind mismatch")`：既不是门禁错误，
+    /// 也不得再借用已删除的「尾部多余字节」变体。
+    #[test]
+    fn payload_kind_mismatch_is_malformed() {
+        let wrong_kind = BusinessPayload::TaskQuery(TaskQuery {
+            schema_version: BUSINESS_SCHEMA_VERSION,
+            sub_task_id: UUID.to_string(),
+        });
+        assert_eq!(
+            decode_with(wrong_kind, BusinessPayloadKind::Query),
+            CodecError::Malformed("payload kind mismatch")
+        );
+    }
+
+    /// DTO 版本不受支持必须是可协商的 `UnsupportedSchemaVersion`，
+    /// 不得再伪装成「codec 未获批」的门禁语义。
+    #[test]
+    fn unsupported_version_is_not_reported_as_unapproved() {
+        assert_eq!(
+            decode_with(
+                BusinessPayload::TaskQuery(TaskQuery {
+                    schema_version: 7,
+                    sub_task_id: UUID.to_string(),
+                }),
+                BusinessPayloadKind::TaskQuery,
+            ),
+            CodecError::UnsupportedSchemaVersion(7)
+        );
+        assert_eq!(
+            encode_business(
+                &NoCodec,
+                Some(&approved_codec_witness()),
+                &BusinessPayload::Query(Query { schema_version: 7 }),
+            ),
+            Err(CodecError::UnsupportedSchemaVersion(7))
+        );
+    }
+
+    /// 其余 DTO 违规 → 固定去敏的 `InvalidDto` 标签；只有「没有见证」才是
+    /// `CodecUnapproved`。
+    #[test]
+    fn dto_violations_stay_invalid_dto_and_only_witness_is_unapproved() {
+        assert_eq!(
+            decode_with(
+                BusinessPayload::TaskQuery(TaskQuery {
+                    schema_version: BUSINESS_SCHEMA_VERSION,
+                    sub_task_id: "not-a-uuid".to_string(),
+                }),
+                BusinessPayloadKind::TaskQuery,
+            ),
+            CodecError::InvalidDto("invalid_uuid")
+        );
+        assert_eq!(
+            encode_business(
+                &NoCodec,
+                Some(&approved_codec_witness()),
+                &BusinessPayload::TaskQuery(TaskQuery {
+                    schema_version: BUSINESS_SCHEMA_VERSION,
+                    sub_task_id: "not-a-uuid".to_string(),
+                }),
+            ),
+            Err(CodecError::InvalidDto("invalid_uuid"))
+        );
+        // DTO 合法、仅缺见证 → 仍是唯一的门禁错误
+        assert_eq!(
+            encode_business(
+                &NoCodec,
+                None,
+                &BusinessPayload::Query(Query {
+                    schema_version: BUSINESS_SCHEMA_VERSION,
+                }),
+            ),
+            Err(CodecError::CodecUnapproved("no approved business codec"))
+        );
+    }
 }

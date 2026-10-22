@@ -1,15 +1,16 @@
 //! 中控进程唯一入口（集成验收 Task 0b：全量 typed 生产装配）。
 //!
 //! 唯一构造点：单一 `DbPool` → 单一 `Arc<HttpAuthState>` → auth/management/tasks/
-//! status/web 五线共享同一认证上下文（session 预过滤、CSRF 绑定表与限速桶跨端点
-//! 互相可见），再经 [`build_production_router`] 合并成唯一顶层 router。
+//! status/events 五条使用会话认证的线共享同一认证上下文（session 预过滤、CSRF
+//! 绑定表与限速桶跨端点互相可见），metrics 是独立 Basic 认证边界，web 为静态资源线；
+//! 七线再经 [`build_production_router`] 合并成唯一顶层 router。
 //! 本入口不构造测试网关、`connect_lazy` 占位池、固定 offline/空能力或 authz
 //! epoch 0，也不构造任何返回伪造取值的常量源；尚未交付的 transport 线三个源以
 //! **读取即失败**的 fail-closed 装配位接入（见 [`UnwiredTransportSources`]）。
 
 use std::sync::Arc;
 
-use rsetup_controller::api::adapters::build_sqlx_management_state;
+use rsetup_controller::api::adapters::build_sqlx_management_state_with_events;
 use rsetup_controller::api::approvals::ManagementNotificationSink;
 use rsetup_controller::api::devices::{DeviceLiveProbe, DeviceLiveView};
 use rsetup_controller::api::system::{RecoveryModeProbe, RecoveryView};
@@ -18,11 +19,13 @@ use rsetup_controller::api::{
 };
 use rsetup_controller::auth::service::AuthService;
 use rsetup_controller::auth::sqlx_repo::SqlxIdentityRepository;
-use rsetup_controller::authz::sqlx_repo::SqlxAuthorizationSnapshotRepository;
+use rsetup_controller::authz::sqlx_repo::{
+    AuthorizationSnapshotRepository, SqlxAuthorizationSnapshotRepository,
+};
 use rsetup_controller::devices::service::AdmissionChangeEvent;
 use rsetup_controller::events::EventBus;
 use rsetup_controller::http_auth::{AppState, HttpAuthState};
-use rsetup_controller::http_device_status::DeviceStatusState;
+use rsetup_controller::http_device_status::{DeviceStatusState, SnapshotDeviceStatusAuthorizer};
 use rsetup_controller::http_events::EventsState;
 use rsetup_controller::http_live::LiveAuth;
 use rsetup_controller::http_security::HttpSecurityConfig;
@@ -74,7 +77,7 @@ impl BootstrapSecretSink for LogSecretSink {
 /// 去敏 `Config` 是契约内的正确失败形态，绝不返回伪造的 `Offline`、空能力或
 /// `ready = true`，也绝不返回 `Ok(())` 假装通知已入队。
 ///
-/// 真实适配器交付后，只需在此处替换为 transport 的实现，五线装配拓扑不变。
+/// 真实适配器交付后，只需在此处替换为 transport 的实现，七线装配拓扑不变。
 struct UnwiredTransportSources;
 
 impl DeviceLiveProbe for UnwiredTransportSources {
@@ -113,7 +116,7 @@ impl ManagementNotificationSink for UnwiredTransportSources {
 /// 唯一被启动期消费的入口是 [`BoardClient::task_record`]（见 `recover_process` 阶段 2）：
 /// 返回 `Err(DeviceOffline)` 经 `query_board_task_record` 记为「未核验」outcome 但**绝不**
 /// 让恢复上抛失败，`queued` 子任务仍按不可信期限保守置 `held`。真实适配器交付后只需替换
-/// 本结构，`recover_process` 的三阶段编排与五线装配拓扑不变。
+/// 本结构，`recover_process` 的三阶段编排与七线装配拓扑不变。
 struct UnwiredBoardClient;
 
 impl BoardClient for UnwiredBoardClient {
@@ -207,10 +210,12 @@ fn production_inputs(
         HttpSecurityConfig::from_env()?,
     ));
 
-    // 事件总线：进程内唯一通道句柄（broadcast 容量 128）。SSE 读线与未来的
-    // 业务发布方共享同一个句柄；本切片只交付发布/订阅基础设施本身，尚无业务
-    // 发布方接线，因此事件流上真实出现的只有心跳与总线自身产生的 reset，
-    // 不伪造任何 device/task/permissions/time 事件。
+    // 事件总线：进程内唯一通道句柄（broadcast 容量 128）。SSE 读线与各条业务发布方
+    // 共享同一个句柄（`Clone` 不新建通道）：任务线在任务状态变化时投 `task.updated`，
+    // 管理线在授权变更成功时投 `permissions.changed`、并暴露
+    // `SystemApiState::publish_system_time_changed` 作为时间证据变化的发布入口
+    // （时间采样侧尚未调用它，因此当前不会有时间事件）。
+    // 除这些真实变化外，事件流上只会出现心跳与总线自身产生的 reset，不伪造任何事件。
     let events = EventsState {
         auth: auth.clone(),
         bus: EventBus::new(),
@@ -219,25 +224,33 @@ fn production_inputs(
     };
 
     let transport = Arc::new(UnwiredTransportSources);
-    let management = build_sqlx_management_state(
+    let management = build_sqlx_management_state_with_events(
         db.clone(),
         auth.clone(),
         transport.clone(),
         transport.clone(),
         transport,
+        Some(events.bus.clone()),
     );
+
+    // 授权快照仓储：任务线与设备状态读线共用同一个只读快照入口（同一个 DbPool，
+    // 不各建一份池），设备状态线的 `device.status.read` 判定只能经它求值。
+    let authz_snapshots = Arc::new(SqlxAuthorizationSnapshotRepository::new(db.clone()));
+    // 显式向上转型：状态线的授权器只依赖只读快照接口，不依赖 Sqlx 具体类型。
+    let status_snapshots: Arc<dyn AuthorizationSnapshotRepository> = authz_snapshots.clone();
 
     let tasks = HttpTasksState {
         api: Arc::new(SqlxTaskApi::with_time_source(
             Arc::new(TaskService::new(SqlxTaskRepository::new(db.0.clone()))),
             Arc::new(SqlxTaskRepository::new(db.0.clone())),
-            Arc::new(SqlxAuthorizationSnapshotRepository::new(db.clone())),
+            Arc::clone(&authz_snapshots),
             cursor_secret,
             // 与启动门禁同一个句柄：submit 的创建证据与 time_review 的比对时钟都由它
             // 的当前快照给出（NTP 成功即被业务消费，失联/超龄即回到不可信）。
             task_time_source(time_gate),
         )),
         auth: auth.clone(),
+        events: Some(events.bus.clone()),
     };
 
     Ok(ProductionInputs {
@@ -258,6 +271,10 @@ fn production_inputs(
             // 都必须先由认证连接管理器 confirm_generation，未确认代际的 update 一律
             // NoActiveGeneration 拒绝（代际不由样本自行建立）。
             snapshot: Arc::new(SnapshotStore::new()),
+            // H1：`device.status.read` 的对象级授权判定（02 §5 + 01 §4/A-06）。
+            // 与任务线共用同一个授权快照仓储；缓存有无样本都不改变该判定，
+            // 因此无样本不再可能像此前那样被任何已登录用户读到。
+            authorizer: Arc::new(SnapshotDeviceStatusAuthorizer::new(status_snapshots)),
         },
         metrics: MetricsLineInputs {
             config: metrics_config,

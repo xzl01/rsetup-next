@@ -158,14 +158,15 @@ fn known_actions_with_unapproved_raw_bytes_fail_closed() {
     let peer = PeerContext {
         authenticated_controller_key: [1u8; 32],
     };
-    // 无获批 codec：即使 action 合法，也不得把原始字节当作业务消息接受
+    // 无获批 codec：即使 action 合法，也不得把原始字节当作业务消息接受；
+    // 这是本端部署/门禁故障，映射 1009 INTERNAL_ERROR，不冒充对端版本不匹配。
     assert_eq!(
         agent.handle_wire(&NoCodec, &peer, "device.task.get", b"not_valid_query"),
-        Err(BusinessStatus::UnsupportedVersion)
+        Err(BusinessStatus::InternalError)
     );
     assert_eq!(
         agent.handle_wire(&NoCodec, &peer, "device.status.get", &[]),
-        Err(BusinessStatus::UnsupportedVersion)
+        Err(BusinessStatus::InternalError)
     );
     assert_eq!(agent.source().mutation_calls(), 0);
 }

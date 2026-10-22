@@ -25,8 +25,19 @@
 //! → ②[`require_business_session`]（临时密码一律 403 `PASSWORD_CHANGE_REQUIRED`，
 //! admin 同样，不要求 `is_admin`）→ ③路径提取（以 `Result<Path<String>,
 //! PathRejection>` 值接收，任何路径提取失败**绝不**先于两个门禁短路，统一在
-//! 门禁后映射 400 `INVALID_ARGUMENT`）与 ID 严格解析 → ④读真实缓存快照
-//! → ⑤统一错误映射。不新增业务 permission。
+//! 门禁后映射 400 `INVALID_ARGUMENT`）与 ID 严格解析 → ④[`DeviceStatusAuthorizer`]
+//! **对象级授权判定**（`device.status.read`）
+//! → ⑤读真实缓存快照 → ⑥统一错误映射。本模块不新增业务 permission，只消费
+//! 01 §4 既有的 `device.status.read`。
+//!
+//! 授权契约（H1；02 §5「`GET /devices/{id}/status` … `device.status.read`，
+//! 只缓存」+ 01 §4 A-04「有 reboot 但无 status/read 不能读取完整状态」
+//! \+ 01 A-06「不可见与不存在统一 404」）：路径解析成功后、读缓存**之前**，
+//! 必须经 [`DeviceStatusState::authorizer`] 做设备级三态判定（见
+//! [`DeviceStatusAccess`]）。授权与存在性求值恒在**同一只读授权快照**上完成
+//! （[`SnapshotDeviceStatusAuthorizer`]），handler 不拼 SQL、不自建第二套
+//! grant/role/group 语义，也不因缓存 `snapshot` 为空而跳过判定——缓存里有没有
+//! 样本，都不改变「谁能看见这台设备的状态」这一事实。
 
 use std::future::Future;
 use std::pin::Pin;
@@ -46,6 +57,10 @@ use uuid::Uuid;
 
 use crate::ControllerError;
 use crate::api::{map_error, parse_device_id_path};
+use crate::auth::service::Session;
+use crate::authz::policy::Permission;
+use crate::authz::service::snapshot_effective_permissions;
+use crate::authz::sqlx_repo::{AuthorizationSnapshot, AuthorizationSnapshotRepository};
 use crate::http_api::{err_response, ok_response};
 use crate::http_auth::{EndpointId, HttpAuthState};
 use crate::http_gate::authenticate_read;
@@ -53,15 +68,20 @@ use crate::model::decimal_u64_json;
 use crate::tasks::http::require_business_session;
 use crate::time::evidence::{TimeEvidence, TimeQuality};
 
-/// 设备状态读路由的显式状态：共享认证上下文 + 真实缓存状态源。
+/// 设备状态读路由的显式状态：共享认证上下文 + 真实缓存状态源 + 对象级授权器。
 ///
 /// `auth` 必须与 auth/management/tasks 三线来自**同一个** `Arc<HttpAuthState>`
 /// （共享 session/CSRF/限流上下文），由 `build_production_router` 以
 /// `Arc::ptr_eq` 强制校验。
+///
+/// `authorizer` 是 `device.status.read` 的唯一判定入口（H1）：三条线共用认证
+/// 上下文，但**不**共用授权判定，缺失该字段即无法编译，装配方无法再次漏掉
+/// 设备级鉴权。
 #[derive(Clone)]
 pub struct DeviceStatusState {
     pub auth: Arc<HttpAuthState>,
     pub snapshot: Arc<dyn DeviceStatusSnapshotSource>,
+    pub authorizer: Arc<dyn DeviceStatusAuthorizer>,
 }
 
 impl FromRef<DeviceStatusState> for Arc<HttpAuthState> {
@@ -128,6 +148,105 @@ impl DeviceStatusSnapshotSource for EmptyDeviceStatusSnapshotSource {
     }
 }
 
+/// `GET /api/v1/devices/{id}/status` 的对象级授权三态（01 §4 权限点 + A-06）。
+///
+/// 三态的**唯一** HTTP 映射写在 [`get_device_status`]：`Allowed` 继续读缓存；
+/// `Forbidden` → 403 `PERMISSION_DENIED`；`NotFound` → 404 `NOT_FOUND`。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceStatusAccess {
+    /// 设备存在且未归档，且有效权限集含 `device.status.read`：允许读状态缓存。
+    Allowed,
+    /// 设备存在且未归档，有效权限集非空但**不含** `device.status.read`（01 §4
+    /// A-04：只有 `device.reboot` 或只有 `device.read` 都不构成读完整状态的授权）。
+    Forbidden,
+    /// 设备缺失或已归档，**或**有效权限集为空（对该设备完全不可见）：与「不存在」
+    /// 不可区分地返回 404，不泄露设备是否存在（01 A-06）。
+    NotFound,
+}
+
+/// 设备状态读的对象级授权判定。
+///
+/// 生产实现 [`SnapshotDeviceStatusAuthorizer`]；测试注入同 trait 的 fake，不连
+/// 任何数据库。实现必须**只读**授权快照，不得触发采集/执行，也不得因状态缓存
+/// 是否有样本而改变结论。
+pub trait DeviceStatusAuthorizer: Send + Sync {
+    /// 以已认证 `actor` 的身份判定其对 `device_id` 的状态读权限。
+    ///
+    /// 返回 `Err` 时 handler 一律走 [`map_error`] 统一映射，**绝不**降级放行，也不
+    /// 因错误种类改写状态码语义：
+    /// - 授权后端不可用（连接/解码/事务失败）→ 由 `map_error` 映射（503）。
+    /// - `actor` 用户行缺失时 [`AuthorizationSnapshotRepository::load_snapshot`] 返回
+    ///   `ControllerError::PermissionDenied` → `map_error` 映射为 **403**（不降级 200，
+    ///   也不折叠成 404）。正常路径下这类 actor 早已在 ①`authenticate` 处被拒（会话
+    ///   绑定的用户不存在即认证失败 401），因此该分支实际不可达；一旦出现（例如认证
+    ///   与授权之间用户行被删除）它就是 403，本组件不为其另造投影。
+    fn authorize<'a>(
+        &'a self,
+        actor: &'a Session,
+        device_id: &'a [u8; 32],
+    ) -> DeviceStatusFuture<'a, DeviceStatusAccess>;
+}
+
+/// 生产授权器：在**同一只读授权快照**上同时求值设备存在性与有效权限集。
+///
+/// 复用授权唯一真源 [`AuthorizationSnapshotRepository::load_snapshot`] 与
+/// [`snapshot_effective_permissions`]（admin shortcut、archived/missing、
+/// actor 生命周期与 grant/role/group 语义全部沿用），本类型不写第二套策略、
+/// 不拼 SQL。
+pub struct SnapshotDeviceStatusAuthorizer {
+    snapshots: Arc<dyn AuthorizationSnapshotRepository>,
+}
+
+impl SnapshotDeviceStatusAuthorizer {
+    pub fn new(snapshots: Arc<dyn AuthorizationSnapshotRepository>) -> Self {
+        Self { snapshots }
+    }
+}
+
+impl DeviceStatusAuthorizer for SnapshotDeviceStatusAuthorizer {
+    fn authorize<'a>(
+        &'a self,
+        actor: &'a Session,
+        device_id: &'a [u8; 32],
+    ) -> DeviceStatusFuture<'a, DeviceStatusAccess> {
+        Box::pin(async move {
+            let snapshot = self
+                .snapshots
+                .load_snapshot(actor.user.id, std::slice::from_ref(device_id))
+                .await?;
+            Ok(evaluate_device_status_access(&snapshot, *device_id))
+        })
+    }
+}
+
+/// 三态求值纯函数：设备存在性（missing/archived）与有效权限集在同一个
+/// `snapshot` 上求值，无副作用、可脱离 DB 单测。
+///
+/// 求值顺序固定：先看设备（缺失/已归档一律 `NotFound`，不进入权限求值），再看
+/// 有效权限集（空集 = 完全不可见 = `NotFound`；含 `DeviceStatusRead` = `Allowed`；
+/// 其余非空 = `Forbidden`）。actor `!active`/`must_change_password` 由
+/// [`snapshot_effective_permissions`] 恒给出空集，因此同样落 `NotFound`（fail-closed）。
+fn evaluate_device_status_access(
+    snapshot: &AuthorizationSnapshot,
+    device_id: [u8; 32],
+) -> DeviceStatusAccess {
+    if !snapshot
+        .devices
+        .get(&device_id)
+        .is_some_and(|device| !device.archived)
+    {
+        return DeviceStatusAccess::NotFound;
+    }
+    let effective = snapshot_effective_permissions(snapshot, device_id);
+    if effective.contains(&Permission::DeviceStatusRead) {
+        DeviceStatusAccess::Allowed
+    } else if effective.is_empty() {
+        DeviceStatusAccess::NotFound
+    } else {
+        DeviceStatusAccess::Forbidden
+    }
+}
+
 /// 设备状态读子路由：恰 1 条端点。
 pub fn build_device_status_router(state: DeviceStatusState) -> Router<()> {
     Router::new()
@@ -141,6 +260,13 @@ pub fn build_device_status_router(state: DeviceStatusState) -> Router<()> {
 /// 不再自动短路成纯文本 400，`authenticate_read` 与
 /// [`require_business_session`] 恒先于任何路径解析执行；门禁通过后的提取失败
 /// 统一映射 400 `INVALID_ARGUMENT` 信封。
+///
+/// 授权判定（H1）恒在路径解析之后、读缓存**之前**：`Forbidden` 403
+/// `PERMISSION_DENIED`、`NotFound` 404 `NOT_FOUND`（不可见与不存在统一投影），
+/// 授权后端错误走 [`map_error`]（连接/解码/事务失败 503；`load_snapshot` 的
+/// actor 行缺失 `PermissionDenied` 为 403，见 [`DeviceStatusAuthorizer::authorize`]），
+/// 一律不降级 200。判定只看会话身份与设备，**不因状态缓存
+/// 为空而短路**——无样本同样必须通过授权才可能拿到 200。
 async fn get_device_status(
     State(state): State<DeviceStatusState>,
     path: Result<Path<String>, PathRejection>,
@@ -161,6 +287,15 @@ async fn get_device_status(
         Ok(id) => id,
         Err(response) => return response,
     };
+    match state.authorizer.authorize(&actor, &id).await {
+        Ok(DeviceStatusAccess::Allowed) => {}
+        // 设备在册但无 device.status.read：403，绝不读缓存。
+        Ok(DeviceStatusAccess::Forbidden) => return map_error(ControllerError::PermissionDenied),
+        // 缺失/已归档/完全不可见：与不存在同投影 404。
+        Ok(DeviceStatusAccess::NotFound) => return map_error(ControllerError::NotFound),
+        // 授权后端失败不降级：统一映射（后端不可用 503 / actor 行缺失 403），绝不返回 200 或 unknown。
+        Err(error) => return map_error(error),
+    }
     let entry = match state.snapshot.snapshot(&id).await {
         Ok(entry) => entry,
         Err(error) => return map_error(error),
@@ -267,11 +402,18 @@ mod tests {
     use super::*;
     use crate::auth::service::{IdentityUser, Login, Session, SessionPage};
     use crate::auth::session::token_digest;
+    use crate::authz::policy::{GrantRecord, GrantScope, GrantSource, SnapshotActor};
+    use crate::authz::sqlx_repo::{
+        AuthorizationSnapshot, AuthorizationSnapshotRepository, RepoFuture,
+    };
+    use crate::devices::repository::DeviceAdminView;
     use crate::http_auth::{AuthFuture, AuthServiceApi, SessionAuthority};
     use crate::http_security::HttpSecurityConfig;
+    use crate::model::{AdmissionState, ReviewDecision};
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use chrono::TimeZone;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tower::ServiceExt;
@@ -281,6 +423,23 @@ mod tests {
     /// 合法设备 ID 形状（64 位小写 hex），只在门禁之后才会被解析。
     const DEVICE_PATH: &str =
         "/api/v1/devices/0000000000000000000000000000000000000000000000000000000000000001/status";
+    /// [`DEVICE_PATH`] 解析后的 32B 设备 ID（授权判定必须以此为目标）。
+    const DEVICE_ID: [u8; 32] = {
+        let mut id = [0u8; 32];
+        id[31] = 1;
+        id
+    };
+    /// [`fixture_session`] 的用户 ID：授权快照的 actor 与 grant 归属都用它。
+    const ACTOR_ID: [u8; 16] = [7u8; 16];
+    /// 第二台在册设备的合法 ID 形状：用于证明 grant 的 scope 只对目标设备成立。
+    const OTHER_DEVICE_PATH: &str =
+        "/api/v1/devices/0000000000000000000000000000000000000000000000000000000000000002/status";
+    /// [`OTHER_DEVICE_PATH`] 解析后的 32B 设备 ID。
+    const OTHER_DEVICE_ID: [u8; 32] = {
+        let mut id = [0u8; 32];
+        id[31] = 2;
+        id
+    };
     /// percent-decode 后非法 UTF-8 的路径段：历史上会让 Axum 的 `Path<String>`
     /// 提取器先于门禁短路成纯文本 400。
     const MALFORMED_PATH: &str = "/api/v1/devices/%FF/status";
@@ -349,13 +508,20 @@ mod tests {
     }
 
     fn fixture_session(must_change_password: bool) -> Session {
+        session_with(must_change_password, false)
+    }
+
+    /// 同 [`fixture_session`]，但可指定 `is_admin`。授权真相是快照里的 actor 行，
+    /// 会话侧的 `is_admin` 只是认证身份；两者的 admin 标记按用例保持一致，避免桩与
+    /// 会话互相矛盾。
+    fn session_with(must_change_password: bool, is_admin: bool) -> Session {
         Session {
             user: IdentityUser {
-                id: [7u8; 16],
+                id: ACTOR_ID,
                 username: "alice".into(),
                 password_hash: "$argon2id$=synthetic-test-only=".into(),
                 active: true,
-                is_admin: false,
+                is_admin,
                 must_change_password,
                 revision: 1,
             },
@@ -438,8 +604,27 @@ mod tests {
         }
     }
 
+    /// 恒有好样本的状态源：验证授权放行后的正常投影。
+    struct SampledSource {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl DeviceStatusSnapshotSource for SampledSource {
+        fn snapshot<'a>(
+            &'a self,
+            _device_id: &'a [u8; 32],
+        ) -> DeviceStatusFuture<'a, Option<DeviceStatusCacheEntry>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(Some(entry(DeviceStatusFreshness::Fresh, None))) })
+        }
+    }
+
     fn test_state(snapshot: Arc<dyn DeviceStatusSnapshotSource>) -> Router<()> {
-        router_with_state(Arc::new(NoSessionAuth), snapshot)
+        router_with_state(
+            Arc::new(NoSessionAuth),
+            snapshot,
+            Arc::new(FixedAccessAuthorizer::allowed()),
+        )
     }
 
     /// 活会话版本：门禁通过后才能观察路径解析与响应投影。
@@ -447,17 +632,57 @@ mod tests {
         snapshot: Arc<dyn DeviceStatusSnapshotSource>,
         must_change_password: bool,
     ) -> Router<()> {
+        live_state_with_authorizer(
+            snapshot,
+            must_change_password,
+            Arc::new(FixedAccessAuthorizer::allowed()),
+        )
+    }
+
+    /// 活会话 + 指定授权桩：授权分支（403/404/后端错误）的可复用入口。
+    fn live_state_with_authorizer(
+        snapshot: Arc<dyn DeviceStatusSnapshotSource>,
+        must_change_password: bool,
+        authorizer: Arc<dyn DeviceStatusAuthorizer>,
+    ) -> Router<()> {
         router_with_state(
             Arc::new(LiveSessionAuth {
                 session: fixture_session(must_change_password),
             }),
             snapshot,
+            authorizer,
+        )
+    }
+
+    /// 活会话 + **生产授权器**（挂在授权快照桩上）：验证真实的设备存在性 +
+    /// 有效权限集三态求值，全程不连数据库。
+    fn live_state_with_snapshot_authorizer(
+        snapshot: Arc<dyn DeviceStatusSnapshotSource>,
+        repo: StubSnapshotRepo,
+    ) -> Router<()> {
+        live_state_with_snapshot_authorizer_as(snapshot, repo, false)
+    }
+
+    /// 同 [`live_state_with_snapshot_authorizer`]，但会话侧的 `is_admin` 可指定
+    /// （须与快照里的 actor 行一致）。
+    fn live_state_with_snapshot_authorizer_as(
+        snapshot: Arc<dyn DeviceStatusSnapshotSource>,
+        repo: StubSnapshotRepo,
+        actor_is_admin: bool,
+    ) -> Router<()> {
+        router_with_state(
+            Arc::new(LiveSessionAuth {
+                session: session_with(false, actor_is_admin),
+            }),
+            snapshot,
+            Arc::new(SnapshotDeviceStatusAuthorizer::new(Arc::new(repo))),
         )
     }
 
     fn router_with_state(
         auth: Arc<dyn AuthServiceApi>,
         snapshot: Arc<dyn DeviceStatusSnapshotSource>,
+        authorizer: Arc<dyn DeviceStatusAuthorizer>,
     ) -> Router<()> {
         build_device_status_router(DeviceStatusState {
             auth: Arc::new(HttpAuthState::new(
@@ -469,7 +694,215 @@ mod tests {
                 },
             )),
             snapshot,
+            authorizer,
         })
+    }
+
+    /// 三态授权桩：按预置结论应答，并记录授权判定的入参与次数（证明授权先于
+    /// 读缓存、且确实以已认证 actor 与路径设备为目标）。
+    #[derive(Clone)]
+    struct FixedAccessAuthorizer {
+        access: DeviceStatusAccess,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl FixedAccessAuthorizer {
+        fn allowed() -> Self {
+            Self::new(DeviceStatusAccess::Allowed)
+        }
+
+        fn new(access: DeviceStatusAccess) -> Self {
+            Self {
+                access,
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl DeviceStatusAuthorizer for FixedAccessAuthorizer {
+        fn authorize<'a>(
+            &'a self,
+            actor: &'a Session,
+            device_id: &'a [u8; 32],
+        ) -> DeviceStatusFuture<'a, DeviceStatusAccess> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(actor.user.id, ACTOR_ID, "授权必须以已认证会话为 actor");
+            assert_eq!(*device_id, DEVICE_ID, "授权目标必须是路径解析出的设备");
+            let access = self.access;
+            Box::pin(async move { Ok(access) })
+        }
+    }
+
+    /// 授权后端失败桩：Err 必须走统一映射，绝不降级为 200。
+    struct FailingAuthorizer;
+
+    impl DeviceStatusAuthorizer for FailingAuthorizer {
+        fn authorize<'a>(
+            &'a self,
+            _actor: &'a Session,
+            _device_id: &'a [u8; 32],
+        ) -> DeviceStatusFuture<'a, DeviceStatusAccess> {
+            Box::pin(async { Err(ControllerError::Config("device status authz read".into())) })
+        }
+    }
+
+    /// 授权快照仓储桩：不连 DB，按预置快照（或固定后端错误）应答 `load_snapshot`，
+    /// 并记录取快照次数。`device` 是该快照对应的**目标设备**（断言取快照的口径）。
+    #[derive(Clone)]
+    struct StubSnapshotRepo {
+        device: [u8; 32],
+        reply: StubReply,
+        calls: Arc<AtomicUsize>,
+    }
+
+    /// `ControllerError` 非 `Clone`，桩用枚举表达两种应答。
+    #[derive(Clone)]
+    enum StubReply {
+        Snapshot(AuthorizationSnapshot),
+        BackendError,
+        /// `actor` 用户行缺失：真实 `load_snapshot` 的 fail-closed 应答。
+        ActorMissing,
+    }
+
+    impl StubSnapshotRepo {
+        fn new(snapshot: AuthorizationSnapshot) -> Self {
+            Self::for_device(snapshot, DEVICE_ID)
+        }
+
+        /// 目标设备不是 [`DEVICE_ID`] 时的构造入口。
+        fn for_device(snapshot: AuthorizationSnapshot, device: [u8; 32]) -> Self {
+            Self {
+                device,
+                reply: StubReply::Snapshot(snapshot),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                device: DEVICE_ID,
+                reply: StubReply::BackendError,
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        /// `actor` 用户行缺失的桩（`load_snapshot` → `PermissionDenied`）。
+        fn actor_missing() -> Self {
+            Self {
+                device: DEVICE_ID,
+                reply: StubReply::ActorMissing,
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl AuthorizationSnapshotRepository for StubSnapshotRepo {
+        fn load_snapshot<'a>(
+            &'a self,
+            actor_id: [u8; 16],
+            device_ids: &'a [[u8; 32]],
+        ) -> RepoFuture<'a, AuthorizationSnapshot> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(actor_id, ACTOR_ID);
+            assert_eq!(device_ids, [self.device], "只按路径目标设备取一次快照");
+            match self.reply.clone() {
+                StubReply::Snapshot(snapshot) => Box::pin(async move { Ok(snapshot) }),
+                StubReply::BackendError => Box::pin(async {
+                    Err(ControllerError::Config(
+                        "device status authz snapshot".into(),
+                    ))
+                }),
+                StubReply::ActorMissing => {
+                    Box::pin(async { Err(ControllerError::PermissionDenied) })
+                }
+            }
+        }
+
+        fn load_admin_target_snapshot<'a>(
+            &'a self,
+            _caller: &'a Session,
+            _target_user: [u8; 16],
+            _device_ids: &'a [[u8; 32]],
+        ) -> RepoFuture<'a, AuthorizationSnapshot> {
+            Box::pin(async { Err(ControllerError::PermissionDenied) })
+        }
+    }
+
+    /// 构造授权快照：`perms` 为 direct grant 的权限集（空集 = 完全不可见），
+    /// `device` 控制设备行是否存在/已归档。actor 恒 active、非 admin、已改密；
+    /// 目标设备 [`DEVICE_ID`]，grant scope 为 `All`。
+    fn snapshot_fixture(perms: &[Permission], device: DeviceFixture) -> AuthorizationSnapshot {
+        snapshot_fixture_scoped(
+            DEVICE_ID,
+            FixtureActor::Member,
+            GrantScope::All,
+            perms,
+            device,
+        )
+    }
+
+    /// 通用授权快照：目标设备、actor 形态、grant scope 各自可指定，其余口径与
+    /// [`snapshot_fixture`] 逐字一致（actor 恒 active、已改密；`perms` 空 = 无 grant）。
+    fn snapshot_fixture_scoped(
+        target: [u8; 32],
+        actor: FixtureActor,
+        scope: GrantScope,
+        perms: &[Permission],
+        device: DeviceFixture,
+    ) -> AuthorizationSnapshot {
+        let mut devices = HashMap::new();
+        if let DeviceFixture::Present { archived } = device {
+            devices.insert(
+                target,
+                DeviceAdminView {
+                    public_key: target,
+                    display_name: "device-1".into(),
+                    admission_state: AdmissionState::Approved,
+                    review_decision: ReviewDecision::Approved,
+                    revision: 1,
+                    descriptor: None,
+                    archived,
+                },
+            );
+        }
+        let grants = if perms.is_empty() {
+            Vec::new()
+        } else {
+            vec![GrantRecord {
+                id: Uuid::new_v4(),
+                user_id: ACTOR_ID,
+                source: GrantSource::Direct(perms.to_vec()),
+                scope,
+                revision: 1,
+            }]
+        };
+        AuthorizationSnapshot {
+            actor: SnapshotActor {
+                id: ACTOR_ID,
+                active: true,
+                is_admin: matches!(actor, FixtureActor::Admin),
+                must_change_password: false,
+            },
+            authz_epoch: 1,
+            grants,
+            roles: HashMap::new(),
+            device_groups: HashMap::new(),
+            devices,
+        }
+    }
+
+    /// 快照里 actor 的两种形态（恒 active、已改密）。
+    #[derive(Clone, Copy, Debug)]
+    enum FixtureActor {
+        Member,
+        Admin,
+    }
+
+    /// 快照里目标设备的三种形态。
+    #[derive(Clone, Copy, Debug)]
+    enum DeviceFixture {
+        Present { archived: bool },
+        Missing,
     }
 
     fn evidence_ago(millis: i64) -> TimeEvidence {
@@ -785,5 +1218,464 @@ mod tests {
         // 状态源 Err 走统一映射：503，绝不降级成 freshness=unknown 的 200。
         let response = map_error(ControllerError::Config("device status cache read".into()));
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // ---------------- H1：`device.status.read` 对象级授权 ----------------
+
+    #[test]
+    fn device_status_access_tristate_is_device_scoped_and_fail_closed() {
+        let present = DeviceFixture::Present { archived: false };
+        // 含 device.status.read → Allowed
+        assert_eq!(
+            evaluate_device_status_access(
+                &snapshot_fixture(&[Permission::DeviceStatusRead], present),
+                DEVICE_ID
+            ),
+            DeviceStatusAccess::Allowed
+        );
+        // 有效权限集非空但不含 status.read → Forbidden
+        for perms in [
+            vec![Permission::DeviceReboot],
+            vec![Permission::DeviceRead],
+            vec![
+                Permission::DeviceRead,
+                Permission::DeviceReboot,
+                Permission::DeviceTaskRead,
+            ],
+        ] {
+            assert_eq!(
+                evaluate_device_status_access(&snapshot_fixture(&perms, present), DEVICE_ID),
+                DeviceStatusAccess::Forbidden,
+                "权限集 {:?} 不构成读完整状态",
+                perms.iter().map(|p| p.as_str()).collect::<Vec<_>>()
+            );
+        }
+        // 完全不可见（空权限集）→ NotFound
+        assert_eq!(
+            evaluate_device_status_access(&snapshot_fixture(&[], present), DEVICE_ID),
+            DeviceStatusAccess::NotFound
+        );
+        // 设备缺失/已归档 → NotFound，即使带 status.read 授权
+        for device in [
+            DeviceFixture::Missing,
+            DeviceFixture::Present { archived: true },
+        ] {
+            assert_eq!(
+                evaluate_device_status_access(
+                    &snapshot_fixture(
+                        &[Permission::DeviceRead, Permission::DeviceStatusRead],
+                        device
+                    ),
+                    DEVICE_ID
+                ),
+                DeviceStatusAccess::NotFound
+            );
+        }
+        // 逐设备求值：另一台设备的结论不得由本设备借用（scope=All 也只对在册设备成立）
+        assert_eq!(
+            evaluate_device_status_access(
+                &snapshot_fixture(&[Permission::DeviceStatusRead], present),
+                [9u8; 32]
+            ),
+            DeviceStatusAccess::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn status_read_permission_returns_200_with_projected_sample() {
+        // 含 device.status.read 的普通用户 → 200，且响应投影照常输出真实样本。
+        let repo = StubSnapshotRepo::new(snapshot_fixture(
+            &[Permission::DeviceRead, Permission::DeviceStatusRead],
+            DeviceFixture::Present { archived: false },
+        ));
+        let repo_calls = repo.calls.clone();
+        let cache_calls = Arc::new(AtomicUsize::new(0));
+        let router = live_state_with_snapshot_authorizer(
+            Arc::new(SampledSource {
+                calls: cache_calls.clone(),
+            }),
+            repo,
+        );
+        let (status, body) = get_with_cookie(router, DEVICE_PATH, Some(RAW_TOKEN)).await;
+        assert_eq!(status, StatusCode::OK);
+        let data = &body["data"];
+        assert_eq!(data["snapshot"]["boot_id"], json!("boot-1"));
+        assert_eq!(data["snapshot"]["sample_seq"], json!("9007199254740993"));
+        assert_eq!(data["snapshot"]["sampled_unix_ms"], json!("1760000000000"));
+        assert_eq!(data["freshness"], json!("fresh"));
+        assert_eq!(repo_calls.load(Ordering::SeqCst), 1, "授权只取一次快照");
+        assert_eq!(cache_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_status_read_permission_returns_403_without_touching_cache() {
+        // 01 §4 A-04：只有 device.read 或只有 device.reboot（甚至两者都有）都
+        // 不能读取完整状态 → 403 `PERMISSION_DENIED`，且绝不触达状态缓存。
+        for perms in [
+            vec![Permission::DeviceRead],
+            vec![Permission::DeviceReboot],
+            vec![Permission::DeviceRead, Permission::DeviceReboot],
+        ] {
+            let repo = StubSnapshotRepo::new(snapshot_fixture(
+                &perms,
+                DeviceFixture::Present { archived: false },
+            ));
+            let cache_calls = Arc::new(AtomicUsize::new(0));
+            let router = live_state_with_snapshot_authorizer(
+                Arc::new(SampledSource {
+                    calls: cache_calls.clone(),
+                }),
+                repo,
+            );
+            let (status, body) = get_with_cookie(router, DEVICE_PATH, Some(RAW_TOKEN)).await;
+            let granted = perms
+                .iter()
+                .map(|permission| permission.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "权限 {granted:?} 不得读取设备状态，实得 {body}"
+            );
+            assert_eq!(
+                body["error"]["code"],
+                json!("PERMISSION_DENIED"),
+                "{granted:?}"
+            );
+            assert_eq!(
+                body["error"]["message_key"],
+                json!("permission.denied"),
+                "{granted:?}"
+            );
+            assert_eq!(
+                cache_calls.load(Ordering::SeqCst),
+                0,
+                "无 status.read 时 GET 不得触达状态缓存（权限 {granted:?}）"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn forbidden_from_authorizer_never_reads_cache() {
+        // 三态 fake 直连：Forbidden → 403 统一信封，缓存零触达。
+        let cache_calls = Arc::new(AtomicUsize::new(0));
+        let authorizer = FixedAccessAuthorizer::new(DeviceStatusAccess::Forbidden);
+        let authorizer_calls = authorizer.calls.clone();
+        let router = live_state_with_authorizer(
+            Arc::new(SampledSource {
+                calls: cache_calls.clone(),
+            }),
+            false,
+            Arc::new(authorizer),
+        );
+        let (status, body) = get_with_cookie(router, DEVICE_PATH, Some(RAW_TOKEN)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["code"], json!("PERMISSION_DENIED"));
+        assert_eq!(authorizer_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cache_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn invisible_device_returns_404_without_touching_cache() {
+        // 完全不可见（有效权限集为空）与不存在同投影 404（01 A-06），零缓存触达。
+        let repo = StubSnapshotRepo::new(snapshot_fixture(
+            &[],
+            DeviceFixture::Present { archived: false },
+        ));
+        let repo_calls = repo.calls.clone();
+        let cache_calls = Arc::new(AtomicUsize::new(0));
+        let router = live_state_with_snapshot_authorizer(
+            Arc::new(SampledSource {
+                calls: cache_calls.clone(),
+            }),
+            repo,
+        );
+        let (status, body) = get_with_cookie(router, DEVICE_PATH, Some(RAW_TOKEN)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "实得 {body}");
+        assert_eq!(body["error"]["code"], json!("NOT_FOUND"));
+        assert_eq!(body["error"]["message_key"], json!("system.not_found"));
+        assert_eq!(repo_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            cache_calls.load(Ordering::SeqCst),
+            0,
+            "不可见设备不得触达状态缓存，避免以 age/freshness 泄露设备存在性"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_or_archived_device_returns_404_even_with_status_read() {
+        // 设备缺失与已归档：即使快照里有 status.read 授权也一律 404（不可见）。
+        for (case, device) in [
+            ("missing", DeviceFixture::Missing),
+            ("archived", DeviceFixture::Present { archived: true }),
+        ] {
+            let repo = StubSnapshotRepo::new(snapshot_fixture(
+                &[Permission::DeviceRead, Permission::DeviceStatusRead],
+                device,
+            ));
+            let cache_calls = Arc::new(AtomicUsize::new(0));
+            let router = live_state_with_snapshot_authorizer(
+                Arc::new(SampledSource {
+                    calls: cache_calls.clone(),
+                }),
+                repo,
+            );
+            let (status, body) = get_with_cookie(router, DEVICE_PATH, Some(RAW_TOKEN)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{case} 设备必须 404");
+            assert_eq!(body["error"]["code"], json!("NOT_FOUND"), "{case}");
+            assert_eq!(
+                body["error"]["message_key"],
+                json!("system.not_found"),
+                "{case}"
+            );
+            assert_eq!(cache_calls.load(Ordering::SeqCst), 0, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn not_found_from_authorizer_never_reads_cache() {
+        let cache_calls = Arc::new(AtomicUsize::new(0));
+        let authorizer = FixedAccessAuthorizer::new(DeviceStatusAccess::NotFound);
+        let router = live_state_with_authorizer(
+            Arc::new(SampledSource {
+                calls: cache_calls.clone(),
+            }),
+            false,
+            Arc::new(authorizer),
+        );
+        let (status, body) = get_with_cookie(router, DEVICE_PATH, Some(RAW_TOKEN)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], json!("NOT_FOUND"));
+        assert_eq!(cache_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn authorizer_backend_error_maps_to_503_never_degrades_to_200() {
+        // 授权后端 Err → 统一映射 503；绝不因「读不到授权」而放行读缓存。
+        for (case, router) in [
+            (
+                "trait 桩",
+                live_state_with_authorizer(
+                    Arc::new(SampledSource {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                    }),
+                    false,
+                    Arc::new(FailingAuthorizer),
+                ),
+            ),
+            (
+                "生产授权器 + 快照仓储失败",
+                live_state_with_snapshot_authorizer(
+                    Arc::new(SampledSource {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                    }),
+                    StubSnapshotRepo::failing(),
+                ),
+            ),
+        ] {
+            let (status, body) = get_with_cookie(router, DEVICE_PATH, Some(RAW_TOKEN)).await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{case} 实得 {body}"
+            );
+            assert_ne!(status, StatusCode::OK, "{case}：授权失败绝不放行");
+        }
+    }
+
+    #[tokio::test]
+    async fn authorization_runs_after_gates_and_before_any_cache_read() {
+        // 门禁顺序：认证 401 与临时密码 403 都不得触达授权与缓存；活会话必须
+        // 先授权（1 次）再读缓存（1 次）——缓存无样本也不得短路授权判定。
+        let cache_calls = Arc::new(AtomicUsize::new(0));
+
+        let authorizer = FixedAccessAuthorizer::allowed();
+        let authorizer_calls = authorizer.calls.clone();
+        let anonymous = router_with_state(
+            Arc::new(NoSessionAuth),
+            Arc::new(CountingSource {
+                calls: cache_calls.clone(),
+            }),
+            Arc::new(authorizer),
+        );
+        let (status, _) = get(anonymous, DEVICE_PATH).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(authorizer_calls.load(Ordering::SeqCst), 0, "未认证不得授权");
+        assert_eq!(cache_calls.load(Ordering::SeqCst), 0);
+
+        let authorizer = FixedAccessAuthorizer::allowed();
+        let authorizer_calls = authorizer.calls.clone();
+        let temporary = live_state_with_authorizer(
+            Arc::new(CountingSource {
+                calls: cache_calls.clone(),
+            }),
+            true,
+            Arc::new(authorizer),
+        );
+        let (status, body) = get_with_cookie(temporary, DEVICE_PATH, Some(RAW_TOKEN)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["code"], json!("PASSWORD_CHANGE_REQUIRED"));
+        assert_eq!(
+            authorizer_calls.load(Ordering::SeqCst),
+            0,
+            "临时密码不得进入授权判定"
+        );
+        assert_eq!(cache_calls.load(Ordering::SeqCst), 0);
+
+        let authorizer = FixedAccessAuthorizer::allowed();
+        let authorizer_calls = authorizer.calls.clone();
+        let live = live_state_with_authorizer(
+            Arc::new(CountingSource {
+                calls: cache_calls.clone(),
+            }),
+            false,
+            Arc::new(authorizer),
+        );
+        let (status, _) = get_with_cookie(live, DEVICE_PATH, Some(RAW_TOKEN)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "缓存无样本只投影 unknown，不得改变授权判定"
+        );
+        assert_eq!(
+            authorizer_calls.load(Ordering::SeqCst),
+            1,
+            "授权必须恰好在读缓存前执行一次"
+        );
+        assert_eq!(cache_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn admin_actor_without_explicit_grant_reads_status_via_admin_shortcut() {
+        // admin shortcut（`eval_memory_permissions`：`active && is_admin` → 全量
+        // `ALL_DEVICE_PERMISSIONS`，不看 grants）：active 且已改密的 admin，快照里
+        // **没有任何显式 grant**，也对在册未归档设备拿到 `device.status.read` → 200。
+        // 证的是本组件的对象级授权与仓库既有 admin 语义一致，不自建第二套策略。
+        let snapshot = snapshot_fixture_scoped(
+            DEVICE_ID,
+            FixtureActor::Admin,
+            GrantScope::All,
+            &[],
+            DeviceFixture::Present { archived: false },
+        );
+        assert_eq!(
+            snapshot.grants.len(),
+            0,
+            "前提：本用例的 admin 必须没有任何显式 grant"
+        );
+        assert_eq!(
+            evaluate_device_status_access(&snapshot, DEVICE_ID),
+            DeviceStatusAccess::Allowed,
+            "admin shortcut 必须在纯求值上就成立"
+        );
+
+        let repo = StubSnapshotRepo::new(snapshot);
+        let repo_calls = repo.calls.clone();
+        let cache_calls = Arc::new(AtomicUsize::new(0));
+        let router = live_state_with_snapshot_authorizer_as(
+            Arc::new(SampledSource {
+                calls: cache_calls.clone(),
+            }),
+            repo,
+            true,
+        );
+        let (status, body) = get_with_cookie(router, DEVICE_PATH, Some(RAW_TOKEN)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "admin 无显式 grant 也必须读到状态，实得 {body}"
+        );
+        assert_eq!(body["data"]["snapshot"]["boot_id"], json!("boot-1"));
+        assert_eq!(body["data"]["freshness"], json!("fresh"));
+        assert_eq!(repo_calls.load(Ordering::SeqCst), 1, "授权只取一次快照");
+        assert_eq!(cache_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn device_scoped_status_read_allows_only_its_own_device() {
+        // scope=Device(target) 的 direct grant 只对目标设备成立（`evaluate_grants`）。
+        // ① 目标设备 → 有效权限集含 `device.status.read` → 200；
+        // ② 同用户对另一台**在册**设备 → 该设备既不在 grant scope 也无其他 grant →
+        //    有效权限集为空 = 完全不可见 → 与「不存在」同投影 404（01 A-06）。本
+        //    fixture 下它是「不可见」而非「可见无权限」，故断言 404 而非 403。
+        let scoped = |target: [u8; 32]| {
+            snapshot_fixture_scoped(
+                target,
+                FixtureActor::Member,
+                GrantScope::Device(DEVICE_ID),
+                &[Permission::DeviceStatusRead],
+                DeviceFixture::Present { archived: false },
+            )
+        };
+
+        // ① 目标设备：200 + 真实样本投影。
+        let repo = StubSnapshotRepo::for_device(scoped(DEVICE_ID), DEVICE_ID);
+        let repo_calls = repo.calls.clone();
+        let cache_calls = Arc::new(AtomicUsize::new(0));
+        let router = live_state_with_snapshot_authorizer(
+            Arc::new(SampledSource {
+                calls: cache_calls.clone(),
+            }),
+            repo,
+        );
+        let (status, body) = get_with_cookie(router, DEVICE_PATH, Some(RAW_TOKEN)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "scope 命中的设备必须放行，实得 {body}"
+        );
+        assert_eq!(body["data"]["snapshot"]["boot_id"], json!("boot-1"));
+        assert_eq!(repo_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cache_calls.load(Ordering::SeqCst), 1);
+
+        // ② 另一台在册设备：同一条 grant 不覆盖它 → 不可见 404，零缓存触达。
+        let other = scoped(OTHER_DEVICE_ID);
+        assert_eq!(
+            evaluate_device_status_access(&other, OTHER_DEVICE_ID),
+            DeviceStatusAccess::NotFound,
+            "前提：另一台设备在纯求值上就应是不可见（非 Forbidden）"
+        );
+        let repo = StubSnapshotRepo::for_device(other, OTHER_DEVICE_ID);
+        let repo_calls = repo.calls.clone();
+        let cache_calls = Arc::new(AtomicUsize::new(0));
+        let router = live_state_with_snapshot_authorizer(
+            Arc::new(SampledSource {
+                calls: cache_calls.clone(),
+            }),
+            repo,
+        );
+        let (status, body) = get_with_cookie(router, OTHER_DEVICE_PATH, Some(RAW_TOKEN)).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "scope 外的在册设备不得暴露存在性，实得 {body}"
+        );
+        assert_eq!(body["error"]["code"], json!("NOT_FOUND"));
+        assert_eq!(body["error"]["message_key"], json!("system.not_found"));
+        assert_eq!(repo_calls.load(Ordering::SeqCst), 1, "按路径目标设备取快照");
+        assert_eq!(
+            cache_calls.load(Ordering::SeqCst),
+            0,
+            "scope 外设备不得触达状态缓存"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_actor_row_from_snapshot_repo_maps_to_403_never_200() {
+        // 与 trait `Err` 文档对齐：`load_snapshot` 在 actor 用户行缺失时返回
+        // `PermissionDenied`，`map_error` 把它映射为 403（不降级 200、也不折叠成 404）。
+        // 正常路径这类 actor 早在 authenticate 就被拒；本用例锁的是「若出现」的投影。
+        let cache_calls = Arc::new(AtomicUsize::new(0));
+        let router = live_state_with_snapshot_authorizer(
+            Arc::new(SampledSource {
+                calls: cache_calls.clone(),
+            }),
+            StubSnapshotRepo::actor_missing(),
+        );
+        let (status, body) = get_with_cookie(router, DEVICE_PATH, Some(RAW_TOKEN)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "实得 {body}");
+        assert_eq!(body["error"]["code"], json!("PERMISSION_DENIED"));
+        assert_ne!(status, StatusCode::OK, "actor 行缺失绝不放行");
+        assert_eq!(cache_calls.load(Ordering::SeqCst), 0, "授权失败不得读缓存");
     }
 }

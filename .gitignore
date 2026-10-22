@@ -18,9 +18,11 @@
 /debian/.debhelper
 /debian/cargo-home
 /debian/rsetup-next
+/debian/rsetup-controller
 /debian/tmp
 /debian/debhelper-build-stamp
 /debian/files
+/debian/*.debhelper
 /debian/*.debhelper.log
 /debian/*.substvars
 /*.deb
@@ -47,3 +49,36 @@ secret/
 !.superpowers/sdd/
 .superpowers/sdd/*
 !.superpowers/sdd/2026-09-12-mmc-storage-tui-tdd-plan/
+
+# ---------------------------------------------------------------------------
+# 本地产物：本地构建缓存与 QA 脚本，只留在开发机上，不纳入版本控制。
+# ---------------------------------------------------------------------------
+
+# 本地隔离的 CARGO_HOME 与 CARGO_TARGET_DIR（离线/交叉构建缓存）。
+/.cargo-home/
+/.cargo-target/
+
+# 仓库根误生成的 npm 脚手架与 pnpm lockfile。正式前端在 apps/controller-web，
+# 构建口径统一为 npm，只跟踪 apps/controller-web/package-lock.json。
+/node_modules/
+/package.json
+/pnpm-lock.yaml
+# 在 apps/controller-web 目录内直接跑 pnpm 也会就地再生成一份 pnpm-lock.yaml；
+# 它与「package-lock.json 唯一锁文件」的口径冲突，显式忽略以免被误提交。
+/apps/controller-web/pnpm-lock.yaml
+
+# Python 字节码缓存（脚本与 Python 测试运行时生成，任意层级）。
+__pycache__/
+*.pyc
+
+# 手误重定向（形如 `cmd > =`）留下的空文件。
+/=
+
+# 本地 QA 截图脚本，不纳入版本控制。
+/scripts/capture_all_spa_views.py
+/scripts/capture_full_views.py
+/scripts/capture_qa_views.py
+/scripts/debug_page_render.py
+/scripts/full_feature_visual_qa.py
+/scripts/generate_all_views_screenshots.py
+/scripts/test_browser_render.py

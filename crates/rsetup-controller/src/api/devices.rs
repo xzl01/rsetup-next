@@ -25,6 +25,7 @@ use crate::authz::policy::Permission;
 use crate::authz::sqlx_repo::validate_display_name;
 use crate::devices::repository::DeviceAdminView;
 use crate::error::ControllerError;
+use crate::events::{EventBus, EventEnvelope, EventObjectAudience};
 use crate::http_api::ok_response;
 use crate::http_auth::{EndpointId, HttpAuthState};
 use crate::http_gate::{
@@ -77,6 +78,11 @@ pub struct DevicesApiState {
     pub auth: Arc<HttpAuthState>,
     pub gateway: Arc<dyn DevicesGateway>,
     pub live_probe: Arc<dyn DeviceLiveProbe>,
+    /// 进程内事件总线句柄（06 §4 `device.updated`）：与 SSE 读线 `EventsState.bus`
+    /// 必须是同一通道句柄（[`EventBus::clone`] 不新建通道）。`None` 表示本装配未开启
+    /// 事件线，写端点行为与接入总线之前完全一致（不发布、不报错、不阻塞）；
+    /// 发布返回值一律忽略，任何 handler 都不得据此改变响应。
+    pub events: Option<EventBus>,
 }
 
 /// `DeviceAdminView`/`HashSet` 来自 repository/std，列表筛选不得静默忽略。
@@ -344,6 +350,10 @@ async fn get_device(
 /// `PATCH /api/v1/devices/{id}`：`authenticate_write` → `require_admin_session` →
 /// 路径 ID 严格解析 → CAS `expected_revision` 严格十进制 → `validate_display_name`
 /// 门禁（仓储唯一真源）→ 网关。版本不符 409 `REVISION_CONFLICT`；不存在 404。
+/// 改名成功后向事件总线投一条 `device.updated`（受众恒管理员范围，06 §4）：载荷
+/// revision 以网关回显的新 revision 为准，回显缺失或不合法时退回 CAS 的**递增下界**
+/// `expected_revision.saturating_add(1)`（06 §4：revision 只作同 kind+id 内单调提示）。
+/// `events` 为 `None` 时不发布；发布返回值不参与响应判定。
 async fn patch_device(
     State(state): State<DevicesApiState>,
     Path(id): Path<String>,
@@ -380,7 +390,30 @@ async fn patch_device(
         Ok(patched) => patched,
         Err(error) => return map_error(error),
     };
+    if let Some(ref bus) = state.events {
+        publish_device_updated(bus, &patched, id, revision);
+    }
     ok_response(patched)
+}
+
+/// 设备写操作成功后的统一 `device.updated` 发布：载荷 id 是设备公钥的小写 hex64，
+/// revision 优先取网关回显的十进制字符串，回显缺失/非法时用 `expected_revision` 的
+/// **饱和递增** `saturating_add(1)` 这一单调下界兜底（不得给任意定值）。取饱和加而非
+/// `+ 1`：`expected_revision` 由客户端任意给出（`parse_revision` 允许上到 `u64::MAX`），
+/// 极限值下 `+ 1` 会在 debug 构建直接 panic、在 release 构建回绕成 0 这种**倒退**的
+/// 版本，饱和加最坏只停在 `u64::MAX`，绝不给出比入参更小的 revision。
+/// 受众是**对象级**管理员范围。
+fn publish_device_updated(bus: &EventBus, patched: &serde_json::Value, id: [u8; 32], from: u64) {
+    let revision = patched
+        .get("revision")
+        .and_then(|value| value.as_str())
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or_else(|| from.saturating_add(1));
+    bus.publish(EventEnvelope::device_updated(
+        &hex::encode(id),
+        revision,
+        EventObjectAudience::admins(),
+    ));
 }
 
 /// 挂载 devices 的 3 条管理路由：集合级 `GET` 唯一注册锚点为 `get(list_devices)`；
@@ -397,6 +430,7 @@ mod tests {
     use super::*;
     use crate::api::users::test_fixture::*;
     use crate::error::ControllerError;
+    use crate::events::{EventAudience, EventName, EventViewer};
     use crate::model::{AdmissionState, ReviewDecision};
     use axum::http::StatusCode;
     use std::sync::Arc;
@@ -430,6 +464,8 @@ mod tests {
         Readable,
         /// `patch` 回显 handler 传入的已解析参数。
         PatchEcho,
+        /// `patch` 回显不含 `revision` 字段：事件 revision 退回 CAS 递增下界。
+        PatchEchoNoRevision,
         /// `patch` 恒 `Err(RevisionConflict)`。
         PatchConflict,
     }
@@ -474,7 +510,10 @@ mod tests {
             let gateway = *self;
             Box::pin(async move {
                 match gateway {
-                    Self::Invisible | Self::PatchEcho | Self::PatchConflict => Ok(None),
+                    Self::Invisible
+                    | Self::PatchEcho
+                    | Self::PatchEchoNoRevision
+                    | Self::PatchConflict => Ok(None),
                     Self::RebootOnly => Err(ControllerError::PermissionDenied),
                     Self::Readable => Ok(Some((
                         fixture_view(),
@@ -496,6 +535,10 @@ mod tests {
                     Self::PatchEcho => Ok(serde_json::json!({
                         "device_id": hex::encode(id),
                         "revision": revision.to_string(),
+                        "display_name": display_name,
+                    })),
+                    Self::PatchEchoNoRevision => Ok(serde_json::json!({
+                        "device_id": hex::encode(id),
                         "display_name": display_name,
                     })),
                     Self::PatchConflict => Err(ControllerError::RevisionConflict),
@@ -546,10 +589,21 @@ mod tests {
         }
     }
 
+    /// 事件线关闭（`events: None`）的装配：既有全部用例的行为基线。
     fn devices_router_with(
         gateway: FixtureDevicesGateway,
         probe: FixtureLiveProbe,
         session: Session,
+    ) -> (axum::Router<()>, Arc<HttpAuthState>) {
+        devices_router_with_events(gateway, probe, session, None)
+    }
+
+    /// 事件总线可选的装配：`Some(bus)` 与 SSE 读线 `EventsState.bus` 是同一通道句柄。
+    fn devices_router_with_events(
+        gateway: FixtureDevicesGateway,
+        probe: FixtureLiveProbe,
+        session: Session,
+        events: Option<EventBus>,
     ) -> (axum::Router<()>, Arc<HttpAuthState>) {
         let auth = fixture_auth(session);
         (
@@ -557,6 +611,7 @@ mod tests {
                 auth: auth.clone(),
                 gateway: Arc::new(gateway),
                 live_probe: Arc::new(probe),
+                events,
             }),
             auth,
         )
@@ -748,6 +803,7 @@ mod tests {
                 auth: fixture_auth(session),
                 gateway,
                 live_probe: Arc::new(FixtureLiveProbe::Ok),
+                events: None,
             },
             secret_slot,
         };
@@ -1001,6 +1057,7 @@ mod tests {
             live_probe: Arc::new(CountingLiveProbe {
                 calls: calls.clone(),
             }),
+            events: None,
         });
         let res = router
             .oneshot(authenticated_get(&format!(
@@ -1163,5 +1220,185 @@ mod tests {
         let (status, code, _) = error_code(res).await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(code, "REVISION_CONFLICT");
+    }
+
+    // -----------------------------------------------------------------------
+    // PATCH 的 `device.updated` 事件发布（06 §4）
+    // -----------------------------------------------------------------------
+
+    /// 收集订阅通道当前待读的事件（订阅只收「之后」的事件，不回放历史）。
+    fn collect_events(
+        rx: &mut tokio::sync::broadcast::Receiver<EventEnvelope>,
+    ) -> Vec<EventEnvelope> {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    /// 事件线正例：`events = Some(bus)` 时 PATCH 成功必须恰好发布一条
+    /// `device.updated`，载荷 `kind`/`id`/`revision` 与受众（仅管理员）逐一钉死。
+    #[tokio::test]
+    async fn patch_device_publishes_device_updated_to_admins_when_bus_configured() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let (router, _state) = devices_router_with_events(
+            FixtureDevicesGateway::PatchEcho,
+            FixtureLiveProbe::Ok,
+            fixture_session(true),
+            Some(bus),
+        );
+        let res = router
+            .oneshot(authenticated_json_patch(
+                &format!("/api/v1/devices/{DEVICE_READABLE}"),
+                serde_json::json!({ "expected_revision": "7", "display_name": "renamed" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let events = collect_events(&mut rx);
+        assert_eq!(events.len(), 1, "改名成功必须恰好发布一条 device.updated");
+        let event = &events[0];
+        assert_eq!(event.name(), EventName::DeviceUpdated);
+        assert_eq!(event.data()["kind"], serde_json::json!("device"));
+        assert_eq!(
+            event.data()["id"],
+            serde_json::json!(DEVICE_READABLE),
+            "载荷 id 必须是设备公钥的小写 hex64"
+        );
+        // 载荷 revision 取网关回显值，且必须是十进制字符串（不经 JS number）。
+        assert_eq!(event.data()["revision"], serde_json::json!("7"));
+        assert!(event.data()["revision"].is_string());
+        assert_eq!(event.audience(), EventAudience::Admins);
+        // 受众门禁：对象级管理员范围事件对普通用户会话不可见。
+        assert!(event.visible_to(EventViewer {
+            user_id: [7u8; 16],
+            is_admin: true,
+        }));
+        assert!(!event.visible_to(EventViewer {
+            user_id: [7u8; 16],
+            is_admin: false,
+        }));
+    }
+
+    /// 网关回显缺少 `revision` 时，载荷 revision 退回 CAS 的递增下界
+    /// `expected_revision.saturating_add(1)`（06 §4：revision 只作同 kind+id 内单调提示）。
+    #[tokio::test]
+    async fn patch_device_without_echoed_revision_publishes_cas_lower_bound() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let (router, _state) = devices_router_with_events(
+            FixtureDevicesGateway::PatchEchoNoRevision,
+            FixtureLiveProbe::Ok,
+            fixture_session(true),
+            Some(bus),
+        );
+        let res = router
+            .oneshot(authenticated_json_patch(
+                &format!("/api/v1/devices/{DEVICE_READABLE}"),
+                serde_json::json!({ "expected_revision": "7", "display_name": "renamed" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let events = collect_events(&mut rx);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data()["revision"], serde_json::json!("8"));
+        assert_eq!(events[0].audience(), EventAudience::Admins);
+    }
+
+    /// 溢出防御：`expected_revision` 是客户端任意输入（`parse_revision` 允许到
+    /// `u64::MAX`），回显缺失时下界取**饱和加**：既不在 debug 构建 panic，也不回绕成
+    /// `0` 这种倒退版本，最坏停在 `u64::MAX`。
+    #[tokio::test]
+    async fn patch_device_at_u64_max_revision_publishes_saturating_lower_bound() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let (router, _state) = devices_router_with_events(
+            FixtureDevicesGateway::PatchEchoNoRevision,
+            FixtureLiveProbe::Ok,
+            fixture_session(true),
+            Some(bus),
+        );
+        let res = router
+            .oneshot(authenticated_json_patch(
+                &format!("/api/v1/devices/{DEVICE_READABLE}"),
+                serde_json::json!({
+                    "expected_revision": u64::MAX.to_string(),
+                    "display_name": "renamed",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let events = collect_events(&mut rx);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].data()["revision"],
+            serde_json::json!(u64::MAX.to_string()),
+            "极限 revision 必须饱和在 u64::MAX，不得回绕"
+        );
+    }
+
+    /// 事件线负例：`events = None`（既有装配语义）时 PATCH 行为与接入总线前完全一致，
+    /// 不发布、不报错；`events = Some(bus)` 但写失败（409）时同样不得发布。
+    #[tokio::test]
+    async fn patch_device_without_event_bus_or_on_failure_publishes_nothing() {
+        // 1) `events: None`：装配不持有任何通道句柄，故不存在发布通路；响应行为不变。
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let (router, _state) = devices_router_with(
+            FixtureDevicesGateway::PatchEcho,
+            FixtureLiveProbe::Ok,
+            fixture_session(true),
+        );
+        let res = router
+            .oneshot(authenticated_json_patch(
+                &format!("/api/v1/devices/{DEVICE_READABLE}"),
+                serde_json::json!({ "expected_revision": "7", "display_name": "renamed" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "events: None 不得有任何事件进入通道"
+        );
+
+        // 2) 有总线但 CAS 失败（409）：未发生变更即不发布。
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let (router, _state) = devices_router_with_events(
+            FixtureDevicesGateway::PatchConflict,
+            FixtureLiveProbe::Ok,
+            fixture_session(true),
+            Some(bus.clone()),
+        );
+        let res = router
+            .oneshot(authenticated_json_patch(
+                &format!("/api/v1/devices/{DEVICE_READABLE}"),
+                serde_json::json!({ "expected_revision": "3", "display_name": "renamed" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            collect_events(&mut rx).len(),
+            0,
+            "409 未发生改名，不得发布 device.updated"
+        );
+        assert_eq!(
+            bus.publish(EventEnvelope::device_updated(
+                DEVICE_READABLE,
+                1,
+                EventObjectAudience::admins(),
+            )),
+            1
+        );
+        // ↑ 反向证据：同一订阅者确实能收到事件，说明上面的 0 条是「未发布」而非「订阅失效」。
     }
 }

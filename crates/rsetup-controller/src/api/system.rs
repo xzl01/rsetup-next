@@ -24,9 +24,11 @@ use axum::routing::get;
 
 use crate::auth::service::Session;
 use crate::error::ControllerError;
+use crate::events::{EventBus, EventEnvelope};
 use crate::http_api::ok_response;
 use crate::http_auth::{EndpointId, HttpAuthState};
 use crate::http_gate::{authenticate_read, not_ready, require_admin_session};
+use crate::time::evidence::TimeEvidence;
 
 use super::{ManagementFuture, map_error};
 
@@ -48,6 +50,29 @@ pub struct SystemApiState {
     pub auth: Arc<HttpAuthState>,
     pub gateway: Arc<dyn SystemGateway>,
     pub recovery_probe: Arc<dyn RecoveryModeProbe>,
+    /// 进程内事件总线句柄（06 §4 `system.time.changed`）：与 SSE 读线 `EventsState.bus`
+    /// 是同一通道句柄。`None` 表示本装配未开启事件线，[`Self::publish_system_time_changed`]
+    /// 即空操作（不发布、不报错、不阻塞）。
+    pub events: Option<EventBus>,
+}
+
+impl SystemApiState {
+    /// 系统时间证据变化时的**唯一发布入口**（06 §4 `system.time.changed`）：调用方是时间
+    /// 采样/校准侧（`time::gate` 的新快照被业务消费的时点），管理线不自己造第二套时间源，
+    /// 也不在 `GET /system/status` 这类读路径上伪造时间事件。
+    ///
+    /// 本切片内**尚无进程内调用方**：时间线接入前本入口不被调用，事件流上因此不会出现任何
+    /// `system.time.changed`（宁可不发，也不伪造一次没有发生过的时间变化）。
+    ///
+    /// 受众不接受调用方给出：[`EventEnvelope::system_time_changed`] 用 `TimeEvidence`
+    /// 一份数据同时钉死载荷与 [`crate::events::EventAudience::Admins`]（06 §4「时间事件仅
+    /// 管理员」）。`events = None` 即本装配未接事件线，直接返回；[`EventBus::publish`]
+    /// 永不阻塞、永不上抛，无订阅者即丢弃，返回值在此丢弃。
+    pub fn publish_system_time_changed(&self, evidence: &TimeEvidence) {
+        if let Some(ref bus) = self.events {
+            bus.publish(EventEnvelope::system_time_changed(evidence));
+        }
+    }
 }
 
 /// 即使只是统计也必须把 actor 送到仓储的当前管理员检查。
@@ -143,6 +168,8 @@ pub fn system_router(state: SystemApiState) -> Router<()> {
 mod tests {
     use super::*;
     use crate::api::users::test_fixture::*;
+    use crate::events::{EventAudience, EventEnvelope, EventName, EventViewer};
+    use crate::time::evidence::TimeQuality;
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use tower::ServiceExt;
@@ -206,10 +233,21 @@ mod tests {
         gateway: Arc<dyn SystemGateway>,
         probe: FixtureRecoveryProbe,
     ) -> SystemApiState {
+        system_state_with_events(gateway, probe, None)
+    }
+
+    /// 事件总线可选的装配：`Some(bus)` 与 SSE 读线 `EventsState.bus` 是同一通道句柄，
+    /// `None`（既有全部用例的基线）表示本装配未开启事件线。
+    fn system_state_with_events(
+        gateway: Arc<dyn SystemGateway>,
+        probe: FixtureRecoveryProbe,
+        events: Option<EventBus>,
+    ) -> SystemApiState {
         SystemApiState {
             auth: fixture_auth(fixture_session(true)),
             gateway,
             recovery_probe: Arc::new(probe),
+            events,
         }
     }
 
@@ -325,6 +363,7 @@ mod tests {
             auth: fixture_auth(fixture_session(false)),
             gateway: Arc::new(FixtureSystemGateway),
             recovery_probe: Arc::new(FixtureRecoveryProbe::Ok),
+            events: None,
         });
         let (status, code, _) = error_code(
             router
@@ -446,5 +485,92 @@ mod tests {
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{page}");
             assert_eq!(code, "STORAGE_UNAVAILABLE", "{page}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // `system.time.changed` 发布入口（06 §4，受众恒管理员）
+    // -----------------------------------------------------------------------
+
+    /// 固定形状的时间证据桩：不接任何真实时钟或 NTP 源。
+    fn fixture_time_evidence() -> TimeEvidence {
+        TimeEvidence {
+            system_wall_utc: chrono::Utc::now(),
+            reference_utc: chrono::Utc::now(),
+            quality: TimeQuality::NtpValid,
+            clock_epoch: uuid::Uuid::nil(),
+            source: Some("ntp.example".into()),
+            sample_age_ms: Some(1_500),
+            offset_ms: Some(-5),
+            uncertainty_ms: Some(15),
+        }
+    }
+
+    /// 正例：`events` 配置了总线时，发布入口投一条 `system.time.changed`，载荷 `kind`
+    /// 固定、`evidence` 就是传入的那一份 `TimeEvidence`（不新增第二套时间字段），受众
+    /// 恒管理员：普通用户会话即便持有同一 user id 也不可见。
+    #[tokio::test]
+    async fn publish_system_time_changed_publishes_admin_only_event_when_bus_configured() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let state = system_state_with_events(
+            Arc::new(FixtureSystemGateway),
+            FixtureRecoveryProbe::Ok,
+            Some(bus),
+        );
+        let evidence = fixture_time_evidence();
+        state.publish_system_time_changed(&evidence);
+        let event: EventEnvelope = rx.try_recv().expect("时间证据变化必须投出一条事件");
+        assert_eq!(event.name(), EventName::SystemTimeChanged);
+        assert_eq!(event.data()["kind"], serde_json::json!("system_time"));
+        assert_eq!(
+            event.data()["evidence"]["source"],
+            serde_json::json!("ntp.example")
+        );
+        assert_eq!(
+            event.data()["evidence"]["quality"],
+            serde_json::json!("ntp_valid")
+        );
+        assert_eq!(
+            event.data()["evidence"]["sample_age_ms"],
+            serde_json::json!("1500")
+        );
+        assert_eq!(event.audience(), EventAudience::Admins);
+        assert!(event.visible_to(EventViewer {
+            user_id: [7u8; 16],
+            is_admin: true,
+        }));
+        assert!(!event.visible_to(EventViewer {
+            user_id: [7u8; 16],
+            is_admin: false,
+        }));
+    }
+
+    /// 负例：`events: None`（既有装配形状）时发布入口是空操作——不 panic、不构造通道；
+    /// 读端点 `GET /system/status` 也不得顺带发布任何时间事件（不伪造变化）。
+    #[tokio::test]
+    async fn publish_system_time_changed_without_bus_is_noop_and_reads_publish_nothing() {
+        let state = fixture_system_state();
+        assert!(state.events.is_none(), "基线装配不得持有总线句柄");
+        state.publish_system_time_changed(&fixture_time_evidence());
+
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let router = system_router(system_state_with_events(
+            Arc::new(FixtureSystemGateway),
+            FixtureRecoveryProbe::Ok,
+            None,
+        ));
+        let res = router
+            .oneshot(authenticated_get("/api/v1/system/status"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "读路径与未接事件线的装配都不得有任何事件进入通道"
+        );
     }
 }

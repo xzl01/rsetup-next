@@ -1,0 +1,32 @@
+[Unit]
+# 中控（controller）：loopback HTTP 控制面。默认不随包启动，见下方 ConditionPathExists。
+Description=rsetup-next Web control center (controller)
+Documentation=file:/usr/share/doc/rsetup-controller/README.Debian
+After=network-online.target
+Wants=network-online.target
+# 未写下例配置（含数据库连接串）时，本单元保持 inactive 而不是启动失败：
+# 包安装不会带着空配置去连库，也不会生成任何状态。
+ConditionPathExists=/etc/default/rsetup-controller
+
+[Service]
+Type=simple
+# 不建静态用户：动态 uid/gid + StateDirectory 即可，postinst 无需 useradd。
+DynamicUser=yes
+StateDirectory=rsetup-controller
+WorkingDirectory=/var/lib/rsetup-controller
+# 唯一配置入口：0600 的 root-only 文件，见 /usr/share/doc/rsetup-controller/README.Debian。
+EnvironmentFile=/etc/default/rsetup-controller
+# 首次启动的一次性管理员凭据只写在这里（0600，读取后请删除）。
+Environment=CONTROLLER_BOOTSTRAP_SECRET_LOG=/var/lib/rsetup-controller/bootstrap-secret.log
+ExecStart=/usr/bin/rsetup-controller
+Restart=on-failure
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/rsetup-controller
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -6,6 +6,15 @@
 //! `GET /api/v1/grants` 按 `(EndpointId::GrantsRead, session.digest)` 走读桶。
 //! `GET` 列表的 `cursor`/`next_cursor` 一律经 `api/mod.rs` 的统一签名 codec 对签发与校验，
 //! `user_id` 筛选以固定 schema 绑定进 cursor MAC，`limit` 不参与绑定。
+//!
+//! 事件线（06 §4 `permissions.changed`）：只有**目标用户明确**时才发布。
+//! - `POST /api/v1/grants`：请求体的 `user_id` 即受影响用户，写成功（仓储同事务
+//!   `bump_authz_epoch`）后向**该目标用户本人**发布一条提示；
+//! - `DELETE /api/v1/grants/{id}`：同样 bump epoch，但网关契约只回显 `{ deleted: true }`、
+//!   **不回显授权归属人**，本层无从确定受影响用户，因此**不发布**——把提示发给发起删除的
+//!   管理员本人只是指向错人的虚假提示（他未必是该授权的归属人，真正的归属人反而收不到）。
+//!   撤权安全性由全局 `authz_epoch` 递增 + SSE 读线每帧按连接 `authz_epoch` 权威复核直接
+//!   关流保证（06 §4），不依赖这条提示。
 
 use std::sync::Arc;
 
@@ -20,6 +29,7 @@ use uuid::Uuid;
 use crate::auth::service::Session;
 use crate::authz::policy::{GrantScope, GrantSource, Permission, validate_permission_list};
 use crate::error::ControllerError;
+use crate::events::EventBus;
 use crate::http_api::ok_response;
 use crate::http_auth::{EndpointId, HttpAuthState};
 use crate::http_gate::{
@@ -29,13 +39,17 @@ use crate::http_gate::{
 use super::{
     CursorFilterCtx, CursorKey, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, ManagementFuture,
     decode_management_list_cursor, management_cursor_secret, map_error, parse_device_id_path,
-    parse_revision, parse_uuid_path, sign_management_list_page,
+    parse_revision, parse_uuid_path, publish_permissions_changed, sign_management_list_page,
 };
 
 #[derive(Clone)]
 pub struct GrantsApiState {
     pub auth: Arc<HttpAuthState>,
     pub gateway: Arc<dyn GrantsGateway>,
+    /// 进程内事件总线句柄（06 §4 `permissions.changed`）：与 SSE 读线 `EventsState.bus`
+    /// 是同一通道句柄。`None` 表示本装配未开启事件线，写端点行为与接入总线之前完全
+    /// 一致（不发布、不报错、不阻塞）；发布返回值一律忽略，不得据此改变响应。
+    pub events: Option<EventBus>,
 }
 
 /// `GrantSource`/`GrantScope` 来自唯一 policy 定义，不另造权限点。
@@ -320,20 +334,28 @@ async fn create_grant(
         Ok(scope) => scope,
         Err(response) => return response,
     };
+    let user_id_raw = user_id.into_bytes();
     let created = match state
         .gateway
-        .create(&actor, user_id.into_bytes(), source, scope)
+        .create(&actor, user_id_raw, source, scope)
         .await
     {
         Ok(created) => created,
         Err(error) => return map_error(error),
     };
+    // 新增授权只改变该目标用户的有效权限：受众即他本人（与载荷 `id` 同一份字节）。
+    if let Some(ref bus) = state.events {
+        publish_permissions_changed(bus, &state.auth, user_id_raw).await;
+    }
     ok_response(created)
 }
 
 /// `DELETE /api/v1/grants/{id}`：读取 bounded JSON body 取得 `expected_revision`，
 /// CSRF 与单值 Origin 校验由 `authenticate_write` 完成；版本不符 → 409
 /// `REVISION_CONFLICT`；不存在 → 404；成功固定投影 `{ deleted: true }`。
+/// 删除成功同样 bump 授权 epoch：网关契约不回显授权归属人，本层拿不到受影响用户，因此
+/// **不发布** `permissions.changed`（发给操作者管理员即是指向错人的虚假提示）；撤权安全性
+/// 由全局 `authz_epoch` 递增 + SSE 读线的权威复核关流保证（06 §4）。
 async fn delete_grant(
     State(state): State<GrantsApiState>,
     Path(id): Path<String>,
@@ -379,6 +401,7 @@ mod tests {
     use super::*;
     use crate::api::users::test_fixture::*;
     use crate::error::ControllerError;
+    use crate::events::{EventAudience, EventEnvelope, EventName, EventViewer};
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use std::sync::{Mutex, OnceLock};
@@ -485,9 +508,20 @@ mod tests {
         session: Session,
         gateway: FixtureGrantsGateway,
     ) -> GrantsApiState {
+        grants_state_with_events(session, gateway, None)
+    }
+
+    /// 事件总线可选的装配：`Some(bus)` 与 SSE 读线 `EventsState.bus` 是同一通道句柄，
+    /// `None`（既有全部用例的基线）表示本装配未开启事件线。
+    fn grants_state_with_events(
+        session: Session,
+        gateway: FixtureGrantsGateway,
+        events: Option<EventBus>,
+    ) -> GrantsApiState {
         GrantsApiState {
             auth: fixture_auth(session),
             gateway: Arc::new(gateway),
+            events,
         }
     }
 
@@ -922,6 +956,7 @@ mod tests {
             grants: GrantsApiState {
                 auth: fixture_auth(fixture_session(true)),
                 gateway,
+                events: None,
             },
             secret_slot,
         };
@@ -1030,5 +1065,144 @@ mod tests {
             1,
             "筛选不匹配的 400 不得触达网关"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 授权变更的 `permissions.changed` 事件发布（06 §4）
+    // -----------------------------------------------------------------------
+
+    /// 收集订阅通道当前待读的事件（订阅只收「之后」的事件，不回放历史）。
+    fn collect_events(
+        rx: &mut tokio::sync::broadcast::Receiver<EventEnvelope>,
+    ) -> Vec<EventEnvelope> {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    /// 带事件总线的 grants 装配：`epoch` 是本装配报告的全局 authz_epoch。
+    fn grants_router_with_bus(
+        gateway: FixtureGrantsGateway,
+        bus: Option<EventBus>,
+        epoch: u64,
+    ) -> axum::Router<()> {
+        grants_router(GrantsApiState {
+            auth: fixture_auth_with_epoch(fixture_session(true), epoch),
+            gateway: Arc::new(gateway),
+            events: bus,
+        })
+    }
+
+    /// 正例：`POST /api/v1/grants` 的受影响用户由请求体 `user_id` 唯一确定，受众必须是
+    /// **该目标用户本人**（而不是发起变更的管理员），载荷 `id` 与他同一份字节。
+    #[tokio::test]
+    async fn create_grant_publishes_permissions_changed_to_target_user() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let router = grants_router_with_bus(FixtureGrantsGateway::Echo, Some(bus), 42);
+        let res = router
+            .oneshot(authenticated_json_post(
+                "/api/v1/grants",
+                serde_json::json!({
+                    "user_id": TARGET_ID,
+                    "source": { "kind": "direct", "permissions": ["device.read"] },
+                    "scope": { "kind": "all" },
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let events = collect_events(&mut rx);
+        assert_eq!(events.len(), 1, "新增授权必须恰好发布一条提示");
+        let event = &events[0];
+        assert_eq!(event.name(), EventName::PermissionsChanged);
+        assert_eq!(event.data()["kind"], serde_json::json!("permissions"));
+        assert_eq!(event.data()["id"], serde_json::json!(TARGET_ID));
+        assert_eq!(event.data()["epoch"], serde_json::json!("42"));
+        assert!(event.data()["epoch"].is_string());
+        let target =
+            <[u8; 16]>::try_from(hex::decode(TARGET_ID_RAW).expect("hex").as_slice()).expect("16B");
+        assert_eq!(event.audience(), EventAudience::User(target));
+        // 撤权者本人（管理员）看不到这条属于目标用户的私有事实。
+        assert!(!event.visible_to(EventViewer {
+            user_id: fixture_session(true).user.id,
+            is_admin: true,
+        }));
+        assert!(event.visible_to(EventViewer {
+            user_id: target,
+            is_admin: false,
+        }));
+    }
+
+    /// 语义收敛（审查反馈 Medium-1）：`DELETE /{id}` 成功同样 bump epoch，但网关不回显
+    /// 授权归属人，本层拿不到受影响用户，因此**不得**向操作者管理员发一条关于其本人的
+    /// `permissions.changed`。撤权安全性由全局 `authz_epoch` 递增 + SSE 读线每帧按连接
+    /// `authz_epoch` 权威复核直接关流保证（06 §4）。
+    #[tokio::test]
+    async fn delete_grant_publishes_no_permissions_changed_without_target_user() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let router = grants_router_with_bus(FixtureGrantsGateway::Allow, Some(bus.clone()), 9);
+        let res = router
+            .oneshot(authenticated_json_write(
+                "DELETE",
+                &format!("/api/v1/grants/{TARGET_ID}"),
+                serde_json::json!({ "expected_revision": "1" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            collect_events(&mut rx).len(),
+            0,
+            "受影响用户不可确定时不得向操作者发布 permissions.changed"
+        );
+        // 反向证据：同一订阅者确实能收到事件，说明上面的 0 条是「未发布」而非「订阅失效」。
+        assert_eq!(
+            bus.publish(EventEnvelope::permissions_changed(
+                fixture_session(true).user.id,
+                9,
+            )),
+            1
+        );
+    }
+
+    /// 负例：`events: None` 的既有装配、以及写失败（409）都不得有任何事件进入通道。
+    #[tokio::test]
+    async fn grant_writes_without_bus_or_on_failure_publish_nothing() {
+        // 1) `events: None`：创建成功也不得有任何事件进入通道。
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let router = grants_router(grants_state_with(FixtureGrantsGateway::Echo));
+        let res = router
+            .oneshot(authenticated_json_post(
+                "/api/v1/grants",
+                serde_json::json!({
+                    "user_id": TARGET_ID,
+                    "source": { "kind": "direct", "permissions": ["device.read"] },
+                    "scope": { "kind": "all" },
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(collect_events(&mut rx).len(), 0, "events: None 不得有事件");
+
+        // 2) 有总线但 CAS 失败（409）。
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let router = grants_router_with_bus(FixtureGrantsGateway::RevisionConflict, Some(bus), 42);
+        let res = router
+            .oneshot(authenticated_json_write(
+                "DELETE",
+                &format!("/api/v1/grants/{TARGET_ID}"),
+                serde_json::json!({ "expected_revision": "1" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        assert_eq!(collect_events(&mut rx).len(), 0, "409 未发生变更，不得发布");
     }
 }

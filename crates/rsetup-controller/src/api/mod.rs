@@ -27,6 +27,7 @@ use sha2::Digest as _;
 use uuid::Uuid;
 
 use crate::error::ControllerError;
+use crate::events::{EventBus, EventEnvelope};
 use crate::http_api::{err_response, ok_response};
 use crate::http_auth::{EndpointId, HttpAuthState};
 
@@ -44,7 +45,8 @@ use self::users::{UsersApiState, UsersGateway};
 pub type ManagementFuture<'a, T> = crate::authz::sqlx_repo::RepoFuture<'a, T>;
 
 /// 管理 router 的显式装配状态：全部网关/probe/sink 由集成 owner 显式提供真实实例，
-/// 不提供默认常量源或 `Option` 缺省；不扩展 cursor 密钥字段。
+/// 不提供默认常量源；不扩展 cursor 密钥字段。唯一允许的 `Option` 是
+/// [`ManagementState::events`]（未装配事件线时不发布），它不是任何真实源的常量兜底。
 #[derive(Clone)]
 pub struct ManagementState {
     pub auth: Arc<HttpAuthState>,
@@ -59,37 +61,53 @@ pub struct ManagementState {
     pub device_probe: Arc<dyn DeviceLiveProbe>,
     pub recovery_probe: Arc<dyn RecoveryModeProbe>,
     pub notification_sink: Arc<dyn ManagementNotificationSink>,
+    /// 进程内事件总线句柄（06 §4）：与 SSE 读线 `EventsState.bus` 必须是同一通道句柄
+    /// （[`EventBus::clone`] 不新建通道）。`None` 表示本装配未开启事件线，各资源写端点
+    /// 的行为与接入总线之前完全一致（不发布、不报错、不阻塞）；发布返回值一律忽略，
+    /// 不得据此改变响应。由 [`build_management_router`] 分发给需要发布的那几个子
+    /// router state（`AuditApiState` 无发布职责，故不持有）。
+    pub events: Option<EventBus>,
 }
 
 /// 生产装配签名（Task 13 打通真实仓储 adapter）。骨架阶段 8 个子 router 各挂载 0 条
 /// 路由，因此本函数返回的 router 不含任何可命中路由——类型前置，不计为 API 验收。
+///
+/// 事件总线按 `Option` 逐个子 router 分发（唯一的 `Option` 例外，见
+/// [`ManagementState::events`]）：`None` 即本装配未开启事件线，写端点行为与接入总线
+/// 之前完全一致，不构造常量源也不伪造发布成功。
 pub fn build_management_router(state: ManagementState) -> axum::Router<()> {
     users::users_router(UsersApiState {
         auth: state.auth.clone(),
         gateway: state.users,
+        events: state.events.clone(),
     })
     .merge(roles::roles_router(RolesApiState {
         auth: state.auth.clone(),
         gateway: state.roles,
+        events: state.events.clone(),
     }))
     .merge(grants::grants_router(GrantsApiState {
         auth: state.auth.clone(),
         gateway: state.grants,
+        events: state.events.clone(),
     }))
     .merge(groups::groups_router(GroupsApiState {
         auth: state.auth.clone(),
         gateway: state.groups,
+        events: state.events.clone(),
     }))
     .merge(devices::devices_router(DevicesApiState {
         auth: state.auth.clone(),
         gateway: state.devices,
         live_probe: state.device_probe.clone(),
+        events: state.events.clone(),
     }))
     .merge(approvals::approvals_router(ApprovalsApiState {
         auth: state.auth.clone(),
         gateway: state.approvals,
         notification_sink: state.notification_sink,
         probe: state.device_probe,
+        events: state.events.clone(),
     }))
     .merge(audit::audit_router(AuditApiState {
         auth: state.auth.clone(),
@@ -99,7 +117,42 @@ pub fn build_management_router(state: ManagementState) -> axum::Router<()> {
         auth: state.auth,
         gateway: state.system,
         recovery_probe: state.recovery_probe,
+        events: state.events,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// 授权变更事件发布（06 §4 `permissions.changed`）
+// ---------------------------------------------------------------------------
+
+/// 授权写成功后的统一 `permissions.changed` 发布入口，**只**供目标用户明确的写线复用：
+/// `users.rs` 的 `PATCH /{id}` 与 `reset-password`、`grants.rs` 的 `create_grant`
+/// （请求体 `user_id` 即受影响用户）。
+///
+/// - `user_id` 是**受影响用户**的 16B UUID。受众与载荷 `id` 由
+///   [`EventEnvelope::permissions_changed`] 用同一份字节生成，调用方在 API 上写不出
+///   「把 Alice 的授权变化投给 Bob」的配对；也正因受众被这份字节绑死，**当受影响用户
+///   集合在本层不可确定时（改角色权限集、改组、删授权不回显归属人）一律不调用本函数**
+///   ——传操作者管理员本人并不是「合法下界」而是虚假提示：他未必在受影响集合内，真正
+///   受影响的持有者反而收不到，客户端还会据 `epoch` 误判自己的授权投影已刷新；
+///   这类变更的安全性由全局 `authz_epoch` 递增 + SSE 读线每帧按连接 `authz_epoch`
+///   权威复核直接关流保证（见下条），本就不需要这条提示；
+/// - epoch 取写入返回之后重读的全局 `schema_meta.authz_epoch`（与各认证端点同源，
+///   不是自造计数器），因此恒 ≥ 本次变更 bump 后的值，客户端据此判定旧授权投影失效；
+/// - epoch 读取失败即**不发布**：宁可不发提示，也不伪造 epoch。正确性本就不依赖这条
+///   提示——SSE 投递侧对每一帧都按连接的 `authz_epoch` 复核（06 §4「发送前验证 session
+///   与 authz_epoch，撤权关闭旧订阅」），事件只是让**受影响的那个**客户端更早主动重鉴权
+///   的优化；受众不可确定时宁可不发；
+/// - [`EventBus::publish`] 永不阻塞、永不上抛，返回值（在线订阅者数）在此丢弃。
+pub(crate) async fn publish_permissions_changed(
+    bus: &EventBus,
+    auth: &HttpAuthState,
+    user_id: [u8; 16],
+) {
+    let Ok(epoch) = auth.auth.authz_epoch().await else {
+        return;
+    };
+    bus.publish(EventEnvelope::permissions_changed(user_id, epoch));
 }
 
 // ---------------------------------------------------------------------------

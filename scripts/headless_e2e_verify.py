@@ -55,8 +55,12 @@ HOST, PORT = LISTEN_ADDRESS.split(":")
 ORIGIN = f"http://{LISTEN_ADDRESS}"
 CURSOR_SECRET_HEX = "0123456789abcdef" * 4  # 64 个十六进制字符 = 32 字节
 
-SCREENSHOT = "/tmp/headless_login.png"
-EVIDENCE_JSON = "/tmp/headless_e2e_evidence.json"
+# 视口可通过环境变量覆盖；320 用于极窄屏横向溢出验收。
+VIEWPORT_WIDTH = int(os.environ.get("HEADLESS_E2E_WIDTH", "1280"))
+VIEWPORT_HEIGHT = int(os.environ.get("HEADLESS_E2E_HEIGHT", "800"))
+
+SCREENSHOT = f"/tmp/headless_login_{VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT}.png"
+EVIDENCE_JSON = f"/tmp/headless_e2e_evidence_{VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT}.json"
 ART_DIR = "/tmp/headless_e2e_artifacts"
 
 # 去敏词典：解析凭据后填充，任何写入控制台/证据的输出都先经过 mask()。
@@ -502,9 +506,14 @@ def main() -> int:
         firefox_bin = firefox_binary()
         if firefox_bin:
             driver_args[1:1] = ["--binary", firefox_bin]
+        driver_env = dict(os.environ)
+        # Firefox headless 的 --width/--height 在部分版本会被窗口最小宽度夹到 500；
+        # MOZ_HEADLESS_WIDTH/HEIGHT 是更可靠的无头视口来源，两者都设置并断言生效。
+        driver_env["MOZ_HEADLESS_WIDTH"] = str(VIEWPORT_WIDTH)
+        driver_env["MOZ_HEADLESS_HEIGHT"] = str(VIEWPORT_HEIGHT)
         driver_proc, driver_handle = spawn(
             driver_args,
-            None,
+            driver_env,
             driver_log,
         )
         driver = WebDriver(driver_port)
@@ -520,7 +529,13 @@ def main() -> int:
             time.sleep(0.3)
         check("geckodriver 启动且 /status ready", gecko_ready, f"port={driver_port}")
 
-        firefox_options: dict = {"args": ["--headless", "--width=1280", "--height=800"]}
+        firefox_options: dict = {
+            "args": [
+                "--headless",
+                f"--width={VIEWPORT_WIDTH}",
+                f"--height={VIEWPORT_HEIGHT}",
+            ]
+        }
         if firefox_bin:
             firefox_options["binary"] = firefox_bin
         caps = {
@@ -582,7 +597,7 @@ def main() -> int:
         png = driver.screenshot_png()
         with open(SCREENSHOT, "wb") as handle:
             handle.write(png)
-        check("⑥ 登录页截图已保存 /tmp/headless_login.png", len(png) > 5_000, f"bytes={len(png)} path={SCREENSHOT}")
+        check("⑥ 登录页截图已保存", len(png) > 5_000, f"bytes={len(png)} path={SCREENSHOT}")
         evidence["artifacts"]["screenshot"] = SCREENSHOT
 
         form_info_raw = driver.script(
@@ -615,9 +630,52 @@ def main() -> int:
         evidence["artifacts"]["login_form"] = form_info
         evidence["artifacts"]["page_title"] = title
 
+        layout_raw = driver.script(
+            "return JSON.stringify({w:window.innerWidth,"
+            " sw:document.documentElement.scrollWidth,"
+            " bw:document.body?document.body.scrollWidth:-1,"
+            " overflow:document.documentElement.scrollWidth>window.innerWidth+1});"
+        )
+        layout = json.loads(layout_raw)
+        check(
+            "⑨ 当前视口宽度未被浏览器夹取",
+            layout["w"] == VIEWPORT_WIDTH,
+            f"requested={VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT} actual={layout['w']}x{VIEWPORT_HEIGHT}",
+        )
+        check(
+            "⑨b 当前视口无横向溢出",
+            not layout["overflow"],
+            f"viewport={layout['w']}x{VIEWPORT_HEIGHT} scrollWidth={layout['sw']} bodyScrollWidth={layout['bw']}",
+        )
+        a11y_raw = driver.script(
+            "var els=[].slice.call(document.querySelectorAll('button,input,a,select,textarea'));"
+            "var unnamed=els.filter(function(e){"
+            " var label=e.getAttribute('aria-label')||e.getAttribute('aria-labelledby')||"
+            " e.getAttribute('title')||e.getAttribute('placeholder');"
+            " var labels=e.labels?[].map.call(e.labels,function(l){return l.textContent||'';}).join(' '):'';"
+            " var text=(e.textContent||'').trim();"
+            " return !(label||labels.trim()||text);"
+            "});"
+            "return JSON.stringify({total:els.length,unnamed:unnamed.length});"
+        )
+        a11y = json.loads(a11y_raw)
+        check(
+            "⑩ 可交互控件均有可访问名称",
+            a11y["unnamed"] == 0,
+            f"controls={a11y['total']} unnamed={a11y['unnamed']}",
+        )
+        evidence["artifacts"]["viewport"] = {
+            "width": VIEWPORT_WIDTH,
+            "height": VIEWPORT_HEIGHT,
+            "scroll_width": layout["sw"],
+            "horizontal_overflow": layout["overflow"],
+            "a11y_controls": a11y["total"],
+            "a11y_unnamed": a11y["unnamed"],
+        }
+
         driver.delete_session()
         browser_phase_done = True
-        check("⑨ WebDriver session 已销毁", driver.session_id is None)
+        check("⑪ WebDriver session 已销毁", driver.session_id is None)
 
         section("5 优雅终止与端口回收")
         log(f"  geckodriver: {shutdown(driver_proc, 'geckodriver')}")

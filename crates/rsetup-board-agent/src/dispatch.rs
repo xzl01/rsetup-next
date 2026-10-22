@@ -16,8 +16,8 @@ use crate::read_only::{PeerContext, ReadOnlySource};
 use crate::tickets::{TicketBinding, TicketManager, TicketOrigin, TicketToken};
 use rsetup_protocol::wire::{
     BUSINESS_SCHEMA_VERSION, BusinessMessage, BusinessPayload, BusinessPayloadKind, Codec,
-    DtoError, RebootExecute, RebootPrepare, RebootTicket, canonical_reboot_payload_hash,
-    decode_business, is_canonical_uuid_v4,
+    CodecError, DtoError, RebootExecute, RebootPrepare, RebootTicket, approved_codec_witness,
+    canonical_reboot_payload_hash, decode_business, is_canonical_uuid_v4,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -46,6 +46,51 @@ pub enum BusinessStatus {
     ExecutionTokenInvalid = 1010,
 }
 
+/// codec 错误 → 业务 `status_code` 的唯一映射。
+///
+/// **穷尽匹配（无 `_` 兜底）**：`CodecError` 现有 10 个变体全部逐条列出，
+/// 协议层新增变体时本函数必须编译失败并强制归类，不得静默落入 1003。
+///
+/// 三条界线按 03 §1 状态码表的稳定语义划分，不得互相冒充：
+///
+/// * **版本可协商** → 1001 [`BusinessStatus::UnsupportedVersion`]：
+///   [`CodecError::UnsupportedSchemaVersion`] 表示对端声明了本部署不支持的
+///   `schema_version`，中控据此触发版本/能力协商；
+/// * **资源超限** → 1008 [`BusinessStatus::ResourceExhausted`]：
+///   [`CodecError::LengthLimit`] 表示消息（含嵌套子消息）字节数越过 512 KiB
+///   整包上限，与「这条请求的字段写错了」不是一回事；
+/// * **部署 / 门禁不可用** → 1009 [`BusinessStatus::InternalError`]：
+///   [`CodecError::CodecUnapproved`] **只**表示「本次没有可用的获批 codec 见证」
+///   （`witness: None`，或传入 [`rsetup_protocol::wire::NoCodec`]），是本端部署
+///   故障，**不是**对端版本问题。它不再冒充 1001：那会让中控误以为「换个版本
+///   重试」就能通过，而真实原因是本端没有获批 codec，重试多少次结果都一样。
+///   03 §1 允许该类内部故障落在 1009 或 1004，本仓取 1009：1004
+///   [`BusinessStatus::CapabilityUnavailable`] 在本板端专指「该动作的执行能力未接线」
+///   （如未注入 reboot 调度器），而 codec 门禁是全部分发动作的公共前置，不是单个动作的能力缺失。
+///   该路径的 fail-closed 语义完全不变——见证守卫在触碰 `bytes` 与任何
+///   source/journal/OS 之前失败关闭，也绝不自造编码器；
+/// * **这条请求自身的编码缺陷** → 1003 [`BusinessStatus::InvalidArgument`]：
+///   `Malformed` / `UnknownField` / `DuplicateField` / `MissingField` /
+///   `InvalidUtf8` / `InvalidDto`，以及 [`CodecError::TooManyMetrics`]
+///   （`metrics` 条目数超 schema 契约上限 `MAX_METRICS`：属集合规模的入参非法，
+///   与 512 KiB 的**整包长度**上限分属两个约束，因此不归 1008）。
+///
+/// 所有分支都绝不回显 payload 内容与 codec 错误细节。
+fn codec_error_status(error: CodecError) -> BusinessStatus {
+    match error {
+        CodecError::UnsupportedSchemaVersion(_) => BusinessStatus::UnsupportedVersion,
+        CodecError::LengthLimit => BusinessStatus::ResourceExhausted,
+        CodecError::CodecUnapproved(_) => BusinessStatus::InternalError,
+        CodecError::TooManyMetrics
+        | CodecError::Malformed(_)
+        | CodecError::UnknownField(_)
+        | CodecError::DuplicateField(_)
+        | CodecError::MissingField(_)
+        | CodecError::InvalidUtf8
+        | CodecError::InvalidDto(_) => BusinessStatus::InvalidArgument,
+    }
+}
+
 pub trait TaskJournalReader: Send + Sync {
     fn query(
         &self,
@@ -58,7 +103,7 @@ pub trait JournalEpochSource: Send + Sync {
     fn journal_epoch(&self) -> String;
 }
 
-/// 结构校验成功后的类型化响应；原始 wire 只有在获批 codec 就位后才可能产出。
+/// 结构校验成功后的类型化响应；原始 wire 入口只有在 codec 解码成功后才可能产出它。
 #[derive(Clone, Debug, PartialEq)]
 pub enum BusinessResponse {
     Capabilities(rsetup_protocol::wire::Capabilities),
@@ -155,9 +200,11 @@ impl<R: ReadOnlySource, J: TaskJournalReader, E: JournalEpochSource> BoardAgent<
     ) -> Result<BusinessResponse, BusinessStatus> {
         // 1) 先做动作判定：不在封闭表内的动作（含 device.task.result）在触碰任何 source/journal 之前被拒绝
         let spec = lookup_action(action).ok_or(BusinessStatus::UnsupportedAction)?;
-        // 2) 结构校验：失败即拒绝，且未触达 I/O。错误按映射表分类（先匹配先赢）：
-        //    仅 schema 版本/能力不匹配 → UnsupportedVersion；
-        //    结构/字段/枚举/长度类校验失败（含空白 sub_task_id）→ InvalidArgument
+        // 2) 结构校验：失败即拒绝，且未触达 I/O。错误按语义分流：
+        //    仅 DtoError::UnsupportedVersion → UnsupportedVersion（1001，可协商的版本错误）；
+        //    其余结构/字段/枚举/长度类校验失败（含空白 sub_task_id）→ InvalidArgument（1003）。
+        //    该分流必须与 [`codec_error_status`] 对 `UnsupportedSchemaVersion` 的归类一致，
+        //    否则同一条版本违规在 typed / wire 两条入口上会得到不同 status_code。
         payload.validate().map_err(|err| match err {
             DtoError::UnsupportedVersion(_) => BusinessStatus::UnsupportedVersion,
             _ => BusinessStatus::InvalidArgument,
@@ -261,7 +308,10 @@ impl<R: ReadOnlySource, J: TaskJournalReader, E: JournalEpochSource> BoardAgent<
         }
     }
 
-    /// 原始字节入口：先查白名单，再 fail-closed，最后才允许解码。
+    /// 原始字节入口：先查白名单与期望载荷类型，再解码，最后汇入同一条类型化分发。
+    ///
+    /// 白名单与 expected kind 的判定顺序不变：未授权动作、动作与载荷类型不匹配都在
+    /// 触碰 codec 与任何 I/O 之前被拒绝。
     pub fn handle_wire(
         &self,
         codec: &dyn Codec,
@@ -285,9 +335,16 @@ impl<R: ReadOnlySource, J: TaskJournalReader, E: JournalEpochSource> BoardAgent<
             }
             _ => return Err(BusinessStatus::InvalidArgument),
         };
-        // 3) 无获批 codec 见证：fail-closed，绝不解析、绝不自造编码器
-        let decoded = decode_business(codec, None, expected, payload)
-            .map_err(|_| BusinessStatus::UnsupportedVersion)?;
+        // 3) 业务 codec 已按项目所有者 2026-10-22 的授权启用（见 `approved_codec_witness`
+        //    的授权性质说明：不是外部专家决议）。见证在本函数栈上取得，
+        //    不引入任何全局可变状态；传入 `NoCodec` 等未获批实现时
+        //    `CodecUnapproved` 仍按原语义在触碰 bytes 与任何 I/O 之前失败关闭，
+        //    绝不自造编码器——它是本端部署故障，按 1009 InternalError 回包（见
+        //    [`codec_error_status`]），不再冒充 1001 版本不匹配。
+        let witness = approved_codec_witness();
+        // 4) 解码错误按语义分流（见 [`codec_error_status`]）；所有路径都不回显 payload。
+        let decoded = decode_business(codec, Some(&witness), expected, payload)
+            .map_err(codec_error_status)?;
         self.handle_typed_action(peer, action, &decoded)
     }
 }
@@ -937,5 +994,64 @@ impl<O: RebootOs, F: Fs> RebootDispatcher for RebootExecutor<O, F> {
             &payload_hash,
             now,
         )
+    }
+}
+
+#[cfg(test)]
+mod codec_error_mapping_tests {
+    //! [`codec_error_status`] 的逐变体锁定：四档归类一旦回退（尤其 1009 重新冒充 1001），
+    //! 本模块直接失败。端到端见证见 `tests/wire_codec.rs`；`TooManyMetrics` 因入站白名单
+    //! 没有 `expected = DeviceStatus` 的动作而无法经 `handle_wire` 触达，只在此锁定。
+    use super::{BusinessStatus, codec_error_status};
+    use rsetup_protocol::wire::CodecError;
+
+    #[test]
+    fn codec_error_status_maps_every_variant_to_its_class() {
+        // 1001：可协商的版本错误
+        assert_eq!(
+            codec_error_status(CodecError::UnsupportedSchemaVersion(2)),
+            BusinessStatus::UnsupportedVersion
+        );
+        // 1008：整包长度越过 512 KiB
+        assert_eq!(
+            codec_error_status(CodecError::LengthLimit),
+            BusinessStatus::ResourceExhausted
+        );
+        // 1009：本端部署/门禁不可用，不是对端版本问题
+        assert_eq!(
+            codec_error_status(CodecError::CodecUnapproved("no approved business codec")),
+            BusinessStatus::InternalError
+        );
+        // 1003：这条请求自身的编码/契约缺陷（含集合条目数超限）
+        let own_defect: &[CodecError] = &[
+            CodecError::Malformed("truncated"),
+            CodecError::UnknownField(9),
+            CodecError::DuplicateField(1),
+            CodecError::MissingField("schema_version"),
+            CodecError::InvalidUtf8,
+            CodecError::TooManyMetrics,
+            CodecError::InvalidDto("invalid_uuid"),
+        ];
+        for error in own_defect {
+            assert_eq!(
+                codec_error_status(error.clone()),
+                BusinessStatus::InvalidArgument,
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_four_classes_are_distinct_wire_codes() {
+        // 四档必须是四个互不相同的 wire 码：任何两者合并都会让中控丢失分流能力。
+        let codes = [
+            BusinessStatus::UnsupportedVersion as i32,
+            BusinessStatus::InvalidArgument as i32,
+            BusinessStatus::ResourceExhausted as i32,
+            BusinessStatus::InternalError as i32,
+        ];
+        assert_eq!(codes, [1001, 1003, 1008, 1009]);
+        let unique: std::collections::BTreeSet<i32> = codes.iter().copied().collect();
+        assert_eq!(unique.len(), codes.len(), "四档不得互相合并");
     }
 }

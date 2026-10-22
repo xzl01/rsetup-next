@@ -5,6 +5,12 @@ The binary package is built with Debian 13 (Trixie) and Rust 1.85 or newer. CI
 then installs and runs the resulting package in Debian 12 (Bookworm), which is
 the runtime compatibility baseline.
 
+This source package also builds the separate `rsetup-controller` binary package
+from the same tree. The compiled web UI is committed under
+`apps/controller-web/dist`, so the build stays network-isolated and needs no
+Node.js/npm. Database migration and host/origin/cursor configuration remain
+operator steps; see `/usr/share/doc/rsetup-controller/README.Debian`.
+
 The package build itself is network-isolated. For local and CI builds, run:
 
     git submodule update --init --recursive

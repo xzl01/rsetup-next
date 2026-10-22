@@ -22,6 +22,7 @@ use serde::Deserialize;
 use crate::auth::service::Session;
 use crate::devices::service::{AdmissionChangeEvent, MAX_ADMISSION_REASON_BYTES};
 use crate::error::ControllerError;
+use crate::events::{EventBus, EventEnvelope, EventObjectAudience};
 use crate::http_api::ok_response;
 use crate::http_auth::{EndpointId, HttpAuthState};
 use crate::http_gate::{
@@ -56,6 +57,11 @@ pub struct ApprovalsApiState {
     /// 审批 `connection_state` 的唯一消费通道：与 devices 侧同源的真实探针实例，
     /// 不新造第二套探针类型、不用常量 offline 源或 `Option` 缺省。
     pub probe: Arc<dyn DeviceLiveProbe>,
+    /// 进程内事件总线句柄（06 §4 `device.updated`）：与 SSE 读线 `EventsState.bus`
+    /// 及 devices 侧发布方必须是同一通道句柄（[`EventBus::clone`] 不新建通道）。
+    /// `None` 表示本装配未开启事件线，写端点行为与接入总线之前完全一致（不发布、
+    /// 不报错、不阻塞）；发布返回值一律忽略，不得据此改变响应。
+    pub events: Option<EventBus>,
 }
 
 pub trait ApprovalsGateway: Send + Sync {
@@ -343,6 +349,8 @@ pub(crate) async fn list_approvals(
 /// `POST /api/v1/approvals/approve`：`authenticate_write` → `require_admin_session` →
 /// body 严格解析 → `confirm == true` → 目标 `1..=1024` 逐项严格解析 → 网关逐项 CAS
 /// （单项冲突/失败收集进 `results`，不改 HTTP 状态码）→ 固定 200。
+/// 事件线：只对逐项结果中 `ok == true` 的项发布 `device.updated`（失败项未发生任何
+/// 变更，不得发布），受众恒管理员范围。
 async fn approve_devices(
     State(state): State<ApprovalsApiState>,
     headers: HeaderMap,
@@ -370,7 +378,67 @@ async fn approve_devices(
         Ok(results) => results,
         Err(error) => return map_error(error),
     };
+    if let Some(ref bus) = state.events {
+        publish_approved_devices(bus, &results, &targets);
+    }
     ok_response(results)
+}
+
+/// 单目标准入状态机（revoke/reauthorize）成功后的 `device.updated` 发布：网关只回显
+/// `{state|decision, requires_device_reset}`，不含新 revision，因此载荷 revision 取
+/// CAS 的**递增下界** `expected_revision.saturating_add(1)`（06 §4：revision 只作同
+/// kind+id 内的单调提示，不是全局版本）。饱和加而非 `+ 1`：`expected_revision` 由客户端
+/// 任意给出，极限值下 `+ 1` 会 panic 或回绕成倒退版本。载荷 id 是设备公钥的小写 hex64，
+/// 受众恒管理员范围。
+fn publish_device_updated(bus: &EventBus, id: &[u8; 32], revision: u64) {
+    bus.publish(EventEnvelope::device_updated(
+        &hex::encode(id),
+        revision,
+        EventObjectAudience::admins(),
+    ));
+}
+
+/// 批量 approve 成功项的 `device.updated` 发布：只遍历逐项结果中 `ok == true` 的项
+/// （集合键兼容 `approved`/`results`，id 键兼容 `device_id`/`id`），载荷 revision 优先
+/// 取该项回显的新 revision，回显缺失时退回同下标 target 的
+/// `expected_revision.saturating_add(1)` 这一单调下界（饱和加：`expected_revision` 由
+/// 客户端任意给出，极限值下 `+ 1` 会 panic 或回绕成倒退版本）。形状不符（非数组/缺 id）
+/// 一律跳过该项，不影响 HTTP 200 响应。
+fn publish_approved_devices(bus: &EventBus, value: &serde_json::Value, targets: &[ApprovalTarget]) {
+    let Some(items) = value
+        .get("approved")
+        .or_else(|| value.get("results"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+    for (index, item) in items.iter().enumerate() {
+        if item.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+            continue;
+        }
+        let Some(raw_id) = item
+            .get("device_id")
+            .or_else(|| item.get("id"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let revision = item
+            .get("revision")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .or_else(|| {
+                targets
+                    .get(index)
+                    .map(|target| target.expected_revision.saturating_add(1))
+            })
+            .unwrap_or(1);
+        bus.publish(EventEnvelope::device_updated(
+            raw_id,
+            revision,
+            EventObjectAudience::admins(),
+        ));
+    }
 }
 
 /// `POST /api/v1/approvals/reject`：同 approve，另加 `reason` 门禁（trim 后非空、
@@ -452,6 +520,8 @@ async fn reopen_approval(
 
 /// `POST /api/v1/devices/{id}/revoke`：准入吊销（仅限已批准），返回
 /// `{ state: "REVOKED", requires_device_reset: true }`；`reason` 门禁同 reject。
+/// 吊销成功后发布 `device.updated`（revision = `expected_revision.saturating_add(1)`，
+/// 仅管理员受众）。
 async fn revoke_device(
     State(state): State<ApprovalsApiState>,
     Path(id): Path<String>,
@@ -491,12 +561,15 @@ async fn revoke_device(
         Ok(value) => value,
         Err(error) => return map_error(error),
     };
+    if let Some(ref bus) = state.events {
+        publish_device_updated(bus, &id, revision.saturating_add(1));
+    }
     ok_response(value)
 }
 
 /// `POST /api/v1/devices/{id}/reauthorize`：仅限原为 `REVOKED` 重新授权，返回
 /// `{ state: "APPROVED", requires_device_reset: true }`；非法前态由网关
-/// `InvalidState` → 409。
+/// `InvalidState` → 409。重新授权成功后发布 `device.updated`（受众恒管理员范围）。
 async fn reauthorize_device(
     State(state): State<ApprovalsApiState>,
     Path(id): Path<String>,
@@ -529,6 +602,9 @@ async fn reauthorize_device(
         Ok(value) => value,
         Err(error) => return map_error(error),
     };
+    if let Some(ref bus) = state.events {
+        publish_device_updated(bus, &id, revision.saturating_add(1));
+    }
     ok_response(value)
 }
 
@@ -555,6 +631,7 @@ mod tests {
     use super::*;
     use crate::api::devices::{DeviceConnectionState, DeviceLiveView, DeviceStreamHealth};
     use crate::api::users::test_fixture::*;
+    use crate::events::{EventAudience, EventName, EventViewer};
     use axum::http::StatusCode;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
@@ -601,7 +678,7 @@ mod tests {
                     serde_json::json!({
                         "device_id": hex::encode(target.device_id),
                         "ok": true,
-                        "revision": (target.expected_revision + 1).to_string(),
+                        "revision": target.expected_revision.saturating_add(1).to_string(),
                     })
                 }
             })
@@ -748,15 +825,26 @@ mod tests {
         }
     }
 
+    /// 事件线关闭（`events: None`）的装配：既有全部用例的行为基线。
     fn approvals_state_with(
         gateway: FixtureApprovalsGateway,
         session: Session,
+    ) -> ApprovalsApiState {
+        approvals_state_with_events(gateway, session, None)
+    }
+
+    /// 事件总线可选的装配：`Some(bus)` 与 SSE 读线 `EventsState.bus` 是同一通道句柄。
+    fn approvals_state_with_events(
+        gateway: FixtureApprovalsGateway,
+        session: Session,
+        events: Option<EventBus>,
     ) -> ApprovalsApiState {
         ApprovalsApiState {
             auth: fixture_auth(session),
             gateway: Arc::new(gateway),
             notification_sink: Arc::new(FixtureNotificationSink),
             probe: Arc::new(FixtureProbe::Ok),
+            events,
         }
     }
 
@@ -1226,6 +1314,7 @@ mod tests {
                 gateway,
                 notification_sink: Arc::new(FixtureNotificationSink),
                 probe,
+                events: None,
             },
             secret_slot,
         };
@@ -1482,5 +1571,270 @@ mod tests {
         let text = value.to_string();
         assert!(!text.contains("connection_state"), "{text}");
         assert!(!text.contains("offline"), "{text}");
+    }
+
+    // -----------------------------------------------------------------------
+    // 准入写端点的 `device.updated` 事件发布（06 §4）
+    // -----------------------------------------------------------------------
+
+    /// 收集订阅通道当前待读的事件（订阅只收「之后」的事件，不回放历史）。
+    fn collect_events(
+        rx: &mut tokio::sync::broadcast::Receiver<EventEnvelope>,
+    ) -> Vec<EventEnvelope> {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    /// `revoke` 成功：恰好一条 `device.updated`，载荷 id 为路径设备公钥 hex64、
+    /// revision 为 CAS 递增下界 `expected_revision.saturating_add(1)`，受众仅管理员。
+    #[tokio::test]
+    async fn revoke_publishes_device_updated_to_admins_when_bus_configured() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let router = approvals_router(approvals_state_with_events(
+            FixtureApprovalsGateway::Standard,
+            fixture_session(true),
+            Some(bus),
+        ));
+        let res = router
+            .oneshot(authenticated_json_post(
+                &format!("/api/v1/devices/{}/revoke", device_id(DEVICE_A)),
+                serde_json::json!({
+                    "expected_revision": "1", "reason": "compromised", "confirm": true,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let events = collect_events(&mut rx);
+        assert_eq!(events.len(), 1, "吊销成功必须恰好发布一条 device.updated");
+        let event = &events[0];
+        assert_eq!(event.name(), EventName::DeviceUpdated);
+        assert_eq!(event.data()["kind"], serde_json::json!("device"));
+        assert_eq!(event.data()["id"], serde_json::json!(device_id(DEVICE_A)));
+        assert_eq!(event.data()["revision"], serde_json::json!("2"));
+        assert!(event.data()["revision"].is_string());
+        assert_eq!(event.audience(), EventAudience::Admins);
+        assert!(
+            event.visible_to(EventViewer {
+                user_id: [7u8; 16],
+                is_admin: true,
+            }),
+            "管理员受众事件对管理员会话可投递"
+        );
+        assert!(
+            !event.visible_to(EventViewer {
+                user_id: [7u8; 16],
+                is_admin: false,
+            }),
+            "对象级管理员范围事件对普通用户不可见"
+        );
+    }
+
+    /// 溢出防御：`expected_revision` 是客户端任意输入（`parse_revision` 允许上到
+    /// `u64::MAX`），CAS 下界取**饱和加**：既不在 debug 构建 panic，也不回绕成 `0`
+    /// 这一倒退 revision。
+    #[tokio::test]
+    async fn revoke_at_u64_max_revision_publishes_saturating_lower_bound() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let router = approvals_router(approvals_state_with_events(
+            FixtureApprovalsGateway::Standard,
+            fixture_session(true),
+            Some(bus),
+        ));
+        let res = router
+            .oneshot(authenticated_json_post(
+                &format!("/api/v1/devices/{}/revoke", device_id(DEVICE_A)),
+                serde_json::json!({
+                    "expected_revision": u64::MAX.to_string(),
+                    "reason": "compromised",
+                    "confirm": true,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let events = collect_events(&mut rx);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].data()["revision"],
+            serde_json::json!(u64::MAX.to_string()),
+            "极限 revision 必须饱和在 u64::MAX，不得回绕"
+        );
+    }
+
+    /// `reauthorize` 成功：同样恰好一条 `device.updated`（受众仅管理员）。
+    #[tokio::test]
+    async fn reauthorize_publishes_device_updated_when_bus_configured() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let router = approvals_router(approvals_state_with_events(
+            FixtureApprovalsGateway::Standard,
+            fixture_session(true),
+            Some(bus),
+        ));
+        let res = router
+            .oneshot(authenticated_json_post(
+                &format!("/api/v1/devices/{}/reauthorize", device_id(DEVICE_A)),
+                serde_json::json!({ "expected_revision": "5", "confirm": true }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let events = collect_events(&mut rx);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name(), EventName::DeviceUpdated);
+        assert_eq!(
+            events[0].data()["id"],
+            serde_json::json!(device_id(DEVICE_A))
+        );
+        assert_eq!(events[0].data()["revision"], serde_json::json!("6"));
+        assert_eq!(events[0].audience(), EventAudience::Admins);
+    }
+
+    /// 批量 `approve`：只对逐项结果里 `ok == true` 的项发布（Mixed 桩下 `b`×64 的
+    /// `REVISION_CONFLICT` 项未发生任何变更，不得发布）；载荷 revision 取回显值。
+    #[tokio::test]
+    async fn approve_publishes_only_successful_items_when_bus_configured() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let router = approvals_router(approvals_state_with_events(
+            FixtureApprovalsGateway::Mixed,
+            fixture_session(true),
+            Some(bus),
+        ));
+        let res = router
+            .oneshot(authenticated_json_post(
+                "/api/v1/approvals/approve",
+                serde_json::json!({
+                    "targets": [
+                        { "device_id": device_id(DEVICE_A), "expected_revision": "1" },
+                        { "device_id": device_id(DEVICE_B), "expected_revision": "99" },
+                    ],
+                    "confirm": true,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let events = collect_events(&mut rx);
+        assert_eq!(
+            events.len(),
+            1,
+            "冲突项未发生任何变更，不得发布 device.updated"
+        );
+        assert_eq!(events[0].name(), EventName::DeviceUpdated);
+        assert_eq!(
+            events[0].data()["id"],
+            serde_json::json!(device_id(DEVICE_A))
+        );
+        assert_eq!(events[0].data()["revision"], serde_json::json!("2"));
+        assert_eq!(events[0].audience(), EventAudience::Admins);
+    }
+
+    /// 全部目标成功的批量 approve：逐项各一条，不多发、不漏发。
+    #[tokio::test]
+    async fn approve_publishes_one_event_per_successful_device() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let router = approvals_router(approvals_state_with_events(
+            FixtureApprovalsGateway::Standard,
+            fixture_session(true),
+            Some(bus),
+        ));
+        let res = router
+            .oneshot(authenticated_json_post(
+                "/api/v1/approvals/approve",
+                serde_json::json!({
+                    "targets": [
+                        { "device_id": device_id(DEVICE_A), "expected_revision": "1" },
+                        { "device_id": device_id(DEVICE_B), "expected_revision": "7" },
+                    ],
+                    "confirm": true,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let events = collect_events(&mut rx);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.data()["id"].as_str().unwrap_or("").to_string())
+                .collect::<Vec<_>>(),
+            vec![device_id(DEVICE_A), device_id(DEVICE_B)]
+        );
+        assert_eq!(events[0].data()["revision"], serde_json::json!("2"));
+        assert_eq!(events[1].data()["revision"], serde_json::json!("8"));
+    }
+
+    /// 负向：`events: None` 的既有装配不发布任何事件（行为与接入总线前一致）；
+    /// 有总线但写失败（409）同样不发布。
+    #[tokio::test]
+    async fn approval_writes_publish_nothing_without_event_bus_or_on_failure() {
+        // 1) `events: None`：装配不持有任何通道句柄，故不存在发布通路；响应不变。
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let router = approvals_router(fixture_approvals_state());
+        let res = router
+            .oneshot(authenticated_json_post(
+                &format!("/api/v1/devices/{}/revoke", device_id(DEVICE_A)),
+                serde_json::json!({
+                    "expected_revision": "1", "reason": "compromised", "confirm": true,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let router = approvals_router(fixture_approvals_state());
+        let res = router
+            .oneshot(authenticated_json_post(
+                "/api/v1/approvals/approve",
+                serde_json::json!({
+                    "targets": [{ "device_id": device_id(DEVICE_A), "expected_revision": "1" }],
+                    "confirm": true,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(
+            collect_events(&mut rx).is_empty(),
+            "events: None 不得有任何事件进入通道"
+        );
+
+        // 2) 有总线但 CAS 409：未发生状态变化即不发布。
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let router = approvals_router(approvals_state_with_events(
+            FixtureApprovalsGateway::Conflict,
+            fixture_session(true),
+            Some(bus.clone()),
+        ));
+        let res = router
+            .oneshot(authenticated_json_post(
+                &format!("/api/v1/devices/{}/revoke", device_id(DEVICE_A)),
+                serde_json::json!({
+                    "expected_revision": "1", "reason": "compromised", "confirm": true,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        assert_eq!(collect_events(&mut rx).len(), 0);
+        // 反向证据：同一订阅者确实能收到事件，说明上面的 0 条是「未发布」而非「订阅失效」。
+        assert_eq!(
+            bus.publish(EventEnvelope::device_updated(
+                &device_id(DEVICE_A),
+                1,
+                EventObjectAudience::admins(),
+            )),
+            1
+        );
     }
 }

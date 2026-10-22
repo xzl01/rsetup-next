@@ -125,8 +125,10 @@ rsetup 将观察与变更分离：
 ## 构建与运行
 
 ```bash
-cargo build --workspace
-cargo test --workspace
+# 不需要 Node、npm 或网络：rsetup-controller 编译期嵌入的 apps/controller-web/dist
+# 已随仓库提供。
+make build
+make test
 
 # 查看当前主机。macOS 会自动返回演示遥测数据。
 cargo run -p rsetup-next -- status
@@ -137,6 +139,51 @@ cargo run -p rsetup-next -- --demo serve
 ```
 
 启动服务器后，打开 `http://127.0.0.1:8788`。
+
+`build` 与 `test`（以及同样要编译 workspace 的 `lint`、`metrics-gates`、`msrv-check`、
+`controller-test-offline`）都依赖 `web-dist-check` 目标：它只检查
+`apps/controller-web/dist/index.html` 是否存在。前端产物**已随仓库提交**，干净检出用
+裸 cargo 就能构建整个 workspace，这几个目标全程不碰 npm。
+
+默认工具链为当前 stable Rust（本地以 rustc 1.99.1 验证）。MSRV 仍保持 1.85：
+`make msrv-check` 使用已安装的 1.85.0 工具链跑 workspace 测试，不把 1.85.0 设为默认。
+
+dist 入库换来的是**一条纪律**：改过 `apps/controller-web` 源码后必须运行
+`make web-build`，并把重新生成的 `dist` 与源码改动一起提交。CI 会从源码重新构建前端，
+再用 `git diff --exit-code -- apps/controller-web/dist` 比对，比对不为空即判红，
+过期的 dist 混不过 pull request。`make web-build`（等价于 `web-assets`）是显式的重建
+入口，用**两个** stamp 分层：
+
+| stamp | 何时重新生成 | 配方 |
+| --- | --- | --- |
+| `apps/controller-web/node_modules/.rsetup-npm-ci-stamp` | `package.json` 或 `package-lock.json` 变化 | `npm --prefix apps/controller-web ci $(NPM_CI_FLAGS)` |
+| `apps/controller-web/dist/.rsetup-build-stamp` | `index.html`、`vite.config.ts`、`tsconfig*.json`、`apps/controller-web/src/` 下的非测试文件（src 目录本身也是先决条件，新增/删除文件才会失效）或 Vite 的 `public/` 目录变化 | `npm --prefix apps/controller-web run build` |
+
+分层正是要点：改一个组件只会重跑 `vite build`，绝不再跑 `npm ci`；`*.test.ts` 与
+`*.test.js` 不是 `vite build` 的输入，改测试文件同样不会重建 `dist`。两个 stamp 文件
+本身被 git 忽略，它们代表的 dist 产物不被忽略。
+
+只有 `make web-build` 需要 Node 22 与 npm（冷缓存首次执行还需网络）。两条离线路子：
+
+```bash
+# 1. 本机 npm cache 已预热：把参数直接透传给 `npm ci`。
+make web-build NPM_CI_FLAGS=--offline
+
+# 2. 以其他方式准备好了 node_modules/：自己补上两个 stamp 让 make 不再重建。
+#    make 只比对 stamp 的时间戳，不看目录本身。
+touch apps/controller-web/node_modules/.rsetup-npm-ci-stamp
+touch apps/controller-web/dist/.rsetup-build-stamp
+```
+
+只把 `node_modules` 拷过来而不补 stamp 是无效的：make 仍认为先决条件更新，照样去跑
+`npm ci`，而这正是离线环境会失败的一步。但注意：**构建 workspace 本身已经不需要这两条**，
+它们只在改动前端源码、需要重新生成 dist 时才用得上。
+
+`make metrics-static-gates` 只跑指标线的只读 grep 静态门禁：不编译、不联网、不需要前端
+产物，CI 可单独调用。其中「不得提交配置实体/凭据目录」这条查**两份**清单——暂存区
+（`git diff --cached --name-only`）与已跟踪文件（`git ls-files`）：CI 是干净检出，暂存区
+为空，只查暂存区的门禁在那里等于什么都没看。`make metrics-gates` 在其之外再跑
+`fmt-check`、dist 存在性检查、clippy 与 controller 测试。
 
 Rust 格式检查请使用 `make fmt-check`，不要使用 `cargo fmt --all`，因为后者会把第三方 submodule `externals/devicesinfo` 一并纳入检查范围；详见 [AGENTS.md](AGENTS.md) 的「Rust 格式检查口径」。
 
@@ -218,6 +265,119 @@ npm run dev
 
 Tauri 打包有意放在根 Cargo workspace 之外，以便普通的 CLI/TUI/server 开发不会下载原生桌面依赖。
 
+## 控制器
+
+`rsetup-controller` 是独立的 HTTP 控制面可执行文件，与 `rsetup-next` 的 CLI/TUI/server
+分开，并以 `rsetup-controller` 之名独立成包（与 `rsetup-next` 同一源码包，安装方式见下文
+「从 Debian 软件包安装」）。它作为 workspace 成员构建（编译期嵌入的前端 `dist` 已随
+仓库提供，无需额外构建步骤，详见「构建与运行」），启动方式：
+
+```bash
+cargo run -p rsetup-controller
+```
+
+必需环境变量，缺失或为空即退出，不会降级启动：
+
+| 变量 | 作用 |
+| --- | --- |
+| `CONTROLLER_DATABASE_URL` | 存放 controller schema 的 MySQL/TiDB 连接串。 |
+| `CONTROLLER_ALLOWED_HOSTS` | 精确匹配的逗号分隔 `Host` 白名单。 |
+| `CONTROLLER_ALLOWED_ORIGIN` | 唯一精确匹配的浏览器 `Origin`。 |
+| `CONTROLLER_MANAGEMENT_CURSOR_SECRET_HEX` | 十六进制编码的管理 cursor 密钥。 |
+
+可选变量：`CONTROLLER_LISTEN_ADDRESS`（默认 `127.0.0.1:8080`）、
+`CONTROLLER_TRUST_TLS`（只有取值恰好是 `1` 或 `true` 才给会话 Cookie 追加 `Secure`，用于由
+反向代理终止 TLS 的部署；不设置或为空即不加，其他取值属于启动错误）、
+`CONTROLLER_BOOTSTRAP_SECRET_LOG`（接收一次性管理员凭据的私有文件路径，默认是相对于工作
+目录的 `controller-bootstrap-secret.log`）、`NTP_SERVERS`（逗号或空白分隔的 NTP 源，供启动
+时间门禁采样；不设置即回退系统时钟，任务线会持续报告时间证据不可信）。
+
+指标线另读三个：`CONTROLLER_CONFIG`（配置文件路径，默认 `controller.toml`，其中保存抓取
+凭据，必须留在仓库之外——静态门禁会拒绝被跟踪的 `controller.toml` 或 `secret/` 条目）、
+`PROMETHEUS_AUTH_USER` 与 `PROMETHEUS_AUTH_PASSWORD`（覆盖 Basic 认证身份，必须成对给出，
+只给一个即启动错误）。以上只列常用项，完整配置约定见
+[指标端点设计文档](docs/superpowers/specs/2026-10-19-prometheus-metrics-endpoint-design.md)。
+
+默认只绑定回环地址，且 HTTP 面按受控可信管理网络设计：不适用于暴露给不可信网络或直接
+接入互联网，进程自身也不终止 TLS。系统不预置任何凭据：首次针对未初始化 schema 启动时，
+进程生成一次性管理员凭据并写入上述私有文件（以 `0600` 与 `O_EXCL` 创建，父目录不受保护，
+因此必须在私有目录下启动进程）。该文件读取一次、登录后立即改密并删除。
+
+`reset-admin` 是内置管理员账号的本机应急通道：不接受任何参数，向控制终端签发一次性新
+凭据并留下审计事件。它的门禁是 OS 的真实/有效 UID，加上 stdin、stdout、stderr 各自都是
+真实 TTY 且 `/dev/tty` 可写。因此非交互的 SSH 单命令执行、cron 与管道都无法驱动它；而
+交互式 `ssh -t` 会分配 pty，同样的 root+TTY 检查会像在本地键盘前一样通过，仍受同一道门禁
+约束。门禁卡的是进程如何连接终端与权限，不是「必须坐在机器前」。
+
+### 从 Debian 软件包安装
+
+`rsetup-controller` 二进制包由本源码包构建，构建过程不需要 Node.js 与 npm：`build.rs`
+编译期嵌入的 `apps/controller-web/dist` 已入库，`dpkg-buildpackage` 全程离线。包内容：
+
+| 路径 | 用途 |
+| --- | --- |
+| `/usr/bin/rsetup-controller` | 控制面进程（单元 `rsetup-controller.service`） |
+| `/usr/bin/rsetup-controller-migrate` | 显式 schema 迁移，`--check` / `--apply` |
+| `/usr/bin/rsetup-controller-reset-admin` | 本机 root 管理员应急恢复（源 bin 名 `reset-admin`） |
+| `/etc/default/rsetup-controller` | `EnvironmentFile` 模板，0644，不含任何秘密 |
+| `/usr/lib/systemd/system/rsetup-controller.service` | 单元：`DynamicUser=yes`、`StateDirectory=rsetup-controller` |
+| `/usr/share/doc/rsetup-controller/README.Debian` | 完整的安装后操作步骤 |
+
+软件包既不 enable 也不启动服务：`dh_installsystemd --no-enable` 让单元不进启动路径，单元
+自身的 `ConditionPathExists=/etc/default/rsetup-controller` 又保证未写配置时保持 inactive，
+因此装完包只是一堆未启动的文件。后续步骤一律由操作员执行，且没有任何一步已代表你对真实
+数据库做过：
+
+1. 填写 `/etc/default/rsetup-controller`：`CONTROLLER_DATABASE_URL`、
+   `CONTROLLER_ALLOWED_HOSTS`、`CONTROLLER_ALLOWED_ORIGIN`、
+   `CONTROLLER_MANAGEMENT_CURSOR_SECRET_HEX`，随后 `chmod 0600`。随包的模板之所以是
+   0644，正因为它不含秘密。
+2. 先对目标库做一份**真实可恢复**的备份，再在 `CONTROLLER_DATABASE_URL` 旁导出四个迁移
+   门禁：`CONTROLLER_MIGRATION_ALLOW_DESTRUCTIVE=1`、
+   `CONTROLLER_MIGRATION_EXPECTED_DATABASE`（必须等于服务端真实返回的库名）、
+   `CONTROLLER_MIGRATION_BACKUP_REF`（指向该备份的引用）、
+   `CONTROLLER_MIGRATION_ACK=isolated-exclusive-backed-up-disposable`。这四项是操作员的
+   显式确认，工具不会替你猜：声明库名与真实连接不一致即 fail-closed。
+3. 先 `rsetup-controller-migrate --check`（只读，只打印 `schema_version=<数字>` 或
+   `schema_version=missing`），再 `rsetup-controller-migrate --apply`。已是受支持版本只做
+   只读一致性复核（幂等）；空库或 v1/v2/v3 先升到 v3 再升到 v4；未识别版本直接拒绝。
+   它不需要 root（写权限来自连接串里的数据库账号），也从不读写 `/dev/tty`。
+4. `systemctl start rsetup-controller`（需要在开机拉起时再 `enable`）。
+5. 首次启动把一次性管理员凭据写到
+   `/var/lib/rsetup-controller/bootstrap-secret.log`（`0600`、`O_EXCL`）；读取一次、登录
+   改密后删除该文件。
+6. 管理员账号遗失或死锁时，在中控主机本机以 root 交互式终端执行
+   `rsetup-controller-reset-admin`。
+7. 默认只监听 `127.0.0.1:8080`；要跨机访问必须经反向代理 + TLS + 可信管理网，并让
+   `CONTROLLER_ALLOWED_HOSTS`/`CONTROLLER_ALLOWED_ORIGIN` 与反代实际转发的值一致。
+
+尚未接线的部分：transport 线（设备实时缓存、恢复控制器、准入通知、板端任务客户端）以
+fail-closed 装配位接入，只报告「not wired」或设备离线，不伪造取值；SSE 事件总线除心跳与
+总线自身的 reset 外还没有业务发布方；设备快照源还没有写入方。这些未接线端点在当前版本
+返回 503 且错误码为 `STORAGE_UNAVAILABLE`（装配位以配置错误形态上抛，错误文案一律不回显），
+或返回结构合法的「无样本」响应体（`snapshot: null`、`freshness: "unknown"`、
+`age_ms: null`），而不是编造读数。`NOT_READY` 表示的是 schema 与加密能力未就绪，未接线的
+transport 装配位不会报这个码。接真实板卡运行前，完整清单见
+`docs/testing/controller-v1-known-gaps.md`。
+
+### 板端代理本地测试
+
+`crates/rsetup-board-agent` 现在提供可在 amd64 本机运行的测试二进制：走真实 typed dispatch
+（`/proc` 的 capabilities/status/clock、journal 查询、错误映射）并提供回环 JSON-lines 控制台；
+它**不是**生产加密隧道，也绝不执行真实主机重启。
+
+```bash
+cargo build -p rsetup-board-agent --release --bin rsetup-board-agent
+./target/release/rsetup-board-agent --once --journal-dir /tmp/rsetup-board-agent-journal
+./target/release/rsetup-board-agent --watch --interval-secs 5 --journal-dir /tmp/rsetup-board-agent-journal
+./target/release/rsetup-board-agent --loopback-test-server --listen 127.0.0.1:39876 \
+  --journal-dir /tmp/rsetup-board-agent-journal
+```
+
+JSON-lines 协议与边界见 [crates/rsetup-board-agent/README.md](crates/rsetup-board-agent/README.md)。
+
+支持并按 CI 验证的架构为 `arm64`（aarch64）与 `amd64`（x86_64），不再维护 32 位目标。
+
 ## 项目结构
 
 ```text
@@ -235,6 +395,14 @@ scripts/import-pinouts.mjs 用于本地 pin-out checkout 的可复现导入器
 ## Debian 软件包
 
 该软件包安装 `rsetup-next` CLI/TUI/Web 二进制文件、其最小特权的 helper、配套的 Polkit 策略、thermal、fan-curve 和 LED 单元，以及固定 SPI 操作使用的 `mtd-utils` 依赖。风扇服务将 root 可写、用户可读的配置持久化到 `/etc/rsetup-next/fan-curve.json`，并作为 `rsetup-next-fan-curve.service` 运行。它不安装已移除的 Bash 实现，也不以 root 身份运行浏览器进程。可选的 `device-tree-compiler`、`gpiod`、`v4l-utils` 和 `ffmpeg` 软件包可增强对应的硬件工具。
+
+同一源码包另会构建 `rsetup-controller`：控制面进程、两个操作员 CLI、一个 systemd 单元与
+`/etc/default/rsetup-controller` 模板。它装了什么、以及操作员仍需亲自执行的迁移与配置步骤，
+见「控制器」章节下的「从 Debian 软件包安装」。两个包的构建都不需要 Node.js 与 npm：测试步骤
+跑整个 workspace（含 controller），cargo 处于离线模式，前端资产用已入库的
+`apps/controller-web/dist`（即 `build.rs` 编译期读取的那一份）。controller 单元以关闭状态
+安装（`dh_installsystemd --no-enable`），且未写配置文件时自身拒绝启动，因此装包不拉起任何
+服务、也不触碰任何数据库。
 
 该软件包依赖 `xz-utils`：写入压缩的 `.img.xz` 系统镜像时通过 `xz -dc` 解压。选择硬依赖
 而非 `Recommends` 的取舍，以及缺少该工具时的回退行为，记录在

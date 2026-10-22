@@ -2,7 +2,7 @@
 
 Spec: 06 §6
 
-> 状态：初始化模板（2026-10-18）。本报告按行合同
+> 状态：阶段性验收记录（初始化 2026-10-18；后续按行更新）。本报告按行合同
 > `| ID | status | executed_at | layer | command_or_steps | evidence |`
 > 登记中控 V1 集成验收事实；`python3 scripts/check_controller_acceptance.py docs/testing/controller-v1-acceptance.md`
 > 校验通过仅证明格式/完整性（ID 集合、重复、越界、合法状态、PASS 证据、Spec 引用），
@@ -31,11 +31,11 @@ Spec: 06 §6
 | T4-03 | PASS | 2026-10-18T16:40:00+08:00 | cargo-test | cargo test -p rsetup-controller --test management_gateway_http | tests/management_gateway_http.rs |
 | T4-04 | PASS | 2026-10-18T16:40:00+08:00 | cargo-test | cargo test -p rsetup-controller --lib tasks::adapter | src/tasks/adapter.rs |
 | T4-05 | PASS | 2026-10-18T16:40:00+08:00 | cargo-test | cargo test -p rsetup-controller --lib tasks::http::decision_tests | src/tasks/http.rs |
-| T4-06 | PASS | 2026-10-18T16:50:00+08:00 | cargo-test | cargo test -p rsetup-controller --lib http_device_status | src/http_device_status.rs |
+| T4-06 | PASS | 2026-10-22T05:48:00+08:00 | cargo-test | cargo test -p rsetup-controller --lib http_device_status | src/http_device_status.rs |
 | T4-07 | PASS | 2026-10-18T16:40:00+08:00 | cargo-test | cargo test -p rsetup-controller --lib tasks::recovery | src/tasks/recovery.rs |
 | T4-08 | PASS | 2026-10-20T19:09:00+08:00 | cargo-test | cargo test -p rsetup-board-agent --test wire_04_execution | crates/rsetup-board-agent/tests/wire_04_execution.rs |
 | T4-09 | BLOCKED | | | | |
-| T4-10 | PASS | 2026-10-19T02:20:00+08:00 | headless-browser | python3 scripts/headless_e2e_verify.py | /tmp/headless_login.png & scripts/headless_e2e_verify.py |
+| T4-10 | PASS | 2026-10-19T02:20:00+08:00 | headless-browser | python3 scripts/headless_e2e_verify.py | scripts/headless_e2e_verify.py（1280 44/44；500 43/44；320 受 Firefox 最小宽度限制未验证） |
 | T4-11 | PASS | 2026-10-18T16:30:00+08:00 | cargo-test | cargo test -p rsetup-controller --test web_assets | tests/web_assets.rs |
 | T4-12 | PASS | 2026-10-18T16:35:00+08:00 | real-db | cargo test -p rsetup-controller --test migration_v4 | tests/migration_v4.rs (MySQL 8.0 & TiDB v7.5) |
 | AT-01 | 未验证 | | | | |
@@ -75,6 +75,10 @@ Spec: 06 §6
   `actions.can_cancel` 只表示可请求取消而非一定成功。
 - T4-06 单调缓存 status：`GET /devices/{id}/status` 独立 Runtime 路由读缓存快照（GET 零采集/零执行），
   单调接收年龄、旧会话/旧序号不覆盖；真实源未接线不挂载、不常量伪 PASS。
+  该端点的 `device.status.read` 对象级权限与设备可见性门禁由本轮修复补齐，实现见
+  `crates/rsetup-controller/src/http_device_status.rs`（对应 T4-06 行的 `cargo test -p rsetup-controller
+  --lib http_device_status`）。快照写入方（transport 轮询）尚未接线这一点未因此改变，见
+  [`controller-v1-known-gaps.md`](<controller-v1-known-gaps.md>) 的 d 节。
 - T4-07 intent 至多一次 execute / 恢复只 query / 迟到证据：恢复对 dispatching/accepted/verifying 仅
   `task.get` 只读；迟到有效证据更新旧任务 outcome/counts 并递增 revision，不删新 generation 设备锁。
 - T4-08 板端 B04 故障：accepted/attempted 两阶段持久化与 OS 调用边界故障分类（以 03 §5 B-04 完整
@@ -87,6 +91,13 @@ Spec: 06 §6
   精确 512KiB 信封与真实认证/双流互通须专家书面决议 + 用户复审 + 获批 codec——门禁未齐，保持 BLOCKED。
 - T4-10 浏览器任务流程与 a11y：预览→确认→详情→取消/time-review/unknown 释放，键盘/焦点/Esc/320px/
   对比度/减少动效、中英切换；A 层 fixture/mock 不批准 B 层真实浏览器。
+  2026-10-22 复核的实际覆盖仅为**登录页外壳**：1280×800 视口 44/44，500×800（Firefox 把请求的
+  320 夹到最小 500）43/44（唯一失败是“视口宽度未被夹取”断言），⑩ 可访问名称在读取 `<label for>`
+  后为 PASS；两视口截图由 `local/qwen` 子代理实际查看，布局/中文/无裁切均 PASS。**320px 真实视口、
+  完整任务流程、键盘/焦点/Esc、对比度/减少动效与中英切换仍未执行**，因此本次 PASS 不得外推为
+  T4-10 全项通过。截图与证据 JSON 位于 `/tmp/headless_login_*` 与 `/tmp/headless_e2e_evidence_*`，
+  属**非仓库内、不可持久复核**的临时产物：复核必须重跑 `scripts/headless_e2e_verify.py`，
+  不得把 `/tmp` 路径当作可长期引用的证据。
 - T4-11 单二进制嵌入资源：缺 `dist` release 构建直接失败；脱离源码/静态目录运行；解析构建产物真实
   JS/CSS、精确 MIME 与 immutable 缓存；API/缺失资产不回退 HTML。
 - T4-12 真库门禁项（双引擎）：普通应用账号真实事务、设备锁、CAS、撤权/提交并发。

@@ -4,7 +4,8 @@
 //! 1. [`compose_component_routers`] 的 synthetic 合并拓扑（可达性、无覆盖、无重复
 //!    探活）——只证明合并能力；
 //! 2. [`build_production_router`] 的 typed 装配——五线状态全部来自各条线**生产**
-//!    构造器（`build_sqlx_management_state`、`SqlxTaskApi`、`build_device_status_router`、
+//!    构造器（`build_sqlx_management_state_with_events`、`SqlxTaskApi`、
+//!    `build_device_status_router`、
 //!    `web_router`），只证明「同一 `Arc<HttpAuthState>` 才能装配」与「五线路由都在
 //!    同一顶层 router 上可达」；认证桩与 lazy 连接池只用于把 router 立起来，
 //!    **不**证明认证语义、SQL 来源、真实设备数据或资源内容。
@@ -90,7 +91,7 @@ mod typed {
     use rsetup_controller::DbPool;
     use rsetup_controller::HttpAuthState;
     use rsetup_controller::api::ManagementFuture;
-    use rsetup_controller::api::adapters::build_sqlx_management_state;
+    use rsetup_controller::api::adapters::build_sqlx_management_state_with_events;
     use rsetup_controller::api::approvals::ManagementNotificationSink;
     use rsetup_controller::api::devices::{
         DeviceConnectionState, DeviceLiveProbe, DeviceLiveView, DeviceStreamHealth,
@@ -103,7 +104,8 @@ mod typed {
     use rsetup_controller::events::EventBus;
     use rsetup_controller::http_auth::{AuthFuture, AuthServiceApi, SessionAuthority};
     use rsetup_controller::http_device_status::{
-        DeviceStatusState, EmptyDeviceStatusSnapshotSource,
+        DeviceStatusAccess, DeviceStatusAuthorizer, DeviceStatusFuture, DeviceStatusState,
+        EmptyDeviceStatusSnapshotSource,
     };
     use rsetup_controller::http_events::EventsState;
     use rsetup_controller::http_security::HttpSecurityConfig;
@@ -385,6 +387,22 @@ mod typed {
         }
     }
 
+    /// 设备状态线授权桩（H1 装配位）：本文件只证明六线装配与共享 gate 优先，
+    /// 状态线的 401 之前不涉及授权；桩按 **fail-closed** 恒返回 `NotFound`
+    /// （404），绝不放行状态读取，也不连任何数据库。授权语义本身由 lib 单测
+    /// `http_device_status` 覆盖。
+    struct FailClosedStatusAuthorizer;
+
+    impl DeviceStatusAuthorizer for FailClosedStatusAuthorizer {
+        fn authorize<'a>(
+            &'a self,
+            _actor: &'a Session,
+            _device_id: &'a [u8; 32],
+        ) -> DeviceStatusFuture<'a, DeviceStatusAccess> {
+            Box::pin(async { Ok(DeviceStatusAccess::NotFound) })
+        }
+    }
+
     /// 用**指定**池装配六线输入（§7.6 第 6/10 条要观察同一个池的读数）。
     fn inputs_with_db(
         db: &DbPool,
@@ -395,12 +413,13 @@ mod typed {
         metrics: MetricsLineInputs,
     ) -> ProductionInputs {
         let transport = Arc::new(SyntheticSources);
+        let events_bus = EventBus::new();
         // events 线复用认证线的同一个 Arc<HttpAuthState>；不一致负例通过覆盖
         // `inputs.events.auth` 制造（见 mismatched_auth_context_is_rejected_on_every_line）。
         ProductionInputs {
             events: EventsState {
                 auth: Arc::clone(&auth),
-                bus: EventBus::new(),
+                bus: events_bus.clone(),
                 // 装配测试不驱动流体内的周期复核，取默认周期即可。
                 revalidate_interval: rsetup_controller::http_events::DEFAULT_REVALIDATE_INTERVAL,
             },
@@ -408,12 +427,15 @@ mod typed {
                 db: db.clone(),
                 auth,
             },
-            management: build_sqlx_management_state(
+            management: build_sqlx_management_state_with_events(
                 db.clone(),
                 management_auth,
                 transport.clone(),
                 transport.clone(),
                 transport,
+                // 与 events 线同一个 EventBus 句柄：管理线的授权变更提示必须投到
+                // SSE 读线正在订阅的那条通道，不是再造一条。
+                Some(events_bus.clone()),
             ),
             tasks: HttpTasksState {
                 api: Arc::new(SqlxTaskApi::new(
@@ -423,10 +445,12 @@ mod typed {
                     SYNTHETIC_CURSOR_SECRET,
                 )),
                 auth: tasks_auth,
+                events: Some(events_bus),
             },
             status: DeviceStatusState {
                 auth: status_auth,
                 snapshot: Arc::new(EmptyDeviceStatusSnapshotSource),
+                authorizer: Arc::new(FailClosedStatusAuthorizer),
             },
             metrics,
             web: web_router(),
@@ -1279,6 +1303,138 @@ mod typed {
             production.matches("MySqlPoolOptions::new").count(),
             0,
             "production.rs 不得新建连接池"
+        );
+    }
+}
+
+/// 顶层统一后置安全头（补齐 `web_assets.rs` 末尾记录的那条已知边界）。
+///
+/// 未匹配任何路由的请求由 axum `Router` 的默认 404 服务产生，既不进 `web.rs` 的
+/// `serve_static`，也不进任何条线，历史上零响应头。`compose_component_routers` 在
+/// 合并结果上挂了一层后置头，只**补**不**覆盖**。本模块用 web 线的**生产** router
+/// （`web_router`）核对：CSP / XFO / Cache-Control 仍逐字是 web.rs 设定的值。
+mod base_security_headers {
+    use super::*;
+    use axum::http::HeaderMap;
+    use rsetup_controller::web_router;
+
+    /// 只有 web 线非空的最小合并：不连数据库、不构造真实 auth。
+    fn composed_with_web() -> Router<()> {
+        compose_component_routers(
+            Router::new(),
+            Router::new(),
+            Router::new(),
+            Router::new(),
+            Router::new(),
+            Router::new(),
+            web_router(),
+        )
+    }
+
+    async fn get(router: &Router<()>, uri: &str) -> (StatusCode, HeaderMap) {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        to_bytes(response.into_body(), 262_144).await.unwrap();
+        (status, headers)
+    }
+
+    fn header(headers: &HeaderMap, name: &str) -> Option<String> {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    }
+
+    /// 未匹配路径：404 语义不变，但两个基础安全头必须在位。
+    #[tokio::test]
+    async fn unmatched_paths_on_composed_router_carry_base_security_headers() {
+        let router = composed_with_web();
+        for uri in [
+            "/nope",
+            "/api/v1/not-found",
+            "/assets/definitely-not-built.js",
+            "/admin/",
+            "/devices/1/2",
+        ] {
+            let (status, headers) = get(&router, uri).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "GET {uri} 的 404 语义不得改变"
+            );
+            assert_eq!(
+                header(&headers, "x-content-type-options").as_deref(),
+                Some("nosniff"),
+                "GET {uri} 应带 X-Content-Type-Options"
+            );
+            assert_eq!(
+                header(&headers, "referrer-policy").as_deref(),
+                Some("no-referrer"),
+                "GET {uri} 应带 Referrer-Policy"
+            );
+            assert!(
+                headers.get("content-type").is_none(),
+                "GET {uri} 不得被回退成 HTML 交付"
+            );
+        }
+    }
+
+    /// web 线 HTML 的 CSP / XFO / Cache-Control 逐字不变，基础头由其上层的层补齐。
+    #[tokio::test]
+    async fn web_html_keeps_web_module_headers_and_gains_base_headers() {
+        let bare = web_router();
+        let composed = composed_with_web();
+        for uri in ["/", "/login", "/devices"] {
+            let (_, bare_headers) = get(&bare, uri).await;
+            let (status, composed_headers) = get(&composed, uri).await;
+            assert_eq!(status, StatusCode::OK, "GET {uri}");
+            // web.rs 自己设定的头必须逐字保持（含 CSP 与 XFO）。
+            for name in [
+                "content-security-policy",
+                "x-frame-options",
+                "cache-control",
+                "content-type",
+            ] {
+                assert_eq!(
+                    header(&composed_headers, name).as_deref(),
+                    header(&bare_headers, name).as_deref(),
+                    "GET {uri} 的 {name} 必须与裸 web_router 完全一致"
+                );
+            }
+            assert!(
+                header(&bare_headers, "content-security-policy").is_some(),
+                "GET {uri} 本就该由 web.rs 带上 CSP（前提校验）"
+            );
+            assert_eq!(
+                header(&composed_headers, "x-content-type-options").as_deref(),
+                Some("nosniff")
+            );
+            assert_eq!(
+                header(&composed_headers, "referrer-policy").as_deref(),
+                Some("no-referrer")
+            );
+        }
+    }
+
+    /// 裸 `web_router` 单独使用时**不会**凭空多出基础头：这层归顶层组装所有。
+    #[tokio::test]
+    async fn bare_web_router_is_not_affected_by_the_top_layer() {
+        let (_, headers) = get(&web_router(), "/definitely-missing").await;
+        assert!(
+            headers.get("x-content-type-options").is_none()
+                && headers.get("referrer-policy").is_none(),
+            "基础头只在顶层组装后出现，web 线自身不变"
         );
     }
 }

@@ -1487,6 +1487,7 @@ dependencies = [
 name = "rsetup-board-agent"
 version = "0.5.0"
 dependencies = [
+ "hex",
  "rsetup-core",
  "rsetup-protocol",
  "serde",

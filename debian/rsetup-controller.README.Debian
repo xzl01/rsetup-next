@@ -1,0 +1,145 @@
+rsetup-controller — notes for Debian users
+==========================================
+
+What this package provides
+--------------------------
+
+  /usr/bin/rsetup-controller            loopback Web control centre (controller)
+  /usr/bin/rsetup-controller-migrate    explicit, operator-only schema migration
+  /usr/bin/rsetup-controller-reset-admin  local root emergency admin recovery
+  /usr/lib/systemd/system/rsetup-controller.service
+  /etc/default/rsetup-controller        configuration template, 0644, no secrets
+
+The controller talks to MySQL/TiDB, serves the embedded web UI, and listens on
+127.0.0.1:8080 unless told otherwise. It does not terminate TLS.
+
+Packaging is delivered here; running a migration and configuring a real target
+are operator actions. Nothing in this package has connected to a real database,
+migrated one, or enabled the service: no step below should be read as already
+done, and the package deliberately does not do any of them on your behalf.
+
+The package installs the unit but does not enable or start it
+(dh_installsystemd --no-enable). The unit additionally refuses to run while
+/etc/default/rsetup-controller is missing. Until you complete step 1 below, the
+service is simply inactive.
+
+1. Configure the service
+------------------------
+
+  sudoedit /etc/default/rsetup-controller
+  sudo chmod 0600 /etc/default/rsetup-controller
+
+Uncomment and fill in the four required variables (CONTROLLER_DATABASE_URL,
+CONTROLLER_ALLOWED_HOSTS, CONTROLLER_ALLOWED_ORIGIN,
+CONTROLLER_MANAGEMENT_CURSOR_SECRET_HEX). The shipped template is 0644 and
+carries no secrets precisely so that the packaged conffile is not sensitive;
+the moment you put a real DSN in it, tighten it to 0600. Keep it out of any
+backup or ticket that is not secret-handling.
+
+2. Back up the target database, then set the migration gates
+------------------------------------------------------------
+
+Take a real, restorable backup of the database the service points at, and note
+the artefact you produced (file, checksum, backup tool reference). The four
+gates below are how that attestation reaches the migration tool; it never
+guesses on your behalf:
+
+  CONTROLLER_DATABASE_URL                 the same variable the service uses
+  CONTROLLER_MIGRATION_ALLOW_DESTRUCTIVE  must be exactly 1
+  CONTROLLER_MIGRATION_EXPECTED_DATABASE  must equal the real connected database name
+  CONTROLLER_MIGRATION_BACKUP_REF         a non-blank reference to the backup you took
+  CONTROLLER_MIGRATION_ACK                exactly: isolated-exclusive-backed-up-disposable
+
+The acknowledgement states "target isolated and exclusively held, real backup
+exists". For a production database it does not mean the data may be discarded.
+Pass them in a throwaway environment rather than leaving them in the unit's
+EnvironmentFile, for example:
+
+  sudo env \
+    CONTROLLER_DATABASE_URL='...' \
+    CONTROLLER_MIGRATION_ALLOW_DESTRUCTIVE=1 \
+    CONTROLLER_MIGRATION_EXPECTED_DATABASE='<real database name>' \
+    CONTROLLER_MIGRATION_BACKUP_REF='/srv/backups/rsc-2026-01-01.sha256' \
+    CONTROLLER_MIGRATION_ACK='isolated-exclusive-backed-up-disposable' \
+    rsetup-controller-migrate --apply
+
+The tool requires no root: write access comes from the database account in the
+URL, and the safety comes from the gates plus the privileges of that account.
+It never reads /dev/tty and prompts for nothing.
+
+3. Check, then migrate
+----------------------
+
+  sudo rsetup-controller-migrate --check
+  # prints exactly one line: schema_version=<number> or schema_version=missing
+
+  sudo rsetup-controller-migrate --apply
+
+--check is read-only and needs only CONTROLLER_DATABASE_URL. --apply is
+idempotent per version: an already-migrated (v4) database only gets the
+read-only consistency pass; an empty database or a v1/v2/v3 database is brought
+to v3 and then to v4. An unrecognised version fails closed. Migration steps are
+not transactional — if a step fails, the tool stops and leaves the partial
+schema for you to inspect; it never auto-repairs and never reports success it
+did not verify. Failures print fixed, de-identified messages: no DSN, database
+name, backup path or driver text.
+
+4. Start the service
+--------------------
+
+  sudo systemctl start rsetup-controller
+  systemctl status rsetup-controller
+  journalctl -u rsetup-controller -n 50
+
+Start it manually on purpose. To have it start at boot once everything is in
+place: sudo systemctl enable --now rsetup-controller.
+
+5. First boot: read the one-time administrator credential
+--------------------------------------------------------
+
+On the first start against a freshly migrated schema the service creates the
+built-in administrator and writes the one-time credential to
+
+  /var/lib/rsetup-controller/bootstrap-secret.log     # mode 0600, owned by the unit
+
+Read it immediately and delete the file:
+
+  sudo cat /var/lib/rsetup-controller/bootstrap-secret.log
+  sudo rm -f /var/lib/rsetup-controller/bootstrap-secret.log
+
+Log in at http://127.0.0.1:8080 with that credential and change the password
+right away. The file is created with O_EXCL: if it already exists the service
+refuses to overwrite it, so a leftover file means an earlier boot, not this one.
+
+6. Losing the administrator account
+-----------------------------------
+
+  sudo rsetup-controller-reset-admin
+
+Run this directly on the controller host, as root, from an interactive
+terminal: it requires real and effective UID 0, interactive stdin/stdout/
+stderr and a writable /dev/tty, and prints the temporary password only on
+/dev/tty, exactly once, after the reset transaction committed. It accepts no
+username or password arguments.
+
+7. Exposure
+-----------
+
+The default bind address is loopback only, and the HTTP surface assumes a
+controlled management network: no TLS termination, no untrusted-network
+hardening, no multi-tenant isolation. If it must be reachable beyond this host,
+put it behind a reverse proxy with TLS and a trusted network, then keep
+CONTROLLER_ALLOWED_HOSTS and CONTROLLER_ALLOWED_ORIGIN aligned with what the
+proxy forwards — a mismatch is rejected by the service, not silently allowed.
+
+Unit hardening you should know about
+------------------------------------
+
+The unit runs with DynamicUser=yes plus StateDirectory=rsetup-controller: there
+is no dedicated system user, so /var/lib/rsetup-controller is owned by a
+dynamic uid that changes across restarts. Anything you place in it must be
+writable by that dynamic identity; do not pre-create it with a fixed owner, and
+do not expect file ownership there to survive a restart. ProtectSystem=strict
+makes /usr and /etc read-only for the service, so /etc/default/rsetup-controller
+is its only configuration input, and RestrictAddressFamilies limits it to
+IPv4/IPv6/Unix sockets.

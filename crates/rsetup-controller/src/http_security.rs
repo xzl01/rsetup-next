@@ -5,6 +5,9 @@
 //!   require an allowed `Origin`; established-session writes tolerate a
 //!   missing `Origin` (non-browser clients) but never relax the
 //!   session-bound `X-CSRF-Token` check.
+//! - Session-bound CSRF comparison is constant time (`subtle::ConstantTimeEq`,
+//!   length checked first because the token is fixed 64-hex) and fails closed on
+//!   an empty bound — see [`csrf_token_matches`].
 //! - Session cookie header construction: the token must be exactly 64
 //!   lowercase hex characters (header-injection safe); attribute set is
 //!   fixed by spec 01 A-03 — `HttpOnly; SameSite=Strict; Path=/`, `Secure`
@@ -22,6 +25,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
+
+use subtle::ConstantTimeEq;
 
 use crate::error::ControllerError;
 
@@ -130,10 +135,35 @@ pub fn check_pre_session(
     Ok(())
 }
 
+/// Session-bound CSRF token 的**常量时间**比较。
+///
+/// - 缺失的 `X-CSRF-Token`（`None`）一律不匹配。
+/// - **空 `bound` 一律不匹配**（fail-closed）：生产 bound 恒为 64 位小写 hex，但本
+///   helper 是公开入口，绝不允许「bound 为空 + provided 为空」被判成匹配——那等于
+///   会话没绑到任何 token 时任何请求都能通过。
+/// - 长度不等直接判否：token 是固定 64 位小写 hex，长度不是秘密，提前返回不会
+///   泄露任何秘密字节的内容；反过来若先做 `ct_eq`，`subtle` 对不等长切片也只保证
+///   按较短长度比较，必须自己先挡掉长度差。
+/// - 长度相等时整体走 `subtle::ConstantTimeEq`，不逐字节短路（等价于
+///   `src/metrics/auth.rs` 的口令比较口径）。
+pub fn csrf_token_matches(provided: Option<&str>, bound: &str) -> bool {
+    let Some(provided) = provided else {
+        return false;
+    };
+    // 空 bound 视为「该会话没有绑定任何 token」：只能拒，不能与空 token 相等放行。
+    if bound.is_empty() || provided.len() != bound.len() {
+        return false;
+    }
+    let equal: bool = provided.as_bytes().ct_eq(bound.as_bytes()).into();
+    equal
+}
+
 /// Established-session write gate: exact allowed `Host`; a present
 /// `Origin` must match exactly; the `csrf` header must equal the token
 /// bound to the session. A missing `Origin` exempts only the `Origin`
-/// check — the bound CSRF check still applies.
+/// check — the bound CSRF check still applies. An empty `bound` never
+/// matches (see [`csrf_token_matches`]), so a session without a bound
+/// token is always denied with `WriteDeny::Csrf`.
 pub fn check_session_write(
     host: Option<&str>,
     origin: Option<&str>,
@@ -149,7 +179,7 @@ pub fn check_session_write(
     if origin.is_some_and(|o| cfg.allowed_origin.as_deref() != Some(o)) {
         return Err(WriteDeny::Origin);
     }
-    if csrf != Some(bound) {
+    if !csrf_token_matches(csrf, bound) {
         return Err(WriteDeny::Csrf);
     }
     Ok(())
@@ -369,6 +399,102 @@ mod tests {
             ),
             Err(WriteDeny::Host)
         );
+    }
+
+    #[test]
+    fn csrf_token_matches_length_then_constant_time() {
+        // 与生产会话 token 同形：64 位小写 hex。
+        let bound = hex::encode([0x5a_u8; 32]);
+        assert_eq!(bound.len(), 64);
+
+        // 等长且逐字节相同 → 匹配。
+        assert!(csrf_token_matches(Some(&bound), &bound));
+        let equal = bound.clone();
+        assert!(csrf_token_matches(Some(&equal), &bound));
+
+        // 等长但只有最后一个字节不同 → 不匹配（短路比较最危险的一格）。
+        let mut last_diff = bound.clone();
+        last_diff.replace_range(bound.len() - 1.., "0");
+        assert_eq!(last_diff.len(), bound.len());
+        assert!(!csrf_token_matches(Some(&last_diff), &bound));
+
+        // 等长但首个字节不同 → 不匹配。
+        let mut first_diff = bound.clone();
+        first_diff.replace_range(..1, "0");
+        assert!(!csrf_token_matches(Some(&first_diff), &bound));
+
+        // 长度不同（前缀、空串、多一字节）→ 一律不匹配。
+        assert!(!csrf_token_matches(Some(&bound[..63]), &bound));
+        assert!(!csrf_token_matches(Some(""), &bound));
+        assert!(!csrf_token_matches(Some(&format!("{bound}0")), &bound));
+        // 缺失的 token 永远不匹配，即便 bound 本身是空串。
+        assert!(!csrf_token_matches(None, &bound));
+        assert!(!csrf_token_matches(None, ""));
+        // 空 bound fail-closed：公开 helper 不接受「两边都是空串」这种平凡相等。
+        // 生产 bound 恒 64 位小写 hex，这里钉的是 helper 自身的契约。
+        assert!(!csrf_token_matches(Some(""), ""));
+        assert!(!csrf_token_matches(Some("0"), ""));
+        assert!(!csrf_token_matches(Some("anything"), ""));
+
+        // 接线：check_session_write 的既有语义不变——等长的错误 token 仍是 Csrf。
+        let c = cfg();
+        assert_eq!(
+            check_session_write(Some("127.0.0.1:8080"), None, Some(&last_diff), &bound, &c),
+            Err(WriteDeny::Csrf)
+        );
+        assert_eq!(
+            check_session_write(Some("127.0.0.1:8080"), None, Some(&bound), &bound, &c),
+            Ok(())
+        );
+        // 接线：空 bound（会话没绑 token）一律 Csrf，绝不因空 token 相等而放行。
+        assert_eq!(
+            check_session_write(Some("127.0.0.1:8080"), None, Some(""), "", &c),
+            Err(WriteDeny::Csrf)
+        );
+    }
+
+    /// 去掉行注释后的纯代码文本（本文件的注释会解释「不许写什么」，直接扫原文会误判）。
+    fn code_only(source: &str) -> String {
+        source
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(index) => &line[..index],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 源码级回归门禁：CSRF 比较必须落在 `subtle::ConstantTimeEq` 上，且不得退回可
+    /// 短路的相等/前缀比较。
+    ///
+    /// 诚实界定：本用例只防**实现回退**（把 `ct_eq` 换回 `!=`/`starts_with` 时测试变
+    /// 红），不构成「机器码恒定时间」的证明——那需要按 `subtle` 的实现与编译选项另行
+    /// 审计。目标串一律用 `concat!` 拆分：编译后仍是逐字相同的目标串，但 `include_str!`
+    /// 到的本测试自身不会成为自己 grep 的命中项（否则正向断言会被自指恒真满足）。
+    #[test]
+    fn csrf_comparison_uses_subtle_constant_time_eq() {
+        let code = code_only(include_str!("http_security.rs"));
+        assert!(
+            code.contains(concat!("use subtle::", "ConstantTimeEq")),
+            "CSRF 比较必须由 subtle::ConstantTimeEq 实现（去掉注释后的代码里必须 import）"
+        );
+        assert!(
+            code.contains(concat!(".", "ct_eq(")),
+            "csrf_token_matches 必须调用 ct_eq，不得改回逐字节/整体短路比较"
+        );
+        for forbidden in [
+            concat!("csrf != ", "Some(bound)"),
+            concat!("csrf == ", "Some(bound)"),
+            concat!("provided != ", "bound"),
+            concat!("provided == ", "bound"),
+            concat!("starts_with(", "bound"),
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "MUST NOT 用可短路的比较判定 CSRF：{forbidden:?}"
+            );
+        }
     }
 
     #[test]

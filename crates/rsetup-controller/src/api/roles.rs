@@ -4,6 +4,15 @@
 //! 管理前置，权威判定仍在仓储事务 guard 内重验；`POST`/`PATCH` 只按 `session.digest` 走
 //! 写限速桶，`GET /api/v1/roles` 按 `(EndpointId::RolesRead, session.digest)` 走读桶。
 //! `GET` 列表的 `cursor`/`next_cursor` 一律经 `api/mod.rs` 的统一签名 codec 对签发与校验。
+//!
+//! 事件线（06 §4 `permissions.changed`）：本文件**不发布**任何 `permissions.changed`。
+//! 该事件的受众是**单个受影响用户**（`EventEnvelope::permissions_changed` 把受众与载荷
+//! `id` 绑成同一份字节），而 `PATCH /{id}` 改权限集/归档影响的是**该角色全部持有者**的
+//! 有效权限（仓储同事务 `bump_authz_epoch`），本层拿不到持有者集合，无法确定受众；把提示
+//! 发给发起变更的管理员本人只会是一条指向错人的虚假提示（管理员未必持有该角色，真正
+//! 受影响的持有者反而收不到）。`POST /api/v1/roles` 新建的角色此刻尚无任何持有者，同样
+//! 不改变任何既有用户的授权投影。撤权安全性由全局 `authz_epoch` 递增与 SSE 读线**每帧
+//! 按连接 `authz_epoch` 权威复核直接关流**（06 §4）保证，不依赖这条提示。
 
 use std::sync::Arc;
 
@@ -18,6 +27,7 @@ use uuid::Uuid;
 use crate::auth::service::Session;
 use crate::authz::policy::{Permission, validate_permission_list};
 use crate::error::ControllerError;
+use crate::events::EventBus;
 use crate::http_api::ok_response;
 use crate::http_auth::{EndpointId, HttpAuthState};
 use crate::http_gate::{
@@ -34,6 +44,10 @@ use super::{
 pub struct RolesApiState {
     pub auth: Arc<HttpAuthState>,
     pub gateway: Arc<dyn RolesGateway>,
+    /// 进程内事件总线句柄（06 §4）：与 SSE 读线 `EventsState.bus` 是同一通道句柄，
+    /// 保留以与其它 management 条线同形装配（生产组装统一注入，见 `api::build_management_router`）。
+    /// roles 条线本身**不发布任何事件**（见模块头的受众口径），因此该句柄在本文件内不被读取。
+    pub events: Option<EventBus>,
 }
 
 pub trait RolesGateway: Send + Sync {
@@ -216,6 +230,10 @@ async fn create_role(
 /// `PATCH /api/v1/roles/{id}`：CAS 补丁。内置角色不可归档由网关返回 `InvalidState`
 /// → 409 `INVALID_STATE`；版本不符 → 409 `REVISION_CONFLICT`；不存在 → 404。
 /// 从归档恢复（`archived: false`）必须携带合法非空 `permissions`，否则 400。
+/// 写成功即该角色全部持有者的有效权限变化（仓储同事务 `bump_authz_epoch`），但本层
+/// **不发布** `permissions.changed`：该事件的受众是**单个**受影响用户，这里受影响的是本层
+/// 拿不到的持有者集合，发给操作者管理员即是一条指向错人的虚假提示（他未必持有该角色）。
+/// 撤权安全性由全局 `authz_epoch` 递增 + SSE 读线每帧的权威复核关流保证（06 §4）。
 async fn patch_role(
     State(state): State<RolesApiState>,
     Path(id): Path<String>,
@@ -284,6 +302,7 @@ mod tests {
     use super::*;
     use crate::api::users::test_fixture::*;
     use crate::error::ControllerError;
+    use crate::events::EventEnvelope;
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use std::sync::{Mutex, OnceLock};
@@ -368,9 +387,20 @@ mod tests {
     }
 
     fn roles_state_with_session(session: Session, gateway: FixtureRolesGateway) -> RolesApiState {
+        roles_state_with_events(session, gateway, None)
+    }
+
+    /// 事件总线可选的装配：`Some(bus)` 与 SSE 读线 `EventsState.bus` 是同一通道句柄，
+    /// `None`（既有全部用例的基线）表示本装配未开启事件线。
+    fn roles_state_with_events(
+        session: Session,
+        gateway: FixtureRolesGateway,
+        events: Option<EventBus>,
+    ) -> RolesApiState {
         RolesApiState {
             auth: fixture_auth(session),
             gateway: Arc::new(gateway),
+            events,
         }
     }
 
@@ -738,6 +768,7 @@ mod tests {
             roles: RolesApiState {
                 auth: fixture_auth(fixture_session(true)),
                 gateway,
+                events: None,
             },
             secret_slot,
         };
@@ -840,5 +871,117 @@ mod tests {
             before,
             "客户端 400 不得触达网关"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 角色写操作的 `permissions.changed` **零发布**（06 §4，受众不可确定即不发布）
+    // -----------------------------------------------------------------------
+
+    /// 收集订阅通道当前待读的事件（订阅只收「之后」的事件，不回放历史）。
+    fn collect_events(
+        rx: &mut tokio::sync::broadcast::Receiver<EventEnvelope>,
+    ) -> Vec<EventEnvelope> {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    /// 带事件总线的 roles 装配：`epoch` 是本装配报告的全局 authz_epoch。
+    fn roles_router_with_bus(
+        gateway: FixtureRolesGateway,
+        bus: Option<EventBus>,
+        epoch: u64,
+    ) -> axum::Router<()> {
+        roles_router(RolesApiState {
+            auth: fixture_auth_with_epoch(fixture_session(true), epoch),
+            gateway: Arc::new(gateway),
+            events: bus,
+        })
+    }
+
+    /// 语义收敛（审查反馈 Medium-1）：`PATCH /{id}` 成功改动的是**该角色全部持有者**的
+    /// 有效权限，本层拿不到持有者集合，因此**不得**向操作者管理员发一条关于其本人的
+    /// `permissions.changed`——那是指向错人的虚假提示（管理员未必持有该角色，真正受影响
+    /// 的持有者反而收不到）。撤权安全性由全局 `authz_epoch` 递增 + SSE 读线每帧按连接
+    /// `authz_epoch` 权威复核直接关流保证（06 §4），不依赖这条提示。
+    #[tokio::test]
+    async fn patch_role_publishes_no_permissions_changed_without_target_user() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let router = roles_router_with_bus(FixtureRolesGateway::Echo, Some(bus.clone()), 42);
+        let res = router
+            .oneshot(authenticated_json_patch(
+                &format!("/api/v1/roles/{TARGET_ID}"),
+                serde_json::json!({ "expected_revision": "5", "permissions": ["device.read"] }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            collect_events(&mut rx).len(),
+            0,
+            "受影响用户不可确定时不得向操作者发布 permissions.changed"
+        );
+        // 反向证据：同一订阅者确实能收到事件，说明上面的 0 条是「未发布」而非「订阅失效」。
+        assert_eq!(
+            bus.publish(EventEnvelope::permissions_changed(
+                fixture_session(true).user.id,
+                42,
+            )),
+            1
+        );
+    }
+
+    /// 负例：新建角色此刻无任何持有者（不改变任何既有用户的授权投影）、`events: None`
+    /// 的既有装配、以及写失败（409）三条路径都不得有任何事件进入通道。
+    #[tokio::test]
+    async fn create_role_without_holders_and_failed_or_unwired_bus_publish_nothing() {
+        // 1) 有总线但只是新建角色。
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let router = roles_router_with_bus(FixtureRolesGateway::Echo, Some(bus.clone()), 42);
+        let res = router
+            .oneshot(authenticated_json_post(
+                "/api/v1/roles",
+                serde_json::json!({ "name": "ops", "permissions": ["device.read"] }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            collect_events(&mut rx).len(),
+            0,
+            "新建角色无持有者，不得发布"
+        );
+
+        // 2) patch 成功但装配未接总线（`events: None`）：与接入事件线之前的行为完全一致。
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let router = roles_router_with_bus(FixtureRolesGateway::Echo, None, 42);
+        let res = router
+            .oneshot(authenticated_json_patch(
+                &format!("/api/v1/roles/{TARGET_ID}"),
+                serde_json::json!({ "expected_revision": "5", "archived": true }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(collect_events(&mut rx).len(), 0, "events: None 不得有事件");
+
+        // 3) 有总线但写失败（内置角色不可归档 → 409）。
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let router = roles_router_with_bus(FixtureRolesGateway::BuiltinReject, Some(bus), 42);
+        let res = router
+            .oneshot(authenticated_json_patch(
+                &format!("/api/v1/roles/{TARGET_ID}"),
+                serde_json::json!({ "expected_revision": "5", "archived": true }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        assert_eq!(collect_events(&mut rx).len(), 0, "409 未发生变更，不得发布");
     }
 }

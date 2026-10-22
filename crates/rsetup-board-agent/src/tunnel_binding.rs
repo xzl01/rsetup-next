@@ -1,10 +1,13 @@
 //! 内存双流绑定与审批门（纯组件切片）。
 //!
 //! 本模块用真实 [`BoardAgent`] + 真实 [`JournalStore`] + mpsc 通道在内存内装配 control/data
-//! 双流，不含任何真实网络 socket、不含任何加密实现、不含任何 codec 实现。
-//! 真实加密通道与真实网络监听停在 [`ApprovalGate`] 之前：默认未批准，双 fail-closed。
+//! 双流，包含所有者授权启用的业务 codec（[`BusinessCodec`]）；
+//! 仍不含真实网络 socket、不含真实加密实现、不含握手实现。
+//! 真实加密通道与真实网络监听停在 [`ApprovalGate`] 的 `network_approved` 之前：
+//! 该门默认未批准，继续 fail-closed。
 
-use rsetup_protocol::wire::{BusinessPayload, NoCodec};
+use rsetup_protocol::BusinessCodec;
+use rsetup_protocol::wire::BusinessPayload;
 use tokio::sync::mpsc;
 
 use crate::actions::lookup_action;
@@ -16,7 +19,17 @@ use crate::journal::Fs;
 use crate::read_only::{PeerContext, ReadOnlySource};
 
 /// 唯一允许建立真实加密通道/真实网络连接的凭证。
-/// 在外部专家书面决议与用户复审落地前，`codec_approved` / `network_approved` 必须保持 false。
+///
+/// 当前口径（2026-10-22）：
+/// * `codec_approved` 默认 **true**：业务 codec 已按项目所有者 2026-10-22 的授权
+///   （原话「直接实现并启用生产 codec」）启用。**这是所有者授权，不是外部专家书面决议**，
+///   也不构成对 03 规格「待审阅」状态的批准；跨库固定测试向量、两进程互操作、
+///   库选型三类证据仍待补齐。
+/// * `network_approved` 默认仍为 **false**：真实 socket、加密与握手仍未获授权，继续 fail-closed。
+///
+/// `evidence_path` 指向所有者授权记录；它只留档「谁在什么范围内授权」这一事实，
+/// 隧道安全协议的外部专家决议仍留在
+/// `docs/superpowers/reviews/2026-10-03-tunnel-security-expert-decisions.md`，二者性质不同。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApprovalGate {
     pub codec_approved: bool,
@@ -27,15 +40,16 @@ pub struct ApprovalGate {
 impl Default for ApprovalGate {
     fn default() -> Self {
         Self {
-            codec_approved: false,
+            codec_approved: true,
             network_approved: false,
-            evidence_path: "docs/superpowers/reviews/2026-10-03-tunnel-security-expert-decisions.md",
+            evidence_path: "docs/superpowers/reviews/2026-10-22-codec-owner-authorization.md",
         }
     }
 }
 
 impl ApprovalGate {
-    /// 测试中显式构造；生产路径只有默认未批准值。
+    /// 测试中显式构造；默认值为 codec 已授权启用、network 仍未批准，
+    /// 需要验证 codec 门关闭的 fail-closed 行为时用本构造函数显式传 `false`。
     pub fn new(codec_approved: bool, network_approved: bool, evidence_path: &'static str) -> Self {
         Self {
             codec_approved,
@@ -44,7 +58,7 @@ impl ApprovalGate {
         }
     }
 
-    /// 未获批 codec：任何原始字节编解码路径都不得进入。
+    /// codec 门关闭（`codec_approved == false`）时：任何原始字节编解码路径都不得进入。
     pub fn require_codec(&self) -> Result<(), StreamError> {
         if self.codec_approved {
             Ok(())
@@ -211,7 +225,15 @@ where
 
     /// 统一守卫：与 [`Self::handle_typed`] 共享判定函数。
     ///
-    /// 绑定内不得出现任何 codec 实现：本入口恒用 [`NoCodec`] 语义（先查白名单，再 fail-closed）。
+    /// 判定顺序固定为 gate → stream → agent，不得劣化：
+    /// 1. [`ApprovalGate::require_codec`]：codec 门关闭时恒返回 [`StreamError::CodecApprovalRequired`]，
+    ///    在触碰流状态与任何下层之前失败关闭；
+    /// 2. [`Self::ensure_business_stream`]：Control 未开流与 Data 流业务 action 仍先行拒绝；
+    /// 3. [`BoardAgent::handle_wire`]：内部仍先查动作白名单与期望载荷类型，再解码。
+    ///
+    /// 本入口使用所有者授权启用的 [`BusinessCodec`]（授权性质见
+    /// [`rsetup_protocol::wire::approved_codec_witness`]）；本模块不引入任何新的 codec 实现，
+    /// 也未因此放开网络/加密/握手门禁。
     pub fn handle_wire(
         &self,
         stream: StreamType,
@@ -219,9 +241,10 @@ where
         action: &str,
         bytes: &[u8],
     ) -> Result<BusinessResponse, StreamError> {
+        self.gate.require_codec()?;
         self.ensure_business_stream(stream, action)?;
         self.agent
-            .handle_wire(&NoCodec, peer, action, bytes)
+            .handle_wire(&BusinessCodec, peer, action, bytes)
             .map_err(StreamError::AgentRejected)
     }
 

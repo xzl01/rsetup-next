@@ -5,6 +5,15 @@
 //! 走写限速桶，`GET /api/v1/groups` 按 `(EndpointId::GroupsRead, session.digest)` 走读桶。
 //! `GET` 列表的 `cursor`/`next_cursor` 一律经 `api/mod.rs` 的统一签名 codec 对签发与校验；
 //! `PUT /{id}/members` 限制 `device_ids.len() <= 1024`，逐项校验小写 hex64 并去重后全量替换。
+//!
+//! 事件线（06 §4 `permissions.changed`）：本文件**不发布**任何 `permissions.changed`。
+//! 该事件的受众是**单个受影响用户**（受众与载荷 `id` 同一份字节），而 `PATCH /{id}`
+//! （改名/归档）影响的是**引用该组的授权可见范围**内的用户集合（仓储同事务
+//! `bump_authz_epoch`），本层拿不到该集合，把提示发给操作者管理员即是虚假提示（他未必
+//! 在受影响范围内）。`POST /api/v1/groups` 新建的空组此刻尚未被任何授权引用；
+//! `PUT /{id}/members` 改的是设备成员集合，仓储在该路径**不**递增 `authz_epoch`，也没有
+//! 可信的新 epoch 可发布。撤权安全性由全局 `authz_epoch` 递增 + SSE 读线每帧按连接
+//! `authz_epoch` 权威复核直接关流保证（06 §4），不依赖这条提示。
 
 use std::sync::Arc;
 
@@ -19,6 +28,7 @@ use uuid::Uuid;
 use crate::auth::service::Session;
 use crate::authz::sqlx_repo::validate_group_name;
 use crate::error::ControllerError;
+use crate::events::EventBus;
 use crate::http_api::{err_response, ok_response};
 use crate::http_auth::{EndpointId, HttpAuthState};
 use crate::http_gate::{
@@ -35,6 +45,10 @@ use super::{
 pub struct GroupsApiState {
     pub auth: Arc<HttpAuthState>,
     pub gateway: Arc<dyn GroupsGateway>,
+    /// 进程内事件总线句柄（06 §4）：与 SSE 读线 `EventsState.bus` 是同一通道句柄，
+    /// 保留以与其它 management 条线同形装配（生产组装统一注入）。groups 条线本身
+    /// **不发布任何事件**（见模块头的受众口径），因此该句柄在本文件内不被读取。
+    pub events: Option<EventBus>,
 }
 
 pub trait GroupsGateway: Send + Sync {
@@ -218,6 +232,10 @@ async fn create_group(
 
 /// `PATCH /api/v1/groups/{id}`：CAS 补丁（归档或改名）。改名复用 `validate_group_name`
 /// 前置 400；版本不符 → 409 `REVISION_CONFLICT`；不存在 → 404。
+/// 写成功即引用该组的授权可见范围变化（仓储同事务 `bump_authz_epoch`），但本层**不发布**
+/// `permissions.changed`：该事件的受众是**单个**受影响用户，这里受影响的是本层拿不到的用
+/// 户集合，发给操作者管理员即是指向错人的虚假提示。撤权安全性由全局 `authz_epoch` 递增 +
+/// SSE 读线每帧的权威复核关流保证（06 §4）。
 async fn patch_group(
     State(state): State<GroupsApiState>,
     Path(id): Path<String>,
@@ -332,6 +350,7 @@ mod tests {
     use super::*;
     use crate::api::users::test_fixture::*;
     use crate::error::ControllerError;
+    use crate::events::EventEnvelope;
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use std::sync::{Mutex, OnceLock};
@@ -451,9 +470,20 @@ mod tests {
         session: Session,
         gateway: FixtureGroupsGateway,
     ) -> GroupsApiState {
+        groups_state_with_events(session, gateway, None)
+    }
+
+    /// 事件总线可选的装配：`Some(bus)` 与 SSE 读线 `EventsState.bus` 是同一通道句柄，
+    /// `None`（既有全部用例的基线）表示本装配未开启事件线。
+    fn groups_state_with_events(
+        session: Session,
+        gateway: FixtureGroupsGateway,
+        events: Option<EventBus>,
+    ) -> GroupsApiState {
         GroupsApiState {
             auth: fixture_auth(session),
             gateway: Arc::new(gateway),
+            events,
         }
     }
 
@@ -870,6 +900,7 @@ mod tests {
             groups: GroupsApiState {
                 auth: fixture_auth(fixture_session(true)),
                 gateway,
+                events: None,
             },
             secret_slot,
         };
@@ -972,5 +1003,128 @@ mod tests {
             before,
             "客户端 400 不得触达网关"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 组写操作的 `permissions.changed` **零发布**（06 §4，受众不可确定即不发布）
+    // -----------------------------------------------------------------------
+
+    /// 收集订阅通道当前待读的事件（订阅只收「之后」的事件，不回放历史）。
+    fn collect_events(
+        rx: &mut tokio::sync::broadcast::Receiver<EventEnvelope>,
+    ) -> Vec<EventEnvelope> {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    /// 带事件总线的 groups 装配：`epoch` 是本装配报告的全局 authz_epoch。
+    fn groups_router_with_bus(
+        gateway: FixtureGroupsGateway,
+        bus: Option<EventBus>,
+        epoch: u64,
+    ) -> axum::Router<()> {
+        groups_router(GroupsApiState {
+            auth: fixture_auth_with_epoch(fixture_session(true), epoch),
+            gateway: Arc::new(gateway),
+            events: bus,
+        })
+    }
+
+    /// 语义收敛（审查反馈 Medium-1）：`PATCH /{id}`（改名/归档）改动的是**引用该组的
+    /// 授权可见范围内全部用户**的有效权限，本层拿不到该集合，因此**不得**向操作者管理员
+    /// 发一条关于其本人的 `permissions.changed`。撤权安全性由全局 `authz_epoch` 递增 +
+    /// SSE 读线每帧按连接 `authz_epoch` 权威复核直接关流保证（06 §4）。
+    #[tokio::test]
+    async fn patch_group_publishes_no_permissions_changed_without_target_user() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let router = groups_router_with_bus(FixtureGroupsGateway::Echo, Some(bus.clone()), 42);
+        let res = router
+            .oneshot(authenticated_json_patch(
+                &format!("/api/v1/groups/{TARGET_ID}"),
+                serde_json::json!({ "expected_revision": "2", "archived": true }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            collect_events(&mut rx).len(),
+            0,
+            "受影响用户不可确定时不得向操作者发布 permissions.changed"
+        );
+        // 反向证据：同一订阅者确实能收到事件，说明上面的 0 条是「未发布」而非「订阅失效」。
+        assert_eq!(
+            bus.publish(EventEnvelope::permissions_changed(
+                fixture_session(true).user.id,
+                42,
+            )),
+            1
+        );
+    }
+
+    /// 负例：新建空组与 `PUT /{id}/members`（仓储在该路径不递增 authz_epoch）即便有总线
+    /// 也不发布；`events: None` 与写失败同样零发布。
+    #[tokio::test]
+    async fn group_creation_member_replacement_unwired_or_failed_bus_publish_nothing() {
+        // 1) 新建空组。
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let router = groups_router_with_bus(FixtureGroupsGateway::Echo, Some(bus.clone()), 42);
+        let res = router
+            .oneshot(authenticated_json_post(
+                "/api/v1/groups",
+                serde_json::json!({ "name": "ops" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(collect_events(&mut rx).len(), 0, "新建空组不得发布");
+
+        // 2) 全量替换成员。
+        let router = groups_router_with_bus(FixtureGroupsGateway::Echo, Some(bus.clone()), 42);
+        let res = router
+            .oneshot(authenticated_json_write(
+                "PUT",
+                &format!("/api/v1/groups/{TARGET_ID}/members"),
+                serde_json::json!({
+                    "expected_revision": "2",
+                    "device_ids": [TARGET_DEVICE],
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            collect_events(&mut rx).len(),
+            0,
+            "成员替换无可信新 epoch，不得发布"
+        );
+
+        // 3) patch 成功但 `events: None`。
+        let router = groups_router_with_bus(FixtureGroupsGateway::Echo, None, 42);
+        let res = router
+            .oneshot(authenticated_json_patch(
+                &format!("/api/v1/groups/{TARGET_ID}"),
+                serde_json::json!({ "expected_revision": "2", "name": "renamed" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(collect_events(&mut rx).len(), 0, "events: None 不得有事件");
+
+        // 4) 有总线但写失败（404）。
+        let router = groups_router_with_bus(FixtureGroupsGateway::Missing, Some(bus), 42);
+        let res = router
+            .oneshot(authenticated_json_patch(
+                &format!("/api/v1/groups/{TARGET_ID}"),
+                serde_json::json!({ "expected_revision": "2", "archived": true }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(collect_events(&mut rx).len(), 0, "404 未发生变更，不得发布");
     }
 }

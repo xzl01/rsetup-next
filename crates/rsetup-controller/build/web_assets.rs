@@ -89,7 +89,7 @@ pub const ASSET_URL_PREFIX: &str = "/assets/";
 pub const DIST_ENV_OVERRIDE: &str = "RSETUP_WEB_DIST";
 
 /// 构建失败时提示的下一步动作，集中一处避免文案漂移。
-const BUILD_HINT: &str = "请先在 apps/controller-web 执行 pnpm build（或 npm --prefix apps/controller-web run build）后重新构建 Rust 侧";
+const BUILD_HINT: &str = "请先执行 npm --prefix apps/controller-web ci 与 npm --prefix apps/controller-web run build 构建前端产物，后重新构建 Rust 侧";
 
 /// 递归遍历 `dist/assets` 的深度上限，防目录环与病态构建。
 const MAX_ASSET_DEPTH: usize = 8;

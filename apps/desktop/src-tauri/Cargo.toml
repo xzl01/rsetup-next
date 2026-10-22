@@ -2,9 +2,8 @@
 name = "rsetup-desktop"
 version = "0.5.0"
 edition = "2024"
-# The same minimum the workspace declares. Declaring it here keeps the lints
-# MSRV-aware, so a suggestion that needs a newer Rust (such as collapsing nested
-# `if let` into the 1.88 let-chain syntax) is not made for this crate either.
+# MSRV 1.85 由 make msrv-check 用 1.85.0 工具链验证；默认构建使用当前 stable
+# （本地验证 rustc 1.99.1），两者不互相替代。
 rust-version = "1.85"
 license = "GPL-3.0-or-later"
 

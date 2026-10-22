@@ -24,11 +24,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy,rustfmt
-      # 中控前端必须先于任何 Rust 编译：rsetup-controller 的 web.rs 用
-      # include_str!/include_bytes! 在编译期嵌入 apps/controller-web/dist 的产物，
-      # dist 缺失时 cargo 直接失败（fail-closed），web_assets 还要读同一份磁盘字节
-      # 作为独立预期源。顺序固定「锁定安装 → 测试 → 类型检查 → 构建」，与
-      # make controller-test-offline 一致。
+      # 中控前端产物 `apps/controller-web/dist` 已随仓库提交：Rust 编译本身不再需要
+      # Node（rsetup-controller 的 build.rs 直接读取入库的 dist，缺失即 fail-closed）。
+      # 本作业仍然跑「锁定安装 → 测试 → 类型检查 → 构建」，目的是**从源码重新构建**，
+      # 再用下一步与入库的 dist 逐字节比对：源码改了却没重新构建提交，流水线即红。
+      # 顺序固定「安装 → 测试 → 类型检查 → 构建 → 比对」，与 make controller-test-offline
+      # 的前端两条门禁一致；web_assets 读的就是这份磁盘字节。
       - uses: actions/setup-node@v7
         with:
           node-version: '22'
@@ -42,8 +43,28 @@ jobs:
         run: npm --prefix apps/controller-web run typecheck
       - name: Build controller web
         run: npm --prefix apps/controller-web run build
+      # dist 入库换来的唯一纪律由这一步保证：vite 构建是确定性的（重复构建字节一致），
+      # 所以「源码 + 已提交 dist」必须自洽。改前端源码却没有 `make web-build` 重新提交，
+      # 或者手工改过 dist，`git diff --exit-code` 都会非零退出把作业判红。
+      - name: Verify committed dist matches the frontend build
+        run: |
+          set -eu
+          changes="$(git status --porcelain -- apps/controller-web/dist)"
+          if [ -n "$changes" ]; then
+            echo "::error::committed apps/controller-web/dist differs from the frontend build; run 'make web-build' and commit the result"
+            printf '%s\n' "$changes"
+            exit 1
+          fi
+          git diff --exit-code -- apps/controller-web/dist
       - name: Check formatting
         run: make fmt-check
+      # 规范 §7.8 的五条 grep 静态门禁（make metrics-static-gates）：纯只读检查，
+      # 不编译、不联网、不需要 apps/controller-web/dist，所以排在 Rust 编译之前，
+      # 与 fmt-check 同属静态轨道，失败时不必等编译就能定位。
+      # 注意不要改成完整的 metrics-gates 目标：它会重复下面的 clippy/cargo test
+      # 并触发编译。该接线由 scripts/tests/controller-ci-contract.test.mjs 钉住。
+      - name: Check metrics static gates
+        run: make metrics-static-gates
       - name: Lint Rust workspace
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test Rust workspace
@@ -72,10 +93,15 @@ jobs:
       - name: Test CI configuration contracts
         run: node --test scripts/tests/*.test.mjs
 
+  # 架构口径：本项目仅维护 64 位目标 aarch64（arm64）与 x86_64（amd64），
+  # 与 debian/control 的 `Architecture: amd64 arm64` 保持一致。
   rust-multi-arch-check:
     runs-on: ubuntu-24.04
     strategy:
       matrix:
+        # 矩阵恰好为下列两项：aarch64-unknown-linux-gnu(arm64) 与
+        # x86_64-unknown-linux-gnu(amd64)。32 位目标（armv7/i686 等）不再纳入
+        # 多架构检查，请勿加回；该口径由 scripts/tests/controller-ci-contract.test.mjs 钉住。
         target:
           - aarch64-unknown-linux-gnu
           - x86_64-unknown-linux-gnu
@@ -104,6 +130,8 @@ jobs:
       - name: Check workspace across target architectures
         run: cargo check --workspace --all-targets --locked --target ${{ matrix.target }}
 
+  # MSRV 验证：默认构建使用 stable（本地验证 1.99.1），本作业单独用 1.85.0 跑
+  # workspace 测试。dist 已入库，故不需要 Node/npm；本作业不把 1.85.0 设为默认。
   rust-msrv:
     runs-on: ubuntu-24.04
     steps:
@@ -111,13 +139,6 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@1.85.0
-      # The action installs 1.85.0 and makes it the default toolchain, which is
-      # how the rustup proxies on PATH come to answer with it. Nothing below
-      # relies on that inference any more: the version the shell actually
-      # resolves is printed and asserted, and the gate itself runs through the
-      # 1.85.0 cargo and rustc resolved by path. A newer compiler earlier in
-      # PATH (a Homebrew or distro rustc) would otherwise answer for 1.85 and
-      # let a 1.88-only construct through unnoticed.
       - name: Assert the resolved toolchain is the minimum supported version
         run: |
           set -eu
@@ -125,9 +146,6 @@ jobs:
           rustup show active-toolchain
           for expected in "rustc 1.85." "cargo 1.85." "rustdoc 1.85."; do
             name="${expected%% *}"
-            # Compare against the whole expected prefix. Splitting the version off
-            # the tool name produced the pattern `1.85.*`, which can never match
-            # `rustc 1.85.0 (...)` — the assertion failed on a correct toolchain.
             case "$("$name" --version)" in
               "$expected"*) ;;
               *)
@@ -136,17 +154,6 @@ jobs:
                 ;;
             esac
           done
-      # msrv-check 跑 cargo test --workspace，其中 rsetup-controller 编译期嵌入
-      # 前端产物，因此先构建 dist。Node 22 只是构建产物的宿主，被测版本仍是 1.85.0。
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: apps/controller-web/package-lock.json
-      - name: Build controller web assets
-        run: |
-          npm --prefix apps/controller-web ci
-          npm --prefix apps/controller-web run build
       - name: Test minimum supported Rust version
         run: make msrv-check
 
@@ -203,17 +210,16 @@ jobs:
           apt-get update &&
           apt-get install -y --no-install-recommends
           build-essential ca-certificates cargo debhelper devscripts dpkg-dev
-          git lintian nodejs npm rustc
+          git lintian nodejs rustc
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-      # dh_auto_test 跑 cargo test --workspace，而 rsetup-controller 在编译期嵌入
-      # apps/controller-web/dist，打包前必须先产出前端产物。Debian trixie 的 nodejs
-      # 为 20.19.x，正好满足 Vite 8 的 ^20.19.0 下限。
-      - name: Build controller web assets
-        run: |
-          npm --prefix apps/controller-web ci
-          npm --prefix apps/controller-web run build
+      # 本作业不构建前端：rsetup-controller 不进入 Debian 软件包，debian/rules 的
+      # dh_auto_test 已用 `--exclude rsetup-controller` 把它排除在编译与测试之外，
+      # 因此这里既不需要 controller 的前端 dist 产物，也不需要 npm——装 nodejs 只是为了
+      # dh_auto_test 的 `node --test ui/*.test.mjs`。若将来把 controller 纳入本包，
+      # 必须先补回 Node 22 + npm 的前端构建，并同步 debian/control 与 debian/rules；
+      # 这一步回归会被 scripts/tests/controller-ci-contract.test.mjs 判红。
       - name: Prepare offline Cargo cache
         run: CARGO_HOME="$GITHUB_WORKSPACE/debian/cargo-home" cargo fetch --locked
       - name: Build Debian package

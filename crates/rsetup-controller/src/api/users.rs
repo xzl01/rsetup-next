@@ -4,6 +4,12 @@
 //! 管理前置，权威判定仍在仓储事务 guard 内重验；`POST`/`PATCH` 只按 `session.digest` 走
 //! 写限速桶，两条 `GET` 按 `(EndpointId, session.digest)` 走读桶。
 //! 响应 `data` 一律由网关的固定投影函数构造，handler 不拼 SQL、不接受任意字段。
+//!
+//! 事件线（06 §4 `permissions.changed`）：`state.events` 配置了 [`EventBus`] 时，
+//! `PATCH /{id}` 改 `active`/`is_admin` 成功与 `POST /{id}/reset-password` 成功后，向
+//! **目标用户本人**投一条授权变化提示（受众由 `EventEnvelope::permissions_changed`
+//! 与载荷 `id` 同源绑定）；`events = None` 时与接入总线之前行为完全一致。角色的授予与
+//! 回收在 HTTP 上是 grants（`source = role`）的写，其发布归属 `api/grants.rs`。
 
 use std::sync::Arc;
 
@@ -16,6 +22,7 @@ use serde::Deserialize;
 
 use crate::auth::service::Session;
 use crate::error::ControllerError;
+use crate::events::EventBus;
 use crate::http_api::ok_response;
 use crate::http_auth::{EndpointId, HttpAuthState};
 use crate::http_gate::{
@@ -25,13 +32,17 @@ use crate::http_gate::{
 use super::{
     CursorFilterCtx, CursorKey, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, ManagementFuture,
     decode_management_list_cursor, management_cursor_secret, map_error, parse_device_id_path,
-    parse_revision, parse_uuid_path, sign_management_list_page,
+    parse_revision, parse_uuid_path, publish_permissions_changed, sign_management_list_page,
 };
 
 #[derive(Clone)]
 pub struct UsersApiState {
     pub auth: Arc<HttpAuthState>,
     pub gateway: Arc<dyn UsersGateway>,
+    /// 进程内事件总线句柄（06 §4 `permissions.changed`）：与 SSE 读线 `EventsState.bus`
+    /// 是同一通道句柄。`None` 表示本装配未开启事件线，写端点行为与接入总线之前完全
+    /// 一致（不发布、不报错、不阻塞）；发布返回值一律忽略，不得据此改变响应。
+    pub events: Option<EventBus>,
 }
 
 /// users 资源网关契约：所有方法显式借用 actor，返回已校验的 HTTP 响应投影。
@@ -244,6 +255,9 @@ async fn create_user(
 
 /// `PATCH /api/v1/users/{id}`：CAS 补丁。降级/停用唯一管理员由网关返回 `LastAdmin`
 /// → 409 `LAST_ADMIN`；版本不符 → 409 `REVISION_CONFLICT`；不存在 → 404。
+/// 授权相关字段（`active`/`is_admin`）在请求里出现且写成功时，向目标用户本人发一条
+/// `permissions.changed`（仓储侧同一次写恒 `bump_authz_epoch`）；只改 `display_name`
+/// 不构成授权变化，不发布。`events = None` 时完全不发布。
 async fn patch_user(
     State(state): State<UsersApiState>,
     Path(id): Path<String>,
@@ -269,11 +283,14 @@ async fn patch_user(
         Ok(revision) => revision,
         Err(response) => return response,
     };
+    // 授权相关性只由入参判定（停用与降权都可能撤销目标的全部有效权限）。
+    let authz_changed = input.active.is_some() || input.is_admin.is_some();
+    let target_raw = target.into_bytes();
     let patched = match state
         .gateway
         .patch(
             &actor,
-            target.into_bytes(),
+            target_raw,
             revision,
             input.active,
             input.is_admin,
@@ -284,11 +301,17 @@ async fn patch_user(
         Ok(patched) => patched,
         Err(error) => return map_error(error),
     };
+    // `filter` 把「本次写是否触及授权字段」与「本装配是否有事件线」合成一次判定。
+    if let Some(ref bus) = state.events.filter(|_| authz_changed) {
+        publish_permissions_changed(bus, &state.auth, target_raw).await;
+    }
     ok_response(patched)
 }
 
 /// `POST /api/v1/users/{id}/reset-password`：重置并一次性返回临时密码；
-/// 撤销目标会话与 LastAdmin 门禁都在网关事务内完成。
+/// 撤销目标会话与 LastAdmin 门禁都在网关事务内完成。重置成功即目标用户的全部会话
+/// 失效且必须改密，属授权侧变化（仓储同事务 `bump_authz_epoch`），因此
+/// `events` 配置了总线时向目标用户本人发一条 `permissions.changed`。
 async fn reset_password(
     State(state): State<UsersApiState>,
     Path(id): Path<String>,
@@ -314,14 +337,18 @@ async fn reset_password(
         Ok(revision) => revision,
         Err(response) => return response,
     };
+    let target_raw = target.into_bytes();
     let rotated = match state
         .gateway
-        .reset_password(&actor, target.into_bytes(), revision)
+        .reset_password(&actor, target_raw, revision)
         .await
     {
         Ok(rotated) => rotated,
         Err(error) => return map_error(error),
     };
+    if let Some(ref bus) = state.events {
+        publish_permissions_changed(bus, &state.auth, target_raw).await;
+    }
     ok_response(rotated)
 }
 
@@ -511,9 +538,12 @@ pub(crate) mod test_fixture {
     }
 
     /// `FixtureAuth`：Task 1 `StubAuth`（`http_gate.rs` tests）的 test_fixture 版克隆。
+    /// `epoch` 是本 fixture 对外报告的**全局** authz_epoch：`permissions.changed` 的载荷
+    /// epoch 必须由 `AuthServiceApi::authz_epoch()` 现读给出，非 0 取值才能证明它不是常量。
     pub(crate) struct FixtureAuth {
         token: String,
         session: Session,
+        epoch: u64,
     }
 
     impl AuthServiceApi for FixtureAuth {
@@ -543,7 +573,8 @@ pub(crate) mod test_fixture {
             Box::pin(async { Ok(()) })
         }
         fn authz_epoch(&self) -> AuthFuture<'_, u64> {
-            Box::pin(async { Ok(0) })
+            let epoch = self.epoch;
+            Box::pin(async move { Ok(epoch) })
         }
         fn is_live_session(&self, _d: &[u8; 32]) -> bool {
             true
@@ -578,10 +609,17 @@ pub(crate) mod test_fixture {
 
     /// 最小装配：合法 Host allowlist + 固定会话 + 绑定 `session.digest` 的 CSRF。
     pub(crate) fn fixture_auth(session: Session) -> Arc<HttpAuthState> {
+        fixture_auth_with_epoch(session, 0)
+    }
+
+    /// 指定全局 authz_epoch 的装配：`permissions.changed` 的载荷 epoch 应等于该值，
+    /// 由此证明 epoch 是写入后经认证服务现读的全局 epoch，不是发布方的常量。
+    pub(crate) fn fixture_auth_with_epoch(session: Session, epoch: u64) -> Arc<HttpAuthState> {
         let auth = Arc::new(HttpAuthState::new(
             Arc::new(FixtureAuth {
                 token: hex64('a'),
                 session: session.clone(),
+                epoch,
             }),
             HttpSecurityConfig::from_values(
                 Some("localhost:3080,controller.test"),
@@ -601,15 +639,26 @@ pub(crate) mod test_fixture {
     }
 
     /// users 资源前置：返回 `(Router, 测试状态)`；入口只差 Session 形态与网关行为。
+    /// 事件线关闭（`events: None`）的装配：既有全部用例的行为基线。
     pub(crate) fn users_state_with(
         session: Session,
         gateway: Arc<dyn UsersGateway>,
+    ) -> (axum::Router<()>, Arc<HttpAuthState>) {
+        users_state_with_events(session, gateway, None)
+    }
+
+    /// 事件总线可选的装配：`Some(bus)` 与 SSE 读线 `EventsState.bus` 是同一通道句柄。
+    pub(crate) fn users_state_with_events(
+        session: Session,
+        gateway: Arc<dyn UsersGateway>,
+        events: Option<EventBus>,
     ) -> (axum::Router<()>, Arc<HttpAuthState>) {
         let auth = fixture_auth(session);
         (
             users_router(UsersApiState {
                 auth: auth.clone(),
                 gateway,
+                events,
             }),
             auth,
         )
@@ -827,10 +876,12 @@ pub(crate) mod test_fixture {
 mod tests {
     use super::effective_permissions_with_secret_provider;
     use super::test_fixture::*;
+    use super::users_router;
     use super::{UsersApiState, UsersGateway};
     use crate::api::{CursorFilterCtx, CursorKey, ManagementFuture, encode_signed_cursor};
     use crate::auth::service::Session;
     use crate::error::ControllerError;
+    use crate::events::{EventAudience, EventBus, EventEnvelope, EventName, EventViewer};
     use crate::http_auth::EndpointId;
     use axum::body::Body;
     use axum::extract::{Path, State};
@@ -1006,6 +1057,7 @@ mod tests {
             users: UsersApiState {
                 auth: fixture_auth(fixture_session(true)),
                 gateway,
+                events: None,
             },
             secret_slot,
         };
@@ -1538,5 +1590,159 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    // -----------------------------------------------------------------------
+    // 授权变更的 `permissions.changed` 事件发布（06 §4）
+    // -----------------------------------------------------------------------
+
+    /// 收集订阅通道当前待读的事件（订阅只收「之后」的事件，不回放历史）。
+    fn collect_events(
+        rx: &mut tokio::sync::broadcast::Receiver<EventEnvelope>,
+    ) -> Vec<EventEnvelope> {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    /// 带事件总线的 users 装配：`epoch` 是本装配报告的全局 authz_epoch。
+    fn users_router_with_bus(
+        gateway: FixtureUsersGateway,
+        bus: Option<EventBus>,
+        epoch: u64,
+    ) -> axum::Router<()> {
+        users_router(UsersApiState {
+            auth: fixture_auth_with_epoch(fixture_session(true), epoch),
+            gateway: Arc::new(gateway),
+            events: bus,
+        })
+    }
+
+    /// 正例：`PATCH` 改 `active`（停用）成功即目标用户授权变化，恰好发布一条
+    /// `permissions.changed`。载荷 `id` 是**目标用户** UUID、`epoch` 是写入后经认证服务
+    /// 现读的全局 epoch（此处合成 42，证明不是常量兜底），受众恒目标用户本人。
+    #[tokio::test]
+    async fn patch_user_publishes_permissions_changed_to_target_user() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let router = users_router_with_bus(FixtureUsersGateway::Echo, Some(bus), 42);
+        let res = router
+            .oneshot(authenticated_json_patch(
+                &format!("/api/v1/users/{TARGET_ID}"),
+                serde_json::json!({ "expected_revision": "7", "active": false }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let events = collect_events(&mut rx);
+        assert_eq!(
+            events.len(),
+            1,
+            "停用用户必须恰好发布一条 permissions.changed"
+        );
+        let event = &events[0];
+        assert_eq!(event.name(), EventName::PermissionsChanged);
+        assert_eq!(event.data()["kind"], serde_json::json!("permissions"));
+        assert_eq!(event.data()["id"], serde_json::json!(TARGET_ID));
+        // epoch 必须是十进制字符串（不经 JS number），且等于装配报告的 epoch。
+        assert_eq!(event.data()["epoch"], serde_json::json!("42"));
+        assert!(event.data()["epoch"].is_string());
+        let target = target_bytes(TARGET_ID);
+        assert_eq!(event.audience(), EventAudience::User(target));
+        // 受众隔离：目标本人可见；同一 id 的管理员视角仍可见（那是他本人的事实），
+        // 发起变更的管理员与任何其他用户都不可见。
+        assert!(event.visible_to(EventViewer {
+            user_id: target,
+            is_admin: false,
+        }));
+        assert!(!event.visible_to(EventViewer {
+            user_id: fixture_session(true).user.id,
+            is_admin: true,
+        }));
+        assert!(!event.visible_to(EventViewer {
+            user_id: target_bytes(OTHER_TARGET_ID),
+            is_admin: false,
+        }));
+    }
+
+    /// 正例：`POST /{id}/reset-password` 成功（全部会话撤销 + 强制改密）同样向目标用户
+    /// 本人发布一条提示。
+    #[tokio::test]
+    async fn reset_password_publishes_permissions_changed_to_target_user() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let router = users_router_with_bus(FixtureUsersGateway::Echo, Some(bus), 7);
+        let res = router
+            .oneshot(authenticated_json_post(
+                &format!("/api/v1/users/{TARGET_ID}/reset-password"),
+                serde_json::json!({ "expected_revision": "3" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let events = collect_events(&mut rx);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name(), EventName::PermissionsChanged);
+        assert_eq!(events[0].data()["id"], serde_json::json!(TARGET_ID));
+        assert_eq!(events[0].data()["epoch"], serde_json::json!("7"));
+        assert_eq!(
+            events[0].audience(),
+            EventAudience::User(target_bytes(TARGET_ID))
+        );
+    }
+
+    /// 负例：三条路径一律零发布——`events: None` 的既有装配、只改 `display_name`（不触及
+    /// 授权字段）、以及写失败（404）。响应行为本身不受事件线影响。
+    #[tokio::test]
+    async fn patch_user_publishes_nothing_without_bus_authz_change_or_on_failure() {
+        // 1) `events: None`：授权字段写成功也不得有任何事件进入通道。
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let (router, _state) = admin_state_with(FixtureUsersGateway::Echo);
+        let res = router
+            .oneshot(authenticated_json_patch(
+                &format!("/api/v1/users/{TARGET_ID}"),
+                serde_json::json!({ "expected_revision": "1", "active": false }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "events: None 不得有任何事件进入通道"
+        );
+
+        // 2) 有总线但只改 `display_name`：不构成授权变化。
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let router = users_router_with_bus(FixtureUsersGateway::Echo, Some(bus.clone()), 42);
+        let res = router
+            .oneshot(authenticated_json_patch(
+                &format!("/api/v1/users/{TARGET_ID}"),
+                serde_json::json!({ "expected_revision": "1", "display_name": "Ops" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(collect_events(&mut rx).len(), 0, "改名不是授权变更");
+
+        // 3) 有总线且触及授权字段，但写失败（404）：未发生变更即不发布。
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let router = users_router_with_bus(FixtureUsersGateway::Missing, Some(bus.clone()), 42);
+        let res = router
+            .oneshot(authenticated_json_patch(
+                &format!("/api/v1/users/{TARGET_ID}"),
+                serde_json::json!({ "expected_revision": "1", "is_admin": false }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(collect_events(&mut rx).len(), 0, "404 未发生变更，不得发布");
     }
 }

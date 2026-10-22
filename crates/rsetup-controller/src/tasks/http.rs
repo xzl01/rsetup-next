@@ -12,6 +12,13 @@
 //! ≤1 MiB + `deny_unknown_fields`、`parse_decimal_u64`、`parse_idempotency_key`、
 //! `clamp_page_limit`）→ ④管理员前置（**仅** time-review / release-lock）→
 //! ⑤[`TaskApi`] → ⑥[`task_error_response`] 统一映射。
+//!
+//! 业务事件（06 §4 `task.updated`）：`state.events` 配置了 [`EventBus`] 时，改变
+//! 任务状态的 4 个写端点（create / cancel / time-review / release-lock）在各自
+//! 成功分支返回响应之前发布一次变化提示；受众由 [`HttpTasksState`] 的发布入口
+//! 如实标注（创建者本人受众，操作者非管理员时再补投一份管理员受众），失败响应
+//! 零发布，`events = None` 时与接入事件总线之前行为完全一致。事件只是变化提示，
+//! 权威事实始终来自 GET 快照。
 
 use std::sync::Arc;
 
@@ -27,6 +34,7 @@ use uuid::Uuid;
 
 use crate::ControllerError;
 use crate::auth::service::Session;
+use crate::events::{EventBus, EventEnvelope, EventObjectAudience};
 use crate::http_api::{err_response, ok_response, request_id};
 use crate::http_auth::{EndpointId, HttpAuthState};
 use crate::http_gate::{
@@ -284,11 +292,70 @@ pub trait TaskApi: Send + Sync {
     ) -> TaskFuture<'a, ReleaseLockResponse>;
 }
 
-/// 任务路由 state：两字段**不扩**（游标密钥由 `api` 的生产实现持有）。
+/// 任务路由 state：业务依赖仍只有 `api` 与 `auth` 两项（游标密钥由 `api` 的生产
+/// 实现持有），`events` 是**可选**的业务事件发布面（06 §4 `task.updated`）。
+///
+/// `events` 为 `None` 时所有写端点行为与接入事件总线之前完全一致（不发布、不
+/// 报错、不阻塞）；发布失败在 [`EventBus::publish`] 的契约里即「无在线订阅者
+/// 即丢弃」，因此任何 handler 都不得依据发布返回值改变响应。
 #[derive(Clone)]
 pub struct HttpTasksState {
     pub api: Arc<dyn TaskApi>,
     pub auth: Arc<HttpAuthState>,
+    /// 进程内事件总线句柄；`None` 表示本部署未开启 SSE 事件线（单测与嵌入式装配）。
+    pub events: Option<EventBus>,
+}
+
+impl HttpTasksState {
+    /// 不接事件总线的构造（保持既有 `{api, auth}` 两字段装配语义的入口）。
+    pub fn new(api: Arc<dyn TaskApi>, auth: Arc<HttpAuthState>) -> Self {
+        Self {
+            api,
+            auth,
+            events: None,
+        }
+    }
+
+    /// 接上生产事件总线（与 SSE 读线 `EventsState.bus` 必须是同一通道句柄）。
+    pub fn with_events(mut self, events: EventBus) -> Self {
+        self.events = Some(events);
+        self
+    }
+
+    /// 任务写操作成功后的统一 `task.updated` 发布：
+    ///
+    /// 1. 先投给**任务创建者本人**（对象级受众 `User(creator_user_id)`，普通
+    ///    用户由此看到自己任务的变化）；
+    /// 2. 操作者不是管理员时再补投一份**管理员受众**——管理员不是「任何合法
+    ///    会话」，也不是创建者的旁路，需要独立受众的一条事件（02 §7 逐事件过滤）；
+    ///    管理员本人已收到第 1 条（其本人受众即覆盖其会话），不重复投递。
+    ///
+    /// `revision` 只作同一 `kind + id` 内的单调提示：调用方给不出精确新值时给
+    /// **递增下界**（CAS 的 `expected_revision.saturating_add(1)`，饱和加以防客户端
+    /// 传入 `u64::MAX` 时 panic 或回绕成倒退版本），不得给任意定值。
+    fn publish_task_update(
+        &self,
+        task_id: &str,
+        revision: u64,
+        creator_user_id: [u8; 16],
+        is_admin_actor: bool,
+    ) {
+        let Some(bus) = self.events.as_ref() else {
+            return;
+        };
+        bus.publish(EventEnvelope::task_updated(
+            task_id,
+            revision,
+            EventObjectAudience::user(creator_user_id),
+        ));
+        if !is_admin_actor {
+            bus.publish(EventEnvelope::task_updated(
+                task_id,
+                revision,
+                EventObjectAudience::admins(),
+            ));
+        }
+    }
 }
 
 impl FromRef<HttpTasksState> for Arc<HttpAuthState> {
@@ -862,6 +929,14 @@ mod routes {
                     SubmitOutcome::Created { main_task_id }
                     | SubmitOutcome::Replayed { main_task_id } => main_task_id,
                 };
+                // 新建主任务的持久 revision 恒为 1（Task 4 submit 的首个版本）；
+                // 幂等重放只是同一主任务的重投，仍按同一 revision 发变化提示。
+                state.publish_task_update(
+                    &task_id.to_string(),
+                    1,
+                    session.user.id,
+                    session.user.is_admin,
+                );
                 accepted_response(json!({ "task_id": task_id.to_string(), "accepted": true }))
             }
             Err(err) => task_error_response(&err),
@@ -996,9 +1071,10 @@ mod routes {
             Ok(request) => request,
             Err(response) => return response,
         };
-        if let Err(err) = parse_decimal_u64(&request.expected_revision) {
-            return task_error_response(&err);
-        }
+        let expected_revision = match parse_decimal_u64(&request.expected_revision) {
+            Ok(revision) => revision,
+            Err(err) => return task_error_response(&err),
+        };
         if !request.confirm {
             return err_response(
                 StatusCode::BAD_REQUEST,
@@ -1008,7 +1084,30 @@ mod routes {
             );
         }
         match state.api.cancel(&session, task_id, request).await {
-            Ok(response) => ok_response(strict_json(&response)),
+            Ok(response) => {
+                // 只有**确实取消了目标**才发变化提示：HTTP 契约把「本事务没有取消任何
+                // 目标」（含无可读目标）投影成 `cancelled: None`（见 `project_cancel_result`，
+                // 绝不为 `Some([])`），此时没有任何值得通知的状态变化，发 `task.updated`
+                // 只是让客户端白跑一次重取。
+                //
+                // HTTP 契约的 `expected_revision` 即取消前的主任务 revision，服务层
+                // 每取消成功一个目标都把主行 revision +1（`sync_main_task_summary`）：
+                // 本层拿不到逐目标结果与最终 revision，故按 **+1 的饱和单调下界**发提示
+                // （revision 只用于同一 id 内的新旧比较，客户端仍以 GET 为权威）。
+                if response
+                    .cancelled
+                    .as_deref()
+                    .is_some_and(|cancelled| !cancelled.is_empty())
+                {
+                    state.publish_task_update(
+                        &task_id.to_string(),
+                        expected_revision.saturating_add(1),
+                        session.user.id,
+                        session.user.is_admin,
+                    );
+                }
+                ok_response(strict_json(&response))
+            }
             Err(err) => task_error_response(&err),
         }
     }
@@ -1043,7 +1142,20 @@ mod routes {
         }
         match state.api.time_review(&session, task_id, request).await {
             Ok(detail) => match project_detail(&detail) {
-                Ok(view) => ok_response(view),
+                Ok(view) => {
+                    // 时限复核是管理员专属写操作：投影成功（即 200）后向管理员范围投
+                    // 递 `task.updated`，revision 用服务层回读的当前主任务 revision
+                    // （精确值，不是下界）；创建者不是本次操作者，其可见性由其自身的
+                    // 后续 GET/自身写操作的提示覆盖，不在此跨受众广播。
+                    if let Some(bus) = state.events.as_ref() {
+                        bus.publish(EventEnvelope::task_updated(
+                            &task_id.to_string(),
+                            detail.revision,
+                            EventObjectAudience::admins(),
+                        ));
+                    }
+                    ok_response(view)
+                }
                 Err(err) => task_error_response(&err),
             },
             // 本端点 DTO 已拒绝未知字段与未知枚举；服务侧 `InvalidArgument` 仍有三
@@ -1114,14 +1226,30 @@ mod routes {
                 json!({}),
             );
         }
-        if let Err(err) = parse_decimal_u64(&request.expected_revision) {
-            return task_error_response(&err);
-        }
+        let expected_revision = match parse_decimal_u64(&request.expected_revision) {
+            Ok(revision) => revision,
+            Err(err) => return task_error_response(&err),
+        };
         if let Err(response) = require_admin_session(&session) {
             return response;
         }
         match state.api.release_lock(&session, subtask_id, request).await {
-            Ok(response) => ok_response(strict_json(&response)),
+            Ok(response) => {
+                // 释放成功即该子任务的代际锁已删除、子任务 revision 已 CAS +1
+                // （服务层 `ReleaseLockOutcome::Released { revision = expected + 1 }`）。
+                // 本层 HTTP 契约（`ReleaseLockResponse` 只有 `released`/`state`）不携带
+                // 主任务 id，也不携带 revision，故此处能如实标注的对象身份只有路径上的
+                // 子任务 id、版本只有 CAS 后的新值；主任务 id 需扩 `ReleaseLockResponse`
+                // 才能带上，那属服务层契约变更，不在本文件作用域内。
+                if let Some(bus) = state.events.as_ref().filter(|_| response.released) {
+                    bus.publish(EventEnvelope::task_updated(
+                        &subtask_id.to_string(),
+                        expected_revision.saturating_add(1),
+                        EventObjectAudience::admins(),
+                    ));
+                }
+                ok_response(strict_json(&response))
+            }
             Err(err) => task_error_response(&err),
         }
     }
@@ -1142,6 +1270,7 @@ mod tests {
     use super::*;
     use crate::auth::service::{IdentityUser, Login, SessionPage};
     use crate::auth::session::token_digest;
+    use crate::events::{EventAudience, EventName};
     use crate::http_auth::{AuthFuture, AuthServiceApi, CsrfBinding, SessionAuthority};
     use crate::http_security::HttpSecurityConfig;
     use crate::tasks::model::ReasonCode;
@@ -2097,6 +2226,17 @@ mod tests {
         must_change_password: bool,
         with_csrf: bool,
     ) -> Router<()> {
+        app_with_events(api, is_admin, must_change_password, with_csrf, None)
+    }
+
+    /// 同 [`app`]，但可注入事件总线：`None` 即「未开启 SSE 事件线」的装配形态。
+    fn app_with_events(
+        api: Arc<FakeTaskApi>,
+        is_admin: bool,
+        must_change_password: bool,
+        with_csrf: bool,
+        events: Option<EventBus>,
+    ) -> Router<()> {
         let session = fixture_session(is_admin, must_change_password);
         let auth = Arc::new(HttpAuthState::new(
             Arc::new(FakeAuth {
@@ -2117,7 +2257,7 @@ mod tests {
                 },
             );
         }
-        build_tasks_router(HttpTasksState { api, auth })
+        build_tasks_router(HttpTasksState { api, auth, events })
     }
 
     fn get_request(uri: &str, with_cookie: bool) -> Request<Body> {
@@ -2943,5 +3083,212 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"]["code"], "INVALID_STATE");
         assert_eq!(body["error"]["message_key"], "task.preview_invalid_state");
+    }
+
+    // ── task.updated 业务事件发布 ─────────────────────────────────────
+
+    /// handler 在返回响应之前完成发布，故此处同步排空即可（无需 await）。
+    fn collect_events(
+        rx: &mut tokio::sync::broadcast::Receiver<EventEnvelope>,
+    ) -> Vec<EventEnvelope> {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    /// fixture 会话的用户 id（`fixture_session` 里 admin 与 alice 共用）。
+    const FIXTURE_USER_ID: [u8; 16] = [7u8; 16];
+
+    #[tokio::test]
+    async fn task_operations_publish_task_updated_events_when_event_bus_is_configured() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let api = Arc::new(FakeTaskApi::new());
+        let task_id = api.detail.id;
+
+        // 1) 普通用户创建：本人受众 + 管理员受众各一条，载荷形状一致。
+        let response = app_with_events(api.clone(), false, false, true, Some(bus.clone()))
+            .oneshot(post_request(
+                "/api/v1/tasks",
+                CREATE_TASK_BODY,
+                true,
+                Some(IDEMPOTENCY_KEY),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(envelope(response).await.0, StatusCode::ACCEPTED);
+        let events = collect_events(&mut rx);
+        assert_eq!(
+            events.len(),
+            2,
+            "普通用户写操作 = 创建者本人 + 管理员各一条"
+        );
+        for event in &events {
+            assert_eq!(event.name(), EventName::TaskUpdated);
+            assert_eq!(event.data()["kind"], json!("task"));
+            assert_eq!(event.data()["id"], json!(task_id.to_string()));
+            // 新建主任务的持久 revision 恒 1，且必须是十进制字符串。
+            assert_eq!(event.data()["revision"], json!("1"));
+            assert!(event.data()["revision"].is_string());
+        }
+        assert_eq!(events[0].audience(), EventAudience::User(FIXTURE_USER_ID));
+        assert_eq!(events[1].audience(), EventAudience::Admins);
+
+        // 2) 管理员创建：本人受众已覆盖其会话，不重复投管理员受众。
+        let response = app_with_events(api.clone(), true, false, true, Some(bus.clone()))
+            .oneshot(post_request(
+                "/api/v1/tasks",
+                CREATE_TASK_BODY,
+                true,
+                Some(IDEMPOTENCY_KEY),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(envelope(response).await.0, StatusCode::ACCEPTED);
+        let events = collect_events(&mut rx);
+        assert_eq!(events.len(), 1, "管理员写操作只发一条，不得重复投递");
+        assert_eq!(events[0].audience(), EventAudience::User(FIXTURE_USER_ID));
+
+        // 3) 取消：`expected_revision` 即取消前主任务 revision，事件按 +1 下界发布。
+        let response = app_with_events(api.clone(), false, false, true, Some(bus.clone()))
+            .oneshot(post_request(
+                &format!("/api/v1/tasks/{task_id}/cancel"),
+                r#"{"expected_revision":"3","confirm":true}"#,
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(envelope(response).await.0, StatusCode::OK);
+        let events = collect_events(&mut rx);
+        assert_eq!(events.len(), 2);
+        for event in &events {
+            assert_eq!(event.name(), EventName::TaskUpdated);
+            assert_eq!(event.data()["id"], json!(task_id.to_string()));
+            assert_eq!(event.data()["revision"], json!("4"), "3 + 1 的单调下界");
+        }
+        assert_eq!(events[0].audience(), EventAudience::User(FIXTURE_USER_ID));
+        assert_eq!(events[1].audience(), EventAudience::Admins);
+
+        // 4) 时限复核（管理员专属）：只投管理员受众，revision 用服务层回读值。
+        let response = app_with_events(api.clone(), true, false, true, Some(bus.clone()))
+            .oneshot(post_request(
+                &format!("/api/v1/tasks/{task_id}/time-review"),
+                r#"{"expected_revision":"3","decision":"resume_original_deadline","evidence":"reference_deadline_proven"}"#,
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(envelope(response).await.0, StatusCode::OK);
+        let events = collect_events(&mut rx);
+        assert_eq!(events.len(), 1, "时限复核只投管理员受众");
+        assert_eq!(events[0].name(), EventName::TaskUpdated);
+        assert_eq!(events[0].audience(), EventAudience::Admins);
+        assert_eq!(events[0].data()["id"], json!(task_id.to_string()));
+        assert_eq!(
+            events[0].data()["revision"],
+            json!("4"),
+            "fake 服务层回读的主任务 revision"
+        );
+
+        // 5) release-lock（管理员专属）：只投管理员受众，对象身份为子任务 id。
+        let subtask_id = Uuid::new_v4();
+        let response = app_with_events(api.clone(), true, false, true, Some(bus.clone()))
+            .oneshot(post_request(
+                &format!("/api/v1/subtasks/{subtask_id}/release-lock"),
+                r#"{"expected_revision":"3","acknowledge_unknown":true,"reason":"现场已人工核实"}"#,
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(envelope(response).await.0, StatusCode::OK);
+        let events = collect_events(&mut rx);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name(), EventName::TaskUpdated);
+        assert_eq!(events[0].audience(), EventAudience::Admins);
+        assert_eq!(events[0].data()["id"], json!(subtask_id.to_string()));
+        assert_eq!(events[0].data()["revision"], json!("4"));
+
+        // 6) 失败响应零发布：幂等冲突（409）不改变任何任务状态。
+        let mut failing = FakeTaskApi::new();
+        failing.failure = Some(FakeFailure::IdempotencyConflict);
+        let failing: Arc<FakeTaskApi> = Arc::new(failing);
+        let response = app_with_events(failing, true, false, true, Some(bus.clone()))
+            .oneshot(post_request(
+                "/api/v1/tasks",
+                CREATE_TASK_BODY,
+                true,
+                Some(IDEMPOTENCY_KEY),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(envelope(response).await.0, StatusCode::CONFLICT);
+        assert!(
+            collect_events(&mut rx).is_empty(),
+            "写操作失败不得发任务变化提示"
+        );
+
+        // 7) 未配置事件总线（events = None）：响应不变、零发布。
+        let response = app(api.clone(), false, false, true)
+            .oneshot(post_request(
+                "/api/v1/tasks",
+                CREATE_TASK_BODY,
+                true,
+                Some(IDEMPOTENCY_KEY),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(envelope(response).await.0, StatusCode::ACCEPTED);
+        assert!(
+            collect_events(&mut rx).is_empty(),
+            "events = None 不得发布任何事件"
+        );
+        assert!(api.calls().contains(&"submit"));
+    }
+
+    /// 零目标取消不发布（审查反馈 Medium-2）：`cancelled` 为 `None` 或空数组表示本次没有
+    /// 任何目标进入取消结果（HTTP 契约把零目标投影成 `None`），主任务状态未变，不得用
+    /// `task.updated` 打扰客户端。同一条用例顺带钉住饱和下界：`expected_revision` 取
+    /// `u64::MAX` 也不得 panic 或回绕。
+    #[tokio::test]
+    async fn task_cancel_without_cancelled_targets_publishes_no_task_updated() {
+        for cancelled in [None, Some(vec![])] {
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let mut fake = FakeTaskApi::new();
+            fake.cancel = CancelTaskResponse {
+                accepted: true,
+                cancelled: cancelled.clone(),
+            };
+            let api: Arc<FakeTaskApi> = Arc::new(fake);
+            let task_id = api.detail.id;
+            let response = app_with_events(api, false, false, true, Some(bus.clone()))
+                .oneshot(post_request(
+                    &format!("/api/v1/tasks/{task_id}/cancel"),
+                    r#"{"expected_revision":"18446744073709551615","confirm":true}"#,
+                    true,
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(envelope(response).await.0, StatusCode::OK);
+            assert!(
+                collect_events(&mut rx).is_empty(),
+                "未取消任何目标不得发 task.updated（cancelled = {cancelled:?}）"
+            );
+            // 反向证据：同一订阅者确实能收到事件，说明上面的 0 条是「未发布」而非「订阅失效」。
+            assert_eq!(
+                bus.publish(EventEnvelope::task_updated(
+                    &task_id.to_string(),
+                    1,
+                    EventObjectAudience::admins(),
+                )),
+                1
+            );
+        }
     }
 }
