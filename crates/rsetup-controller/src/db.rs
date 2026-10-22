@@ -426,11 +426,12 @@ fn normalize_check(value: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         let byte = bytes[i];
-        if bytes.get(i..i + 2) == Some(b"/*") && bytes.get(i + 2) != Some(&b'!') {
-            if let Some(end) = bytes[i + 2..].windows(2).position(|pair| pair == b"*/") {
-                i += end + 4;
-                continue;
-            }
+        if bytes.get(i..i + 2) == Some(b"/*")
+            && bytes.get(i + 2) != Some(&b'!')
+            && let Some(end) = bytes[i + 2..].windows(2).position(|pair| pair == b"*/")
+        {
+            i += end + 4;
+            continue;
         }
         if byte == b'#'
             || (bytes.get(i..i + 2) == Some(b"--")
@@ -5401,57 +5402,54 @@ mod tests {
                                 "literal_escape_or_other_mismatch",
                                 Ok((_, _, Some(stored), enforced)),
                             ) = (index, classification, row)
+                                && let Some(probe) = fixed_grant_check_escape_probe(index, stored)
                             {
-                                if let Some(probe) = fixed_grant_check_escape_probe(index, stored) {
+                                println!(
+                                    "check_index={index} candidate_equal={} backslash_quote_pair_count={} total_backslash_count={} restored_tokens_equal={}",
+                                    probe.candidate_equal,
+                                    probe.backslash_quote_pair_count,
+                                    probe.total_backslash_count,
+                                    probe.restored_tokens_equal,
+                                );
+                                if let Some(diff) = fixed_grant_check_token_diff(index, stored) {
                                     println!(
-                                        "check_index={index} candidate_equal={} backslash_quote_pair_count={} total_backslash_count={} restored_tokens_equal={}",
-                                        probe.candidate_equal,
-                                        probe.backslash_quote_pair_count,
-                                        probe.total_backslash_count,
-                                        probe.restored_tokens_equal,
+                                        "check_index={index} observed_tokens_parseable={} expected_tokens_parseable={} observed_token_count={:?} expected_token_count={:?} first_mismatch_token_index={:?} first_mismatch_token_class={:?} expected_class={:?}",
+                                        diff.observed_tokens_parseable,
+                                        diff.expected_tokens_parseable,
+                                        diff.observed_token_count,
+                                        diff.expected_token_count,
+                                        diff.first_mismatch_token_index,
+                                        diff.first_mismatch_token_class.map(|class| class.code()),
+                                        diff.expected_class.map(|class| class.code()),
                                     );
-                                    if let Some(diff) = fixed_grant_check_token_diff(index, stored)
-                                    {
-                                        println!(
-                                            "check_index={index} observed_tokens_parseable={} expected_tokens_parseable={} observed_token_count={:?} expected_token_count={:?} first_mismatch_token_index={:?} first_mismatch_token_class={:?} expected_class={:?}",
-                                            diff.observed_tokens_parseable,
-                                            diff.expected_tokens_parseable,
-                                            diff.observed_token_count,
-                                            diff.expected_token_count,
-                                            diff.first_mismatch_token_index,
-                                            diff.first_mismatch_token_class
-                                                .map(|class| class.code()),
-                                            diff.expected_class.map(|class| class.code()),
-                                        );
-                                    }
-                                    if let Some((exact_bytes, tokens_equal)) =
-                                        fixed_wrapped_grant_probe(index, stored)
-                                    {
-                                        println!(
-                                            "check_index={index} wrapped_candidate_exact_bytes={} wrapped_candidate_tokens_equal={}",
-                                            exact_bytes, tokens_equal,
-                                        );
-                                    }
-                                    if let Some(observation) =
-                                        grant_format_observation(index, stored, enforced.as_deref())
-                                    {
-                                        println!(
-                                            "check_index={index} enforced={} stored_len={} candidate_len={} leading_parens={} trailing_parens={} ascii_whitespace={} backticks={} wrapped_layers_0_to_4={:?}",
-                                            observation.enforced,
-                                            observation.stored_len,
-                                            observation.candidate_len,
-                                            observation.leading_parens,
-                                            observation.trailing_parens,
-                                            observation.ascii_whitespace,
-                                            observation.backticks,
-                                            observation.wrapped_matches,
-                                        );
-                                    } else {
-                                        println!(
-                                            "check_index={index} enforced={} grant_format_observation=unknown",
-                                            diagnostic_enforced_code(enforced.as_deref())
-                                        );
-                                    }
+                                }
+                                if let Some((exact_bytes, tokens_equal)) =
+                                    fixed_wrapped_grant_probe(index, stored)
+                                {
+                                    println!(
+                                        "check_index={index} wrapped_candidate_exact_bytes={} wrapped_candidate_tokens_equal={}",
+                                        exact_bytes, tokens_equal,
+                                    );
+                                }
+                                if let Some(observation) =
+                                    grant_format_observation(index, stored, enforced.as_deref())
+                                {
+                                    println!(
+                                        "check_index={index} enforced={} stored_len={} candidate_len={} leading_parens={} trailing_parens={} ascii_whitespace={} backticks={} wrapped_layers_0_to_4={:?}",
+                                        observation.enforced,
+                                        observation.stored_len,
+                                        observation.candidate_len,
+                                        observation.leading_parens,
+                                        observation.trailing_parens,
+                                        observation.ascii_whitespace,
+                                        observation.backticks,
+                                        observation.wrapped_matches,
+                                    );
+                                } else {
+                                    println!(
+                                        "check_index={index} enforced={} grant_format_observation=unknown",
+                                        diagnostic_enforced_code(enforced.as_deref())
+                                    );
                                 }
                             }
                         }

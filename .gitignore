@@ -14,11 +14,15 @@
 /apps/desktop/rsetup-dist-staging/
 /apps/desktop/.rsetup-dist-staging-*
 
-# Debian build output and package-local Cargo cache
+# Debian build output and package-local Cargo cache. The three per-package staging
+# directories below are created by dh_install from debian/rules; rsetup-board-agent
+# is the newest of them and is listed explicitly so an interrupted package build
+# never leaves a staging tree showing up as untracked noise.
 /debian/.debhelper
 /debian/cargo-home
 /debian/rsetup-next
 /debian/rsetup-controller
+/debian/rsetup-board-agent
 /debian/tmp
 /debian/debhelper-build-stamp
 /debian/files
@@ -66,6 +70,11 @@ secret/
 # 在 apps/controller-web 目录内直接跑 pnpm 也会就地再生成一份 pnpm-lock.yaml；
 # 它与「package-lock.json 唯一锁文件」的口径冲突，显式忽略以免被误提交。
 /apps/controller-web/pnpm-lock.yaml
+# 中控前端产物 apps/controller-web/dist 是 vite 每次构建现生成的，不入库；忽略规则
+# 只由 apps/controller-web/.gitignore 声明这一处。本文件**既不重新忽略也不
+# 反向放行**（尤其不得出现 `!apps/controller-web/dist` 之类的重包含），否则两处
+# 规则相互覆盖，产物会随本地构建状态忽隐忽现。上文的 /apps/desktop/dist 属桌面端
+# Tauri 的另一套产物，与本条无关。
 
 # Python 字节码缓存（脚本与 Python 测试运行时生成，任意层级）。
 __pycache__/

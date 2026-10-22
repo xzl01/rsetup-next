@@ -6,7 +6,7 @@ What this package provides
 
   /usr/bin/rsetup-controller            loopback Web control centre (controller)
   /usr/bin/rsetup-controller-migrate    explicit, operator-only schema migration
-  /usr/bin/rsetup-controller-reset-admin  local root emergency admin recovery
+  /usr/bin/rsetup-admin                   local root emergency admin recovery
   /usr/lib/systemd/system/rsetup-controller.service
   /etc/default/rsetup-controller        configuration template, 0644, no secrets
 
@@ -114,7 +114,7 @@ refuses to overwrite it, so a leftover file means an earlier boot, not this one.
 6. Losing the administrator account
 -----------------------------------
 
-  sudo rsetup-controller-reset-admin
+  sudo rsetup-admin
 
 Run this directly on the controller host, as root, from an interactive
 terminal: it requires real and effective UID 0, interactive stdin/stdout/
@@ -135,11 +135,21 @@ proxy forwards — a mismatch is rejected by the service, not silently allowed.
 Unit hardening you should know about
 ------------------------------------
 
-The unit runs with DynamicUser=yes plus StateDirectory=rsetup-controller: there
-is no dedicated system user, so /var/lib/rsetup-controller is owned by a
-dynamic uid that changes across restarts. Anything you place in it must be
-writable by that dynamic identity; do not pre-create it with a fixed owner, and
-do not expect file ownership there to survive a restart. ProtectSystem=strict
-makes /usr and /etc read-only for the service, so /etc/default/rsetup-controller
-is its only configuration input, and RestrictAddressFamilies limits it to
-IPv4/IPv6/Unix sockets.
+The unit runs as the static system account rsetup-controller (User= and
+Group=, plus StateDirectory=rsetup-controller). The package creates that
+account and its private group on install with
+`adduser --system --group --no-create-home --disabled-login`, and removes
+nothing on purge beyond the account itself. The uid/gid is allocated once and
+then stays put: /var/lib/rsetup-controller has one stable owner (mode 0700,
+rsetup-controller:rsetup-controller) across restarts and upgrades, so backup
+and rsync policies, ACLs and "who wrote this file" forensics keep working.
+That stability is exactly why the unit does not use DynamicUser=yes — a dynamic
+user gets a fresh temporary uid on every start and systemd re-chowns the state
+directory each time, so ownership of persistent state drifts on every restart.
+Do not pre-create /var/lib/rsetup-controller with a different owner; systemd
+creates and owns it. If you take over an installation that used a dynamic user,
+chown the existing state once:
+`sudo chown -R rsetup-controller:rsetup-controller /var/lib/rsetup-controller`.
+ProtectSystem=strict makes /usr and /etc read-only for the service, so
+/etc/default/rsetup-controller is its only configuration input, and
+RestrictAddressFamilies limits it to IPv4/IPv6/Unix sockets.

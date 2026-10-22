@@ -282,7 +282,7 @@ fn decode_journal_hash32(value: &str) -> Result<[u8; 32], JournalError> {
         }
     };
     let mut out = [0u8; 32];
-    for (slot, pair) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+    for (slot, pair) in out.iter_mut().zip(bytes.as_chunks::<2>().0) {
         let hi = nibble(pair[0]).ok_or_else(bad)?;
         let lo = nibble(pair[1]).ok_or_else(bad)?;
         *slot = (hi << 4) | lo;
@@ -346,18 +346,18 @@ fn validate_loaded_journal(meta: &JournalMeta, logs: &JournalLogs) -> Result<(),
                 "invalid pre_boot_id format".to_string(),
             ));
         }
-        if let Some(observed) = stored.record.observed_boot_id.as_deref() {
-            if !rsetup_protocol::wire::is_canonical_uuid_v4(observed) {
-                return Err(JournalError::Decode(
-                    "invalid observed_boot_id format".to_string(),
-                ));
-            }
+        if let Some(observed) = stored.record.observed_boot_id.as_deref()
+            && !rsetup_protocol::wire::is_canonical_uuid_v4(observed)
+        {
+            return Err(JournalError::Decode(
+                "invalid observed_boot_id format".to_string(),
+            ));
         }
         // TR-R6-2：reason_code（若存在）必须严格属于十二词表（空串不在词表内，同样拒绝）。
-        if let Some(code) = stored.record.reason_code.as_deref() {
-            if !rsetup_protocol::wire::TASK_REASON_CODES.contains(&code) {
-                return Err(JournalError::Decode("invalid reason code".to_string()));
-            }
+        if let Some(code) = stored.record.reason_code.as_deref()
+            && !rsetup_protocol::wire::TASK_REASON_CODES.contains(&code)
+        {
+            return Err(JournalError::Decode("invalid reason code".to_string()));
         }
         // TR-R6-2：自称 boot_transition_observed 必须携带与 pre_boot_id 不同的 observed_boot_id 证据。
         match stored.record.evidence_kind.as_deref() {
@@ -468,15 +468,15 @@ fn persisted_shape_is_valid(record: &TaskRecord) -> bool {
     if !rsetup_protocol::wire::is_canonical_uuid_v4(&record.pre_boot_id) {
         return false;
     }
-    if let Some(observed) = record.observed_boot_id.as_deref() {
-        if !rsetup_protocol::wire::is_canonical_uuid_v4(observed) {
-            return false;
-        }
+    if let Some(observed) = record.observed_boot_id.as_deref()
+        && !rsetup_protocol::wire::is_canonical_uuid_v4(observed)
+    {
+        return false;
     }
-    if let Some(code) = record.reason_code.as_deref() {
-        if !rsetup_protocol::wire::TASK_REASON_CODES.contains(&code) {
-            return false;
-        }
+    if let Some(code) = record.reason_code.as_deref()
+        && !rsetup_protocol::wire::TASK_REASON_CODES.contains(&code)
+    {
+        return false;
     }
     match record.evidence_kind.as_deref() {
         None => true,
@@ -912,10 +912,10 @@ impl<F: Fs> JournalStore<F> {
         if !matches!(state, TaskState::Failed | TaskState::Unknown) {
             return Err(JournalError::Conflict);
         }
-        if let Some(code) = reason {
-            if !rsetup_protocol::wire::TASK_REASON_CODES.contains(&code) {
-                return Err(JournalError::Decode("invalid reason code".to_string()));
-            }
+        if let Some(code) = reason
+            && !rsetup_protocol::wire::TASK_REASON_CODES.contains(&code)
+        {
+            return Err(JournalError::Decode("invalid reason code".to_string()));
         }
         let controller_hex = encode_journal_hash32(controller_key);
         let mut records = self.lock_records()?;

@@ -211,17 +211,16 @@ impl Controller {
 
     pub fn overlay_status(&self) -> Result<OverlayStatus, HardwareError> {
         let status = self.hardware.overlay_status()?;
-        if status.requires_authorization {
-            if let Some(cached) = self
+        if status.requires_authorization
+            && let Some(cached) = self
                 .overlay_cache
                 .read()
                 .expect("overlay cache lock")
                 .as_ref()
-            {
-                let mut cached = cached.clone();
-                cached.cached = true;
-                return Ok(cached);
-            }
+        {
+            let mut cached = cached.clone();
+            cached.cached = true;
+            return Ok(cached);
         }
         Ok(status)
     }

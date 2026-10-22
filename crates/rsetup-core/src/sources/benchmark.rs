@@ -143,10 +143,10 @@ fn benchmark_targets(
                 .lines()
                 .filter(|line| line.split_whitespace().next() == Some("deb"))
             {
-                if let Some((_, end, uri)) = uri_tokens(line).first().copied() {
-                    if let Some(suite) = line[end..].split_whitespace().next() {
-                        add(uri, suite);
-                    }
+                if let Some((_, end, uri)) = uri_tokens(line).first().copied()
+                    && let Some(suite) = line[end..].split_whitespace().next()
+                {
+                    add(uri, suite);
                 }
             }
         } else {

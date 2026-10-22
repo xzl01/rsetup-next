@@ -109,10 +109,10 @@ pub fn evaluate_grants(
 
         match &grant.source {
             GrantSource::Role(rid) => {
-                if let Some(role) = roles.get(rid) {
-                    if !role.archived {
-                        effective.extend(role.permissions.iter().copied());
-                    }
+                if let Some(role) = roles.get(rid)
+                    && !role.archived
+                {
+                    effective.extend(role.permissions.iter().copied());
                 }
             }
             GrantSource::Direct(perms) => {
@@ -243,14 +243,14 @@ pub fn permission_sources(
         }
         match &grant.source {
             GrantSource::Role(rid) => {
-                if let Some(role) = roles.get(rid) {
-                    if !role.archived {
-                        for permission in &role.permissions {
-                            entries.push(PermissionSourceEntry {
-                                permission: *permission,
-                                source: PermissionSourceKind::Role(*rid),
-                            });
-                        }
+                if let Some(role) = roles.get(rid)
+                    && !role.archived
+                {
+                    for permission in &role.permissions {
+                        entries.push(PermissionSourceEntry {
+                            permission: *permission,
+                            source: PermissionSourceKind::Role(*rid),
+                        });
                     }
                 }
             }

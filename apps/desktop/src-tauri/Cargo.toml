@@ -2,9 +2,6 @@
 name = "rsetup-desktop"
 version = "0.5.0"
 edition = "2024"
-# MSRV 1.85 由 make msrv-check 用 1.85.0 工具链验证；默认构建使用当前 stable
-# （本地验证 rustc 1.99.1），两者不互相替代。
-rust-version = "1.85"
 license = "GPL-3.0-or-later"
 
 [build-dependencies]

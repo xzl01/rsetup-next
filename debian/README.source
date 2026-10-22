@@ -1,17 +1,26 @@
 rsetup-next and Cargo dependencies
 ==================================
 
-The binary package is built with Debian 13 (Trixie) and Rust 1.85 or newer. CI
+The binary package is built with Debian 13 (Trixie) and its current stable Rust
+toolchain; no minimum supported Rust version is pinned. CI
 then installs and runs the resulting package in Debian 12 (Bookworm), which is
 the runtime compatibility baseline.
 
 This source package also builds the separate `rsetup-controller` binary package
-from the same tree. The compiled web UI is committed under
-`apps/controller-web/dist`, so the build stays network-isolated and needs no
-Node.js/npm. Database migration and host/origin/cursor configuration remain
-operator steps; see `/usr/share/doc/rsetup-controller/README.Debian`.
+from the same tree. The web UI is a build artifact, not a committed one: the
+source tree carries only the `apps/controller-web` sources, and
+`override_dh_auto_build` generates `apps/controller-web/dist` with
+`npm --prefix apps/controller-web ci` plus `npm --prefix apps/controller-web run build`
+before the first cargo command, because `crates/rsetup-controller/build.rs` reads that
+directory at compile time and fails closed when it is missing. Node.js and npm are
+therefore both Build-Depends, and the npm install needs a reachable npm cache (or a
+pre-warmed one); only the Rust side stays network-isolated. No generated asset file
+name or hash is pinned anywhere in the packaging, so a frontend change that renames an
+asset needs no packaging edit. Database migration and host/origin/cursor
+configuration remain operator steps; see
+`/usr/share/doc/rsetup-controller/README.Debian`.
 
-The package build itself is network-isolated. For local and CI builds, run:
+The Cargo part of the package build is network-isolated. For local and CI builds, run:
 
     git submodule update --init --recursive
     make deb-prepare
@@ -24,7 +33,10 @@ source ZIP/tarballs omit submodule contents, so use a recursive Git clone.
 
 The second command resolves Cargo.lock and fills debian/cargo-home. That ignored
 cache is intentionally not part of the source package. Both preparation steps
-must finish before the offline dpkg-buildpackage step.
+must finish before the offline dpkg-buildpackage step. `debian/rules` builds the
+frontend itself, so the CI packaging job only installs `npm` alongside `nodejs`
+and may run the same two npm commands beforehand as an early, separately visible
+failure signal.
 
 The generated Debian packages are maintained and distributed only from the
 rsetup-next repository. They are not intended for submission to the Debian

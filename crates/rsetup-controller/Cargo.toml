@@ -5,9 +5,20 @@ default-run = "rsetup-controller"
 build = "build.rs"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+
+# 两个运维 CLI 的 cargo bin 名与 Debian 打包名保持一致：主进程仍由 src/main.rs
+# 自动发现为 `rsetup-controller`，测试专用的 `migrate-identity-test` 亦自动发现，
+# 这里只显式命名需要随包交付的二进制，避免交付名与构建产物名不一致。
+[[bin]]
+name = "rsetup-controller-migrate"
+path = "src/bin/migrate-controller.rs"
+
+[[bin]]
+# 交付名统一为 `rsetup-admin`；源文件与 crate 内部模块仍沿用 reset-admin 这一概念名。
+name = "rsetup-admin"
+path = "src/bin/reset-admin.rs"
 
 [dependencies]
 argon2.workspace = true

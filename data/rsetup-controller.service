@@ -10,8 +10,17 @@ ConditionPathExists=/etc/default/rsetup-controller
 
 [Service]
 Type=simple
-# 不建静态用户：动态 uid/gid + StateDirectory 即可，postinst 无需 useradd。
-DynamicUser=yes
+# 以静态系统账户运行：该账户与同名私有组由包安装脚本（debian/rsetup-controller.postinst）
+# 用 adduser --system 幂等创建，uid/gid 一旦分配就不再变化。
+# 不再使用 DynamicUser=yes：动态用户每次启动都会换一个临时 uid/gid，
+# /var/lib/rsetup-controller 的所有权要靠 systemd 在每次启动时重新 chown，
+# 于是持久状态（含 journal、审计落盘与备份文件）的属主随重启漂移，
+# 运维侧的 rsync --owner、ACL、SELinux/备份策略与「谁写了这个文件」的事后取证都失去稳定锚点；
+# 静态账户让属主、权限与授权在同台机器上始终一致、可审计，也让卸载后的残留状态有明确归属。
+# 因此本单元显式降权到下面的 User/Group，其余 hardening 全部保留。
+User=rsetup-controller
+Group=rsetup-controller
+# StateDirectory 仍由 systemd 创建为 0700 并归属上面的 User/Group。
 StateDirectory=rsetup-controller
 WorkingDirectory=/var/lib/rsetup-controller
 # 唯一配置入口：0600 的 root-only 文件，见 /usr/share/doc/rsetup-controller/README.Debian。

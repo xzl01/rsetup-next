@@ -1287,8 +1287,8 @@ pub fn validate_output_separation(dist_dir: &Path, snapshot_dir: &Path) -> Resul
     // 失败关闭，绝不能带着「看不见的链接」进入下面的真实路径比对。
     let dist_dir = &normalize_dir_path_for_symlink_check(dist_dir, "dist 目录")?;
     let snapshot_dir = &normalize_dir_path_for_symlink_check(snapshot_dir, "快照目录")?;
-    // 用 `matches!` + 守卫而不是 let 链：let 链是 edition2024/1.88+ 才稳定的语法，
-    // 本仓 MSRV 1.85 不可用（不用 let 链也避免 clippy::collapsible_if）。
+    // 用 `matches!` + 守卫折叠这一次判定：结果是个具名布尔量，下面的错误信息直接复用，
+    // 也不会再给 clippy::collapsible_if 留下可折的嵌套。
     let snapshot_is_symlink = matches!(
         fs::symlink_metadata(snapshot_dir),
         Ok(metadata) if metadata.file_type().is_symlink()

@@ -426,10 +426,10 @@ rsetup_controller_db_pool_connections{state="idle"} 3
         {
             return false;
         }
-        if let Some(labels) = labels {
-            if labels.is_empty() || labels.contains('}') || !labels.contains('=') {
-                return false;
-            }
+        if let Some(labels) = labels
+            && (labels.is_empty() || labels.contains('}') || !labels.contains('='))
+        {
+            return false;
         }
         true
     }

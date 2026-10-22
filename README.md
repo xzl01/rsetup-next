@@ -181,8 +181,9 @@ recursive clone for source builds. The submodule revision belongs to the parent
 repository, so updating Next also requires updating its submodules.
 
 ```bash
-# No Node, npm or network needed: the committed apps/controller-web/dist is what
-# rsetup-controller embeds at compile time.
+# The frontend is generated on demand: the first target that compiles
+# rsetup-controller runs `npm ci` and `vite build` for you, because
+# apps/controller-web/dist is a build product and is not committed.
 make build
 make test
 
@@ -196,22 +197,24 @@ cargo run -p rsetup-next -- --demo serve
 
 Open `http://127.0.0.1:8788` after starting the server.
 
-`build` and `test` — like `lint`, `metrics-gates`, `msrv-check` and
+`build` and `test` — like `lint`, `metrics-gates` and
 `controller-test-offline`, which also compile the workspace — depend on
-`web-dist-check`, a pure existence check of `apps/controller-web/dist/index.html`.
-The frontend build product is **committed to the repository**, so a clean checkout
-builds the whole workspace with cargo alone; nothing in those targets calls npm.
+`web-dist-check`, the gate that keeps `apps/controller-web/dist/index.html` in place
+before cargo runs: when the file is missing the target runs `make web-build` for you,
+and when it is already there it only confirms it, so a warm tree never pays for a
+second npm install. `apps/controller-web/dist` is a **generated artifact** — the whole
+directory is git-ignored — so the frontend is compiled locally, in CI and in the Debian
+package build rather than shipped as a committed binary blob, and no file name or hash
+of a generated asset is pinned anywhere in the tree.
 
-The default toolchain is the current stable Rust (verified locally with rustc
-1.99.1). The MSRV remains 1.85: `make msrv-check` runs the workspace tests with the
-installed 1.85.0 toolchain, and 1.85.0 is not used as the default.
+The toolchain is the current stable Rust (verified locally with rustc 1.99.1). No
+minimum supported Rust version is pinned any more: the manifests carry no
+`rust-version`, and there is no separate lower-version job in CI or in the Makefile.
 
-What the committed `dist` costs is one piece of discipline: after changing anything
-under `apps/controller-web`, run `make web-build` and commit the regenerated `dist`
-together with your source change. CI rebuilds the frontend from source and turns red
-when `git diff --exit-code -- apps/controller-web/dist` is not empty, so a stale `dist`
-never survives a pull request. `make web-build` (an alias of `web-assets`) is the
-explicit rebuild entry point and works through **two** stamp files:
+After changing anything under `apps/controller-web` there is nothing extra to commit:
+`make web-build` regenerates `dist`, and `web-dist-check` calls it for you the next time
+you run a compiling target. `make web-build` is the explicit rebuild entry point, and it
+works through **two** stamp files:
 
 | Stamp | Rebuilt when | Recipe |
 | --- | --- | --- |
@@ -220,11 +223,11 @@ explicit rebuild entry point and works through **two** stamp files:
 
 The split is the point: editing a component re-runs only `vite build`, never `npm ci`.
 `*.test.ts` and `*.test.js` are not `vite build` inputs, so touching a spec does not
-rebuild `dist` either. The stamp files themselves are git-ignored; the `dist` files
-they stand for are not.
+rebuild `dist` either. Both stamp files live under git-ignored paths
+(`node_modules/` and `dist/`), which is also why `dist` itself never shows up in a diff.
 
-`make web-build` is the only step that needs Node 22, npm and — on a first run with a
-cold cache — network access. Two ways to keep it offline:
+Building the frontend is the one step that needs Node 22, npm and — on a first run with
+a cold cache — network access. Two ways to keep it offline:
 
 ```bash
 # 1. npm cache already warm on this machine: the flag goes straight to `npm ci`.
@@ -238,8 +241,8 @@ touch apps/controller-web/dist/.rsetup-build-stamp
 
 Copying `node_modules` in without the stamp files does not help: make still sees the
 prerequisites as newer and runs `npm ci` again, which is exactly what fails offline.
-Neither route is needed to *build* the workspace any more — only to regenerate the
-frontend after a frontend change.
+Either route also satisfies `web-dist-check`, which is what lets a network-isolated
+machine keep compiling: it builds the frontend only when `dist` is genuinely missing.
 
 `make metrics-static-gates` runs only the read-only Prometheus metric-line grep
 gates: no compilation, no network access and no frontend build, so CI can call it on
@@ -247,7 +250,8 @@ its own. One of those gates rejects committed configuration or credential files,
 checks two lists — the staged index (`git diff --cached --name-only`) and the tracked
 file list (`git ls-files`) — because a CI checkout has an empty index, where a
 staged-only check would pass without ever looking at anything. `make metrics-gates`
-additionally runs `fmt-check`, the dist presence check, clippy and the controller test
+additionally runs `fmt-check`, the frontend check (`web-dist-check`, which builds `dist`
+when it is missing), clippy and the controller test
 suites.
 
 For Rust format checks run `make fmt-check` rather than `cargo fmt --all`,
@@ -384,8 +388,9 @@ CLI/TUI/server development does not download native desktop dependencies.
 `rsetup-controller` is a standalone HTTP control-plane binary, separate from the
 `rsetup-next` CLI/TUI/server and packaged on its own as `rsetup-controller` (built
 from this same source package; see "Install from the Debian package" below). Build it as
-part of the workspace — the frontend `dist` it embeds at compile time ships in the
-repository, so no extra build step is required (see "Build and run") — and start it with:
+part of the workspace — `web-dist-check`
+builds the frontend `dist` it embeds at compile time when that directory is missing, so
+there is no separate build step to remember (see "Build and run") — and start it with:
 
 ```bash
 cargo run -p rsetup-controller
@@ -428,8 +433,9 @@ generates a one-time administrator credential and writes it to the private file 
 process from a private directory). Read that credential once, log in, change it, and
 delete the file.
 
-`reset-admin` is the local emergency path for that administrator account. It takes no
-arguments, issues a fresh one-time credential to the controlling terminal, and records
+`rsetup-admin` is the local emergency path for that administrator
+account. It takes no arguments, issues a fresh one-time credential to the controlling
+terminal, and records
 an audit event. Its gate is the OS real and effective UID plus a real TTY on stdin,
 stdout and stderr and a writable `/dev/tty`. Non-interactive SSH command execution,
 cron and a pipe therefore cannot drive it; an interactive `ssh -t` session still works,
@@ -439,18 +445,33 @@ physical locality.
 
 ### Install from the Debian package
 
-The `rsetup-controller` binary package comes out of this same source package and needs
-no Node.js or npm to build: `apps/controller-web/dist`, which `build.rs` embeds, is
-committed, so `dpkg-buildpackage` stays fully offline. It installs
+The `rsetup-controller` binary package comes out of this same source package. Its build
+step generates the web UI with npm (`npm --prefix apps/controller-web ci` and
+`npm --prefix apps/controller-web run build`, both in `debian/rules`) before the first
+cargo command, because `build.rs` embeds `apps/controller-web/dist` at compile time and
+that directory is not part of the source package; only the Rust side stays offline. It
+installs
 
 | Path | Purpose |
 | --- | --- |
 | `/usr/bin/rsetup-controller` | the control-plane process (unit `rsetup-controller.service`) |
 | `/usr/bin/rsetup-controller-migrate` | explicit schema migration, `--check` / `--apply` |
-| `/usr/bin/rsetup-controller-reset-admin` | local root emergency admin recovery (source bin `reset-admin`) |
+| `/usr/bin/rsetup-admin` | local root emergency admin recovery (cargo bin name equals the delivered name; source `src/bin/reset-admin.rs`) |
 | `/etc/default/rsetup-controller` | `EnvironmentFile` template, 0644, secret-free |
-| `/usr/lib/systemd/system/rsetup-controller.service` | unit: `DynamicUser=yes`, `StateDirectory=rsetup-controller` |
+| `/usr/lib/systemd/system/rsetup-controller.service` | unit: `User=rsetup-controller` (static system account), `StateDirectory=rsetup-controller` |
 | `/usr/share/doc/rsetup-controller/README.Debian` | the full post-install walkthrough |
+
+The unit drops privileges to the static system account `rsetup-controller` (`User=` and
+`Group=`). The package creates that account and its private group on install with
+`adduser --system --group --home /var/lib/rsetup-controller --no-create-home
+--disabled-login`, idempotently, and the uid/gid never changes afterwards:
+`/var/lib/rsetup-controller` keeps one stable owner (0700,
+`rsetup-controller:rsetup-controller`) across restarts and upgrades, so backup, rsync and
+ACL policies have a stable anchor. `DynamicUser=yes` is deliberately gone: a dynamic user
+gets a fresh temporary uid on every start, systemd re-chowns the state directory each time,
+and the owner of persistent state drifts across restarts, which leaves forensics and
+authorization policy without an anchor. The maintainer script only creates the account; it
+never starts or enables a service.
 
 The package enables and starts nothing. `dh_installsystemd --no-enable` keeps the unit
 out of the boot path, and the unit also refuses to run while its `EnvironmentFile` is
@@ -479,7 +500,7 @@ operator action, and nothing below has been run against a real database on your 
 5. On first boot the one-time administrator credential lands in
    `/var/lib/rsetup-controller/bootstrap-secret.log` (`0600`, `O_EXCL`); read it, log in,
    change the password, delete the file.
-6. `rsetup-controller-reset-admin` recovers a locked-out administrator account from a
+6. `rsetup-admin` recovers a locked-out administrator account from a
    local root interactive terminal.
 7. The listener stays on `127.0.0.1:8080` by default; reaching it beyond this host means
    a reverse proxy with TLS and a trusted management network, plus matching
@@ -515,6 +536,22 @@ cargo build -p rsetup-board-agent --release --bin rsetup-board-agent
 See [crates/rsetup-board-agent/README.md](crates/rsetup-board-agent/README.md) for the
 JSON-lines protocol and its scope limits.
 
+Board-side delivery and running user: `rsetup-board-agent` is its own Debian binary package
+built from this source package, installing `/usr/bin/rsetup-board-agent` and the unit
+`/usr/lib/systemd/system/rsetup-board-agent.service` (`dh_installsystemd --no-enable`, so
+disabled by default). The unit runs the read-only sampling watch loop as
+`User=root`/`Group=root` (`--interval-secs 10 --journal-dir /var/lib/rsetup-board-agent`,
+with the state directory created 0700 by `StateDirectory`): the board's hardware and system
+state sources are not uniformly readable by an unprivileged user, so both the production
+and the test deployment of the board side run as root, inside a sandbox of
+`ProtectSystem=strict`, `NoNewPrivileges=yes`, `PrivateTmp=yes`, `ProtectHome=yes` and
+`LockPersonality=yes` with a single `ReadWritePaths`. A manual run in a shell elevates
+nothing and stays with the invoking user. **The delivery boundary is unchanged**: the
+production encrypted tunnel is not wired up, so the unit starts a sampling loop that only
+writes to the local journald and opens no encrypted session with a controller;
+`device.reboot.prepare` and `device.reboot.execute` answer capability unavailable, and the
+real reboot boundary remains unimplemented.
+
 Supported and CI-verified architectures are `arm64` (aarch64) and `amd64` (x86_64);
 32-bit targets are no longer maintained.
 
@@ -545,14 +582,20 @@ the removed Bash implementation or run the browser process as root. Optional
 `device-tree-compiler`, `gpiod`, `v4l-utils`, and `ffmpeg` packages enrich the
 corresponding hardware tools.
 
-The same source package also builds `rsetup-controller`: the control-centre process, its
-two operator CLIs, one systemd unit and the `/etc/default/rsetup-controller` template.
+The same source package also builds two more packages. `rsetup-controller`: the
+control-centre process, its two operator CLIs (`rsetup-controller-migrate` and
+`rsetup-admin`), one systemd unit and the `/etc/default/rsetup-controller` template; the
+unit drops privileges to the static system account `rsetup-controller` created on install.
 What it installs, and the migration and configuration steps an operator still has to
-perform, are in "Install from the Debian package" under "Controller". Neither package
-needs Node.js or npm: the test step runs the whole workspace, controller included, with
-cargo offline against the committed `apps/controller-web/dist` that `build.rs` embeds.
-The controller unit is installed disabled (`dh_installsystemd --no-enable`) and refuses
-to run while its configuration file is missing, so installing the package starts nothing
+perform, are in "Install from the Debian package" under "Controller". `rsetup-board-agent`:
+the board-side agent binary and its own systemd unit, running as root in the read-only
+watch loop; the production encrypted tunnel and a real reboot boundary are not wired up.
+Building any of them needs Node.js and npm, both Build-Depends: `debian/rules` generates
+the controller's web UI with `npm ci` + `npm run build` before cargo runs, while the Rust
+side keeps `CARGO_NET_OFFLINE` and the package-local Cargo cache.
+Both systemd units are installed disabled (`dh_installsystemd --no-enable`), and the
+controller unit additionally refuses to run while its configuration file is missing, so
+installing the packages starts nothing
 and touches no database.
 
 The package depends on `xz-utils` because writing a compressed `.img.xz` system
@@ -572,8 +615,8 @@ Cargo cache. The following `dpkg-buildpackage` step runs Cargo in offline mode.
 The generated packages are maintained and distributed only through this
 repository; they are not intended for submission to the Debian archive.
 
-Packages are built on Debian 13/Trixie with Rust 1.85 or newer, then installed
-and smoke-tested on Debian 12/Bookworm. Bookworm is the runtime compatibility
+Packages are built on Debian 13/Trixie with its current stable Rust toolchain, then
+installed and smoke-tested on Debian 12/Bookworm. Bookworm is the runtime compatibility
 baseline; its Rust 1.63 toolchain is not used for source builds. CI validates
 both amd64 and arm64 packages.
 

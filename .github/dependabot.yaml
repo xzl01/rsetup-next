@@ -9,8 +9,9 @@ updates:
     schedule:
       interval: weekly
     ignore:
-      # The rust-msrv job pins this action to the workspace rust-version.
-      # Bumping it would silently stop testing the declared minimum.
+      # Every job resolves the toolchain through this action's `stable` ref, and
+      # the workspace declares no rust-version: newer compilers arrive via the
+      # stable channel itself, so an action bump would only swap the installer.
       - dependency-name: dtolnay/rust-toolchain
   - package-ecosystem: cargo
     directory: /

@@ -62,11 +62,11 @@ fn read_namespaces_total_bytes(ctrl_dir: &Path) -> u64 {
             // Match namespace directories like nvme0n1
             if name.contains('n') && entry.path().is_dir() {
                 let size_file = entry.path().join("size");
-                if let Ok(size_str) = fs::read_to_string(&size_file) {
-                    if let Ok(blocks) = size_str.trim().parse::<u64>() {
-                        // Standard block size for sysfs block layer size attribute is 512 bytes
-                        total_bytes = total_bytes.saturating_add(blocks.saturating_mul(512));
-                    }
+                if let Ok(size_str) = fs::read_to_string(&size_file)
+                    && let Ok(blocks) = size_str.trim().parse::<u64>()
+                {
+                    // Standard block size for sysfs block layer size attribute is 512 bytes
+                    total_bytes = total_bytes.saturating_add(blocks.saturating_mul(512));
                 }
             }
         }

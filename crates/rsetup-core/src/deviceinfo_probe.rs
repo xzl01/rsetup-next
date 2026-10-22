@@ -69,14 +69,14 @@ impl LocalProbe {
             watch: vec!["/".into(), "/boot".into()],
         };
         let mut state = deviceinfo::observe_system(&self.root, &options);
-        if self.previous.is_none() {
-            if let Some(window) = self.baseline_window {
-                // A difference-based CPU sample needs a baseline: keep the first
-                // sample as `previous`, wait, then observe again.
-                self.previous = Some(state);
-                std::thread::sleep(window);
-                state = deviceinfo::observe_system(&self.root, &options);
-            }
+        if self.previous.is_none()
+            && let Some(window) = self.baseline_window
+        {
+            // A difference-based CPU sample needs a baseline: keep the first
+            // sample as `previous`, wait, then observe again.
+            self.previous = Some(state);
+            std::thread::sleep(window);
+            state = deviceinfo::observe_system(&self.root, &options);
         }
         // Kernel/hostname changes invalidate immediately, even inside the TTL.
         let fingerprint = [

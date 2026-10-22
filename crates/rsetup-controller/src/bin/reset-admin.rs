@@ -23,14 +23,14 @@ use rsetup_controller::error::ControllerError;
 
 /// 使用方式；只含固定文本，不含主机、路径或任何凭据。
 const USAGE: &str = "\
-reset-admin - local root emergency recovery for the built-in administrator account
+rsetup-admin - local root emergency recovery for the built-in administrator account
 
 Run this CLI directly on the controller host, as root, from an interactive terminal:
 
-  sudo rsetup-controller-reset-admin
+  sudo rsetup-admin
 
 (Packaged binary name; when running from the build tree the binary is
-`target/debug/reset-admin`.)
+`target/debug/rsetup-admin`.)
 
 Constraints enforced fail-closed before any database access:
   * real and effective UID must both be root (as reported by the OS, not by env vars);
@@ -102,7 +102,7 @@ where
         _ => {
             // 绝不回显收到的 token：其中可能正是操作员误传的密码，也可能是含非法字节的输入。
             Err(CliError {
-                message: "unexpected argument: reset-admin takes no arguments \
+                message: "unexpected argument: rsetup-admin takes no arguments \
                           (the bootstrap administrator account is always 'admin')"
                     .to_owned(),
                 show_usage: true,
@@ -213,7 +213,7 @@ async fn main() -> std::process::ExitCode {
     let request = match parse_request(std::env::args_os().skip(1)) {
         Ok(request) => request,
         Err(error) => {
-            note_stderr(&format!("reset-admin: {}\n", error.message));
+            note_stderr(&format!("rsetup-admin: {}\n", error.message));
             if error.show_usage {
                 note_stderr(USAGE);
             }
@@ -223,7 +223,7 @@ async fn main() -> std::process::ExitCode {
     match run(request).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
-            note_stderr(&format!("reset-admin: {}\n", error.message));
+            note_stderr(&format!("rsetup-admin: {}\n", error.message));
             if error.show_usage {
                 note_stderr(USAGE);
             }

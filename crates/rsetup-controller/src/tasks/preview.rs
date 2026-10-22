@@ -207,10 +207,10 @@ fn mono_deadline_at(nonce: &[u8; 32]) -> Option<Instant> {
 /// 清空登记表（仅测试用于隔离用例）。
 #[cfg(test)]
 fn clear_preview_mono_deadlines() {
-    if let Ok(mut guard) = PREVIEW_MONO_DEADLINES.lock() {
-        if let Some(map) = guard.as_mut() {
-            map.clear();
-        }
+    if let Ok(mut guard) = PREVIEW_MONO_DEADLINES.lock()
+        && let Some(map) = guard.as_mut()
+    {
+        map.clear();
     }
 }
 

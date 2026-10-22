@@ -9,24 +9,33 @@ export CARGO_PROFILE_RELEASE_DEBUG := 1
 %:
 	dh $@ --buildsystem=none
 
-# One source package, two binary packages, both built completely offline:
+# One source package, three binary packages. The Rust side builds with cargo in offline
+# mode against the package-local debian/cargo-home (the npm step below is the one part
+# of the build that needs a network or a warm npm cache):
 #   rsetup-next        — the CLI/TUI/Web binary, its narrow privileged helper, the Polkit
 #                        policy, the thermal/fan-curve/LED units and the tmpfiles.d rule;
 #   rsetup-controller  — the loopback Web control centre, its two operator CLIs
-#                        (rsetup-controller-migrate, rsetup-controller-reset-admin), the
-#                        systemd unit and the /etc/default/rsetup-controller template.
+#                        (rsetup-controller-migrate, rsetup-admin), the systemd unit and the
+#                        /etc/default/rsetup-controller template;
+#   rsetup-board-agent — the board-side read-only agent binary and its systemd unit.
 #
-# Neither package needs Node.js or npm. The controller embeds its web UI at compile time
-# (crates/rsetup-controller/build.rs reads apps/controller-web/dist), and that dist ships
-# in the source package, so the tree is self-contained: the test step below runs the whole
-# workspace, controller crate included, with cargo in offline mode. nodejs remains in
-# Build-Depends solely for the `node --test ui/*.test.mjs` step, which covers the browser
-# side of this repository and produces nothing that is packaged.
+# The controller embeds its web UI at compile time (crates/rsetup-controller/build.rs
+# reads apps/controller-web/dist), and that dist is a generated artifact: it does not
+# ship in the source package, its file names carry a vite content hash, and nothing in
+# this file hardcodes one. override_dh_auto_build therefore builds the frontend with
+# npm — the locked install plus `vite build` — before the first cargo invocation, which
+# is why both nodejs and npm are Build-Depends. Only the Rust side stays
+# network-isolated (CARGO_NET_OFFLINE plus the package-local debian/cargo-home); the
+# npm install needs a reachable npm cache. The test step below runs the whole
+# workspace, controller crate included, against that freshly generated dist, and
+# `node --test ui/*.test.mjs` covers the browser side of this repository.
 #
-# The controller unit is installed but neither enabled nor started
-# (override_dh_installsystemd below, plus the unit's own ConditionPathExists). Connecting
-# to a real database, running a migration and writing /etc/default/rsetup-controller are
-# operator actions; see debian/rsetup-controller.README.Debian.
+# The controller and the board agent units are installed but neither enabled nor
+# started (override_dh_installsystemd below, plus the controller unit's own
+# ConditionPathExists). Connecting to a real database, running a migration and writing
+# /etc/default/rsetup-controller are operator actions; see
+# debian/rsetup-controller.README.Debian, and so is deciding whether a board should run
+# the read-only agent at all; see debian/rsetup-board-agent.README.Debian.
 #
 # deviceinfo is a Git submodule linked as a Cargo path dependency. A Debian
 # build must start from a recursive clone; GitHub source archives omit it.
@@ -38,18 +47,29 @@ check-submodule:
 	  exit 1; \
 	}
 
+# The frontend is a build input of rsetup-controller, never a committed artifact, so it
+# is generated here first: `npm ci` installs the tree pinned by
+# apps/controller-web/package-lock.json, and `npm run build` writes
+# apps/controller-web/dist with whatever file names vite chose for this build. These two
+# lines must stay ahead of every cargo line below — build.rs reads that dist at compile
+# time and fails closed when it is missing. Nothing here needs to know the generated
+# names; build.rs discovers the assets by scanning the dist directory.
 override_dh_auto_build: check-submodule
+	npm --prefix apps/controller-web ci
+	npm --prefix apps/controller-web run build
 	cargo rustc -p rsetup-next --release --bin rsetup-next --locked --offline -- -C target-feature=+crt-static
 	cargo rustc -p rsetup-next --release --bin rsetup-next-helper --locked --offline -- -C target-feature=+crt-static
 	cargo rustc -p rsetup-controller --release --bin rsetup-controller --locked --offline -- -C target-feature=+crt-static
-	cargo rustc -p rsetup-controller --release --bin migrate-controller --locked --offline -- -C target-feature=+crt-static
-	cargo rustc -p rsetup-controller --release --bin reset-admin --locked --offline -- -C target-feature=+crt-static
+	cargo rustc -p rsetup-controller --release --bin rsetup-controller-migrate --locked --offline -- -C target-feature=+crt-static
+	cargo rustc -p rsetup-controller --release --bin rsetup-admin --locked --offline -- -C target-feature=+crt-static
+	cargo rustc -p rsetup-board-agent --release --bin rsetup-board-agent --locked --offline -- -C target-feature=+crt-static
 
 override_dh_auto_test:
 ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
-	# The whole workspace, rsetup-controller included: its compile-time web asset table
-	# (apps/controller-web/dist) is committed to the source package, so building and
-	# testing the crate needs no npm and no frontend build step — see the header above.
+	# The whole workspace, rsetup-controller included. Its compile-time web asset table
+	# reads apps/controller-web/dist, the dist generated by the npm build in
+	# override_dh_auto_build above — the source package carries no frontend artifact, so
+	# building and testing the crate needs that frontend build step and nothing else.
 	cargo test --workspace --release --locked --offline
 	node --test ui/*.test.mjs
 endif
@@ -70,8 +90,9 @@ override_dh_auto_install:
 	cargo rustc -p rsetup-next --release --bin rsetup-next --locked --offline -- -C target-feature=+crt-static
 	cargo rustc -p rsetup-next --release --bin rsetup-next-helper --locked --offline -- -C target-feature=+crt-static
 	cargo rustc -p rsetup-controller --release --bin rsetup-controller --locked --offline -- -C target-feature=+crt-static
-	cargo rustc -p rsetup-controller --release --bin migrate-controller --locked --offline -- -C target-feature=+crt-static
-	cargo rustc -p rsetup-controller --release --bin reset-admin --locked --offline -- -C target-feature=+crt-static
+	cargo rustc -p rsetup-controller --release --bin rsetup-controller-migrate --locked --offline -- -C target-feature=+crt-static
+	cargo rustc -p rsetup-controller --release --bin rsetup-admin --locked --offline -- -C target-feature=+crt-static
+	cargo rustc -p rsetup-board-agent --release --bin rsetup-board-agent --locked --offline -- -C target-feature=+crt-static
 	install -Dm755 target/release/rsetup-next debian/rsetup-next/usr/bin/rsetup-next
 	install -Dm755 target/release/rsetup-next-helper debian/rsetup-next/usr/libexec/rsetup-next-helper
 	install -Dm644 data/com.radxa.rsetup-next.policy debian/rsetup-next/usr/share/polkit-1/actions/com.radxa.rsetup-next.policy
@@ -80,25 +101,29 @@ override_dh_auto_install:
 	install -Dm644 data/rsetup-next-led-state.service debian/rsetup-next/usr/lib/systemd/system/rsetup-next-led-state.service
 	install -Dm644 debian/rsetup-next.tmpfiles debian/rsetup-next/usr/lib/tmpfiles.d/rsetup-next.conf
 	install -Dm755 target/release/rsetup-controller debian/rsetup-controller/usr/bin/rsetup-controller
-	# cargo bin name is migrate-controller; the packaged name is namespaced.
-	install -Dm755 target/release/migrate-controller debian/rsetup-controller/usr/bin/rsetup-controller-migrate
-	# cargo bin name is reset-admin; the packaged name is namespaced.
-	install -Dm755 target/release/reset-admin debian/rsetup-controller/usr/bin/rsetup-controller-reset-admin
+	install -Dm755 target/release/rsetup-controller-migrate debian/rsetup-controller/usr/bin/rsetup-controller-migrate
+	install -Dm755 target/release/rsetup-admin debian/rsetup-controller/usr/bin/rsetup-admin
 	install -Dm644 data/rsetup-controller.service debian/rsetup-controller/usr/lib/systemd/system/rsetup-controller.service
 	# Configuration template: a conffile, 0644, and secret-free by construction. The
 	# operator is told to chmod 0600 it as soon as a real DSN goes in.
 	install -Dm644 debian/rsetup-controller.default debian/rsetup-controller/etc/default/rsetup-controller
 	install -Dm644 debian/rsetup-controller.README.Debian debian/rsetup-controller/usr/share/doc/rsetup-controller/README.Debian
+	install -Dm755 target/release/rsetup-board-agent debian/rsetup-board-agent/usr/bin/rsetup-board-agent
+	install -Dm644 data/rsetup-board-agent.service debian/rsetup-board-agent/usr/lib/systemd/system/rsetup-board-agent.service
+	install -Dm644 debian/rsetup-board-agent.README.Debian debian/rsetup-board-agent/usr/share/doc/rsetup-board-agent/README.Debian
 
-# The controller is shipped disabled: dh_installsystemd would otherwise symlink it into
-# multi-user.target, which would put a service that needs a configured database and a
-# migrated schema into the boot path of every machine that installs this package. An
-# override replaces the helper for every binary package, so rsetup-next is passed through
-# with the default handling (its thermal/fan-curve/LED units keep being enabled) and only
-# the controller package opts out.
+# The controller and the board agent are shipped disabled: dh_installsystemd would
+# otherwise symlink them into multi-user.target, which would put a service that needs a
+# configured database and a migrated schema — and, on the board side, an always-on
+# root-owned sampler that cannot yet be reached over the production tunnel — into the boot
+# path of every machine that installs this package. An override replaces the helper for
+# every binary package, so rsetup-next is passed through with the default handling (its
+# thermal/fan-curve/LED units keep being enabled) and only the controller and the board
+# agent packages opt out.
 override_dh_installsystemd:
 	dh_installsystemd -prsetup-next
 	dh_installsystemd -prsetup-controller --no-enable
+	dh_installsystemd -prsetup-board-agent --no-enable
 
 override_dh_auto_clean:
 	cargo clean

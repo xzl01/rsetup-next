@@ -49,32 +49,32 @@ fn run_loop(
     loop {
         state.poll_benchmark();
         terminal.draw(|frame| render(frame, &mut state))?;
-        if event::poll(Duration::from_millis(250))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                if state.install.open {
-                    match key.code {
-                        KeyCode::Esc => state.install.close(),
-                        other => state.install_key(other),
-                    }
-                    continue;
-                }
+        if event::poll(Duration::from_millis(250))?
+            && let Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            if state.install.open {
                 match key.code {
-                    KeyCode::Char('q') => break,
-                    KeyCode::Char('i') if !state.source_picker => state.install.open_panel(),
-                    KeyCode::Esc if state.source_picker => state.close_source_picker(),
-                    KeyCode::Esc => break,
-                    KeyCode::Char('j') | KeyCode::Down => state.next(),
-                    KeyCode::Char('k') | KeyCode::Up => state.previous(),
-                    KeyCode::Char('r') => state.refresh()?,
-                    KeyCode::Char('b') if state.source_picker => state.start_benchmark(),
-                    KeyCode::Enter => state.request_run(),
-                    KeyCode::Char('y') if state.confirm_pending => state.execute_selected()?,
-                    KeyCode::Char('n') if state.confirm_pending => state.confirm_pending = false,
-                    _ => {}
+                    KeyCode::Esc => state.install.close(),
+                    other => state.install_key(other),
                 }
+                continue;
+            }
+            match key.code {
+                KeyCode::Char('q') => break,
+                KeyCode::Char('i') if !state.source_picker => state.install.open_panel(),
+                KeyCode::Esc if state.source_picker => state.close_source_picker(),
+                KeyCode::Esc => break,
+                KeyCode::Char('j') | KeyCode::Down => state.next(),
+                KeyCode::Char('k') | KeyCode::Up => state.previous(),
+                KeyCode::Char('r') => state.refresh()?,
+                KeyCode::Char('b') if state.source_picker => state.start_benchmark(),
+                KeyCode::Enter => state.request_run(),
+                KeyCode::Char('y') if state.confirm_pending => state.execute_selected()?,
+                KeyCode::Char('n') if state.confirm_pending => state.confirm_pending = false,
+                _ => {}
             }
         }
     }

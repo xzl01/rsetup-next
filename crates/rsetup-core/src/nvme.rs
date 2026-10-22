@@ -89,10 +89,11 @@ impl NvmeManager {
             })?;
             let file_name = entry.file_name();
             let name = file_name.to_string_lossy();
-            if let Some(suffix) = name.strip_prefix("nvme") {
-                if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
-                    devices.push(name.to_string());
-                }
+            if let Some(suffix) = name.strip_prefix("nvme")
+                && !suffix.is_empty()
+                && suffix.chars().all(|c| c.is_ascii_digit())
+            {
+                devices.push(name.to_string());
             }
         }
         devices.sort();

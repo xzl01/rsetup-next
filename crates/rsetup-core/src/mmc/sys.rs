@@ -211,10 +211,10 @@ pub fn read_block_device_size(sysfs_root: &Path, block_name: &str) -> u64 {
         sysfs_root.join(format!("sys/class/block/{}/size", block_name))
     };
 
-    if let Ok(size_str) = fs::read_to_string(&size_file) {
-        if let Ok(blocks) = size_str.trim().parse::<u64>() {
-            return blocks.saturating_mul(512);
-        }
+    if let Ok(size_str) = fs::read_to_string(&size_file)
+        && let Ok(blocks) = size_str.trim().parse::<u64>()
+    {
+        return blocks.saturating_mul(512);
     }
     0
 }
@@ -311,27 +311,27 @@ pub(crate) fn read_device_sysfs_with(
     let mut block_name: Option<String> = None;
 
     let block_dir = dev_dir.join("block");
-    if block_dir.exists() {
-        if let Ok(entries) = fs::read_dir(&block_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if is_primary_mmcblk(&name) {
-                    block_name = Some(name);
-                    break;
-                }
+    if block_dir.exists()
+        && let Ok(entries) = fs::read_dir(&block_dir)
+    {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if is_primary_mmcblk(&name) {
+                block_name = Some(name);
+                break;
             }
         }
     }
 
     // Fallback: check dev_dir entries directly for primary mmcblk*
-    if block_name.is_none() {
-        if let Ok(entries) = fs::read_dir(&dev_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if is_primary_mmcblk(&name) {
-                    block_name = Some(name);
-                    break;
-                }
+    if block_name.is_none()
+        && let Ok(entries) = fs::read_dir(&dev_dir)
+    {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if is_primary_mmcblk(&name) {
+                block_name = Some(name);
+                break;
             }
         }
     }

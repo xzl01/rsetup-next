@@ -24,13 +24,14 @@ use rsetup_controller::db::{
 };
 use rsetup_controller::{ControllerConfig, ControllerError, DbPool};
 
-/// 使用方式：纯固定文本，不含主机、路径或任何凭据。
+/// 使用方式：纯固定文本，不含主机、路径或任何凭据。命令名用交付给操作员的二进制名
+/// `rsetup-controller-migrate`（cargo bin 名与 Debian `/usr/bin` 名一致），不是源文件名。
 const USAGE: &str = "\
-migrate-controller - explicit schema migration for the controller database
+rsetup-controller-migrate - explicit schema migration for the controller database
 
 Usage:
-  migrate-controller --check    read-only: print the current schema version
-  migrate-controller --apply    migrate the database to the supported version
+  rsetup-controller-migrate --check    read-only: print the current schema version
+  rsetup-controller-migrate --apply    migrate the database to the supported version
 
 Environment (--check):
   CONTROLLER_DATABASE_URL                     required, the controller database URL

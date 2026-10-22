@@ -2432,12 +2432,11 @@ fn main() {
 
 /// 找一个可用的 rustc：优先 `CARGO` 同级的 rustc，其次 PATH 上的 `rustc`。
 fn rustc_program() -> PathBuf {
-    if let Ok(cargo) = std::env::var("CARGO") {
-        if let Some(sibling) = Path::new(&cargo).parent().map(|dir| dir.join("rustc")) {
-            if sibling.is_file() {
-                return sibling;
-            }
-        }
+    if let Ok(cargo) = std::env::var("CARGO")
+        && let Some(sibling) = Path::new(&cargo).parent().map(|dir| dir.join("rustc"))
+        && sibling.is_file()
+    {
+        return sibling;
     }
     PathBuf::from("rustc")
 }

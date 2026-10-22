@@ -1071,10 +1071,10 @@ fn status_revision(
         hash.update(device.kind.as_bytes());
         hash.update(&device.max_state.to_le_bytes());
     }
-    if let Some(saved) = saved {
-        if let Ok(bytes) = serde_json::to_vec(saved) {
-            hash.update(&bytes);
-        }
+    if let Some(saved) = saved
+        && let Ok(bytes) = serde_json::to_vec(saved)
+    {
+        hash.update(&bytes);
     }
     format!("fan-{:016x}", hash.finish())
 }

@@ -24,12 +24,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy,rustfmt
-      # 中控前端产物 `apps/controller-web/dist` 已随仓库提交：Rust 编译本身不再需要
-      # Node（rsetup-controller 的 build.rs 直接读取入库的 dist，缺失即 fail-closed）。
-      # 本作业仍然跑「锁定安装 → 测试 → 类型检查 → 构建」，目的是**从源码重新构建**，
-      # 再用下一步与入库的 dist 逐字节比对：源码改了却没重新构建提交，流水线即红。
-      # 顺序固定「安装 → 测试 → 类型检查 → 构建 → 比对」，与 make controller-test-offline
-      # 的前端两条门禁一致；web_assets 读的就是这份磁盘字节。
+      # 中控前端产物 `apps/controller-web/dist` 是**生成物，不入库**：Rust 侧的
+      # rsetup-controller 在编译期读取这份 dist（build.rs 缺失即 fail-closed），所以任何
+      # 编译它的作业都必须先把前端构建出来。本作业按「锁定安装 → 测试 → 类型检查 → 构建」
+      # 的顺序跑，顺序与 make controller-test-offline 的前端两条门禁一致；随后
+      # `--test web_assets` 读的就是这一步写到磁盘上的字节。产物文件名带 vite 的 hash，
+      # 每次都由 vite 决定，仓库与流水线都不写死具体名字。
       - uses: actions/setup-node@v7
         with:
           node-version: '22'
@@ -43,19 +43,6 @@ jobs:
         run: npm --prefix apps/controller-web run typecheck
       - name: Build controller web
         run: npm --prefix apps/controller-web run build
-      # dist 入库换来的唯一纪律由这一步保证：vite 构建是确定性的（重复构建字节一致），
-      # 所以「源码 + 已提交 dist」必须自洽。改前端源码却没有 `make web-build` 重新提交，
-      # 或者手工改过 dist，`git diff --exit-code` 都会非零退出把作业判红。
-      - name: Verify committed dist matches the frontend build
-        run: |
-          set -eu
-          changes="$(git status --porcelain -- apps/controller-web/dist)"
-          if [ -n "$changes" ]; then
-            echo "::error::committed apps/controller-web/dist differs from the frontend build; run 'make web-build' and commit the result"
-            printf '%s\n' "$changes"
-            exit 1
-          fi
-          git diff --exit-code -- apps/controller-web/dist
       - name: Check formatting
         run: make fmt-check
       # 规范 §7.8 的五条 grep 静态门禁（make metrics-static-gates）：纯只读检查，
@@ -121,7 +108,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
-      # 交叉 --check 也要编译 rsetup-controller，编译期嵌入的前端产物必须先构建。
+      # 交叉 --check 同样要编译 rsetup-controller，而它编译期读取的
+      # apps/controller-web/dist 是不入库的生成物，必须先在本作业里构建出来。
       - uses: actions/setup-node@v7
         with:
           node-version: '22'
@@ -133,33 +121,6 @@ jobs:
           npm --prefix apps/controller-web run build
       - name: Check workspace across target architectures
         run: cargo check --workspace --all-targets --locked --target ${{ matrix.target }}
-
-  # MSRV 验证：默认构建使用 stable（本地验证 1.99.1），本作业单独用 1.85.0 跑
-  # workspace 测试。dist 已入库，故不需要 Node/npm；本作业不把 1.85.0 设为默认。
-  rust-msrv:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@1.85.0
-      - name: Assert the resolved toolchain is the minimum supported version
-        run: |
-          set -eu
-          rustc -vV
-          rustup show active-toolchain
-          for expected in "rustc 1.85." "cargo 1.85." "rustdoc 1.85."; do
-            name="${expected%% *}"
-            case "$("$name" --version)" in
-              "$expected"*) ;;
-              *)
-                echo "::error::the MSRV job resolved $("$name" --version); expected ${expected}x"
-                exit 1
-                ;;
-            esac
-          done
-      - name: Test minimum supported Rust version
-        run: make msrv-check
 
   # apps/desktop/src-tauri is listed in Cargo.toml's `workspace.exclude`, so no
   # other job here ever compiles it: the workspace commands skip it and the
@@ -214,16 +175,23 @@ jobs:
           apt-get update &&
           apt-get install -y --no-install-recommends
           build-essential ca-certificates cargo debhelper devscripts dpkg-dev
-          git lintian nodejs rustc
+          git lintian nodejs npm rustc
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-      # 本作业不构建前端：dist 已入库，rsetup-controller 与主程序均使用内置离线产物
-      # （crates/rsetup-controller/build.rs 在编译期读入库产物，缺失即失败关闭），源码包
-      # 因此可全程离线构建；装 nodejs 只是为了 dh_auto_test 的
-      # `node --test ui/*.test.mjs`，与前端构建无关。
-      # 这条边界由 scripts/tests/controller-ci-contract.test.mjs 钉住：在本作业里引回前端
-      # 构建（连注释留下前端目录路径或相应的依赖安装命令字样都算）都会让该合同测试判红。
+      # 前端产物 apps/controller-web/dist 不入库，而 debian/rules 的
+      # override_dh_auto_build 会在 cargo 之前用 npm 现生成它
+      # （crates/rsetup-controller/build.rs 编译期读取该目录，缺失即失败关闭）。本作业先
+      # 显式跑一遍同样的两条命令作为双保险：安装或构建失败时先在作业日志里单独可见，
+      # 之后再由 dpkg-buildpackage 走 rules 里的同一条链路。npm 与 nodejs 都是
+      # Build-Depends（见 debian/control），与本行的安装一致。
+      - name: Build controller web assets
+        run: |
+          npm --prefix apps/controller-web ci
+          npm --prefix apps/controller-web run build
+      # 这条边界由 scripts/tests/controller-ci-contract.test.mjs 钉住：每条编译
+      # rsetup-controller 的作业——包括走 dpkg-buildpackage 的本作业——都必须先把前端
+      # 构建出来（本作业的兜底是 debian/rules 里那两条 npm 命令）。
       - name: Prepare offline Cargo cache
         run: CARGO_HOME="$GITHUB_WORKSPACE/debian/cargo-home" cargo fetch --locked
       - name: Build Debian package
@@ -234,6 +202,8 @@ jobs:
           dpkg-deb --contents ../rsetup-next_*.deb
           dpkg-deb --info ../rsetup-controller_*.deb
           dpkg-deb --contents ../rsetup-controller_*.deb
+          dpkg-deb --info ../rsetup-board-agent_*.deb
+          dpkg-deb --contents ../rsetup-board-agent_*.deb
           if readelf -d target/release/rsetup-next | grep -q '(NEEDED)'; then
             echo "rsetup-next unexpectedly has dynamic library dependencies"
             exit 1
@@ -246,12 +216,16 @@ jobs:
             echo "rsetup-controller unexpectedly has dynamic library dependencies"
             exit 1
           fi
-          if readelf -d target/release/migrate-controller | grep -q '(NEEDED)'; then
-            echo "migrate-controller unexpectedly has dynamic library dependencies"
+          if readelf -d target/release/rsetup-controller-migrate | grep -q '(NEEDED)'; then
+            echo "rsetup-controller-migrate unexpectedly has dynamic library dependencies"
             exit 1
           fi
-          if readelf -d target/release/reset-admin | grep -q '(NEEDED)'; then
-            echo "reset-admin unexpectedly has dynamic library dependencies"
+          if readelf -d target/release/rsetup-admin | grep -q '(NEEDED)'; then
+            echo "rsetup-admin unexpectedly has dynamic library dependencies"
+            exit 1
+          fi
+          if readelf -d target/release/rsetup-board-agent | grep -q '(NEEDED)'; then
+            echo "rsetup-board-agent unexpectedly has dynamic library dependencies"
             exit 1
           fi
           lintian --fail-on error ../*.changes
@@ -260,6 +234,7 @@ jobs:
           mkdir -p artifacts
           cp ../rsetup-next_*_${{ matrix.architecture }}.deb artifacts/
           cp ../rsetup-controller_*_${{ matrix.architecture }}.deb artifacts/
+          cp ../rsetup-board-agent_*_${{ matrix.architecture }}.deb artifacts/
       - uses: actions/upload-artifact@v7
         with:
           name: rsetup-next-debian-${{ matrix.architecture }}
@@ -285,7 +260,7 @@ jobs:
       - name: Install on Debian 12
         run: |
           apt-get update
-          apt-get install -y ./artifacts/rsetup-next_*_${{ matrix.architecture }}.deb ./artifacts/rsetup-controller_*_${{ matrix.architecture }}.deb
+          apt-get install -y ./artifacts/rsetup-next_*_${{ matrix.architecture }}.deb ./artifacts/rsetup-controller_*_${{ matrix.architecture }}.deb ./artifacts/rsetup-board-agent_*_${{ matrix.architecture }}.deb
       - name: Smoke test on Debian 12
         run: |
           rsetup-next --demo status --json | grep -q '"identity"'
@@ -297,8 +272,11 @@ jobs:
           /usr/libexec/rsetup-next-helper action system.inspect --confirmed | grep -q '"actionId":"system.inspect"'
           test -x /usr/bin/rsetup-controller
           test -x /usr/bin/rsetup-controller-migrate
-          test -x /usr/bin/rsetup-controller-reset-admin
+          test -x /usr/bin/rsetup-admin
+          test -x /usr/bin/rsetup-board-agent
+          test -f /usr/lib/systemd/system/rsetup-board-agent.service
           test -f /usr/lib/systemd/system/rsetup-controller.service
           test -f /etc/default/rsetup-controller
-          /usr/bin/rsetup-controller-migrate --help | grep -q "migrate-controller"
-          /usr/bin/rsetup-controller-reset-admin --help | grep -q "reset-admin"
+          /usr/bin/rsetup-controller-migrate --help | grep -q "rsetup-controller-migrate"
+          /usr/bin/rsetup-admin --help | grep -q "rsetup-admin"
+          /usr/bin/rsetup-board-agent --help | grep -q "rsetup-board-agent"

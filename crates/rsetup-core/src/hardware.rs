@@ -1057,11 +1057,11 @@ impl HardwareManager {
             .map(|group| group.id.as_str())
             .collect::<BTreeSet<_>>();
         for led in &mut leds {
-            if let Some((group, channel)) = split_rgb_channel(&led.id) {
-                if groups.contains(group.as_str()) {
-                    led.rgb_group = Some(group);
-                    led.rgb_channel = Some(channel.into());
-                }
+            if let Some((group, channel)) = split_rgb_channel(&led.id)
+                && groups.contains(group.as_str())
+            {
+                led.rgb_group = Some(group);
+                led.rgb_channel = Some(channel.into());
             }
         }
         let supported = !leds.is_empty();

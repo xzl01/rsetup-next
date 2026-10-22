@@ -1,26 +1,35 @@
-// 中控 CI 配置合同：钉住离线测试目标 `controller-test-offline`、CI 中
-// 「前端先构建、Rust 编译与资源测试后运行」的硬顺序，以及 dist 入库后的
-// 新口径：编译类目标只检查 dist 在位，前端重建走显式 `make web-build`，
-// CI 用 `git diff --exit-code -- apps/controller-web/dist` 比对入库产物。
+// 中控 CI 配置合同：钉住离线测试目标 `controller-test-offline`、CI 与 Debian 打包中
+// 「前端先构建、Rust 编译与资源测试后运行」的硬顺序，以及 dist 改为**生成物**后的口径：
 //
-// 这是纯配置断言：只读取仓库内的 Makefile、.gitignore 与 .github/workflows/ci.yml
-// 文本，不执行 npm/cargo，也不接触任何数据库。真实双引擎（MySQL/TiDB）用例属操作员
-// 逐引擎显式授权的 `--ignored` 轨道，不在本合同范围内。
+//   * `apps/controller-web/dist` 不入库（既不被 git 跟踪，也被 .gitignore 忽略）；
+//   * 每条编译 rsetup-controller 的路径——make 目标、CI 作业、dpkg-buildpackage——
+//     都必须先把前端构建出来；
+//   * 构建产物的文件名与 hash 由 vite 决定，任何构建配置里都不许写死具体名字。
 //
-// 为什么顺序仍是硬约束：`crates/rsetup-controller/src/web.rs` 用 include_str!/
+// 这是纯配置断言：只读取仓库内的 Makefile、.gitignore、debian/control、debian/rules、
+// 相关文档与 .github/workflows/ci.yml 文本，外加两条**只读**的 git 查询
+// （`ls-files` 与 `check-ignore`）确认 dist 的入库状态。不执行 npm/cargo，不联网，
+// 也不接触任何数据库；真实双引擎（MySQL/TiDB）用例属操作员逐引擎显式授权的
+// `--ignored` 轨道，不在本合同范围内。
+//
+// 为什么顺序是硬约束：`crates/rsetup-controller/src/web.rs` 用 include_str!/
 // include_bytes! 在**编译期**嵌入 `apps/controller-web/dist` 的产物（缺 dist 直接
-// 编译失败），`tests/web_assets.rs` 再读同一份磁盘字节作为独立预期源。dist 已随仓库
-// 提交，所以 CI 里保留前端构建步骤的意义从「产出编译输入」变成「验证入库产物与源码
-// 一致」；两条被编译的 controller 作业仍按原顺序先构建再编译。
+// 编译失败关闭），`tests/web_assets.rs` 再读同一份磁盘字节作为独立预期源。dist 不再
+// 随仓库提供之后，「先构建前端」从 CI 的额外保险变回编译的必要前提，所以每一条编译
+// controller 的作业都要为它负责。
 import { test } from 'node:test';
-import { readFileSync, existsSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
+
 const make = readFileSync('Makefile', 'utf8');
 const ci = readFileSync('.github/workflows/ci.yml', 'utf8');
+const rules = readFileSync('debian/rules', 'utf8');
+const WEB_DIST = 'apps/controller-web/dist';
 
 // 按 `jobs:` 下两空格缩进的键切分作业块；整行注释不参与顺序判断。
-// text 是剔除整行注释后的可执行文本，rawText 额外保留注释（供「连注释都不许
-// 出现某字样」的排他断言使用，例如 Debian 作业不得再以任何形式引回前端构建）。
+// text 是剔除整行注释后的可执行文本，rawText 额外保留注释（供「某字样必须出现在含注释
+// 的作业块里」这类断言使用）。
 const parseJobs = (text) => {
   const jobs = [];
   let inJobs = false;
@@ -50,21 +59,65 @@ const parseJobs = (text) => {
 
 const jobs = parseJobs(ci);
 const jobNamed = (needle) => jobs.find((job) => job.text.includes(needle));
+const jobCalled = (name) => jobs.find((job) => job.name === name);
 
-// 会编译 rsetup-controller 的步骤：workspace 级 cargo 编译、显式 -p rsetup-controller，
-// 以及等价入口（make test）。经 --manifest-path 指向其它 crate
+// 会编译 rsetup-controller 的步骤：workspace 级 cargo 编译、显式 -p rsetup-controller、
+// 等价入口（make test），以及 **dpkg-buildpackage**——本源码包的 debian/rules 会用
+// cargo 编译并打包 controller 的三个二进制，所以它同样是「编译 controller」的路径，
+// 必须为前端产物负责。经 --manifest-path 指向其它 crate
 // （如 apps/desktop/src-tauri）的命令不算。
-// dpkg-buildpackage **不算**：本包的 debian/rules 用 dh_auto_test 的
-// `--exclude rsetup-controller` 把 controller 排除在编译与测试之外，也不安装它的
-// 二进制，所以 Debian 作业不需要前端 dist——把它算进来会逼着 CI 为一个不打包的
-// crate 去跑 npm，正是本次移除的空转步骤。该排除本身由下面的 Debian 合同钉住。
 const compilesController = (line) => {
   if (line.includes('--manifest-path')) return false;
+  if (/dpkg-buildpackage\b/.test(line)) return true;
   if (/(?:^|[^\w])make\s+test\b/.test(line)) return true;
   return /cargo\s+(?:test|check|clippy|build|rustc)\b/.test(line) || /-p\s+rsetup-controller\b/.test(line);
 };
 
+// dpkg-buildpackage 入口单独留一个谓词：它的构建配方在 debian/rules 里，
+// 「前端先构建」只能在那里核对。
+const buildsDebianPackage = (line) => /dpkg-buildpackage\b/.test(line);
+
 const BUILD_STEP = 'apps/controller-web run build';
+const NPM_CI_STEP = 'npm --prefix apps/controller-web ci';
+
+// 剥掉 recipe 里以 # 开头的行（含 make 配方内 tab 缩进的 shell 注释），只留真命令。
+const stripComments = (text) =>
+  text
+    .split('\n')
+    .filter((line) => !line.trim().startsWith('#'))
+    .join('\n');
+
+const rulesCode = stripComments(rules);
+
+// debian/control 字段解析：字段名起于行首，续行以空白缩进；返回去掉字段名后的原值。
+const controlField = (control, field) => {
+  const lines = control.split('\n');
+  const start = lines.findIndex((line) => new RegExp(`^${field}:`).test(line));
+  assert.ok(start >= 0, `debian/control 缺少 ${field} 字段`);
+  const block = [lines[start].replace(new RegExp(`^${field}:`), '')];
+  for (const line of lines.slice(start + 1)) {
+    if (!/^[ \t]/.test(line)) break;
+    block.push(line);
+  }
+  return block.join(',');
+};
+
+// debian/rules 是 Debian 构建真正的配方所在：npm 装依赖与 vite build 必须成对出现，
+// 且都排在第一条 cargo 之前，否则 build.rs 读不到 dist 就把整包编译打断。
+const assertRulesBuildFrontendBeforeCargo = (source) => {
+  const code = stripComments(source);
+  const ciAt = code.search(/^[ \t]*npm --prefix apps\/controller-web ci[ \t]*$/m);
+  const buildAt = code.search(/^[ \t]*npm --prefix apps\/controller-web run build[ \t]*$/m);
+  const cargoAt = code.search(/^[ \t]*cargo\b/m);
+  assert.ok(ciAt >= 0, 'debian/rules 必须执行 npm --prefix apps/controller-web ci 安装锁定依赖');
+  assert.ok(buildAt >= 0, 'debian/rules 必须执行 npm --prefix apps/controller-web run build 生成 dist');
+  assert.ok(cargoAt >= 0, 'debian/rules 必须真的有 cargo 编译命令');
+  assert.ok(ciAt < buildAt, 'debian/rules 里 npm ci 必须早于 npm run build');
+  assert.ok(
+    buildAt < cargoAt,
+    'debian/rules 里前端构建必须早于第一条 cargo 编译命令：build.rs 编译期读取 apps/controller-web/dist',
+  );
+};
 
 // 提取一个 Makefile 目标：返回「头部行 + 其后所有 Tab 缩进的配方行」，遇到第一
 // 条非配方、非注释、非空行（即下一条目标/伪目标）停止。配方行只保留 Tab 开头的
@@ -102,6 +155,9 @@ const assignment = (name) => {
 
 // 允许 $(NPM) 变量形式与裸 npm。
 const NPM_CMD = String.raw`(?:\$\(NPM\)|\bnpm\b)`;
+
+// 允许 $(MAKE) 变量形式与裸 make（web-dist-check 递归调用自己的兄弟目标）。
+const MAKE_CMD = String.raw`(?:\$\$?\(MAKE\)|\bmake\b)`;
 
 // 剥掉 make 的 $(fn …) 函数调用（含嵌套括号），以空格占位。核对依赖列表时必须先
 // 去掉 $(shell find …)：它的参数里也带 src 路径，留着就能把「src 目录本身是不是
@@ -151,26 +207,45 @@ const prereqTokens = (text) =>
     .split(/\s+/)
     .filter(Boolean);
 
+// 只读的 git 查询：确认 dist 的入库状态。两条命令都不写任何东西。
+const gitOutput = (args) => execFileSync('git', args, { encoding: 'utf8' });
+const gitIgnores = (path) => {
+  try {
+    execFileSync('git', ['check-ignore', '-q', path], {
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+    return true;
+  } catch (err) {
+    // 退出码 1 = 明确「未被忽略」，是要断言的正常分支；其余（128 等）是工具出错，
+    // 必须原样抛出：本测试在这一点上 Fail-Closed，绝不把 git 故障当成通过。
+    if (err && err.status === 1) return false;
+    throw err;
+  }
+};
+
 test('controller offline target and CI build frontend before Rust assets', () => {
-  // 意图不变：`--test web_assets` 读的是 apps/controller-web/dist 的磁盘字节，
-  // 所以它运行前 dist 必须已经在位。dist 入库后这个「在位」不再由 npm 构建保证，
-  // 而由 web-dist-check 的存在性检查保证；目标体内仍保留前端两条门禁。
+  // 意图不变：`--test web_assets` 读的是 apps/controller-web/dist 的磁盘字节，所以它
+  // 运行前 dist 必须已经在位。dist 不入库之后，这个「在位」由 web-dist-check 保证：
+  // 产物缺失时它自己 `$(MAKE) web-build` 构建（见下一条测试），目标体内则保留前端
+  // 自身的两条门禁。
   const offline = extractTarget(/^controller-test-offline:/);
   assert.ok(offline, 'missing controller-test-offline target');
   assert.match(offline.header, /\bweb-dist-check\b/, 'controller-test-offline 必须先决于 web-dist-check');
   assert.doesNotMatch(
     offline.header,
     /\bweb-assets\b/,
-    'controller-test-offline 不得再自动触发 npm ci/run build：dist 已入库，重建属显式 make web-build',
+    'controller-test-offline 不直接依赖 web-assets：构建走 web-dist-check 的按需分支',
   );
   // 目标体内仍需有前端门禁与 Rust 资源测试。
   for (const step of ['test -- --run', 'run typecheck', '--test web_assets']) {
     assert.ok(offline.recipe.includes(step), `controller-test-offline 配方缺少步骤：${step}`);
   }
+  // 构建只在 web-dist-check 里发生一次；目标体内再手写一条 `npm run build` 会变成
+  // 「无论 dist 是否新鲜都重建」，正是本次要消除的重复。
   assert.doesNotMatch(
     offline.recipe,
     new RegExp(`${NPM_CMD}\\s+--prefix\\s+\\S+\\s+run build(\\s|$)`),
-    'dist 入库后 controller-test-offline 不再自行构建前端，构建是 make web-build 的职责',
+    '前端构建由 web-dist-check 按需触发，controller-test-offline 不再自行执行 npm run build',
   );
 
   // 显式重建入口仍在：`make web-build` → web-assets → $(WEB_STAMP)，stamp 规则执行
@@ -202,60 +277,153 @@ test('controller offline target and CI build frontend before Rust assets', () =>
   assert.match(ci, /--test web_assets/);
 });
 
+// dist 是生成物：编译类目标的先决条件必须能在**干净检出**上把产物造出来，否则
+// 「不入库」就等于「干净检出编不过」。web-dist-check 因此是条件式的——缺失即自动
+// `$(MAKE) web-build`，在位则一条 npm 都不跑。
+test('web-dist-check builds the frontend when dist is missing', () => {
+  assert.match(
+    make,
+    /^\.PHONY:.*\bweb-dist-check\b.*$/m,
+    'Makefile 必须把 web-dist-check 声明为 .PHONY 目标',
+  );
+  assert.match(
+    make,
+    /^\.PHONY:.*\bweb-build\b.*$/m,
+    'Makefile 必须把 web-build 声明为 .PHONY 目标',
+  );
+  const distCheck = extractTarget(/^web-dist-check:/);
+  assert.ok(distCheck, 'missing web-dist-check target');
+  const expanded = expandVars(distCheck.recipe);
+  assert.match(
+    expanded,
+    /test -f \S*apps\/controller-web\/dist\/index\.html/,
+    'web-dist-check 必须用 test -f 检查 apps/controller-web/dist/index.html',
+  );
+  // 自动构建：必须真的递归调用 web-build（允许 $(MAKE) 形式），且文案告诉操作员
+  // 「将自动构建」，而不是让人再去手工补一条命令。
+  assert.match(
+    distCheck.recipe,
+    new RegExp(`${MAKE_CMD}\\s+web-build(\\s|$|;)`),
+    'dist 缺失时 web-dist-check 必须自动执行 make web-build',
+  );
+  assert.match(
+    distCheck.recipe,
+    /将自动构建|自动构建/,
+    'web-dist-check 的提示必须说明将自动构建前端',
+  );
+  // 条件式而非无条件：`$(MAKE) web-build` 必须落在 if/else 的「缺失」分支里，
+  // 否则每次 make build 都重装依赖 + 重建前端。
+  const ifAt = distCheck.recipe.search(/\bif test -f\b/);
+  const elseAt = distCheck.recipe.search(/\belse\b/);
+  const buildAt = distCheck.recipe.search(new RegExp(`${MAKE_CMD}\\s+web-build`));
+  const fiAt = distCheck.recipe.search(/(?:^|[\s;])fi\b/);
+  assert.ok(
+    ifAt >= 0 && elseAt > ifAt && buildAt > elseAt && fiAt > buildAt,
+    '自动构建必须写在「dist 不存在」分支内（if test -f … else … fi），在位时不得重复构建',
+  );
+  // 构建之后仍要有终局存在性检查：npm 失败但退出码被吞时，也不能让 cargo 裸奔。
+  const finalCheck = distCheck.recipe.lastIndexOf('test -f');
+  assert.ok(finalCheck > buildAt, '自动构建之后必须再确认一次 dist/index.html 在位');
+});
+
 test('controller-test-offline is declared as a phony target', () => {
   assert.match(make, /^\.PHONY:.*\bcontroller-test-offline\b.*$/m);
 });
 
+// rust-and-ui：前端四条门禁按「安装 → 测试 → 类型检查 → 构建」执行，构建必须排在
+// 读磁盘字节的 `--test web_assets` 之前。dist 入库时代的「与提交产物比对」一步已随
+// 之删除——现在构建是编译输入的生产步骤，不是校验步骤。
 test('CI runs the locked web build in the same job before the web_assets test', () => {
   const job = jobNamed('--test web_assets');
   assert.ok(job, 'no CI job runs cargo test --test web_assets');
   const buildAt = job.text.indexOf(BUILD_STEP);
   const assetsAt = job.text.indexOf('--test web_assets');
-  const installAt = job.text.search(/npm --prefix apps\/controller-web ci\b/);
-  assert.ok(buildAt >= 0, 'the web_assets job must build apps/controller-web first');
+  const installAt = job.text.indexOf(NPM_CI_STEP);
   assert.ok(installAt >= 0, 'the web_assets job must install locked dependencies with npm ci');
+  assert.ok(buildAt >= 0, 'the web_assets job must build apps/controller-web first');
   assert.ok(installAt < buildAt, 'npm ci must run before the frontend build');
   assert.ok(buildAt < assetsAt, 'the frontend build must run before --test web_assets');
+
+  // 入库比对已删除：产物不入库之后没有任何「提交产物」可比，留着只会让流水线在
+  // 一个不存在的前提上判红。
+  assert.doesNotMatch(
+    ci,
+    /git diff --exit-code -- apps\/controller-web\/dist/,
+    'dist 已不入库，CI 不得再与提交产物比对',
+  );
+  assert.doesNotMatch(
+    ci,
+    /Verify committed dist/,
+    'CI 不得再保留「校验入库 dist」的步骤',
+  );
 });
 
+// 每条编译 rsetup-controller 的 CI 路径都必须先有 dist。编译入口有三类：
+// 显式 cargo 编译（rust-and-ui、rust-multi-arch-check），以及走
+// dpkg-buildpackage 的 debian-package——后者的配方在 debian/rules 里，
+// 显式的 npm 步骤是双保险。
 test('every CI job that compiles rsetup-controller builds the web dist first', () => {
   const compiling = jobs.filter((job) => job.lines.some(compilesController));
-  // 数量口径：rust-msrv 作业用 1.85.0 跑 make msrv-check（默认构建仍是 stable），
-  // 它依赖 dist 已入库而不在作业内构建前端；因此 compilesController 只统计
-  // rust-and-ui 与 rust-multi-arch-check 两条显式 cargo 编译作业。msrv 作业由
-  // 下方专门的合同测试单独钉住。
-  assert.ok(
-    compiling.length >= 2,
-    `expected several jobs to compile the controller, got: ${compiling.map((job) => job.name).join(', ')}`,
-  );
   assert.deepEqual(
     compiling.map((job) => job.name).sort(),
-    ['rust-and-ui', 'rust-multi-arch-check'],
+    ['debian-package', 'rust-and-ui', 'rust-multi-arch-check'],
     '编译 rsetup-controller 的作业集合发生变化：每条编译作业都必须先构建 apps/controller-web dist',
   );
+  assertRulesBuildFrontendBeforeCargo(rules);
   for (const job of compiling) {
     const buildLine = job.lines.findIndex((line) => line.includes(BUILD_STEP));
     const compileLine = job.lines.findIndex(compilesController);
-    assert.ok(
-      buildLine >= 0,
-      `job ${job.name} compiles rsetup-controller but never builds apps/controller-web dist`,
-    );
+    const compiledByDpkg = job.lines.some(buildsDebianPackage);
+    if (buildLine < 0) {
+      // 没有显式前端步骤时，唯一合法的解释是「由 debian/rules 构建」：该作业必须是
+      // dpkg-buildpackage 入口，且 rules 里的前端构建排在 cargo 之前（上面已断言）。
+      assert.ok(
+        compiledByDpkg,
+        `job ${job.name} compiles rsetup-controller but never builds apps/controller-web dist`,
+      );
+      continue;
+    }
     assert.ok(
       buildLine < compileLine,
       `job ${job.name} must build apps/controller-web dist before compiling rsetup-controller`,
     );
   }
+  // dpkg-buildpackage 入口单独点名：漏掉它就是「Debian 构建又不装前端了」的回归。
+  const debian = jobCalled('debian-package');
+  assert.ok(
+    debian && debian.lines.some(buildsDebianPackage),
+    'debian-package 作业必须仍在 dpkg-buildpackage 里编译 controller',
+  );
 });
 
-// MSRV 作业保留，但只用于 1.85.0 验证；默认工具链仍是 stable，dist 已入库，
-// 因此该作业不需要 setup-node/npm，也不在作业内构建前端。
-test('rust-msrv job still verifies 1.85.0 with the committed dist', () => {
-  const job = jobs.find((entry) => entry.name === 'rust-msrv');
-  assert.ok(job, 'ci.yml 必须保留 rust-msrv 作业（MSRV 1.85 验证）');
-  assert.match(job.text, /dtolnay\/rust-toolchain@1\.85\.0/, 'MSRV 作业必须显式安装 1.85.0');
-  assert.match(job.text, /make msrv-check/, 'MSRV 作业必须运行 make msrv-check');
-  assert.doesNotMatch(job.text, /\bnpm\b/, 'dist 已入库，MSRV 作业不得再执行 npm');
-  assert.doesNotMatch(job.text, /actions\/setup-node/, 'dist 已入库，MSRV 作业不需要 setup-node');
+// 工具链口径：本仓不锁定 Rust 最低版本（没有 rust-version，也没有 msrv-check 目标），
+// 所有 Rust 作业统一用 dtolnay/rust-toolchain@stable。这里钉住「不再引回某个具体
+// 小版本」：CI 与 Makefile 里出现 1.85 之类的版本作业，或出现非 stable 的工具链
+// 安装，都会让本条判红。
+test('every Rust job uses the stable toolchain; no MSRV pin left', () => {
+  const toolchainLines = ci
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => /uses:[ \t]*dtolnay\/rust-toolchain/.test(line));
+  assert.ok(toolchainLines.length >= 3, 'CI 里应有多条 dtolnay/rust-toolchain 安装步骤');
+  for (const line of toolchainLines) {
+    assert.match(
+      line,
+      /dtolnay\/rust-toolchain@stable\b/,
+      `Rust 工具链必须统一为 stable，实际为：${line}`,
+    );
+  }
+  for (const [name, text] of [
+    ['ci.yml', ci],
+    ['Makefile', make],
+  ]) {
+    assert.doesNotMatch(
+      text,
+      /\bmsrv\b|msrv-check|rust-msrv/,
+      `${name} 不应再出现 MSRV/最低版本作业：已统一使用 stable 工具链`,
+    );
+    assert.doesNotMatch(text, /\b1\.85\b/, `${name} 不应再钉住 Rust 1.85`);
+  }
 });
 
 // 架构口径：用户已明确项目只维护 64 位的 arm64 与 amd64。
@@ -283,7 +451,7 @@ const parseMatrixTargets = (jobText) => {
 };
 
 test('multi-arch matrix is exactly the 64-bit arm64 and amd64 targets', () => {
-  const job = jobs.find((item) => item.name === 'rust-multi-arch-check');
+  const job = jobCalled('rust-multi-arch-check');
   assert.ok(job, 'ci.yml 里找不到 rust-multi-arch-check 作业');
   const targets = parseMatrixTargets(job.text);
   assert.deepEqual(
@@ -325,7 +493,7 @@ test('CI runs the metrics static gates before Rust compilation', () => {
   );
 
   // CI 侧：必须真的执行静态门禁目标。
-  const job = jobs.find((item) => item.name === 'rust-and-ui');
+  const job = jobCalled('rust-and-ui');
   assert.ok(job, 'ci.yml 里找不到 rust-and-ui 作业');
   assert.match(
     job.text,
@@ -344,7 +512,7 @@ test('CI runs the metrics static gates before Rust compilation', () => {
   assert.ok(fmtAt >= 0, 'rust-and-ui 作业必须保留 make fmt-check 这一步');
   assert.ok(
     cargoPositions.length >= 3,
-    `rust-and-ui 作业应包含多条 cargo 命令，实际找到 ${cargoPositions.length} 条`,
+    `rust-and-ui 作业应包含多条 cargo 编译命令，实际找到 ${cargoPositions.length} 条`,
   );
   assert.ok(
     fmtAt < gatesAt,
@@ -391,53 +559,53 @@ test('CI runs the metrics static gates before Rust compilation', () => {
   }
 });
 
-// Debian 作业与 controller 的边界：controller 已由 `rsetup-controller` 包交付，
-// dh_auto_test 必须编译并测试完整 workspace，但**不**在 Debian 作业里构建前端——
-// dist 已入库，源码包离线构建，既不装 npm 也不跑 vite。
-//
-// 断言分两层：作业的可执行文本（剔除整行注释）里不得出现任何 npm / setup-node，
-// 连注释也不许出现前端目录字样——注释最容易被后来人照抄成真正的步骤。
-test('debian package builds controller without a frontend build', () => {
-  const debian = jobs.find((job) => job.name === 'debian-package');
+// Debian 侧的接线：`rsetup-controller` 由本源码包编译交付，而它编译期读取的
+// apps/controller-web/dist 不再随源码包提供，所以 debian/rules 必须在 cargo 之前
+// 用 npm 生成它，npm 也必须进 Build-Depends。CI 的 debian-package 作业另外显式跑
+// 一遍同样的两条命令（双保险），并在 apt 安装清单里带上 npm。
+test('debian package builds the frontend before cargo', () => {
+  const debian = jobCalled('debian-package');
   assert.ok(debian, 'ci.yml 里找不到 debian-package 作业');
 
-  const rules = readFileSync('debian/rules', 'utf8');
-  // 只认可执行行：debian/rules 的说明注释也可能提到 cargo test，光比对整份文本
-  // 会让「注释还在、命令已被改坏」的回归蒙混过关。
-  const rulesCode = rules
-    .split('\n')
-    .filter((line) => !line.trim().startsWith('#'))
-    .join('\n');
+  // 配方层：npm ci → npm run build → 第一条 cargo。
+  assertRulesBuildFrontendBeforeCargo(rules);
+  // dh_auto_test 仍跑完整 workspace（controller 已随包交付，不得再排除）。
   assert.match(
     rulesCode,
     /^[ \t]*cargo test --workspace[^\n]*--locked[^\n]*--offline[ \t]*$/m,
     'dh_auto_test 必须编译并测试完整 workspace（controller 已随包交付，不得再排除）',
   );
-  assert.doesNotMatch(
-    rulesCode,
-    /(?:^|[ \t])npm(?![\w-])/,
-    'Debian 构建不得依赖 npm：dist 已入库，源码包离线构建',
-  );
 
-  assert.doesNotMatch(
+  // 构建依赖层：nodejs 与 npm 都必须是 Build-Depends——前者喂 dh_auto_test 的
+  // `node --test ui/*.test.mjs`，后者喂 override_dh_auto_build 的前端构建。
+  const control = readFileSync('debian/control', 'utf8');
+  const buildDeps = controlField(control, 'Build-Depends')
+    .split(',')
+    .map((item) => item.trim().replace(/\s*\(.*\)$/, ''))
+    .filter(Boolean);
+  for (const dep of ['nodejs', 'npm']) {
+    assert.ok(
+      buildDeps.includes(dep),
+      `debian/control 的 Build-Depends 必须包含 ${dep}，实际：${buildDeps.join(', ')}`,
+    );
+  }
+
+  // 作业层：dpkg-buildpackage 之前既有 npm 的安装清单，也有显式的前端构建步骤。
+  const dpkgAt = debian.text.search(/dpkg-buildpackage\b/);
+  const installAt = debian.text.indexOf(NPM_CI_STEP);
+  const buildAt = debian.text.indexOf(BUILD_STEP);
+  assert.ok(dpkgAt >= 0, 'debian-package 作业必须仍用 dpkg-buildpackage 构建');
+  assert.ok(installAt >= 0, 'debian-package 作业必须显式安装前端锁定依赖（npm ci）');
+  assert.ok(buildAt >= 0, 'debian-package 作业必须显式构建前端（npm run build）');
+  assert.ok(installAt < buildAt, '前端依赖安装必须早于前端构建');
+  assert.ok(
+    buildAt < dpkgAt,
+    '前端构建必须早于 dpkg-buildpackage：显式步骤是 rules 里同一条链路的双保险',
+  );
+  assert.match(
     debian.text,
-    /\bnpm\b/,
-    'debian-package 作业不得调用 npm：dist 已入库，无需前端构建',
-  );
-  assert.doesNotMatch(
-    debian.text,
-    /actions\/setup-node/,
-    'debian-package 作业不需要 setup-node：没有前端构建步骤',
-  );
-  assert.doesNotMatch(
-    debian.rawText,
-    /apps\/controller-web/,
-    'debian-package 作业连注释都不应引用前端目录，避免被照抄成新的构建步骤',
-  );
-  assert.doesNotMatch(
-    debian.rawText,
-    /npm --prefix/,
-    'debian-package 作业不得残留前端依赖安装的命令字样',
+    /apt-get install[\s\S]*?\bnodejs\b[\s\S]*?\bnpm\b/,
+    'debian-package 作业的 apt 安装清单必须同时带上 nodejs 与 npm（容器里没有预装）',
   );
 });
 
@@ -517,11 +685,11 @@ test('web stamps split the locked install from the dist build', () => {
     '测试文件不是 vite build 的输入，改 spec 不得触发前端重建',
   );
 
-  // 编译 workspace 的入口目标只先决于 dist 的**存在性检查**，不再自动触发 npm：
-  // dist 已入库，干净检出与离线机器跑 `make build` 不该需要 Node 与网络。
-  // 五个入口目标就是 Makefile 里会编译 rsetup-controller 的全部入口（最低版本门禁
-  // 已随「不锁定 Rust 版本」的口径一并删除，不在其列）。
-  for (const name of ['build', 'test', 'lint', 'metrics-gates', 'msrv-check', 'controller-test-offline']) {
+  // 编译 workspace 的入口目标都先决于 web-dist-check：dist 不入库之后，该先决条件是
+  // 「缺失即自动构建、在位则只确认一次」的那道门（见
+  // web-dist-check builds the frontend when dist is missing）。它们不直接依赖
+  // web-assets，否则热工作区每次 make build 都会重新走一遍 npm 依赖安装判断。
+  for (const name of ['build', 'test', 'lint', 'metrics-gates', 'controller-test-offline']) {
     const target = extractTarget(new RegExp(`^${name}:`));
     assert.ok(target, `missing ${name} target`);
     assert.match(
@@ -532,7 +700,7 @@ test('web stamps split the locked install from the dist build', () => {
     assert.doesNotMatch(
       target.header,
       /\bweb-assets\b/,
-      `${name} 不得再依赖 web-assets：前端重建是 make web-build 的显式职责`,
+      `${name} 不得直接依赖 web-assets：按需构建统一走 web-dist-check`,
     );
   }
 });
@@ -551,12 +719,10 @@ test('debian package declares only the amd64 and arm64 architectures', () => {
   }
 });
 
-// dist 入库是这一轮的口径变更：`apps/controller-web/dist` 从「本地忽略产物」变成
-// 交付物，`crates/rsetup-controller/build.rs` 编译期直接读它，干净检出与离线构建
-// 因此不再需要 Node/npm/网络。代价是一条纪律——改前端源码必须重新 `make web-build`
-// 并把 dist 一起提交，由 CI 的 dist 比对（下一条测试）兜底。
-// 这里只读文本与磁盘存在性，不执行 git/npm/cargo：合同测试自己不能变成需要网络的步骤。
-test('controller web dist is committed while only the make stamp stays ignored', () => {
+// dist 的入库状态：`apps/controller-web/dist` 是 vite 的生成物，**既不入库也被忽略**。
+// 这一条同时防两个方向的回归：把产物重新提交回仓库（固定哈希产物再次漂移），以及
+// 忽略规则被删掉（干净检出后本地构建一次就让 dist 变成一大片 untracked 噪声）。
+test('controller web dist is generated, untracked and ignored', () => {
   const webIgnore = readFileSync('apps/controller-web/.gitignore', 'utf8');
   const rootIgnore = readFileSync('.gitignore', 'utf8');
   const ruleLines = webIgnore
@@ -564,104 +730,78 @@ test('controller web dist is committed while only the make stamp stays ignored',
     .map((line) => line.trim())
     .filter((line) => line !== '' && !line.startsWith('#'));
 
-  // 裸 dist 忽略规则一律禁止：`dist`、`dist/`、`/dist`、`**/dist/` 都会把三个交付
-  // 文件重新变成本地产物，干净检出立刻回到「不装 Node 就编不出 controller」。
+  // 必须有一条整目录的 dist 忽略规则（`dist`、`dist/`、`/dist`、`**/dist/` 之一）。
   const BARE_DIST_RULE = /^\/?(?:\*\*\/)?dist\/?$/;
-  const bare = ruleLines.filter((line) => BARE_DIST_RULE.test(line));
-  assert.deepEqual(bare, [], 'apps/controller-web/.gitignore 不得再忽略整个 dist 目录');
-
-  // 唯一允许被忽略的 dist 内文件是 make 的时间戳：它每次 web-build 都刷新，入库只会
-  // 制造无意义 diff。写全相对路径，不接受 `*.rsetup-build-stamp` 这类通配放宽。
   assert.ok(
-    ruleLines.includes('dist/.rsetup-build-stamp'),
-    'apps/controller-web/.gitignore 必须继续忽略 dist/.rsetup-build-stamp',
+    ruleLines.some((line) => BARE_DIST_RULE.test(line)),
+    'apps/controller-web/.gitignore 必须忽略整个 dist 目录（dist/），产物不入库',
   );
   for (const kept of ['node_modules/', 'coverage/', '.npm-cache/']) {
     assert.ok(ruleLines.includes(kept), `apps/controller-web/.gitignore 必须保留 ${kept} 忽略项`);
   }
 
-  // 上层也不能把交付物重新忽略掉：根 .gitignore 的锚定规则优先级足够造成同样的后果。
+  // 根 .gitignore 既不得再为 dist 放行（`!…/dist` 重包含），也不得再加一条与
+  // 子目录规则相互覆盖的 dist 规则——两处规则同时存在时，谁生效取决于目录顺序。
   const rootRules = rootIgnore
     .split('\n')
     .map((line) => line.trim())
     .filter((line) => line !== '' && !line.startsWith('#'));
-  assert.equal(
-    rootRules.find((line) => /^\/?apps\/controller-web\/dist(\/.*)?$/.test(line) && !line.startsWith('!')),
-    undefined,
-    '根 .gitignore 不得忽略 apps/controller-web/dist',
+  const conflicting = rootRules.filter((line) =>
+    /^!?\/?apps\/controller-web\/dist(\/.*)?$/.test(line),
   );
+  assert.deepEqual(conflicting, [], '根 .gitignore 不得再为 apps/controller-web/dist 写忽略或重包含规则');
 
-  // 交付物确实在工作区里（入库后 CI 与本地都必然满足）：index.html 是 build.rs 的
-  // 硬输入，assets 目录是哈希资产的家。
-  assert.ok(existsSync('apps/controller-web/dist/index.html'), 'dist/index.html 必须存在');
-  assert.ok(existsSync('apps/controller-web/dist/assets'), 'dist/assets 目录必须存在');
-
-  // Makefile 侧：dist 缺失要在 cargo 编译前用可读错误拦下，且该检查绝不碰 npm。
-  assert.match(
-    make,
-    /^\.PHONY:.*\bweb-dist-check\b.*$/m,
-    'Makefile 必须把 web-dist-check 声明为 .PHONY 目标',
-  );
-  const distCheck = extractTarget(/^web-dist-check:/);
-  assert.ok(distCheck, 'missing web-dist-check target');
-  const expanded = expandVars(distCheck.recipe);
-  assert.match(
-    expanded,
-    /test -f \S*apps\/controller-web\/dist\/index\.html/,
-    'web-dist-check 必须用 test -f 检查 apps/controller-web/dist/index.html',
-  );
-  assert.match(
-    distCheck.recipe,
-    /make web-build/,
-    'web-dist-check 的报错必须直接指向 make web-build',
-  );
-  assert.doesNotMatch(
-    distCheck.recipe,
-    new RegExp(NPM_CMD),
-    'web-dist-check 只检查产物存在，不得执行 npm',
-  );
-  // 显式重建入口必须仍然落到装依赖 + 构建的完整链路（配方的其余部分由第一条测试钉住）。
-  assert.match(
-    make,
-    /^\.PHONY:.*\bweb-build\b.*$/m,
-    'Makefile 必须把 web-build 声明为 .PHONY 目标',
-  );
-});
-
-// dist 入库的一致性由 CI 兜底：从源码重新构建一遍，再与入库产物比对。vite 构建是
-// 确定性的（重复构建字节一致），所以「源码 + 已提交 dist」不自洽时 diff 必然非空。
-test('CI compares the committed dist with a frontend build from source', () => {
-  const job = jobs.find((item) => item.name === 'rust-and-ui');
-  assert.ok(job, 'ci.yml 里找不到 rust-and-ui 作业');
-
-  // 验证源码的四条前端门禁仍要在位：dist 入库不等于跳过前端测试与类型检查。
-  for (const step of [
-    'npm --prefix apps/controller-web ci',
-    'npm --prefix apps/controller-web test -- --run',
-    'npm --prefix apps/controller-web run typecheck',
-    BUILD_STEP,
-  ]) {
-    assert.ok(job.text.includes(step), `rust-and-ui 作业必须保留前端步骤：${step}`);
+  // 磁盘真相：git 没有跟踪 dist 里的任何文件，且这些路径确实被忽略。
+  const tracked = gitOutput(['ls-files', '--', '.'])
+    .split('\n')
+    .filter((path) => path.startsWith(`${WEB_DIST}/`));
+  assert.deepEqual(tracked, [], `apps/controller-web/dist 不得有文件被 git 跟踪，实际：${tracked.join(', ')}`);
+  for (const probe of [`${WEB_DIST}/index.html`, `${WEB_DIST}/assets/probe.js`]) {
+    assert.ok(gitIgnores(probe), `${probe} 必须被 .gitignore 忽略`);
   }
 
-  // 比对步骤：必须存在、必须排在构建之后，否则比的是入库产物自己。
-  const DIFF = 'git diff --exit-code -- apps/controller-web/dist';
-  const buildAt = job.text.indexOf(BUILD_STEP);
-  const diffAt = job.text.indexOf(DIFF);
-  assert.ok(diffAt >= 0, `rust-and-ui 作业必须有 ${DIFF}，否则 dist 与源码脱钩无人发现`);
-  assert.ok(buildAt >= 0 && buildAt < diffAt, 'dist 比对必须排在 npm run build 之后');
-  assert.match(
-    job.text,
-    /name: Verify committed dist matches the frontend build/,
-    'dist 比对必须是独立可见的步骤名，便于失败定位',
-  );
-  // 退出码必须能传出去：多行 run 块要 set -eu，且 --exit-code 不能被管道吃掉。
-  const diffBlockStart = job.text.lastIndexOf('run: |', diffAt);
-  const diffBlock = job.text.slice(diffBlockStart, diffAt);
-  assert.match(diffBlock, /set -eu/, 'dist 比对的多行 run 块必须 set -eu，否则非零退出被吞掉');
+  // Debian 的构建目录同样要忽略：新增 rsetup-board-agent 包后，打包会多出
+  // debian/rsetup-board-agent 这棵 staging 树。
+  const debianDirs = ['debian/rsetup-next', 'debian/rsetup-controller', 'debian/rsetup-board-agent'];
+  for (const dir of debianDirs) {
+    assert.ok(
+      rootRules.some((line) => line === `/${dir}` || line === `/${dir}/`),
+      `根 .gitignore 必须忽略打包 staging 目录 /${dir}`,
+    );
+    assert.ok(gitIgnores(dir), `${dir} 必须被 .gitignore 忽略`);
+  }
+});
+
+// vite 给产物加内容 hash，名字随源码变化。任何构建配置里写死 `assets/index-XXXX.js`
+// 之类的名字，都会在下次前端改动后变成静默的坏链接或直接 404，所以这里一次扫尽
+// 构建与文档侧的全部相关文件（合成名只允许出现在 Rust 测试 fixture 里）。
+const ASSET_HASH_PATTERN = /assets\/index-[A-Za-z0-9_-]{4,}\.(?:js|css)/;
+test('no build configuration or doc hardcodes a generated asset file name', () => {
+  const scanned = [
+    'Makefile',
+    '.gitignore',
+    'apps/controller-web/.gitignore',
+    'debian/control',
+    'debian/rules',
+    'debian/README.source',
+    '.github/workflows/ci.yml',
+    'README.md',
+    'README.zh.md',
+    'apps/controller-web/README.md',
+    'apps/controller-web/DEV-PROXY.md',
+    'docs/testing/controller-v1-known-gaps.md',
+  ];
+  for (const path of scanned) {
+    const text = readFileSync(path, 'utf8');
+    const hits = text.split('\n').filter((line) => ASSET_HASH_PATTERN.test(line));
+    assert.deepEqual(hits, [], `${path} 不得写死 vite 生成的资产文件名：${hits.join(' | ')}`);
+  }
+  // 构建脚本按目录扫描资产，不认具体名字（这条同时钉住「运行时按 index.html 引用解析」
+  // 的实现方式，改名不会让嵌入逻辑失配）。
+  const buildScript = readFileSync('crates/rsetup-controller/build/web_assets.rs', 'utf8');
   assert.doesNotMatch(
-    job.text.slice(diffAt, diffAt + DIFF.length),
-    /\|/,
-    'dist 比对命令不得接管道，否则退出码来自管道末端',
+    buildScript,
+    ASSET_HASH_PATTERN,
+    'build 侧资产表不得写死某个 hash 的文件名',
   );
 });

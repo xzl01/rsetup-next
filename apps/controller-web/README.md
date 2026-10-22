@@ -28,11 +28,14 @@ NPM_CONFIG_CACHE="$PWD/.npm-cache" NPM_CONFIG_LOGS_DIR="$PWD/.npm-cache/_logs" n
 
 本目录以 `package-lock.json` 为唯一锁文件（其他包管理器的锁文件不入库），它固定依赖树。保留接管时的 Vue 3.5.43、Vite 8.3.2、Vitest 5.0.3 等直接版本；`@types/node` 固定为 22.12.0 以满足 Vite peer 范围。`overrides` 将 `@vue/test-utils` 固定为 2.4.6（满足 Vue Testing Library 的 `^2.4.1`），避免 2.5.1 引入的 `js-beautify@2` → `nopt@10` 要求 Node 22.22.2 而不兼容当前 22.22.1；这是已有安装错误证据的兼容性固定，不是漏洞修复或升级策略。本目录的 `pnpm-lock.yaml` 已被 `.gitignore` 忽略；请勿再生成或提交其他锁文件，统一使用 `package-lock.json`。
 
-`node_modules/`、`coverage/`、`.npm-cache/` 仅为本地忽略产物。`dist/` 则**已随仓库提交**：
-它是 [crates/rsetup-controller/build.rs](<../../crates/rsetup-controller/build.rs>) 编译期读取并嵌入中控二进制的交付物，入库后干净检出与离线构建不再需要 Node/npm。
-改过本目录源码后必须回到仓库根运行 `make web-build` 重新生成 `dist/`，并把产物与源码改动
-一起提交；CI 会从源码重新构建并用 `git diff --exit-code -- apps/controller-web/dist` 比对，
-不一致即判红。`dist/.rsetup-build-stamp` 是 make 的时间戳文件，仍然忽略、不入库。
+`node_modules/`、`coverage/`、`.npm-cache/` 与 `dist/` 都是本地忽略产物：`dist/` 是
+vite 的构建产物，**不入库**。它是 [crates/rsetup-controller/build.rs](<../../crates/rsetup-controller/build.rs>)
+编译期读取并嵌入中控二进制的输入，因此每条编译路径都要先把它生成出来：本地跑
+`make web-build`（仓库根，或让 `make build` 一类的编译目标按需触发 `web-dist-check` 自动构建），
+Debian 打包跑 `debian/rules` 里的 `npm --prefix apps/controller-web ci` +
+`npm --prefix apps/controller-web run build`，CI 的各个编译作业同样先构建再编译。
+产物文件名带 vite 的内容 hash，随源码变化，仓库与构建脚本都不写死具体名字，也不再
+提交或比对固定哈希产物。`dist/.rsetup-build-stamp` 是 make 的时间戳文件，同样忽略。
 测试使用 jsdom 渲染真实 Vue SFC，并在每个测试后自动 cleanup。测试、类型检查与构建是独立步骤。`--no-audit` 并不表示依赖无漏洞。
 
 本目录本身不要求常驻开发/预览服务（开发代理的用法见 [DEV-PROXY.md](<DEV-PROXY.md>)）；构建或 jsdom 测试通过不代表浏览器布局、键盘/辅助技术、320px 视口或端到端验收通过。已有的操作员无头浏览器执行记录与证据局限性见 [DEV-PROXY.md](<DEV-PROXY.md>) 与验收账本 T4-10；真实业务全链路与发布验收仍未完成，见 [中控 V1 当前已知缺口](<../../docs/testing/controller-v1-known-gaps.md>)。

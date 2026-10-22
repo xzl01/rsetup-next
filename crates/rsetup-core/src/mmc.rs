@@ -86,10 +86,10 @@ impl MmcManager {
             let name = file_name.to_string_lossy().to_string();
             let dev_dir = entry.path();
             let type_file = dev_dir.join("type");
-            if let Some(card_type) = sys::read_trimmed_attr(&type_file) {
-                if card_type == "MMC" || card_type == "SD" {
-                    devices.push(name);
-                }
+            if let Some(card_type) = sys::read_trimmed_attr(&type_file)
+                && (card_type == "MMC" || card_type == "SD")
+            {
+                devices.push(name);
             }
         }
         devices.sort();

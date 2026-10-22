@@ -431,8 +431,8 @@ fn pure_preconnect_gate_rejects_missing_stale_mismatch_and_scope() {
             w
         },
     ] {
-        if let Ok(auth) = observer::read_authorization(wire.to_string().as_bytes()) {
-            if observer::authorize_open(
+        if let Ok(auth) = observer::read_authorization(wire.to_string().as_bytes())
+            && observer::authorize_open(
                 &prepared,
                 Some(&auth),
                 &account,
@@ -440,9 +440,8 @@ fn pure_preconnect_gate_rejects_missing_stale_mismatch_and_scope() {
                 tokio::time::Instant::now() + std::time::Duration::from_secs(1),
             )
             .is_ok()
-            {
-                calls += 1;
-            }
+        {
+            calls += 1;
         }
     }
     assert_eq!(calls, 0);

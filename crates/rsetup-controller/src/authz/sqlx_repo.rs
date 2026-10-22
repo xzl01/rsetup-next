@@ -1304,10 +1304,10 @@ impl AuthorizationSnapshotRepository for SqlxAuthorizationSnapshotRepository {
             // 单快照：target 的 grants/roles/device_groups/devices 全部在同一 tx 内加载，
             // schema_meta 单例与版本防线由 load_snapshot_in_tx 承担，不另开第二套。
             let snapshot = load_snapshot_in_tx(&mut tx, target, &keys).await?;
-            if let Some(id) = device_id {
-                if !snapshot.devices.get(&id).is_some_and(|view| !view.archived) {
-                    return Err(ControllerError::NotFound);
-                }
+            if let Some(id) = device_id
+                && !snapshot.devices.get(&id).is_some_and(|view| !view.archived)
+            {
+                return Err(ControllerError::NotFound);
             }
             let has_next = device_id.is_none() && keys.len() > limit;
             let mut items = Vec::new();
@@ -2499,10 +2499,10 @@ impl AuthzRepository for SqlxAuthzRepository {
             if let Some(perms) = permissions {
                 crate::authz::policy::validate_permission_list(perms)?;
             }
-            if let Some(n) = name {
-                if n.is_empty() || n.chars().count() > 128 || n.chars().any(char::is_control) {
-                    return Err(ControllerError::InvalidArgument);
-                }
+            if let Some(n) = name
+                && (n.is_empty() || n.chars().count() > 128 || n.chars().any(char::is_control))
+            {
+                return Err(ControllerError::InvalidArgument);
             }
             let mut tx = begin_guard(&self.db).await?;
             crate::integrity::require_active_admin(&mut tx, actor.user.id).await?;
@@ -2575,21 +2575,19 @@ impl AuthzRepository for SqlxAuthzRepository {
                 return Err(ControllerError::RevisionConflict);
             }
 
-            if let Some(perms) = permissions {
-                if !next_archived {
-                    sqlx::query("DELETE FROM role_permissions WHERE role_id = ?")
-                        .bind(id.as_bytes().as_slice())
-                        .execute(&mut *tx)
-                        .await?;
-                    for p in perms {
-                        sqlx::query(
-                            "INSERT INTO role_permissions (role_id, permission) VALUES (?, ?)",
-                        )
+            if let Some(perms) = permissions
+                && !next_archived
+            {
+                sqlx::query("DELETE FROM role_permissions WHERE role_id = ?")
+                    .bind(id.as_bytes().as_slice())
+                    .execute(&mut *tx)
+                    .await?;
+                for p in perms {
+                    sqlx::query("INSERT INTO role_permissions (role_id, permission) VALUES (?, ?)")
                         .bind(id.as_bytes().as_slice())
                         .bind(p.as_str())
                         .execute(&mut *tx)
                         .await?;
-                    }
                 }
             }
 

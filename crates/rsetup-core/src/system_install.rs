@@ -654,15 +654,13 @@ impl SystemInstallManager {
                 "the image {path} is empty"
             )));
         }
-        // Nested rather than a `let` chain: chains need Rust 1.88 and this crate
-        // declares 1.85 as its minimum.
-        if let Some(mount) = longest_mount_prefix(mounts, Path::new(path)) {
-            if resolves_to_target(&mount.device, target) {
-                return Err(SystemInstallError::Conflict(format!(
-                    "the image {path} is stored on {} which is being overwritten",
-                    mount.mount_point
-                )));
-            }
+        if let Some(mount) = longest_mount_prefix(mounts, Path::new(path))
+            && resolves_to_target(&mount.device, target)
+        {
+            return Err(SystemInstallError::Conflict(format!(
+                "the image {path} is stored on {} which is being overwritten",
+                mount.mount_point
+            )));
         }
         let mut file = File::open(path).map_err(|error| {
             SystemInstallError::InvalidInput(format!("the image {path} is unreadable: {error}"))
@@ -1045,11 +1043,11 @@ fn resolve_mount_names(
 ) -> Vec<String> {
     let known = block_names(root);
     let mut names = Vec::new();
-    if let Some(number) = mountinfo.get(&mount.mount_point) {
-        if let Some(name) = index.get(number) {
-            collect_slaves(root, name, &known, &mut names);
-            return names;
-        }
+    if let Some(number) = mountinfo.get(&mount.mount_point)
+        && let Some(name) = index.get(number)
+    {
+        collect_slaves(root, name, &known, &mut names);
+        return names;
     }
     // No usable mount table entry: a source that already is a kernel name, or a
     // fixture root. `/dev/root` and by-uuid symlinks need the table above.
@@ -1207,12 +1205,10 @@ fn mint_nonce() -> u64 {
 /// is only useful to the process that issued it.
 fn mint_token_key() -> [u8; 32] {
     let mut key = [0u8; 32];
-    // Nested rather than a `let` chain: chains need Rust 1.88 and this crate
-    // declares 1.85 as its minimum.
-    if let Ok(mut urandom) = File::open("/dev/urandom") {
-        if urandom.read_exact(&mut key).is_ok() {
-            return key;
-        }
+    if let Ok(mut urandom) = File::open("/dev/urandom")
+        && urandom.read_exact(&mut key).is_ok()
+    {
+        return key;
     }
     let mut seed = Vec::new();
     let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
@@ -2284,7 +2280,7 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
         message.push(0);
     }
     message.extend_from_slice(&bit_length.to_be_bytes());
-    for block in message.chunks_exact(64) {
+    for block in message.as_chunks::<64>().0 {
         let mut schedule = [0u32; 64];
         for index in 0..16 {
             schedule[index] = u32::from_be_bytes(
@@ -2568,13 +2564,12 @@ mod tests {
             let mut written = self.chunks.lock().expect("chunk lock");
             let total: u64 =
                 written.iter().map(|size| *size as u64).sum::<u64>() + chunk.len() as u64;
-            // Nested rather than a `let` chain: chains need Rust 1.88 and this
-            // crate declares 1.85 as its minimum. The guard is still held for the
-            // whole statement, exactly as it was with the chain.
-            if let Some(fail_after) = *self.fail_after.lock().expect("fail lock") {
-                if total > fail_after {
-                    return Err(SystemInstallError::Io("simulated device failure".into()));
-                }
+            // The guard of `fail_after` stays held for the whole statement,
+            // exactly as it did with the nested form.
+            if let Some(fail_after) = *self.fail_after.lock().expect("fail lock")
+                && total > fail_after
+            {
+                return Err(SystemInstallError::Io("simulated device failure".into()));
             }
             written.push(chunk.len());
             let mut file = OpenOptions::new()

@@ -1,7 +1,10 @@
 node_modules/
 coverage/
 .npm-cache/
-# dist 的构建产物已随仓库提供（crates/rsetup-controller/build.rs 编译期读取），
-# 干净检出与离线 cargo 构建不再需要 Node/npm。唯一被忽略的是 make 的时间戳文件：
-# 它每次 `make web-build` 都会刷新，属本地噪声，不入库。
-dist/.rsetup-build-stamp
+# dist 是 vite 的构建产物，不入库：本地由 `make web-build` 生成，Debian 打包与 CI 在
+# 编译 rsetup-controller 之前执行 `npm --prefix apps/controller-web ci` 与
+# `npm --prefix apps/controller-web run build` 现生成它
+# （crates/rsetup-controller/build.rs 编译期读取 dist，缺失即 fail-closed）。
+# 整个目录连同 make 的时间戳 dist/.rsetup-build-stamp 一并忽略，产物文件名与 hash
+# 由 vite 决定，因此永远不会被写死进仓库，也不再产生 dist 漂移的 diff。
+dist/

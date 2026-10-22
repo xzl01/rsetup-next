@@ -815,13 +815,13 @@ mod tests {
                 // and before the in-lock revalidation check, so the
                 // repository recheck branch below is exercised through the
                 // real service path. Applied once, to the exact digest only.
-                if let Some(drift) = self.selected_drift.lock().unwrap().take() {
-                    if drift.digest == stored.0 {
-                        match drift.kind {
-                            SelectedDriftKind::Owner => stored.3 = [0xff; 16],
-                            SelectedDriftKind::Epoch => stored.2 = [0xee; 16],
-                            SelectedDriftKind::Revoked => stored.1 = true,
-                        }
+                if let Some(drift) = self.selected_drift.lock().unwrap().take()
+                    && drift.digest == stored.0
+                {
+                    match drift.kind {
+                        SelectedDriftKind::Owner => stored.3 = [0xff; 16],
+                        SelectedDriftKind::Epoch => stored.2 = [0xee; 16],
+                        SelectedDriftKind::Revoked => stored.1 = true,
                     }
                 }
                 // Revalidate owner/epoch/revoked in the same boundary:

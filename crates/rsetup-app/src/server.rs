@@ -252,15 +252,15 @@ fn valid_request_boundary(request: &Request) -> bool {
     if headers.get_all(header::ORIGIN).iter().count() > 1 {
         return false;
     }
-    if let Some(origin) = headers.get(header::ORIGIN) {
-        if origin.to_str().ok() != Some(format!("http://{host}").as_str()) {
-            return false;
-        }
+    if let Some(origin) = headers.get(header::ORIGIN)
+        && origin.to_str().ok() != Some(format!("http://{host}").as_str())
+    {
+        return false;
     }
-    if let Some(site) = headers.get("sec-fetch-site") {
-        if !matches!(site.to_str(), Ok("same-origin" | "none")) {
-            return false;
-        }
+    if let Some(site) = headers.get("sec-fetch-site")
+        && !matches!(site.to_str(), Ok("same-origin" | "none"))
+    {
+        return false;
     }
     request.method() == axum::http::Method::GET
         || request.method() == axum::http::Method::HEAD

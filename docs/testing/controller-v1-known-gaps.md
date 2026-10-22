@@ -41,10 +41,18 @@
   `--loopback-test-server` 提供**仅测试用**的逐行 JSON 控制台；reboot prepare/execute 恒
   `CapabilityUnavailable`，绝不在本地触发重启。业务 codec 已按所有者授权启用（见 i 节），但该
   JSON 控制台仍不是生产加密隧道，不能替代真实 wire；真实双流绑定的 codec 接入见 a/i 节现状。
-- **影响**：真实重启路径（含 03 §5 B-04 的两阶段持久化在真实 OS 调用后的行为）与生产板端进程形态
-  （认证隧道、守护、journal 真实环境）仍未实现；本地测试只覆盖只读 DTO、白名单、journal 查询与错误映射。
-- **下一步**：在受控板端环境实现真实 reboot 边界与其负例/回退路径，再把本地测试 bin 接入生产隧道与
-  部署单元；在真实设备上取得可持久证据前，不得宣称重启能力可用。
+  本轮另把板端进程做成独立 Debian 包 `rsetup-board-agent`（`/usr/bin/rsetup-board-agent` +
+  `rsetup-board-agent.service`，默认 `--no-enable`）：单元固定以
+  `User=root`/`Group=root` 运行 `--watch --interval-secs 10 --journal-dir
+  /var/lib/rsetup-board-agent` 的**只读采样**循环，样本只进本地 journald，不开任何监听套接字，
+  也不与中控建立加密会话；板端的生产与测试运行用户因此统一为 root（手工 shell 运行仍只是调用者
+  身份，不提权）。也就是说，包内单元交付的是守护形态的只读探针，不是控制链路。
+- **影响**：真实重启路径（含 03 §5 B-04 的两阶段持久化在真实 OS 调用后的行为）仍未实现；板端进程
+  形态只到「root 运行的只读采样守护 + 本地 journal」，认证隧道仍未实现，systemd 单元也尚未在真实
+  板卡上取证；本地测试只覆盖只读 DTO、白名单、journal 查询与错误映射。
+- **下一步**：在受控板端环境实现真实 reboot 边界与其负例/回退路径，再把只读 watch 单元升级为接入
+  生产加密隧道的板端守护（现有单元与 root 运行用户可直接复用），并在真实设备上取得可持久证据；
+  在此之前不得宣称重启能力或板端控制链路可用。
 
 ## c) SSE 业务发布方已部分接线，端到端与时间线仍有边界
 
@@ -137,39 +145,75 @@
 
 ## g) 交付与架构口径
 
-- **代码位置**：[`debian/control`](<../../debian/control>) 的 `Package: rsetup-controller` 段与两个包的
+- **代码位置**：[`debian/control`](<../../debian/control>) 的 `Package: rsetup-controller` 与
+  `Package: rsetup-board-agent` 段及三个包的
   `Architecture`；[`debian/rules`](<../../debian/rules>)（`override_dh_auto_build`/`override_dh_auto_install`
-  逐条静态构建 controller 三个 bin，`override_dh_auto_test` 已恢复完整 workspace，
-  `override_dh_installsystemd` 以 `--no-enable` 安装 controller 单元）；
+  逐条静态构建 controller 三个 bin（`rsetup-controller`、`rsetup-controller-migrate`、
+  `rsetup-admin`，后两者的 cargo bin 名与 `/usr/bin` 交付名一致）与板端 bin
+  （`rsetup-board-agent`），
+  `override_dh_auto_test` 已恢复完整 workspace，
+  `override_dh_installsystemd` 以 `--no-enable` 安装 controller 与 board-agent 两个单元）；
   [`data/rsetup-controller.service`](<../../data/rsetup-controller.service>)；
   [`debian/rsetup-controller.default`](<../../debian/rsetup-controller.default>)；
+  [`debian/rsetup-controller.postinst`](<../../debian/rsetup-controller.postinst>)（`configure`
+  分支用 `adduser --system` 幂等建静态账户，不启动服务）；
   [`debian/rsetup-controller.README.Debian`](<../../debian/rsetup-controller.README.Debian>)；
+  [`data/rsetup-board-agent.service`](<../../data/rsetup-board-agent.service>) 与
+  [`debian/rsetup-board-agent.README.Debian`](<../../debian/rsetup-board-agent.README.Debian>)；
   迁移入口 [`crates/rsetup-controller/src/db.rs`](<../../crates/rsetup-controller/src/db.rs>) 的
   `migration_config_from_env`/`run_production_migration` 与
-  [`crates/rsetup-controller/src/bin/migrate-controller.rs`](<../../crates/rsetup-controller/src/bin/migrate-controller.rs>)；
+  [`crates/rsetup-controller/src/bin/migrate-controller.rs`](<../../crates/rsetup-controller/src/bin/migrate-controller.rs>)
+  （cargo bin 名 `rsetup-controller-migrate`）；
   [`debian/rsetup-next.tmpfiles`](<../../debian/rsetup-next.tmpfiles>)（包内安装的 tmpfiles.d 配置）；
   CI 架构矩阵见 [`.github/workflows/ci.yml`](<../../.github/workflows/ci.yml>)。
-- **现状**：controller **已进入包内**，且 Debian 源码包全程离线构建、不需要 Node/npm——
-  `apps/controller-web/dist` 已入库，`build.rs` 编译期读取的资产由源码包自带。`rsetup-controller`
+- **现状**：controller **已进入包内**。前端产物 `apps/controller-web/dist` **不再入库**（整个
+  目录被 `.gitignore` 忽略，仓库也不再保存固定哈希的构建产物）：`debian/control` 的
+  Build-Depends 同时带 `nodejs` 与 `npm`，`debian/rules` 的 `override_dh_auto_build` 在第一条
+  cargo 之前执行 `npm --prefix apps/controller-web ci` 与 `npm --prefix apps/controller-web run
+  build` 现生成 `build.rs` 编译期读取的资产，产物文件名/hash 全由 vite 决定、无处写死；Rust
+  侧仍走 `CARGO_NET_OFFLINE` + 包内 `debian/cargo-home` 离线。`rsetup-controller`
   包安装 `/usr/bin/rsetup-controller`、`/usr/bin/rsetup-controller-migrate`、
-  `/usr/bin/rsetup-controller-reset-admin`、`rsetup-controller.service`、0644 无秘密的
-  `/etc/default/rsetup-controller` 模板与 `README.Debian`；单元用 `DynamicUser=yes` +
-  `StateDirectory=rsetup-controller`，不建静态用户，并以 `--no-enable` + `ConditionPathExists`
-  双重保证装包不启动。`rsetup-next` 包内容不变（CLI/TUI 主二进制、helper、Polkit 策略、
+  `/usr/bin/rsetup-admin`、`rsetup-controller.service`、0644 无秘密的
+  `/etc/default/rsetup-controller` 模板与 `README.Debian`；单元改为静态系统账户
+  `User=rsetup-controller`/`Group=rsetup-controller` + `StateDirectory=rsetup-controller`，
+  账户与同名私有组由 postinst 以 `adduser --system --group --no-create-home --disabled-login`
+  幂等创建（包 `Depends: adduser`），**不再使用 `DynamicUser=yes`**：动态用户的临时 uid 每次
+  启动都不同、状态目录随之重新 chown，`/var/lib/rsetup-controller` 的属主随重启漂移；静态账户
+  让属主跨重启与升级稳定（0700，`rsetup-controller:rsetup-controller`），备份/rsync/ACL 与事后
+  取证才有锚点。单元以 `--no-enable` + `ConditionPathExists`
+  双重保证装包不启动，postinst 也只建账户不启动服务。`rsetup-board-agent` 包安装
+  `/usr/bin/rsetup-board-agent`、`rsetup-board-agent.service`（`User=root`/`Group=root`、
+  `StateDirectory=rsetup-board-agent` 0700、`--watch --interval-secs 10`）与
+  `README.Debian`，同样 `--no-enable`，依赖仅 `systemd`。`rsetup-next` 包内容不变（CLI/TUI 主二进制、helper、Polkit 策略、
   thermal/fan-curve/LED 单元与 tmpfiles.d 配置）。架构口径仍只维护 64 位 `arm64`（aarch64）与
   `amd64`（x86_64），不维护 32 位目标。
 - **影响**：装完包**得不到可用的中控服务**，只得到未启动的交付物：配置 `/etc/default/rsetup-controller`
   （改成 0600 并填入数据库连接串）、对真实库做可恢复备份、设置四个 `CONTROLLER_MIGRATION_*` 门禁、
   `rsetup-controller-migrate --check` 后 `--apply`、`systemctl start`、读取并删除
   `bootstrap-secret.log` 后改密——这些一律是**操作员动作**，仓库不代跑，也没有任何一条被伪造为
-  已完成。本轮已用 `dpkg-buildpackage -d --build=binary --no-sign` 实际成功构建
-  `rsetup-next_0.5.0-1_amd64.deb` 与 `rsetup-controller_0.5.0-1_amd64.deb`，并用
-  `dpkg-deb --contents`/解包冒烟核对包内路径与三个二进制；**系统级 `dpkg -i` 安装、systemd
+  已完成。本轮已用 `DEB_BUILD_OPTIONS=nocheck dpkg-buildpackage -d -b -uc -us`（`-d` 跳过构建依赖
+  校验、`nocheck` 跳过 `override_dh_auto_test` 的完整 workspace 测试）实际成功构建
+  `rsetup-next_0.5.0-1_amd64.deb`、`rsetup-controller_0.5.0-1_amd64.deb` 与新增的
+  `rsetup-board-agent_0.5.0-1_amd64.deb`，并用 `dpkg-deb --contents`/`dpkg -e` 解包核对包内路径
+  （`/usr/bin/rsetup-admin` 已取代旧交付名、`rsetup-board-agent.service` 在
+  `/usr/lib/systemd/system/`、controller 包内 `postinst` 即 `adduser --system` 脚本且无
+  `systemctl` 调用）、`Depends`（controller 含 `adduser`，board-agent 仅 `systemd`）与
+  `readelf -d` 静态性（`rsetup-admin`、`rsetup-board-agent` 均零 `NEEDED`）；**系统级 `dpkg -i` 安装、systemd
   服务启动、真实库上的 `--apply` 与首次启动取凭据仍未执行**（真库迁移证据见
   [`docs/testing/real-db-2026-10-22/report.md`](<real-db-2026-10-22/report.md>)，其中不含本轮的
-  生产入口执行记录）。CI 合同测试已同步为“Debian 构建 controller、无需前端构建”，当前 12/12 通过。
+   生产入口执行记录）。CI 合同测试已同步为「每条编译 controller 的作业都先构建前端；Debian
+   作业经 `debian/rules` 里的 npm 步骤构建；dist 不入库，也不得再被提交比对」，并额外钉住
+   「构建配置与文档不得写死生成资产文件名」，当前 13/13 通过。上述 `.deb` 证据出自 dist 仍入库
+   的那一轮；本轮改为打包期现构建前端后，已用同一条
+   `DEB_BUILD_OPTIONS=nocheck dpkg-buildpackage -d -b -uc -us` 重新构建成功——日志里
+   `override_dh_auto_build` 先 `npm --prefix apps/controller-web ci` 与 `run build` 生成
+   vite 产物，再进入 cargo 静态编译三个包，本次生成的 js/css 资产名嵌入
+   `rsetup-controller`，全程不引用任何提交产物。
 - **下一步**：在受控环境跑一次真实安装链路（`dpkg -i`、`--check`/`--apply` 与首次启动取凭据）并按行
-  合同登记可持久证据；补齐升级路径与卸载残留（`/var/lib/rsetup-controller` 由动态 uid 持有）的复核。
+  合同登记可持久证据；补齐升级路径与卸载残留的复核——静态账户改造后新装的
+  `/var/lib/rsetup-controller` 由 `rsetup-controller` 持有，而**由旧版动态 uid 升级上来的机器**
+  仍可能残留旧属主，需要按 `README.Debian` 里的一次性 `chown -R` 步骤复核（postinst 不代替
+  操作员改动既有状态目录）；purge 时静态账户与状态目录的残留处置同样待复核。
   不改现有架构口径。
 
 ## h) CSRF 绑定容量清理的边界

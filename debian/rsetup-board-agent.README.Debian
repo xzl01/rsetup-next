@@ -1,0 +1,69 @@
+rsetup-board-agent — notes for Debian users
+===========================================
+
+What this package provides
+--------------------------
+
+  /usr/bin/rsetup-board-agent                board-side agent binary
+  /usr/lib/systemd/system/rsetup-board-agent.service
+  /var/lib/rsetup-board-agent                durable task journal (state, mode 0700)
+
+The unit is installed but neither enabled nor started
+(dh_installsystemd --no-enable), and because of that the package carries no
+systemd maintainer snippet either — installing or upgrading it does not run
+`systemctl daemon-reload` for you. To run the read-only sampler on this board:
+
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now rsetup-board-agent
+  journalctl -u rsetup-board-agent -f
+
+Read this before you enable it
+------------------------------
+
+This package delivers the agent's read-only half, and nothing more:
+
+  * The production encrypted tunnel is NOT wired up. The unit starts the binary's
+    --watch loop, i.e. a local read-only sampling of device.status.get every 10
+    seconds written to journald. The process opens no session with a controller —
+    the wire protocol codec has not been approved, so there is nothing to connect
+    to yet.
+  * A real host reboot boundary is NOT implemented. Both device.reboot.prepare
+    and device.reboot.execute answer "capability unavailable"; the binary and the
+    unit never reboot the machine.
+
+Enabling the unit therefore gives you an always-on local probe, not a controllable
+board. Do not record the control path (in particular reboot) as closed-loop on the
+strength of this package.
+
+Running user: root
+------------------
+
+The unit runs as User=root/Group=root, without a dedicated unprivileged account
+and without DynamicUser. The agent reads the whole board's hardware and system
+state (/proc and /sys temperatures, load, memory, the kernel boot_id, and the
+firmware/partition/power sources that will be added later); those sources are not
+uniformly readable by an unprivileged user, and running as one root process under
+the sandbox below is preferable to widening a sudo/polkit allow-list per reading.
+
+Because the process is root, the unit keeps the surrounding restrictions:
+ProtectSystem=strict makes /usr and /etc read-only for it, ProtectHome=yes hides
+home directories, PrivateTmp=yes, NoNewPrivileges=yes and LockPersonality=yes are
+set, and /var/lib/rsetup-board-agent (created 0700 by StateDirectory) is the only
+path it may write to. RestrictAddressFamilies permits IPv4/IPv6/Unix sockets only —
+the current --watch mode binds no socket at all; the allowance is there so the unit
+needs no change once the tunnel is actually connected.
+
+Local, non-systemd runs
+-----------------------
+
+Run by hand, the binary runs as whoever invokes it (no privilege elevation of any
+kind), for example:
+
+  rsetup-board-agent --once
+  rsetup-board-agent --watch --interval-secs 10
+  rsetup-board-agent --loopback-test-server --listen 127.0.0.1:39876
+
+The last mode is a test-only JSON-lines console on loopback; it is not the
+production wire protocol and must not be exposed. Some readings require root to be
+meaningful, which is why the packaged unit runs as root while a manual run stays
+with the invoking user.

@@ -125,8 +125,8 @@ rsetup 将观察与变更分离：
 ## 构建与运行
 
 ```bash
-# 不需要 Node、npm 或网络：rsetup-controller 编译期嵌入的 apps/controller-web/dist
-# 已随仓库提供。
+# 前端按需构建：第一条要编译 rsetup-controller 的目标会先替你跑 `npm ci` 与
+# `vite build`，因为 apps/controller-web/dist 是构建产物，不随仓库提交。
 make build
 make test
 
@@ -140,19 +140,20 @@ cargo run -p rsetup-next -- --demo serve
 
 启动服务器后，打开 `http://127.0.0.1:8788`。
 
-`build` 与 `test`（以及同样要编译 workspace 的 `lint`、`metrics-gates`、`msrv-check`、
-`controller-test-offline`）都依赖 `web-dist-check` 目标：它只检查
-`apps/controller-web/dist/index.html` 是否存在。前端产物**已随仓库提交**，干净检出用
-裸 cargo 就能构建整个 workspace，这几个目标全程不碰 npm。
+`build` 与 `test`（以及同样要编译 workspace 的 `lint`、`metrics-gates`、
+`controller-test-offline`）都依赖 `web-dist-check` 目标：它保证 cargo 开工前
+`apps/controller-web/dist/index.html` 已在位——**缺失就自动执行 `make web-build`**
+把前端构建出来，已存在则只确认一次，热工作区不会重复装依赖。
+`apps/controller-web/dist` 是 **vite 生成的产物**，整个目录被 git 忽略：前端在本地、
+CI 与 Debian 打包时各自编译，仓库不再保存固定哈希的提交产物，任何地方也都不写死
+生成文件的文件名与 hash。
 
-默认工具链为当前 stable Rust（本地以 rustc 1.99.1 验证）。MSRV 仍保持 1.85：
-`make msrv-check` 使用已安装的 1.85.0 工具链跑 workspace 测试，不把 1.85.0 设为默认。
+工具链统一用当前 stable Rust（本地以 rustc 1.99.1 验证），**不再锁定最低版本**：
+manifest 里没有 `rust-version`，Makefile 与 CI 也都不再有单独的低版本验证作业。
 
-dist 入库换来的是**一条纪律**：改过 `apps/controller-web` 源码后必须运行
-`make web-build`，并把重新生成的 `dist` 与源码改动一起提交。CI 会从源码重新构建前端，
-再用 `git diff --exit-code -- apps/controller-web/dist` 比对，比对不为空即判红，
-过期的 dist 混不过 pull request。`make web-build`（等价于 `web-assets`）是显式的重建
-入口，用**两个** stamp 分层：
+改过 `apps/controller-web` 源码后没有额外要提交的东西：`make web-build` 重新生成
+`dist`（下次跑编译类目标时 `web-dist-check` 也会自己补上），产物与 stamp 都在忽略
+列表里，永远不出现在 diff 中。`make web-build` 是显式的重建入口，用**两个** stamp 分层：
 
 | stamp | 何时重新生成 | 配方 |
 | --- | --- | --- |
@@ -161,9 +162,10 @@ dist 入库换来的是**一条纪律**：改过 `apps/controller-web` 源码后
 
 分层正是要点：改一个组件只会重跑 `vite build`，绝不再跑 `npm ci`；`*.test.ts` 与
 `*.test.js` 不是 `vite build` 的输入，改测试文件同样不会重建 `dist`。两个 stamp 文件
-本身被 git 忽略，它们代表的 dist 产物不被忽略。
+都落在被 git 忽略的目录里（`node_modules/` 与 `dist/`），这也是 dist 永远不会出现在
+diff 里的原因。
 
-只有 `make web-build` 需要 Node 22 与 npm（冷缓存首次执行还需网络）。两条离线路子：
+构建前端这一步才需要 Node 22 与 npm（冷缓存首次执行还需网络）。两条离线路子：
 
 ```bash
 # 1. 本机 npm cache 已预热：把参数直接透传给 `npm ci`。
@@ -176,14 +178,15 @@ touch apps/controller-web/dist/.rsetup-build-stamp
 ```
 
 只把 `node_modules` 拷过来而不补 stamp 是无效的：make 仍认为先决条件更新，照样去跑
-`npm ci`，而这正是离线环境会失败的一步。但注意：**构建 workspace 本身已经不需要这两条**，
-它们只在改动前端源码、需要重新生成 dist 时才用得上。
+`npm ci`，而这正是离线环境会失败的一步。这两条同样能满足 `web-dist-check`：机器没有
+网络时，只要 `dist` 已在位，编译类目标就不会去碰 npm。
 
 `make metrics-static-gates` 只跑指标线的只读 grep 静态门禁：不编译、不联网、不需要前端
 产物，CI 可单独调用。其中「不得提交配置实体/凭据目录」这条查**两份**清单——暂存区
 （`git diff --cached --name-only`）与已跟踪文件（`git ls-files`）：CI 是干净检出，暂存区
 为空，只查暂存区的门禁在那里等于什么都没看。`make metrics-gates` 在其之外再跑
-`fmt-check`、dist 存在性检查、clippy 与 controller 测试。
+`fmt-check`、前端产物检查（`web-dist-check`，dist 缺失时会自动构建）、clippy 与
+controller 测试。
 
 Rust 格式检查请使用 `make fmt-check`，不要使用 `cargo fmt --all`，因为后者会把第三方 submodule `externals/devicesinfo` 一并纳入检查范围；详见 [AGENTS.md](AGENTS.md) 的「Rust 格式检查口径」。
 
@@ -269,8 +272,8 @@ Tauri 打包有意放在根 Cargo workspace 之外，以便普通的 CLI/TUI/ser
 
 `rsetup-controller` 是独立的 HTTP 控制面可执行文件，与 `rsetup-next` 的 CLI/TUI/server
 分开，并以 `rsetup-controller` 之名独立成包（与 `rsetup-next` 同一源码包，安装方式见下文
-「从 Debian 软件包安装」）。它作为 workspace 成员构建（编译期嵌入的前端 `dist` 已随
-仓库提供，无需额外构建步骤，详见「构建与运行」），启动方式：
+「从 Debian 软件包安装」）。它作为 workspace 成员构建（编译期读取的前端 `dist` 缺失时由
+`web-dist-check` 自动构建，无需记住额外的步骤，详见「构建与运行」），启动方式：
 
 ```bash
 cargo run -p rsetup-controller
@@ -303,7 +306,7 @@ cargo run -p rsetup-controller
 进程生成一次性管理员凭据并写入上述私有文件（以 `0600` 与 `O_EXCL` 创建，父目录不受保护，
 因此必须在私有目录下启动进程）。该文件读取一次、登录后立即改密并删除。
 
-`reset-admin` 是内置管理员账号的本机应急通道：不接受任何参数，向控制终端签发一次性新
+`rsetup-admin` 是内置管理员账号的本机应急通道：不接受任何参数，向控制终端签发一次性新
 凭据并留下审计事件。它的门禁是 OS 的真实/有效 UID，加上 stdin、stdout、stderr 各自都是
 真实 TTY 且 `/dev/tty` 可写。因此非交互的 SSH 单命令执行、cron 与管道都无法驱动它；而
 交互式 `ssh -t` 会分配 pty，同样的 root+TTY 检查会像在本地键盘前一样通过，仍受同一道门禁
@@ -311,17 +314,27 @@ cargo run -p rsetup-controller
 
 ### 从 Debian 软件包安装
 
-`rsetup-controller` 二进制包由本源码包构建，构建过程不需要 Node.js 与 npm：`build.rs`
-编译期嵌入的 `apps/controller-web/dist` 已入库，`dpkg-buildpackage` 全程离线。包内容：
+`rsetup-controller` 二进制包由本源码包构建。它的构建步骤会先用 npm 现生成前端
+（`debian/rules` 里的 `npm --prefix apps/controller-web ci` 与
+`npm --prefix apps/controller-web run build`），再进入 cargo：`build.rs` 编译期读取的
+`apps/controller-web/dist` 不在源码包里，只有 Rust 侧保持离线。包内容：
 
 | 路径 | 用途 |
 | --- | --- |
 | `/usr/bin/rsetup-controller` | 控制面进程（单元 `rsetup-controller.service`） |
 | `/usr/bin/rsetup-controller-migrate` | 显式 schema 迁移，`--check` / `--apply` |
-| `/usr/bin/rsetup-controller-reset-admin` | 本机 root 管理员应急恢复（源 bin 名 `reset-admin`） |
+| `/usr/bin/rsetup-admin` | 本机 root 管理员应急恢复（cargo bin 名与交付名一致；源文件 `src/bin/reset-admin.rs`） |
 | `/etc/default/rsetup-controller` | `EnvironmentFile` 模板，0644，不含任何秘密 |
-| `/usr/lib/systemd/system/rsetup-controller.service` | 单元：`DynamicUser=yes`、`StateDirectory=rsetup-controller` |
+| `/usr/lib/systemd/system/rsetup-controller.service` | 单元：`User=rsetup-controller`（静态系统账户）、`StateDirectory=rsetup-controller` |
 | `/usr/share/doc/rsetup-controller/README.Debian` | 完整的安装后操作步骤 |
+
+单元显式降权到静态系统账户 `rsetup-controller`（`User=`/`Group=`）：该账户与同名私有组由
+包安装脚本以 `adduser --system --group --home /var/lib/rsetup-controller --no-create-home
+--disabled-login` 幂等创建，uid/gid 一经分配不再变化，`/var/lib/rsetup-controller` 的属主
+因此跨重启、跨升级保持稳定（0700，`rsetup-controller:rsetup-controller`），备份、rsync 与
+ACL 策略都有稳定锚点。不再使用 `DynamicUser=yes`：动态用户每次启动换一个临时 uid/gid，
+systemd 每次都要重新 chown 状态目录，持久状态的属主随重启漂移，事后取证与授权策略失去锚点。
+安装脚本只建账户，不启动也不 enable 任何服务。
 
 软件包既不 enable 也不启动服务：`dh_installsystemd --no-enable` 让单元不进启动路径，单元
 自身的 `ConditionPathExists=/etc/default/rsetup-controller` 又保证未写配置时保持 inactive，
@@ -347,7 +360,7 @@ cargo run -p rsetup-controller
    `/var/lib/rsetup-controller/bootstrap-secret.log`（`0600`、`O_EXCL`）；读取一次、登录
    改密后删除该文件。
 6. 管理员账号遗失或死锁时，在中控主机本机以 root 交互式终端执行
-   `rsetup-controller-reset-admin`。
+   `rsetup-admin`。
 7. 默认只监听 `127.0.0.1:8080`；要跨机访问必须经反向代理 + TLS + 可信管理网，并让
    `CONTROLLER_ALLOWED_HOSTS`/`CONTROLLER_ALLOWED_ORIGIN` 与反代实际转发的值一致。
 
@@ -376,6 +389,19 @@ cargo build -p rsetup-board-agent --release --bin rsetup-board-agent
 
 JSON-lines 协议与边界见 [crates/rsetup-board-agent/README.md](crates/rsetup-board-agent/README.md)。
 
+板侧交付与运行用户：`rsetup-board-agent` 是同源码包构建的独立 Debian 包，装
+`/usr/bin/rsetup-board-agent` 与单元
+`/usr/lib/systemd/system/rsetup-board-agent.service`（`dh_installsystemd --no-enable`，默认
+不启用）。单元固定以 `User=root`/`Group=root` 运行只读采样 watch 循环
+（`--interval-secs 10 --journal-dir /var/lib/rsetup-board-agent`，状态目录由
+`StateDirectory` 建为 0700）：整机硬件与系统状态来源并非一律对非特权用户可读，因此板端的
+生产与测试部署口径统一为 root，配合 `ProtectSystem=strict`、`NoNewPrivileges=yes`、
+`PrivateTmp=yes`、`ProtectHome=yes`、`LockPersonality=yes` 与唯一 `ReadWritePaths` 的沙箱
+限制运行。手工在 shell 里运行不做任何提权，仍以调用者身份执行。**边界未变**：生产加密隧道
+尚未接线，该单元启动的是只写本地 journald 的采样循环，不与中控建立任何加密会话；
+`device.reboot.prepare` 与 `device.reboot.execute` 一律返回 capability unavailable，真实重启
+边界仍未实现。
+
 支持并按 CI 验证的架构为 `arm64`（aarch64）与 `amd64`（x86_64），不再维护 32 位目标。
 
 ## 项目结构
@@ -396,12 +422,16 @@ scripts/import-pinouts.mjs 用于本地 pin-out checkout 的可复现导入器
 
 该软件包安装 `rsetup-next` CLI/TUI/Web 二进制文件、其最小特权的 helper、配套的 Polkit 策略、thermal、fan-curve 和 LED 单元，以及固定 SPI 操作使用的 `mtd-utils` 依赖。风扇服务将 root 可写、用户可读的配置持久化到 `/etc/rsetup-next/fan-curve.json`，并作为 `rsetup-next-fan-curve.service` 运行。它不安装已移除的 Bash 实现，也不以 root 身份运行浏览器进程。可选的 `device-tree-compiler`、`gpiod`、`v4l-utils` 和 `ffmpeg` 软件包可增强对应的硬件工具。
 
-同一源码包另会构建 `rsetup-controller`：控制面进程、两个操作员 CLI、一个 systemd 单元与
-`/etc/default/rsetup-controller` 模板。它装了什么、以及操作员仍需亲自执行的迁移与配置步骤，
-见「控制器」章节下的「从 Debian 软件包安装」。两个包的构建都不需要 Node.js 与 npm：测试步骤
-跑整个 workspace（含 controller），cargo 处于离线模式，前端资产用已入库的
-`apps/controller-web/dist`（即 `build.rs` 编译期读取的那一份）。controller 单元以关闭状态
-安装（`dh_installsystemd --no-enable`），且未写配置文件时自身拒绝启动，因此装包不拉起任何
+同一源码包另会构建两个包。`rsetup-controller`：控制面进程、两个操作员 CLI
+（`rsetup-controller-migrate`、`rsetup-admin`）、一个 systemd 单元与
+`/etc/default/rsetup-controller` 模板；单元降权到安装时创建的静态系统账户
+`rsetup-controller`。它装了什么、以及操作员仍需亲自执行的迁移与配置步骤，
+见「控制器」章节下的「从 Debian 软件包安装」。`rsetup-board-agent`：板端代理二进制与
+自己的 systemd 单元，以 root 运行只读采样 watch，生产加密隧道与真实重启尚未接线。
+三个包的构建都需要 Node.js 与 npm（两者都在 `Build-Depends` 里）：`debian/rules` 在
+cargo 之前用 `npm ci` + `npm run build` 现生成 controller 嵌入的前端产物，Rust 侧才保持
+`CARGO_NET_OFFLINE` 与包内 Cargo 缓存离线。两个 systemd 单元都以关闭状态
+安装（`dh_installsystemd --no-enable`），controller 单元另外在未写配置文件时自身拒绝启动，因此装包不拉起任何
 服务、也不触碰任何数据库。
 
 该软件包依赖 `xz-utils`：写入压缩的 `.img.xz` 系统镜像时通过 `xz -dc` 解压。选择硬依赖
@@ -416,7 +446,7 @@ make deb
 
 `deb-prepare` 将锁定版本的 Rust 依赖下载到被忽略的、软件包本地的 Cargo 缓存中。随后的 `dpkg-buildpackage` 步骤以离线模式运行 Cargo。生成的软件包仅通过本仓库维护和分发；不打算提交至 Debian 归档。
 
-软件包在 Debian 13/Trixie 上以 Rust 1.85 或更高版本构建，然后在 Debian 12/Bookworm 上安装并冒烟测试。Bookworm 是运行时兼容基线；其 Rust 1.63 工具链不用于源码构建。CI 同时校验 amd64 和 arm64 软件包。
+软件包在 Debian 13/Trixie 上以其当前 stable Rust 工具链构建，然后在 Debian 12/Bookworm 上安装并冒烟测试。Bookworm 是运行时兼容基线；其 Rust 1.63 工具链不用于源码构建。CI 同时校验 amd64 和 arm64 软件包。
 
 `ui/assets` 下的 SoC 厂商标识仍归其各自所有者所有。它们仅用于设备厂商识别，不会按本项目的 GPL-3+ 许可证重新授权。
 

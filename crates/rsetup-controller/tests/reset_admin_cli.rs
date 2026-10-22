@@ -1,4 +1,4 @@
-//! `reset-admin` CLI 的真实子进程验收：只验证 fail-closed 行为，不接触任何数据库。
+//! `rsetup-admin`（概念名 reset-admin）CLI 的真实子进程验收：只验证 fail-closed 行为，不接触任何数据库。
 //!
 //! 子进程的 stdin/stdout/stderr 均为管道（非交互 TTY），因此在任何 DB 访问之前就会被拒绝；
 //! 这正是要断言的生产语义：非交互、无配置、非法参数一律非 0 退出，且输出零凭据。
@@ -8,7 +8,7 @@ use std::ffi::OsStr;
 use std::process::{Command, Output, Stdio};
 
 fn reset_admin_binary() -> &'static str {
-    env!("CARGO_BIN_EXE_reset-admin")
+    env!("CARGO_BIN_EXE_rsetup-admin")
 }
 
 fn run<I, S>(args: I, clear_database_url: bool) -> Output
@@ -27,7 +27,7 @@ where
     }
     command
         .output()
-        .expect("reset-admin binary must be executable")
+        .expect("rsetup-admin binary must be executable")
 }
 
 fn text(output: &Output) -> String {
@@ -50,14 +50,14 @@ fn help_is_served_without_configuration_or_database_access() {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
-            .expect("reset-admin binary must be executable");
+            .expect("rsetup-admin binary must be executable");
         assert!(
             output.status.success(),
             "usage must succeed: {}",
             text(&output)
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("reset-admin"));
+        assert!(stdout.contains("rsetup-admin"));
         assert!(stdout.contains("/dev/tty"));
         assert!(!stdout.contains("Temporary password"));
     }
@@ -111,7 +111,7 @@ fn non_interactive_invocation_without_configuration_fails_closed() {
 }
 
 /// 以原始字节构造参数，绕开 Rust 源码的 UTF-8 约束，还原操作员在 shell 里
-/// 误传非法字节口令的真实场景（例如 `reset-admin $'FAKE_PASSWORD\xff'`）。
+/// 误传非法字节口令的真实场景（例如 `rsetup-admin $'FAKE_PASSWORD\xff'`）。
 #[cfg(unix)]
 fn raw_os_bytes(bytes: &[u8]) -> std::ffi::OsString {
     use std::os::unix::ffi::OsStringExt as _;
@@ -138,7 +138,7 @@ fn assert_fail_closed_no_leak(output: &Output, secret: &[u8], label: &str) {
         "{label}: stderr 含非 ASCII 字节，等于回显外部输入"
     );
     assert!(
-        stderr.contains("reset-admin: unexpected argument"),
+        stderr.contains("rsetup-admin: unexpected argument"),
         "{label}: 缺少固定脱敏错误行: {stderr}"
     );
     assert!(
@@ -229,7 +229,7 @@ fn non_utf8_configuration_value_is_not_echoed() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .expect("reset-admin binary must be executable");
+        .expect("rsetup-admin binary must be executable");
 
     assert_eq!(output.status.code(), Some(1), "必须固定失败而非 panic");
     assert!(output.stdout.is_empty());

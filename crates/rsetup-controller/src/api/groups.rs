@@ -261,10 +261,10 @@ async fn patch_group(
         Ok(revision) => revision,
         Err(response) => return response,
     };
-    if let Some(name) = input.name.as_deref() {
-        if let Err(error) = validate_group_name(name) {
-            return map_error(error);
-        }
+    if let Some(name) = input.name.as_deref()
+        && let Err(error) = validate_group_name(name)
+    {
+        return map_error(error);
     }
     let patched = match state
         .gateway

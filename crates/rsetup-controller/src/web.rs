@@ -151,10 +151,11 @@ fn is_known_spa_path(path: &str) -> bool {
         return true;
     }
     for prefix in ["/devices/", "/tasks/"] {
-        if let Some(rest) = path.strip_prefix(prefix) {
-            if !rest.is_empty() && !rest.contains('/') {
-                return true;
-            }
+        if let Some(rest) = path.strip_prefix(prefix)
+            && !rest.is_empty()
+            && !rest.contains('/')
+        {
+            return true;
         }
     }
     false

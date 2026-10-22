@@ -1,8 +1,11 @@
-// 本模块是被多个集成测试引入的共享测试辅助库：migration_v4.rs 用显式
-// `#[path = "common/mod.rs"] mod common;`，mysql_identity.rs 与 tidb_identity.rs
-// 走目录约定 `mod common;`；
+// 本模块是被多个集成测试引入的共享测试辅助库：mysql_identity.rs、tidb_identity.rs
+// 与 metrics_real_db.rs 走目录约定 `mod common;`；
 // 每个集成测试是独立编译的二进制，只会调用自身需要的辅助函数，
 // 因此其余辅助条目必然在部分测试目标中呈现为未使用，此处统一豁免 dead_code。
+//
+// 基线约定：所有真库用例以**当前受支持的身份 schema v4 为唯一基线**，v4 库由操作员
+// 预先迁移预置；用例只连接、断言与写入业务数据，绝不在用例内构造 v1/v2/v3 中间态，
+// 也不再调用显式 test migration 工具（migrate-identity-test）搭建夹具。
 #![allow(dead_code)]
 use rsetup_controller::{ControllerConfig, DbPool, TestMigrationConfig};
 use std::sync::Mutex;
@@ -29,28 +32,20 @@ pub async fn required_test_db() -> DbPool {
     db
 }
 
-pub async fn required_fresh_identity_db() -> DbPool {
-    let db = required_test_db().await;
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE()",
-    )
-    .fetch_one(&db.0)
-    .await
-    .unwrap_or_else(|_| panic!("task4_fixture_operation_failed"));
-    assert_eq!(
-        count, 0,
-        "fresh disposable test schema required; never reset existing schema"
-    );
-    db
-}
-
-pub async fn assert_fresh_v3_is_check_and_fk_free(db: &DbPool) {
+/// v4 基线结构断言（接替原 v3 终态基线断言，语义保持）：夹具库已由操作员预迁移到
+/// 当前受支持版本 v4。断言 `schema_meta.schema_version = 4`、singleton 单行且尚未
+/// 初始化、CHECK/FOREIGN KEY 约束为零、恰好 16 张表（11 identity + 5 runtime），
+/// 最后由 v4 普通启动门禁 `check_identity_schema` 放行。
+pub async fn assert_fresh_v4_is_check_and_fk_free(db: &DbPool) {
     let version: i32 =
         sqlx::query_scalar("SELECT schema_version FROM schema_meta WHERE singleton = 1")
             .fetch_one(&db.0)
             .await
             .unwrap_or_else(|_| panic!("task4_fixture_operation_failed"));
-    assert_eq!(version, 3);
+    assert_eq!(
+        version, 4,
+        "fixture must be on supported identity schema v4"
+    );
     let initialized: bool =
         sqlx::query_scalar("SELECT initialized FROM schema_meta WHERE singleton = 1")
             .fetch_one(&db.0)
@@ -71,79 +66,46 @@ pub async fn assert_fresh_v3_is_check_and_fk_free(db: &DbPool) {
     .fetch_one(&db.0)
     .await
     .unwrap_or_else(|_| panic!("task4_fixture_operation_failed"));
-    assert_eq!(tables, 11);
-    rsetup_controller::check_v3_ready(db)
+    assert_eq!(tables, 16, "v4 fixture must have exactly 16 tables");
+    rsetup_controller::check_identity_schema(db)
         .await
         .unwrap_or_else(|_| panic!("task4_fixture_operation_failed"));
 }
 
-pub async fn assert_actor_fixture_v3_without_check_or_fk(db: &DbPool) {
+/// v4 基线夹具入口：直接连接操作员已预迁移到 v4 的测试库，一次核验目标引擎身份与
+/// v4 基线结构。`bootstrap_admin`、`AdmissionStore::compare_and_set` 的写事务 guard
+/// （`integrity::lock_integrity_guard`）与普通启动门禁的期望版本均取编译期
+/// `SUPPORTED_SCHEMA_VERSION = 4`，因此夹具必须已是 v4；用例不再自行到达 v4。
+pub async fn required_v4_identity_db(expected: ExpectedIdentityEngine) -> DbPool {
+    let db = required_test_db().await;
+    let version: String = sqlx::query_scalar("SELECT VERSION()")
+        .fetch_one(&db.0)
+        .await
+        .expect("read target engine identity before fixture assertions");
+    assert!(
+        version_matches_expected_engine(&version, expected),
+        "fixture target engine does not match expected identity"
+    );
+    assert_fresh_v4_is_check_and_fk_free(&db).await;
+    db
+}
+
+pub async fn assert_actor_fixture_v4_without_check_or_fk(db: &DbPool) {
     let version: i32 =
         sqlx::query_scalar("SELECT schema_version FROM schema_meta WHERE singleton = 1")
             .fetch_one(&db.0)
             .await
             .unwrap_or_else(|_| panic!("task4_fixture_operation_failed"));
-    assert_eq!(version, 3, "actor fixture must be on identity schema v3");
+    assert_eq!(version, 4, "actor fixture must be on identity schema v4");
     let constraints: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.table_constraints WHERE table_schema = DATABASE() AND constraint_type IN ('CHECK', 'FOREIGN KEY')")
         .fetch_one(&db.0).await.unwrap_or_else(|_| panic!("task4_fixture_operation_failed"));
     assert_eq!(constraints, 0, "actor fixture must have no CHECK or FK");
-    rsetup_controller::check_v3_ready(db)
+    rsetup_controller::check_identity_schema(db)
         .await
         .unwrap_or_else(|_| panic!("task4_fixture_operation_failed"));
 }
 
-/// 夹具升级辅助：把显式 test migration 建成的 v3 终态库升级到 **v4（当前受支持版本）**。
-///
-/// 为什么必须升级：显式 `migrate-identity-test --mode upgrade` 的终态只有 v3，
-/// 而当前生产代码只支持 v4 —— `bootstrap_admin` 与 `AdmissionStore::compare_and_set`
-/// 在同一写事务内先取 `integrity::lock_integrity_guard`，其期望版本取自编译期
-/// `SUPPORTED_SCHEMA_VERSION`（=4），v3 库必然 `Config("identity data meta.guard")`；
-/// 普通启动门禁 `check_identity_schema` 也会先 `SchemaNotReady { required: 4 }`。
-/// 因此凡调用 v4-only 生产入口的用例都必须先经本函数升级；v3 只作为**迁移起点**
-/// 保留，并在此显式校验后才放行 v4 迁移。
-pub async fn upgrade_fixture_to_v4(db: &DbPool) {
-    // 1. 起点：显式 test migration 幂等续跑，确认库确实处于 v3 终态。
-    run_explicit_identity_test_command("upgrade");
-    let v3_version: i32 =
-        sqlx::query_scalar("SELECT schema_version FROM schema_meta WHERE singleton = 1")
-            .fetch_one(&db.0)
-            .await
-            .unwrap_or_else(|_| panic!("task4_fixture_v3_baseline_failed"));
-    assert_eq!(
-        v3_version, 3,
-        "fixture must be at v3 before the explicit v4 migration"
-    );
-    rsetup_controller::check_v3_ready(db)
-        .await
-        .unwrap_or_else(|_| panic!("task4_fixture_v3_baseline_failed"));
-    // 2. 生产 v3 → v4 迁移入口（普通启动路径绝不隐式调用，只能显式触发）。
-    rsetup_controller::db::run_schema_v4_migration(db)
-        .await
-        .unwrap_or_else(|_| panic!("task4_fixture_v4_migration_failed"));
-    // 3. 终态：v4 普通启动门禁确认真实到达 v4（版本 + identity 结构 + runtime 五表
-    //    + identity 数据 + runtime 数据 + 无 FK），随后沿用既有断言口径复核结构。
-    rsetup_controller::check_identity_schema(db)
-        .await
-        .unwrap_or_else(|_| panic!("task4_fixture_v4_gate_failed"));
-    let v4_version: i32 =
-        sqlx::query_scalar("SELECT schema_version FROM schema_meta WHERE singleton = 1")
-            .fetch_one(&db.0)
-            .await
-            .unwrap_or_else(|_| panic!("task4_fixture_v4_gate_failed"));
-    assert_eq!(v4_version, 4, "fixture must be at v4 after the migration");
-    let tables: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE()",
-    )
-    .fetch_one(&db.0)
-    .await
-    .unwrap_or_else(|_| panic!("task4_fixture_v4_gate_failed"));
-    assert_eq!(tables, 16, "v4 fixture must have exactly 16 tables");
-    let constraints: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.table_constraints WHERE table_schema = DATABASE() AND constraint_type IN ('CHECK', 'FOREIGN KEY')")
-        .fetch_one(&db.0).await.unwrap_or_else(|_| panic!("task4_fixture_v4_gate_failed"));
-    assert_eq!(constraints, 0, "v4 fixture must have no CHECK or FK");
-}
-
-/// 夹具健康检查（v4 口径）：夹具已由 `upgrade_fixture_to_v4` 升到 v4 后，任何
+/// 夹具健康检查（v4 口径）：夹具由操作员预置为 v4（当前受支持版本），任何
 /// 「夹具仍然健康」的中途复核都必须用 v4 普通启动门禁；沿用 v3 终态门禁
 /// `check_v3_ready` 会在 v4 库上必然 `SchemaNotReady { required: 3 }` 而误报。
 pub async fn assert_v4_fixture_healthy(db: &DbPool) {
@@ -198,100 +160,13 @@ fn version_gate_rejects_wrong_engine_without_live_database() {
     }
 }
 
-pub async fn assert_legacy_fixture_upgrades_to_v3(mode: &str, expected: ExpectedIdentityEngine) {
-    assert!(matches!(mode, "fixture-v1" | "fixture-v2" | "mixed-v1"));
-    let db = required_fresh_identity_db().await;
-    let version: String = sqlx::query_scalar("SELECT VERSION()")
-        .fetch_one(&db.0)
-        .await
-        .expect("read target engine identity before fixture DDL");
-    assert!(
-        version_matches_expected_engine(&version, expected),
-        "fixture target engine does not match expected identity"
-    );
-    run_explicit_identity_test_command(if mode == "mixed-v1" {
-        "fixture-v1"
-    } else {
-        mode
-    });
-    if mode == "mixed-v1" {
-        run_explicit_identity_test_command("fixture-partial-v1");
-    }
-    let original_version = if mode == "fixture-v2" { 2 } else { 1 };
-    let id: Vec<u8> = sqlx::query_scalar("SELECT instance_id FROM schema_meta WHERE singleton=1")
-        .fetch_one(&db.0)
-        .await
-        .unwrap();
-    let user_id = uuid::Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id,username,display_name,password_hash,active,is_admin,must_change_password,revision,created_time) VALUES (?, 'legacy_fixture', 'Fixture', 'fixture-placeholder', TRUE, TRUE, FALSE, 7, NOW(6))")
-        .bind(user_id.as_bytes().as_slice()).execute(&db.0).await.unwrap();
-    sqlx::query("UPDATE schema_meta SET initialized=TRUE WHERE singleton=1")
-        .execute(&db.0)
-        .await
-        .unwrap();
-    // 这里断言的是「尚未达到 v3」，期望版本必须锁定为 3，因此只能用 v3 终态
-    // 门禁；v4 启动门禁 check_identity_schema 会先按 required=4 fail-closed，
-    // 掩盖真正的 v3 版本判定。
-    assert!(matches!(
-        rsetup_controller::check_v3_ready(&db).await,
-        Err(rsetup_controller::ControllerError::SchemaNotReady { found: Some(found), required: 3 }) if found == original_version
-    ));
-    run_explicit_identity_test_command("upgrade");
-    // 显式 test migration 的终态是 v3（仅 11 张 identity 表，无 runtime 五表），
-    // 收尾校验必须用 v3 终态门禁，而不是 v4 普通启动门禁。
-    rsetup_controller::check_v3_ready(&db).await.unwrap();
-    let meta: (i32, Vec<u8>, bool) = sqlx::query_as(
-        "SELECT schema_version,instance_id,initialized FROM schema_meta WHERE singleton=1",
-    )
-    .fetch_one(&db.0)
-    .await
-    .unwrap();
-    assert_eq!(meta.0, 3);
-    assert_eq!(meta.1, id);
-    assert!(meta.2);
-    let user: (String, u64) = sqlx::query_as("SELECT password_hash,revision FROM users WHERE id=?")
-        .bind(user_id.as_bytes().as_slice())
-        .fetch_one(&db.0)
-        .await
-        .unwrap();
-    assert_eq!(user, ("fixture-placeholder".into(), 7));
-    let constraints: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.table_constraints WHERE table_schema=DATABASE() AND constraint_type IN ('CHECK','FOREIGN KEY')")
-        .fetch_one(&db.0).await.unwrap();
-    assert_eq!(constraints, 0);
-    run_explicit_identity_test_command("upgrade");
-    let retried: (i32, Vec<u8>, bool) = sqlx::query_as(
-        "SELECT schema_version,instance_id,initialized FROM schema_meta WHERE singleton=1",
-    )
-    .fetch_one(&db.0)
-    .await
-    .unwrap();
-    assert_eq!(retried, meta);
-}
-
 pub async fn required_prepared_identity_db() -> DbPool {
     let db = required_test_db().await;
-    // 夹具库由 test migration 建到 v3 终态，门禁必须同为 v3 终态门禁。
-    rsetup_controller::check_v3_ready(&db)
+    // 夹具库由操作员预置为当前受支持版本 v4，重连健康检查必须用 v4 普通启动门禁。
+    rsetup_controller::check_identity_schema(&db)
         .await
-        .expect("existing v3 identity schema");
+        .expect("existing v4 identity schema");
     db
-}
-
-pub fn run_explicit_identity_test_command(mode: &str) {
-    assert!(matches!(
-        mode,
-        "upgrade" | "fixture-v1" | "fixture-partial-v1" | "fixture-v2"
-    ));
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_migrate-identity-test"))
-        .args(["--mode", mode])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .unwrap_or_else(|_| panic!("task4_migration_process_failed"));
-    assert!(
-        status.success(),
-        "explicit test migration failed; inspect disposable schema manually"
-    );
 }
 
 #[test]
@@ -329,213 +204,6 @@ fn fixture_authorization_requires_all_confirmations() {
         assert!(c.authorize("test_identity").is_err());
     }
     assert!(base.authorize("test_not_expected").is_err());
-}
-
-// Each caller must provide a different authorized, backed-up, empty database. Never
-// run the entire ignored matrix against one URL; each invocation consumes its fixture.
-const NEGATIVE_FIXTURES: [(&str, &str, &str, &str); 10] = [
-    (
-        "schema_meta",
-        "authz_epoch",
-        "UPDATE schema_meta SET authz_epoch = -1 WHERE singleton = 1",
-        "SELECT authz_epoch FROM schema_meta WHERE singleton = 1",
-    ),
-    (
-        "schema_meta",
-        "admin_guard_revision",
-        "UPDATE schema_meta SET admin_guard_revision = -1 WHERE singleton = 1",
-        "SELECT admin_guard_revision FROM schema_meta WHERE singleton = 1",
-    ),
-    (
-        "users",
-        "revision",
-        "INSERT INTO users (id,username,display_name,password_hash,active,is_admin,must_change_password,revision,created_time) VALUES (UNHEX(REPLACE(UUID(),'-','')),'alice','fixture','hash',TRUE,FALSE,FALSE,-1,NOW(6))",
-        "SELECT revision FROM users",
-    ),
-    (
-        "roles",
-        "revision",
-        "INSERT INTO roles (id,name,builtin,archived,revision) VALUES (UNHEX(REPLACE(UUID(),'-','')),'fixture',FALSE,FALSE,-1)",
-        "SELECT revision FROM roles",
-    ),
-    (
-        "device_groups",
-        "revision",
-        "INSERT INTO device_groups (id,name,archived,revision) VALUES (UNHEX(REPLACE(UUID(),'-','')),'fixture',FALSE,-1)",
-        "SELECT revision FROM device_groups",
-    ),
-    (
-        "devices",
-        "revision",
-        "INSERT INTO devices (public_key,display_name,admission_state,review_decision,revision,archived) VALUES (REPEAT('x',32),'fixture','PENDING','none',-1,FALSE)",
-        "SELECT revision FROM devices",
-    ),
-    (
-        "grants",
-        "revision",
-        "INSERT INTO grants (id,user_id,source_kind,permissions,scope_kind,revision) VALUES (UNHEX(REPLACE(UUID(),'-','')),?,'direct','[\"device.read\"]','all',-1)",
-        "SELECT revision FROM grants",
-    ),
-    (
-        "admission_decisions",
-        "previous_revision",
-        "INSERT INTO admission_decisions (id,device_id,decision,previous_revision,new_revision,time_evidence) VALUES (UNHEX(REPLACE(UUID(),'-','')),?,'approved',-1,0,'{}')",
-        "SELECT previous_revision FROM admission_decisions",
-    ),
-    (
-        "admission_decisions",
-        "new_revision",
-        "INSERT INTO admission_decisions (id,device_id,decision,previous_revision,new_revision,time_evidence) VALUES (UNHEX(REPLACE(UUID(),'-','')),?,'approved',0,-1,'{}')",
-        "SELECT new_revision FROM admission_decisions",
-    ),
-    (
-        "audit_events",
-        "event_seq",
-        "INSERT INTO audit_events (id,actor_kind,event_type,params_redacted,outcome,time_evidence,process_epoch,event_seq) VALUES (UNHEX(REPLACE(UUID(),'-','')),'system','fixture','{}','success','{}',UNHEX(REPLACE(UUID(),'-','')),-1)",
-        "SELECT event_seq FROM audit_events",
-    ),
-];
-
-// Every negative child references a real parent; all other row fields remain valid.
-const NEGATIVE_PARENT_SEEDS: [Option<&str>; 10] = [
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    Some(
-        "INSERT INTO users (id,username,display_name,password_hash,active,is_admin,must_change_password,revision,created_time) VALUES (?,'negative_parent','Fixture','fixture-placeholder',TRUE,FALSE,FALSE,0,NOW(6))",
-    ),
-    Some(
-        "INSERT INTO devices (public_key,display_name,admission_state,review_decision,revision,archived) VALUES (?,'negative parent','PENDING','none',0,FALSE)",
-    ),
-    Some(
-        "INSERT INTO devices (public_key,display_name,admission_state,review_decision,revision,archived) VALUES (?,'negative parent','PENDING','none',0,FALSE)",
-    ),
-    None,
-];
-
-#[test]
-fn negative_revision_fixtures_have_valid_existing_parents_and_grant_permissions() {
-    assert_eq!(NEGATIVE_PARENT_SEEDS.len(), NEGATIVE_FIXTURES.len());
-    for (index, table) in [(6, "users"), (7, "devices"), (8, "devices")] {
-        let seed = NEGATIVE_PARENT_SEEDS[index].expect("negative child requires a parent");
-        assert!(seed.starts_with(&format!("INSERT INTO {table} ")));
-        assert!(seed.contains('?'), "parent id must be bound");
-        assert!(
-            NEGATIVE_FIXTURES[index].2.contains('?'),
-            "child must bind the same id"
-        );
-    }
-    assert!(
-        NEGATIVE_PARENT_SEEDS
-            .iter()
-            .enumerate()
-            .all(|(i, seed)| (6..=8).contains(&i) || seed.is_none())
-    );
-    let grant = NEGATIVE_FIXTURES[6].2;
-    assert!(
-        grant.contains("'[\"device.read\"]'"),
-        "direct grant needs valid permission JSON"
-    );
-    assert!(!grant.contains("'{}'"));
-    for (_, _, inject, _) in NEGATIVE_FIXTURES.iter().take(9).skip(6) {
-        assert!(inject.contains("-1"));
-    }
-}
-
-pub async fn negative_fixture_prevents_all_alters(index: usize) {
-    let db = required_fresh_identity_db().await;
-    run_explicit_identity_test_command("fixture-v1");
-    let (table, column, inject, read_value) = NEGATIVE_FIXTURES[index];
-    if let Some(parent_sql) = NEGATIVE_PARENT_SEEDS[index] {
-        let parent_id = if index == 6 {
-            uuid::Uuid::new_v4().as_bytes().to_vec()
-        } else {
-            unique_public_key().to_vec()
-        };
-        sqlx::query(parent_sql)
-            .bind(parent_id.as_slice())
-            .execute(&db.0)
-            .await
-            .unwrap();
-        sqlx::query(inject)
-            .bind(parent_id.as_slice())
-            .execute(&db.0)
-            .await
-            .unwrap();
-    } else {
-        sqlx::query(inject).execute(&db.0).await.unwrap();
-    }
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_migrate-identity-test"))
-        .args(["--mode", "upgrade"])
-        .output()
-        .unwrap();
-    assert!(
-        !output.status.success(),
-        "negative {table}.{column} must refuse migration"
-    );
-    let diagnostic = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        diagnostic.contains(&format!("negative identity column {table}.{column}")),
-        "migration must reject injected {table}.{column}, not another error"
-    );
-    let version: i32 =
-        sqlx::query_scalar("SELECT schema_version FROM schema_meta WHERE singleton = 1")
-            .fetch_one(&db.0)
-            .await
-            .unwrap();
-    assert_eq!(version, 1);
-    let value: i64 = sqlx::query_scalar(read_value)
-        .fetch_one(&db.0)
-        .await
-        .unwrap();
-    assert_eq!(value, -1, "original {table}.{column} must survive");
-    for &(name, field, _, _) in &NEGATIVE_FIXTURES {
-        let shape: String = sqlx::query_scalar("SELECT CAST(column_type AS CHAR) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?")
-            .bind(name).bind(field).fetch_one(&db.0).await.unwrap();
-        assert_eq!(
-            shape.to_ascii_lowercase(),
-            "bigint",
-            "ALTER occurred before preflight: {name}.{field}"
-        );
-    }
-}
-
-pub async fn later_column_interruption_is_resumable() {
-    let db = required_fresh_identity_db().await;
-    run_explicit_identity_test_command("fixture-v1");
-    // Stop after the second exact 0002 ALTER in this authorized disposable DB.
-    for statement in [
-        "ALTER TABLE schema_meta MODIFY COLUMN authz_epoch BIGINT UNSIGNED NOT NULL DEFAULT 0",
-        "ALTER TABLE schema_meta MODIFY COLUMN admin_guard_revision BIGINT UNSIGNED NOT NULL DEFAULT 0",
-    ] {
-        sqlx::query(statement).execute(&db.0).await.unwrap();
-    }
-    let version: i32 =
-        sqlx::query_scalar("SELECT schema_version FROM schema_meta WHERE singleton = 1")
-            .fetch_one(&db.0)
-            .await
-            .unwrap();
-    assert_eq!(version, 1);
-    // 断言的是「部分 ALTER 后仍未达 v3」，期望版本锁定为 3，必须用 v3 终态门禁。
-    assert!(matches!(
-        rsetup_controller::check_v3_ready(&db).await,
-        Err(rsetup_controller::ControllerError::SchemaNotReady {
-            found: Some(1),
-            required: 3
-        })
-    ));
-    run_explicit_identity_test_command("upgrade");
-    // 续跑后的终态是 v3，用 v3 终态门禁收尾。
-    rsetup_controller::check_v3_ready(&db).await.unwrap();
-    let version: i32 =
-        sqlx::query_scalar("SELECT schema_version FROM schema_meta WHERE singleton = 1")
-            .fetch_one(&db.0)
-            .await
-            .unwrap();
-    assert_eq!(version, 3);
 }
 
 #[derive(Default)]
@@ -931,7 +599,7 @@ pub async fn admission_actor_permissions_are_atomic(db: &DbPool) {
         fixture_ok(sqlx::query("INSERT INTO users (id,username,display_name,password_hash,active,is_admin,must_change_password,revision,created_time) VALUES (?,?,'task4 fixture','fixture-placeholder',?,?,?,0,NOW(6))")
             .bind(actor.as_slice()).bind(name).bind(active).bind(admin).bind(change).execute(&db.0).await);
         let key = task4_device(db).await;
-        // v4 夹具健康检查：夹具已由 upgrade_fixture_to_v4 升到 v4（当前受支持版本），
+        // v4 夹具健康检查：夹具基线即当前受支持版本 v4（由 required_v4_identity_db 断言），
         // 必须用 v4 普通启动门禁；v3 终态门禁对 v4 库必然 required:3 fail-closed。
         assert_v4_fixture_healthy(db).await;
         let before = fixture_ok(db.load(key).await);
@@ -1026,7 +694,7 @@ async fn raw_admission(db: &DbPool, key: &[u8; 32]) -> (String, String, u64, i64
         .bind(key.as_slice()).fetch_one(&db.0).await)
 }
 
-/// 污染组合的只读拒绝：夹具已由 `upgrade_fixture_to_v4` 升到 v4（当前受支持版本）。
+/// 污染组合的只读拒绝：夹具基线即当前受支持版本 v4（由 `required_v4_identity_db` 断言）。
 /// 污染注入必须发生在 v4 夹具之上——v4 门禁对 v3 库会在版本/结构阶段就
 /// `SchemaNotReady{required:4}` 或结构 fail-closed，根本到不了 identity 数据扫描，
 /// 「污染必须被拒绝」就无从断言。在 v4 夹具上注入污染后，load / CAS / 就绪门禁
@@ -1117,7 +785,7 @@ pub async fn admission_polluted_combinations_are_readonly_rejected(db: &DbPool) 
             // 错误串完全等价，仍是 Config("identity data devices.state")，断言
             // 强度不降。唯一差异是到达数据扫描之前的前置阶段：v3 夹具会被 v4 门禁
             // 在版本决策处 SchemaNotReady{required:4} 直接挡掉，永远走不到数据
-            // 扫描，因此本用例必须先把夹具升到 v4，才能在 v4 门禁上真正复现
+            // 扫描，因此本用例必须直接以操作员预置的 v4 库为夹具，才能在 v4 门禁上真正复现
             // 「污染被拒绝且零写入」的语义。
             rsetup_controller::check_identity_schema(db).await,
             AdmissionFailure::ReadinessCombination,
@@ -1254,7 +922,7 @@ async fn task4_deactivate_actor(tx: &mut sqlx::Transaction<'_, sqlx::MySql>, act
         .fetch_all(&mut **tx)
         .await,
     );
-    // v3→v4 校验链路差异：夹具已升级到 v4（当前受支持版本），持锁方复核的 guard
+    // v3→v4 校验链路差异：夹具由操作员预置为 v4（当前受支持版本），持锁方复核的 guard
     // 行版本随之等价更新为 (singleton=1, schema_version=4)；断言本身仍是精确的
     // 两列等值比较，未放宽。v4-only 的写事务 guard（lock_integrity_guard）期望
     // 版本正是编译期 SUPPORTED_SCHEMA_VERSION=4，若这里仍是 3 则 CAS 早已失败。

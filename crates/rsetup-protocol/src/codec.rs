@@ -1122,10 +1122,10 @@ impl crate::wire::Codec for BusinessCodec {
         // 与解码端对称：不得产出解码端必然拒绝的字节。`supported_actions` 的分配
         // 守卫在 `decode_capabilities` 里，编码端同步封顶（DTO 词表已保证取值合法，
         // 越界的只可能是重复项）。
-        if let BusinessPayload::Capabilities(message) = message {
-            if message.supported_actions.len() > MAX_SUPPORTED_ACTIONS {
-                return Err(CodecError::InvalidDto("too_many_actions"));
-            }
+        if let BusinessPayload::Capabilities(message) = message
+            && message.supported_actions.len() > MAX_SUPPORTED_ACTIONS
+        {
+            return Err(CodecError::InvalidDto("too_many_actions"));
         }
         let bytes = Self::encode_payload(message);
         check_size(&bytes)?;

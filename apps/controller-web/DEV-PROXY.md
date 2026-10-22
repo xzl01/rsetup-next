@@ -54,3 +54,4 @@ export CONTROLLER_DEV_BACKEND_TARGET="http://127.0.0.1:8080"
    - 前端通过相对路径 `/api/v1` 发起请求，`credentials: 'same-origin'` 依靠浏览器同源策略在开发服务器域名下管理 cookie。
 4. **不影响 Production Build**：
    - 生产构建直接打包纯静态资产（HTML/CSS/JS），不嵌入任何 proxy 配置。
+   - 生产构建（本目录 `npm run build`，或仓库根 `make web-build`）每次现生成 `dist/`，该目录不入库、文件名带内容 hash；后端 `crates/rsetup-controller/build.rs` 在编译期读取它，所以编译 `rsetup-controller`（含 Debian 打包与 CI）前必须先跑一次生产构建。开发代理只服务 `vite dev`，与这条链路无关。

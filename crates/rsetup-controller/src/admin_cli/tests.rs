@@ -150,10 +150,10 @@ impl EmergencyResetStore for MemoryStore {
                 return Err(ControllerError::Database(sqlx::Error::RowNotFound));
             }
             // 模拟“锁定后另一写者先提交”：CAS 的 expected_revision 因此失配。
-            if state.racing_commit {
-                if let Some(admin) = state.draft.as_mut().and_then(|row| row.admin.as_mut()) {
-                    admin.revision += 1;
-                }
+            if state.racing_commit
+                && let Some(admin) = state.draft.as_mut().and_then(|row| row.admin.as_mut())
+            {
+                admin.revision += 1;
             }
             let draft = state.draft.as_mut().expect("guard acquired first");
             // 真实 CAS 语义：WHERE id = ? AND revision = ? 未命中即 0 行。

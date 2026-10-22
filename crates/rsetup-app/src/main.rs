@@ -1455,12 +1455,12 @@ fn decode_base64(value: &str) -> Option<Vec<u8>> {
             _ => None,
         }
     }
-    if value.len() % 4 != 0 {
+    if !value.len().is_multiple_of(4) {
         return None;
     }
     let mut output = Vec::with_capacity(value.len() / 4 * 3);
     let chunk_count = value.len() / 4;
-    for (index, chunk) in value.as_bytes().chunks_exact(4).enumerate() {
+    for (index, chunk) in value.as_bytes().as_chunks::<4>().0.iter().enumerate() {
         if (chunk.contains(&b'=') && index + 1 != chunk_count)
             || (chunk[2] == b'=' && chunk[3] != b'=')
         {

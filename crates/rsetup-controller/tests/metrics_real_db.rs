@@ -563,10 +563,10 @@ async fn grouping_is_byte_exact_on_both_engines() {
 fn random_bytes(len: usize) -> Vec<u8> {
     use std::io::Read;
     let mut buf = vec![0u8; len];
-    if let Ok(mut file) = std::fs::File::open("/dev/urandom") {
-        if file.read_exact(&mut buf).is_ok() {
-            return buf;
-        }
+    if let Ok(mut file) = std::fs::File::open("/dev/urandom")
+        && file.read_exact(&mut buf).is_ok()
+    {
+        return buf;
     }
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

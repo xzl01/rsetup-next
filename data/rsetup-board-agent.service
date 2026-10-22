@@ -1,0 +1,51 @@
+[Unit]
+# 板端代理（board agent）：在被管理板卡上周期采样只读指标，供中控侧查询。
+# 默认不随包启用（dh_installsystemd --no-enable），由运维显式 systemctl enable。
+Description=rsetup-next board agent
+Documentation=file:/usr/share/doc/rsetup-board-agent/README.Debian
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# ── 运行用户：固定 root ──────────────────────────────────────────────────────
+# 板端代理以 root 运行，不使用 DynamicUser，也不建静态降权账户：它要读取整机
+# 硬件与系统状态（/proc、/sys 下的温度、负载、内存、启动代际 boot_id，以及后续
+# 会接入的固件/分区/电源类受控动作），这些来源对非特权用户不是一律可读；以
+# root 运行可避免为每项读数临时扩权（sudo/polkit 白名单）带来的额外授权面。
+# 权限因此来自「进程本身即 root + 下方 sandbox 限制」，而不是靠账户降权。
+User=root
+Group=root
+# 持久任务 journal 目录：systemd 创建为 0700 并归属 User/Group。
+StateDirectory=rsetup-board-agent
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/rsetup-board-agent
+# 只读采样循环：每 10s 一次 device.status.get，样本写 stdout（进 journald），
+# journal 落盘在 StateDirectory 下。
+ExecStart=/usr/bin/rsetup-board-agent --watch --interval-secs 10 --journal-dir /var/lib/rsetup-board-agent
+Restart=on-failure
+RestartSec=5s
+# ── 沙箱 ────────────────────────────────────────────────────────────────────
+# root 运行下这些限制尤其重要：/usr 与 /etc 对本进程只读，唯一可写路径是下面的
+# ReadWritePaths；/root 与 /home 不可见；不获得新特权；私有 /tmp。
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/rsetup-board-agent
+LockPersonality=yes
+# 当前 --watch 模式不打开任何监听套接字；保留 IPv4/IPv6/Unix 三类地址族，是为后续
+# 接线加密隧道时不必修改本单元，其余地址族（packet/bluetooth 等）一律禁止。
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
+
+# ── 交付边界（务必先读）─────────────────────────────────────────────────────
+# 1) 生产加密隧道尚未接线：本单元启动的是二进制自带的 --watch 只读采样循环，
+#    样本只写本地 journald，进程不与中控建立任何加密会话（业务 codec 已按所有者授权
+#    启用，但加密隧道与双流传输仍未接线）。
+# 2) 真实重启边界仍未实现：device.reboot.prepare / device.reboot.execute 一律返回
+#    capability unavailable，本单元与二进制都不会重启主机。
+# 3) 因此本单元当前的实际作用是在板卡上长期跑只读探针与本地 journal 验收，
+#    不得据此声称板端控制链路（含重启）已闭环。

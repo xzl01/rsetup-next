@@ -802,10 +802,8 @@ fn transact(
                 failures.push(e.to_string());
             }
         }
-        if entry_written {
-            if let Err(e) = atomic_write(&context.entry, &context.entry_bytes) {
-                failures.push(e.to_string());
-            }
+        if entry_written && let Err(e) = atomic_write(&context.entry, &context.entry_bytes) {
+            failures.push(e.to_string());
         }
         if failures.is_empty() {
             for (from, to) in moves
@@ -817,10 +815,8 @@ fn transact(
                     failures.push(e.to_string());
                 }
             }
-            if base_created {
-                if let Err(e) = fs::remove_file(&context.base_target) {
-                    failures.push(e.to_string());
-                }
+            if base_created && let Err(e) = fs::remove_file(&context.base_target) {
+                failures.push(e.to_string());
             }
         }
         let _ = sync_directory(&context.directory);

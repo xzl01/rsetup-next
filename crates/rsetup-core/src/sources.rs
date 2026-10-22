@@ -620,19 +620,18 @@ fn transform_document(
         let mut updated = (*line).to_string();
         let mut edits = Vec::new();
         for (start, end, uri) in uri_tokens(line) {
-            if let Some((kind, _, suffix)) = classify_uri(uri, distribution_id) {
-                if let Some(target) = target_uri(
+            if let Some((kind, _, suffix)) = classify_uri(uri, distribution_id)
+                && let Some(target) = target_uri(
                     provider,
                     kind,
                     distribution_id,
                     architecture,
                     security.get(index).copied().unwrap_or(false),
                     &suffix,
-                ) {
-                    if target != uri.trim_end_matches('/') {
-                        edits.push((start, end, target));
-                    }
-                }
+                )
+                && target != uri.trim_end_matches('/')
+            {
+                edits.push((start, end, target));
             }
         }
         for (start, end, target) in edits.iter().rev() {

@@ -1,0 +1,42 @@
+#!/bin/sh
+# postinst for rsetup-controller: create the static system account only.
+#
+# This script deliberately does NOT start, stop, restart or enable any service.
+# The unit ships disabled (dh_installsystemd --no-enable) and is additionally
+# gated by ConditionPathExists=/etc/default/rsetup-controller, because starting
+# it means connecting to a real database — an operator action, see
+# /usr/share/doc/rsetup-controller/README.Debian.
+set -e
+
+SERVICE_USER=rsetup-controller
+SERVICE_HOME=/var/lib/rsetup-controller
+
+case "$1" in
+    configure)
+        # Static system account + private group with the same name, created
+        # idempotently. adduser --system is a no-op (exit 0, info message) when
+        # the account already exists, so configuring, upgrades and re-installs
+        # all take this same path.
+        #
+        # --system         no login shell, no password, low uid from the system
+        #                  range; the account is a service identity, not a user.
+        # --group          create the matching private group.
+        # --home ...       record the state directory as home in the passwd
+        #                  entry only.
+        # --no-create-home /var/lib/rsetup-controller is owned by systemd
+        #                  (StateDirectory=rsetup-controller creates it 0700 and
+        #                  chowns it to User/Group on every start), so the
+        #                  package must not pre-create or pre-own it.
+        # --disabled-login no password/authentication path for this account.
+        adduser --system \
+            --group \
+            --home "$SERVICE_HOME" \
+            --no-create-home \
+            --disabled-login \
+            "$SERVICE_USER"
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

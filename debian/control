@@ -2,10 +2,11 @@ Source: rsetup-next
 Section: admin
 Maintainer: xzl <xiangzelong@radxa.com>
 Build-Depends:
- cargo (>= 1.85),
+ cargo,
  debhelper-compat (= 13),
  nodejs,
- rustc (>= 1.85),
+ npm,
+ rustc,
 Standards-Version: 4.7.4.1
 Rules-Requires-Root: no
 Homepage: https://github.com/xzl01/rsetup-next
@@ -50,6 +51,7 @@ Priority: optional
 # 与 rsetup-next 同一架构口径：仅维护 64 位 amd64/arm64，不做 Architecture: any。
 Architecture: amd64 arm64
 Depends:
+ adduser,
  ca-certificates,
  systemd,
  ${misc:Depends},
@@ -67,3 +69,27 @@ Description: Web control center (controller) for rsetup-next
  /etc/default/rsetup-controller (database URL, allowed Host list, allowed
  browser Origin, management cursor secret), migrate the target database with
  rsetup-controller-migrate, and only then start the service.
+ .
+ The unit drops privileges to the static system account rsetup-controller,
+ which the package creates on install (adduser --system) so that
+ /var/lib/rsetup-controller keeps one stable owner across restarts.
+
+Package: rsetup-board-agent
+Priority: optional
+# 与其余两个包同一架构口径：仅维护 64 位 amd64/arm64，不做 Architecture: any。
+Architecture: amd64 arm64
+Depends:
+ systemd,
+ ${misc:Depends},
+Description: board-side agent for rsetup-next
+ rsetup-board-agent is the agent process intended to run on a managed single
+ board: it answers the controller's typed read-only queries (capabilities,
+ device status, clock, durable task journal) from a local, read-only source and
+ keeps a durable task journal under its own state directory.
+ .
+ The shipped binary is a read-only sampling agent. The production encrypted
+ tunnel is not wired up yet (the wire protocol codec is not approved), and a
+ real host reboot boundary is not implemented: both reboot actions answer
+ "capability unavailable" and the process never reboots the machine. The systemd
+ unit runs it as root in the read-only watch loop, because reading the board's
+ full hardware state requires root privileges.

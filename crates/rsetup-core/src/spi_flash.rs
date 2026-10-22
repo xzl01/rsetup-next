@@ -592,12 +592,12 @@ fn validate_request(request: &SpiFlashRequest) -> Result<(), HardwareError> {
             "invalid SPI flash target identifier".into(),
         ));
     }
-    if let Some(image_id) = &request.image_id {
-        if !valid_asset_id(image_id) || !image_id.contains(':') {
-            return Err(HardwareError::InvalidInput(
-                "invalid installed boot image identifier".into(),
-            ));
-        }
+    if let Some(image_id) = &request.image_id
+        && (!valid_asset_id(image_id) || !image_id.contains(':'))
+    {
+        return Err(HardwareError::InvalidInput(
+            "invalid installed boot image identifier".into(),
+        ));
     }
     if request.operation == "erase" && request.image_id.is_some() {
         return Err(HardwareError::InvalidInput(

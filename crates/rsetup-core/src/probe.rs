@@ -294,10 +294,8 @@ fn inspected_capability(
     reason: Option<&str>,
 ) -> Capability {
     let mut result = capability(id, label, available, detail);
-    if !available {
-        if let Some(reason) = reason {
-            result.detail = reason.into();
-        }
+    if !available && let Some(reason) = reason {
+        result.detail = reason.into();
     }
     result
 }
