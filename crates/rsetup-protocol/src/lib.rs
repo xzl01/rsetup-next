@@ -8,6 +8,7 @@
 
 pub mod admission;
 pub mod codec;
+pub mod crypto;
 pub mod ed25519;
 pub mod frame;
 pub mod handshake;
@@ -15,6 +16,7 @@ pub mod sig;
 pub mod wire;
 
 pub use codec::BusinessCodec;
+pub use crypto::{CryptoError, EphemeralKeyPair, RecordLayer, RecordLayerPair, SessionKeys};
 pub use wire::{
     ApprovedCodecWitness, BUSINESS_SCHEMA_VERSION, BusinessMessage, BusinessPayload,
     BusinessPayloadKind, Capabilities, ClockSample, Codec, CodecError, DeviceStatus, DtoError,

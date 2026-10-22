@@ -16,15 +16,18 @@ fn header_bytes(magic: [u8; 2], ver: u8, ftype: u8, len: u32) -> Vec<u8> {
 
 #[test]
 fn frame_encode_header_exact_layout() {
-    // T01：输出前 8B 恰为 53 45 02 01 00 00 00 04；总长 = 8 + payload。
+    // T01：输出前 8B 恰为 53 45 03 01 00 00 00 04；总长 = 8 + payload。
     let payload = [0xAA, 0xBB, 0xCC, 0xDD];
     let frame = encode_frame(FrameType::ClientHello, &payload).unwrap();
     assert_eq!(
         &frame[..8],
-        [0x53, 0x45, 0x02, 0x01, 0x00, 0x00, 0x00, 0x04]
+        [0x53, 0x45, 0x03, 0x01, 0x00, 0x00, 0x00, 0x04]
     );
     assert_eq!(frame.len(), 12);
     assert_eq!(&frame[8..], &payload);
+    // 版本常量本身钉死为 v3，Magic 保持 0x5345 不变（§4.1）。
+    assert_eq!(FRAME_VERSION, 0x03);
+    assert_eq!(FRAME_MAGIC, [0x53, 0x45]);
 }
 
 #[test]
@@ -60,27 +63,50 @@ fn frame_reject_bad_magic_variants() {
 }
 
 #[test]
-fn frame_reject_ver_01_no_downgrade() {
-    // S2：Ver=0x01 直接拒绝，不存在“按 v1 降级解析”分支。
+fn frame_reject_ver_01_02_no_downgrade() {
+    // S2：v3 首帧遇 Ver=0x01/0x02 直接 BadVersion，不存在“按旧版本降级解析”分支，
+    // 同一连接与新 TCP 均不自动回退（§4.1）。
+    for ver in [0x01u8, 0x02] {
+        assert_eq!(
+            parse_frame_header(&header_bytes(FRAME_MAGIC, ver, 0x01, 4)),
+            Err(FrameError::BadVersion),
+            "旧版本 {ver:#04x} 必须拒绝且不降级"
+        );
+    }
+    // 旧版本即使 FrameType/长度均合法，也仍在 version 一步被拒。
     assert_eq!(
-        parse_frame_header(&header_bytes(FRAME_MAGIC, 0x01, 0x01, 4)),
-        Err(FrameError::BadVersion),
+        parse_frame_header(&header_bytes(FRAME_MAGIC, 0x02, 0x04, 0)),
+        Err(FrameError::BadVersion)
     );
 }
 
 #[test]
 fn frame_reject_unknown_ver_and_type() {
-    // S3/S4：Ver=0x03 → BadVersion；FrameType 0x00/0x07/0xFF → BadFrameType(v)，不透传。
-    assert_eq!(
-        parse_frame_header(&header_bytes(FRAME_MAGIC, 0x03, 0x01, 4)),
-        Err(FrameError::BadVersion),
-    );
+    // S3/S4：Ver=0x00/0x04/0x05/0x80/0xFF（未定义）→ BadVersion；
+    // FrameType 0x00/0x07/0xFF → BadFrameType(v)，不透传。
+    for ver in [0x00u8, 0x04, 0x05, 0x80, 0xFF] {
+        assert_eq!(
+            parse_frame_header(&header_bytes(FRAME_MAGIC, ver, 0x01, 4)),
+            Err(FrameError::BadVersion),
+            "未知版本 {ver:#04x} 必须拒绝"
+        );
+    }
     for t in [0x00u8, 0x07, 0xFF] {
         assert_eq!(
             parse_frame_header(&header_bytes(FRAME_MAGIC, FRAME_VERSION, t, 4)),
             Err(FrameError::BadFrameType(t)),
         );
     }
+    // 检查顺序固定 magic → version → type → length：版本坏时先看版本。
+    assert_eq!(
+        parse_frame_header(&header_bytes(
+            FRAME_MAGIC,
+            0x02,
+            0xFF,
+            MAX_PAYLOAD_LEN as u32 + 1
+        )),
+        Err(FrameError::BadVersion)
+    );
 }
 
 #[test]

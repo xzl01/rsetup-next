@@ -7,7 +7,9 @@ use thiserror::Error;
 
 pub const FRAME_HEADER_LEN: usize = 8;
 pub const FRAME_MAGIC: [u8; 2] = [0x53, 0x45];
-pub const FRAME_VERSION: u8 = 0x02;
+/// 协议版本 `0x03`（§4.1）。收到 `0x01`/`0x02` 或任何未知版本一律
+/// [`FrameError::BadVersion`]，双方均不得自动降级或回退解析。
+pub const FRAME_VERSION: u8 = 0x03;
 pub const MAX_PAYLOAD_LEN: usize = 16_384;
 pub const MAX_FRAME_BYTES: usize = FRAME_HEADER_LEN + MAX_PAYLOAD_LEN;
 
