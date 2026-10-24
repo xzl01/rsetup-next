@@ -513,10 +513,13 @@ pub fn build_sqlx_management_state_with_events(
         notification_sink,
         events,
         None,
+        None,
+        None,
     )
 }
 
 /// 生产全装配入口：同时注入事件总线与时间门禁句柄。
+#[allow(clippy::too_many_arguments)]
 pub fn build_sqlx_management_state_full(
     db: DbPool,
     auth: Arc<HttpAuthState>,
@@ -525,6 +528,8 @@ pub fn build_sqlx_management_state_full(
     notification_sink: Arc<dyn approvals::ManagementNotificationSink>,
     events: Option<EventBus>,
     time_source: Option<crate::time::TimeGateHandle>,
+    recovery_controller: Option<Arc<crate::operations::RuntimeRecoveryController>>,
+    transport_manager: Option<Arc<crate::transport::TransportManager>>,
 ) -> ManagementState {
     let repo = Arc::new(SqlxAuthzRepository::new(db.clone()));
     let snapshots = Arc::new(SqlxAuthorizationSnapshotRepository::new(db.clone()));
@@ -553,6 +558,8 @@ pub fn build_sqlx_management_state_full(
         notification_sink,
         events,
         time_source,
+        recovery_controller,
+        transport_manager,
     }
 }
 

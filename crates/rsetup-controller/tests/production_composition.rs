@@ -446,6 +446,8 @@ mod typed {
                 )),
                 auth: tasks_auth,
                 events: Some(events_bus),
+                // 该装配用例只验证六线组合与认证一致性，不启用受控恢复提交闸门（05 §9）。
+                recovery: None,
             },
             status: DeviceStatusState {
                 auth: status_auth,

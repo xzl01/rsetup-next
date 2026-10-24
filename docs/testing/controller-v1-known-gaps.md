@@ -28,15 +28,14 @@
   2. 准入吊销已可向活跃会话投递切断与停止重连信令；
   3. `TaskScheduler` 生产调度驱动已在 `main.rs` 启动后台循环，`SqlxSchedulerStore` 完成真实候选联查与短事务 CAS 意图落库，并对排队超时（`expired`）与 prepare 失败（`failed`）进行持久化收敛与设备锁释放；
   4. 中控结果接入 `SqlxTaskResultSink` 接入生产 listener 并注入 `TaskEvidenceApplier`，完成合法状态机推进与设备锁处理；板端在 `execute` 持久落盘后通过会话通道异步触发 `device.task.result` 事件；
-  5. 生产装配以真实 `RuntimeRecoveryController` 取代占位探针，`GET /api/v1/system/status` 能够由恢复控制器读取 `ready = true` 与当前模式（`normal` / `controlled_recovery`）；调度循环与恢复控制器联动，受控恢复模式下阻止调度派发；
+  5. 生产装配以真实 `RuntimeRecoveryController` 取代占位探针，`GET /api/v1/system/status` 能够由恢复控制器读取 `ready = true` 与当前模式（`normal` / `controlled_recovery`）；冷启动支持 `CONTROLLER_CONTROLLED_RECOVERY=1` 环境变量触发进入；管理路由支持 `POST /api/v1/system/recovery/enter`（会话吊销与断开连接）与 `POST /api/v1/system/recovery/exit`（严格核对清单与观察窗约束），并在任务提交端点（`POST /api/v1/tasks`）设置 503 受控恢复拦截闸门，调度循环联动阻止派发；
   6. 数据保留期守则 `is_safe_to_delete` 与清理框架 `clean_retention_data` 已实现并通过单元测试，严格保护 `Held`、`Unknown` 与持锁未决记录，幂等索引保留期不早于任务清理；
   7. 关停广播已联合覆盖 HTTP、板端监听、准入复查、撤销消费、状态轮询与任务调度。
 - **仍存在的缺口**：
-  1. 受控恢复模式（ControlledRecovery）机制与调度闸已建立，但生产端到端触发链（外部备份恢复检测、管理员核对退出端点）仍待接入；
-  2. 数据保留期清理 `clean_retention_data` 尚无后台定时调度任务；
-  3. 真实数据库环境下的端到端长时间任务压测与容灾验证尚未完成。
-- **影响**：任务派发、执行通知、状态持久化闭环与恢复模式探针已建立，但受控恢复模式的生产触发链与保留期周期清理仍待补齐调度驱动。
-- **下一步**：补齐受控恢复管理端点与保留期定时驱动；在具备完备隔离与备份门禁的真实数据库目标上进行长期压测与容灾演练。
+  1. 数据保留期清理 `clean_retention_data` 尚无后台定时调度任务；
+  2. 真实数据库环境下的端到端长时间任务压测与容灾验证尚未完成。
+- **影响**：任务派发、执行通知、状态持久化闭环、受控恢复模式（冷启动触发、管理进入与退出核对端点、会话吊销与提交/调度拦截闸门）已全部建立。
+- **下一步**：为保留期清理补齐后台周期驱动；在具备完备隔离与备份门禁的真实数据库目标上进行长期压测与容灾演练。
 
 ## b) 真实主机重启仍未实现；板端生产连接模式已接线
 

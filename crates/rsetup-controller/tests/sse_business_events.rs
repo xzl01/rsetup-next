@@ -607,6 +607,8 @@ impl World {
             api: api.clone(),
             auth: Arc::clone(&auth),
             events: Some(bus.clone()),
+            // 本测试只验事件投递，不启用受控恢复提交闸门（05 §9）。
+            recovery: None,
         });
         let management = build_management_router(ManagementState {
             auth: Arc::clone(&auth),
@@ -623,6 +625,8 @@ impl World {
             notification_sink: probe,
             events: Some(bus.clone()),
             time_source: None,
+            recovery_controller: None,
+            transport_manager: None,
         });
         let events = build_events_router(EventsState {
             auth,

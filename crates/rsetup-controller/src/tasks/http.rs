@@ -42,6 +42,7 @@ use crate::http_gate::{
     require_admin_session, single_header,
 };
 use crate::model::decimal_u64_json;
+use crate::operations::{RecoveryMode, RecoveryOperation, RuntimeRecoveryController};
 use crate::parse_device_id;
 use crate::tasks::model::{EvidenceKind, MainTaskOutcome, MainTaskState, ReasonCode, SubTaskState};
 use crate::tasks::preview::{PREVIEW_TTL, PreviewOutcome, is_canonical_uuid_v4_key};
@@ -293,17 +294,24 @@ pub trait TaskApi: Send + Sync {
 }
 
 /// 任务路由 state：业务依赖仍只有 `api` 与 `auth` 两项（游标密钥由 `api` 的生产
-/// 实现持有），`events` 是**可选**的业务事件发布面（06 §4 `task.updated`）。
+/// 实现持有），`events` 是**可选**的业务事件发布面（06 §4 `task.updated`），
+/// `recovery` 是**可选**的受控恢复模式真源句柄（05 §9 提交闸门）。
 ///
 /// `events` 为 `None` 时所有写端点行为与接入事件总线之前完全一致（不发布、不
 /// 报错、不阻塞）；发布失败在 [`EventBus::publish`] 的契约里即「无在线订阅者
 /// 即丢弃」，因此任何 handler 都不得依据发布返回值改变响应。
+///
+/// `recovery` 为 `None` 表示本装配不提供受控恢复闸门（单测、嵌入式装配），提交
+/// 行为与接入该闸门之前一致；生产装配必须注入与 transport 探针、调度循环**同一个**
+/// `Arc<RuntimeRecoveryController>`，不得为闸门再造一套模式快照。
 #[derive(Clone)]
 pub struct HttpTasksState {
     pub api: Arc<dyn TaskApi>,
     pub auth: Arc<HttpAuthState>,
     /// 进程内事件总线句柄；`None` 表示本部署未开启 SSE 事件线（单测与嵌入式装配）。
     pub events: Option<EventBus>,
+    /// 受控恢复模式唯一真源（05 §9）；`None` 表示本装配不启用提交闸门。
+    pub recovery: Option<Arc<RuntimeRecoveryController>>,
 }
 
 impl HttpTasksState {
@@ -313,6 +321,7 @@ impl HttpTasksState {
             api,
             auth,
             events: None,
+            recovery: None,
         }
     }
 
@@ -320,6 +329,25 @@ impl HttpTasksState {
     pub fn with_events(mut self, events: EventBus) -> Self {
         self.events = Some(events);
         self
+    }
+
+    /// 接上受控恢复模式唯一真源（05 §9）。必须与 transport 探针、`/system/status`、
+    /// 调度循环用的是同一个 `Arc<RuntimeRecoveryController>`；本模块只读它的当前
+    /// 模式，不改模式（进入/解除归管理员侧管理写线）。
+    pub fn with_recovery(mut self, recovery: Arc<RuntimeRecoveryController>) -> Self {
+        self.recovery = Some(recovery);
+        self
+    }
+
+    /// 受控恢复模式提交闸门（05 §9「禁止变更任务调度/提交」）。
+    ///
+    /// 每条请求实时读控制器当前模式，不缓存模式快照：管理员解除受控模式后，下一条
+    /// 提交即放行。`recovery = None`（未装配闸门）与正常模式同为「不阻止」；
+    /// 只读端点、管理与只读核验类操作不经本闸门。
+    fn blocks_mutation_task(&self) -> bool {
+        self.recovery
+            .as_ref()
+            .is_some_and(|controller| !controller.permits(RecoveryOperation::MutationTask))
     }
 
     /// 任务写操作成功后的统一 `task.updated` 发布：
@@ -384,6 +412,20 @@ pub(crate) fn require_business_session(session: &Session) -> Result<(), Response
         ));
     }
     Ok(())
+}
+
+/// 受控恢复模式下的变更任务提交响应（05 §9「禁止变更任务调度/提交」）。
+///
+/// 503 而非 403：模式是**临时**运行状态，不是对调用者身份的判定，解除受控模式后
+/// 同一请求即可重放；`params.recovery_mode` 逐字给出线上契约字符串，便于前端提示，
+/// 不含设备、任务或凭据信息（去敏）。
+pub(crate) fn controlled_recovery_response() -> Response {
+    err_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "CONTROLLED_RECOVERY_ACTIVE",
+        "task.controlled_recovery_active",
+        json!({ "recovery_mode": RecoveryMode::ControlledRecovery.as_str() }),
+    )
 }
 
 /// 8 条任务路由共用的唯一错误映射：既有契约码 + Task 4 两个新变体，
@@ -890,6 +932,12 @@ mod routes {
     /// `POST /api/v1/tasks`：消费预览创建任务（202 仅表示持久接收）。
     ///
     /// 唯一校验 `Idempotency-Key` 的端点（其余写端点靠 `expected_revision` CAS）。
+    ///
+    /// 受控恢复模式闸门（05 §9「禁止变更任务调度/提交」）：认证与临时密码前置之后、
+    /// 解析任何请求体之前判定，处于受控恢复模式即 503 `CONTROLLED_RECOVERY_ACTIVE`
+    /// 且**绝不触达** [`TaskApi::submit`]（不落库、不下发、不发事件）。放在认证之后
+    /// 保证未认证请求仍是 401，管理/只读类操作（登录、状态查看、单设备只读核验、
+    /// 任务列表与详情）不受本闸门影响。
     pub async fn create_task(
         State(state): State<HttpTasksState>,
         headers: HeaderMap,
@@ -901,6 +949,9 @@ mod routes {
         };
         if let Err(response) = require_business_session(&session) {
             return response;
+        }
+        if state.blocks_mutation_task() {
+            return controlled_recovery_response();
         }
         let idempotency_key =
             match parse_idempotency_key(single_header(&headers, IDEMPOTENCY_KEY_HEADER)) {
@@ -2237,6 +2288,27 @@ mod tests {
         with_csrf: bool,
         events: Option<EventBus>,
     ) -> Router<()> {
+        build_app(api, is_admin, must_change_password, with_csrf, events, None)
+    }
+
+    /// 同 [`app`]，但注入受控恢复模式唯一真源（05 §9 提交闸门测试入口）：
+    /// 会话为非临时密码的管理员、CSRF 已绑定，排除其它门禁的干扰。
+    fn app_with_recovery(
+        api: Arc<FakeTaskApi>,
+        recovery: Arc<RuntimeRecoveryController>,
+    ) -> Router<()> {
+        build_app(api, true, false, true, None, Some(recovery))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_app(
+        api: Arc<FakeTaskApi>,
+        is_admin: bool,
+        must_change_password: bool,
+        with_csrf: bool,
+        events: Option<EventBus>,
+        recovery: Option<Arc<RuntimeRecoveryController>>,
+    ) -> Router<()> {
         let session = fixture_session(is_admin, must_change_password);
         let auth = Arc::new(HttpAuthState::new(
             Arc::new(FakeAuth {
@@ -2257,7 +2329,12 @@ mod tests {
                 },
             );
         }
-        build_tasks_router(HttpTasksState { api, auth, events })
+        build_tasks_router(HttpTasksState {
+            api,
+            auth,
+            events,
+            recovery,
+        })
     }
 
     fn get_request(uri: &str, with_cookie: bool) -> Request<Body> {
@@ -2476,6 +2553,107 @@ mod tests {
         assert_eq!(data["task_id"], task_id.to_string());
         assert_eq!(data["accepted"], true);
         assert_eq!(api.calls(), vec!["submit"]);
+    }
+
+    /// 受控恢复模式下的提交闸门（05 §9「禁止变更任务调度/提交」）：503
+    /// `CONTROLLED_RECOVERY_ACTIVE`，且**绝不触达** `TaskApi::submit`
+    /// （不落库、不下发、不发事件）。
+    #[tokio::test]
+    async fn create_task_returns_503_when_controlled_recovery_active() {
+        let api = Arc::new(FakeTaskApi::new());
+        let recovery = Arc::new(RuntimeRecoveryController::new());
+        recovery.enter_controlled_recovery();
+        let response = app_with_recovery(api.clone(), recovery)
+            .oneshot(post_request(
+                "/api/v1/tasks",
+                CREATE_TASK_BODY,
+                true,
+                Some(IDEMPOTENCY_KEY),
+            ))
+            .await
+            .unwrap();
+        let (status, body) = envelope(response).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["code"], "CONTROLLED_RECOVERY_ACTIVE");
+        assert_eq!(
+            body["error"]["message_key"],
+            "task.controlled_recovery_active"
+        );
+        // 去敏：只暴露线上契约的模式字符串，不含设备、任务或凭据信息。
+        assert_eq!(
+            body["error"]["params"]["recovery_mode"],
+            "controlled_recovery"
+        );
+        assert!(
+            api.calls().is_empty(),
+            "受控模式下 submit 必须零调用: {:?}",
+            api.calls()
+        );
+    }
+
+    /// 闸门的边界与时效：受控模式只挡变更任务提交，只读列表与预览照旧放行；
+    /// 管理员解除受控模式后，**同一路由实例**的下一条提交立即放行（模式不缓存）。
+    #[tokio::test]
+    async fn controlled_recovery_gate_spares_reads_and_reopens_after_exit() {
+        use crate::operations::RecoveryExitChecklist;
+
+        let api = Arc::new(FakeTaskApi::new());
+        let recovery = Arc::new(RuntimeRecoveryController::new());
+        recovery.enter_controlled_recovery();
+        let router = app_with_recovery(api.clone(), Arc::clone(&recovery));
+
+        let response = router
+            .clone()
+            .oneshot(get_request("/api/v1/tasks", true))
+            .await
+            .unwrap();
+        let (status, _) = envelope(response).await;
+        assert_eq!(status, StatusCode::OK, "受控模式下任务列表必须仍可读");
+
+        let response = router
+            .clone()
+            .oneshot(post_request(
+                "/api/v1/task-previews",
+                &format!(
+                    r#"{{"operation":"reboot","device_ids":["{}"],"group_ids":[]}}"#,
+                    "aa".repeat(32)
+                ),
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        let (status, _) = envelope(response).await;
+        assert_eq!(status, StatusCode::OK, "预览是只读资格投影，不创建任务");
+
+        let before = api.calls();
+        assert!(
+            !before.contains(&"submit"),
+            "受控模式下 submit 不得被调用: {before:?}"
+        );
+
+        recovery
+            .exit_controlled_recovery(&RecoveryExitChecklist {
+                revocations_checked: true,
+                grants_checked: true,
+                passwords_checked: true,
+                tasks_checked: true,
+            })
+            .expect("默认观察窗为 0，四项核对齐备即可解除");
+        assert_eq!(recovery.current_mode(), RecoveryMode::Normal);
+
+        let response = router
+            .oneshot(post_request(
+                "/api/v1/tasks",
+                CREATE_TASK_BODY,
+                true,
+                Some(IDEMPOTENCY_KEY),
+            ))
+            .await
+            .unwrap();
+        let (status, _) = envelope(response).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "解除受控模式后提交即放行");
+        assert!(api.calls().contains(&"submit"));
     }
 
     #[tokio::test]

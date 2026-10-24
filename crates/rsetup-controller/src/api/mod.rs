@@ -69,6 +69,10 @@ pub struct ManagementState {
     pub events: Option<EventBus>,
     /// 时间门禁句柄：`GET /api/v1/system/time` 读取真实时间证据与重试状态的来源。
     pub time_source: Option<crate::time::TimeGateHandle>,
+    /// 进程内唯一的恢复模式控制器句柄（受控恢复触发/解除管理路由使用）。
+    pub recovery_controller: Option<Arc<crate::operations::RuntimeRecoveryController>>,
+    /// 生产传输管理器（受控恢复进入时用于会话吊销与断开连接）。
+    pub transport_manager: Option<Arc<crate::transport::TransportManager>>,
 }
 
 /// 生产装配签名（Task 13 打通真实仓储 adapter）。骨架阶段 8 个子 router 各挂载 0 条
@@ -121,6 +125,8 @@ pub fn build_management_router(state: ManagementState) -> axum::Router<()> {
         recovery_probe: state.recovery_probe,
         events: state.events,
         time_source: state.time_source,
+        recovery_controller: state.recovery_controller,
+        transport_manager: state.transport_manager,
     }))
 }
 

@@ -21,23 +21,39 @@
 //! 扁平形状与线上嵌套契约互不耦合。
 //! 探针可失败：Runtime 不可读时上抛固定去敏错误，handler 映射 503 `NOT_READY`，
 //! 不用常量 `normal` 兜底、不把恢复模式等同调度放行。
+//!
+//! 受控恢复模式的触发与解除（05 §9 / 04 §5.2，管理员专属写端点）：
+//! `POST /api/v1/system/recovery/enter` 进入受控恢复模式（先切模式即阻止自动准入与
+//! 变更调度，再吊销传输线全部活跃会话），`POST /api/v1/system/recovery/exit` 携带
+//! 四项核对清单的 JSON body 解除。两者都先过 `authenticate_write` 再过
+//! `require_admin_session`，`data` 恒为 `{ "mode": <逐字模式串> }`；清单不齐 →
+//! 400 `CHECKLIST_INCOMPLETE`，非受控模式/观察窗未满 → 409 `INVALID_STATE`，
+//! 未接入控制器 → 503 `NOT_READY`。模式真源与 `recovery_probe` 是同一个
+//! `Arc<RuntimeRecoveryController>`，因此 `POST` 之后 `GET /system/status` 的
+//! `recovery_mode` 立即随之改变；每次调用（含被拒的尝试）都在控制器内留一条去敏
+//! 审计记录（无身份字节、无公钥原文，见 `operations::recovery`）。
 
 use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::State;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use axum::routing::get;
+use axum::routing::{get, post};
+use serde::Deserialize;
 
 use crate::auth::service::Session;
 use crate::error::ControllerError;
 use crate::events::{EventBus, EventEnvelope};
-use crate::http_api::ok_response;
+use crate::http_api::{err_response, ok_response};
 use crate::http_auth::{EndpointId, HttpAuthState};
-use crate::http_gate::{authenticate_read, not_ready, require_admin_session};
+use crate::http_gate::{
+    authenticate_read, authenticate_write, not_ready, read_json_body, require_admin_session,
+};
+use crate::operations::recovery::{RecoveryExitChecklist, RuntimeRecoveryController};
 use crate::time::TimeGateHandle;
 use crate::time::evidence::{TimeEvidence, TimeQuality};
+use crate::transport::manager::TransportManager;
 
 use super::{ManagementFuture, map_error};
 
@@ -67,6 +83,19 @@ pub struct SystemApiState {
     /// `TimeGateHandle`（内部状态全在 `Arc` 后，克隆共享同一权威快照）。`None` 表示本
     /// 装配未接时间线，`GET /system/time` 回退为当前系统墙钟的 `SystemFallback` 证据。
     pub time_source: Option<TimeGateHandle>,
+    /// 受控恢复模式控制器（05 §9 / 04 §5.2 的进程内唯一真源）：
+    /// `POST /system/recovery/enter|exit` 两条管理路由的写入对象。`None` 表示本装配
+    /// 未接入恢复控制器（既有装配的形态），两条路由在会话与管理员门禁之后回
+    /// 503 `NOT_READY`——不伪造模式切换，也不新建第二套模式快照。
+    ///
+    /// 与 [`Self::recovery_probe`] 必须是**同一个** `Arc<RuntimeRecoveryController>`
+    /// 句柄：写的是它、读的也是它，`GET /system/status` 的 `recovery_mode` 才会随写
+    /// 即时改变；装配两个实例就是把真源复制成了两份。
+    pub recovery_controller: Option<Arc<RuntimeRecoveryController>>,
+    /// 传输管理器（活跃设备会话的真源）：进入受控恢复模式时用它逐个
+    /// `apply_revoke` 吊销全部活跃会话。`None` 表示本装配没有隧道线，进入语义退化为
+    /// 只切模式（审计记 `sessions_revoked = 0`），不伪造吊销成功。
+    pub transport_manager: Option<Arc<TransportManager>>,
 }
 
 impl SystemApiState {
@@ -211,8 +240,113 @@ async fn get_system_time(State(state): State<SystemApiState>, headers: HeaderMap
     }))
 }
 
-/// 挂载 system 的 2 条管理路由：`GET /api/v1/system/status` 与
-/// `GET /api/v1/system/time` 的唯一注册锚点。
+// ---------------------------------------------------------------------------
+// 受控恢复模式的触发与解除（05 §9 / 04 §5.2）
+// ---------------------------------------------------------------------------
+
+/// `POST /api/v1/system/recovery/exit` 的严格 body DTO（05 §9「核对最近吊销/授权/
+/// 密码/任务后才解除」）：四个布尔**全部必填**、未知字段拒绝，任何形状不符都是
+/// `read_json_body` 的固定 400 `INVALID_ARGUMENT`。
+///
+/// 这四个布尔是**调用方的核对声明**，不是服务端核验结果：本层无法替管理员去核对
+/// 备份窗口内的吊销/授权/密码/任务，因此四项缺一项即 400 `CHECKLIST_INCOMPLETE`，
+/// 绝不因「都传 true 太容易」而放宽——诚实的核对发生在管理员工具一侧。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryExitInput {
+    pub(crate) revocations_checked: bool,
+    pub(crate) grants_checked: bool,
+    pub(crate) passwords_checked: bool,
+    pub(crate) tasks_checked: bool,
+}
+
+/// 固定 400 `CHECKLIST_INCOMPLETE`：解除门禁未满足（核对清单四项未全为 `true`）。
+/// 去敏：不带任何参数，不回显 body 原文。
+fn checklist_incomplete() -> Response {
+    err_response(
+        StatusCode::BAD_REQUEST,
+        "CHECKLIST_INCOMPLETE",
+        "system.recovery_checklist_incomplete",
+        serde_json::json!({}),
+    )
+}
+
+/// `POST /api/v1/system/recovery/enter`（05 §9）：进入受控恢复模式。
+///
+/// 调用顺序固定为 `authenticate_write`（Host/Origin/会话/CSRF/写限速）→
+/// `require_admin_session` → 控制器存在性检查 → 模式迁移 + 会话吊销。
+/// 语义：先切模式（自动准入/变更调度即刻被闸门阻止），再吊销传输线上的全部活跃
+/// 会话（`transport_manager` 未装配时退化为只切模式）。响应 `data` 恰为
+/// `{ "mode": "controlled_recovery" }`，逐字取自 [`RecoveryMode::as_str`]。
+///
+/// 幂等：已在受控模式时重复调用不重置观察窗（进入时刻保持首次值），响应不变；
+/// 每次调用都留一条去敏审计记录（含本次吊销的会话数）。
+///
+/// 未接入恢复控制器的装配：会话与管理员门禁之后 503 `NOT_READY`（不伪造切换成功）。
+async fn enter_recovery_mode(State(state): State<SystemApiState>, headers: HeaderMap) -> Response {
+    let actor = match authenticate_write(&state.auth, &headers).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_admin_session(&actor) {
+        return response;
+    }
+    let Some(controller) = &state.recovery_controller else {
+        return not_ready();
+    };
+    let mode =
+        controller.enter_controlled_recovery_with_revocation(state.transport_manager.as_deref());
+    ok_response(serde_json::json!({ "mode": mode.as_str() }))
+}
+
+/// `POST /api/v1/system/recovery/exit`（05 §9 唯一解除路径）：解除受控恢复模式。
+///
+/// 调用顺序固定为 `authenticate_write` → `require_admin_session` → 严格 body 解析
+/// → 控制器存在性检查 → `exit_controlled_recovery`。三段解除门禁的真源全在控制器：
+/// 1. 核对清单四项未全为 `true` → 400 `CHECKLIST_INCOMPLETE`；
+/// 2. 当前不处于受控恢复模式 → 409 `INVALID_STATE`（`InvalidState` 的既有映射）；
+/// 3. 保留观察窗未度满 → 409 `INVALID_STATE`（过早解除，状态不符）。
+///
+/// 成功即切回正常模式，响应 `data` 恰为 `{ "mode": "normal" }`。被拒的尝试同样留
+/// 审计记录（拒绝原因逐字为 `checklist_incomplete` / `invalid_state` /
+/// `observation_window_open`）。响应不含会话令牌、设备公钥或清单外的任何投影。
+async fn exit_recovery_mode(
+    State(state): State<SystemApiState>,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> Response {
+    let actor = match authenticate_write(&state.auth, &headers).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_admin_session(&actor) {
+        return response;
+    }
+    let input = match read_json_body::<RecoveryExitInput>(&headers, body).await {
+        Ok(input) => input,
+        Err(response) => return response,
+    };
+    let checklist = RecoveryExitChecklist {
+        revocations_checked: input.revocations_checked,
+        grants_checked: input.grants_checked,
+        passwords_checked: input.passwords_checked,
+        tasks_checked: input.tasks_checked,
+    };
+    let Some(controller) = &state.recovery_controller else {
+        return not_ready();
+    };
+    match controller.exit_controlled_recovery(&checklist) {
+        Ok(mode) => ok_response(serde_json::json!({ "mode": mode.as_str() })),
+        // 控制器将「门禁未满足」表达为 `PermissionDenied`（调用方确是已认证管理员）：
+        // 线上契约要的是可区分的 400 原因码，这里窄化，不透传成 403。
+        Err(ControllerError::PermissionDenied) => checklist_incomplete(),
+        // 状态不符（非受控模式 / 观察窗未满）：`InvalidState` → 409 `INVALID_STATE`。
+        Err(error) => map_error(error),
+    }
+}
+
+/// 挂载 system 的管理路由：`GET /api/v1/system/status`、`GET /api/v1/system/time`
+/// 与 2 条受控恢复模式管理端点的唯一注册锚点。
 /// 本函数只接受显式装配的 `SystemApiState`，其中恢复探针是可失败读取。
 /// 生产恢复控制器尚未接线时仍挂载路由，由占位探针返回错误，
 /// `/system/status` handler 将其映射为 503 `NOT_READY`，不伪造恢复模式。
@@ -220,6 +354,8 @@ pub fn system_router(state: SystemApiState) -> Router<()> {
     Router::new()
         .route("/api/v1/system/status", get(get_system_status))
         .route("/api/v1/system/time", get(get_system_time))
+        .route("/api/v1/system/recovery/enter", post(enter_recovery_mode))
+        .route("/api/v1/system/recovery/exit", post(exit_recovery_mode))
         .with_state(state)
 }
 
@@ -307,6 +443,10 @@ mod tests {
             recovery_probe: Arc::new(probe),
             events,
             time_source: None,
+            // 恢复管理路由的基线装配：未接入控制器与传输线（既有装配形状），
+            // enter/exit 在会话与管理员门禁之后一律 503 `NOT_READY`。
+            recovery_controller: None,
+            transport_manager: None,
         }
     }
 
@@ -420,10 +560,11 @@ mod tests {
     async fn system_status_rejects_non_admin_with_403() {
         let router = system_router(SystemApiState {
             auth: fixture_auth(fixture_session(false)),
-            gateway: Arc::new(FixtureSystemGateway),
-            recovery_probe: Arc::new(FixtureRecoveryProbe::Ok),
-            events: None,
-            time_source: None,
+            ..system_state_with_events(
+                Arc::new(FixtureSystemGateway),
+                FixtureRecoveryProbe::Ok,
+                None,
+            )
         });
         let (status, code, _) = error_code(
             router
@@ -752,10 +893,12 @@ mod tests {
     async fn system_time_rejects_non_admin_with_403() {
         let router = system_router(SystemApiState {
             auth: fixture_auth(fixture_session(false)),
-            gateway: Arc::new(FixtureSystemGateway),
-            recovery_probe: Arc::new(FixtureRecoveryProbe::Ok),
-            events: None,
             time_source: Some(fixture_time_gate(fixture_time_evidence(), true).await),
+            ..system_state_with_events(
+                Arc::new(FixtureSystemGateway),
+                FixtureRecoveryProbe::Ok,
+                None,
+            )
         });
         let (status, code, text) = error_code(
             router

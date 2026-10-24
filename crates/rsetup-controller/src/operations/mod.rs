@@ -13,6 +13,9 @@ pub mod recovery;
 pub mod retention;
 
 pub use recovery::{
+    MAX_RECOVERY_AUDIT_EVENTS, RECOVERY_AUDIT_ENTER, RECOVERY_AUDIT_EXIT,
+    RECOVERY_AUDIT_OUTCOME_CHECKLIST_INCOMPLETE, RECOVERY_AUDIT_OUTCOME_INVALID_STATE,
+    RECOVERY_AUDIT_OUTCOME_OK, RECOVERY_AUDIT_OUTCOME_WINDOW_NOT_OPEN, RecoveryAuditEvent,
     RecoveryExitChecklist, RecoveryMode, RecoveryOperation, RuntimeRecoveryController,
 };
 pub use retention::{
