@@ -394,7 +394,7 @@ impl Gate {
 }
 
 /// 可编程 handler：按 action 决定 echo / 未知动作 / panic / 挂起 / 固定回包。
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct TestHandler {
     calls: Arc<AtomicUsize>,
     events: Arc<AtomicUsize>,
@@ -403,7 +403,13 @@ struct TestHandler {
     systems: Arc<Mutex<Vec<SystemSignal>>>,
     closed: Arc<Mutex<Vec<SessionCloseReason>>>,
     gates: Arc<Mutex<Vec<oneshot::Receiver<()>>>>,
-    event_gates: Arc<Mutex<Vec<oneshot::Receiver<()>>>>,
+    /// 事件回调用的**同步**闸门（与 `on_closed` 同一形状）：回调由 driver 在
+    /// `tokio::spawn` 的任务里同步调用，只能真实占住线程，不能用 tokio 的
+    /// blocking API（见 [`TestHandler::arm_event_gate`]）。
+    event_gates: Arc<Mutex<Vec<Arc<Gate>>>>,
+    /// 事件回调每**进入**一次补一个许可：测试等「回调真的卡住了」时既不轮询
+    /// 也不 sleep，许可累计在信号量里，先产生后等待也不会丢。
+    event_entered: Arc<tokio::sync::Semaphore>,
     /// 预置一次「事件回调内真实阻塞」：模拟 handler 把回调任务钉住。
     slow_event: Arc<Mutex<Option<std::time::Duration>>>,
     /// 预置一次「on_closed 内的不可取消阻塞」：直到测试打开闸门才返回。
@@ -414,6 +420,30 @@ struct TestHandler {
     /// 预置一次「on_event 内 panic」：把回调任务打死。
     panic_event: Arc<AtomicBool>,
     payload: Arc<Mutex<Option<Vec<u8>>>>,
+}
+
+impl Default for TestHandler {
+    /// 逐字段初始化：`event_entered` 需要「零个许可」的起始状态，而
+    /// `tokio::sync::Semaphore` 没有 `Default`（`Default` 与 `new(0)` 不同义），
+    /// 所以这里不再 derive。
+    fn default() -> Self {
+        Self {
+            calls: Arc::new(AtomicUsize::new(0)),
+            events: Arc::new(AtomicUsize::new(0)),
+            ready: Arc::new(AtomicUsize::new(0)),
+            epochs: Arc::new(Mutex::new(Vec::new())),
+            systems: Arc::new(Mutex::new(Vec::new())),
+            closed: Arc::new(Mutex::new(Vec::new())),
+            gates: Arc::new(Mutex::new(Vec::new())),
+            event_gates: Arc::new(Mutex::new(Vec::new())),
+            event_entered: Arc::new(tokio::sync::Semaphore::new(0)),
+            slow_event: Arc::new(Mutex::new(None)),
+            closed_gate: Arc::new(Mutex::new(None)),
+            events_in: Arc::new(AtomicUsize::new(0)),
+            panic_event: Arc::new(AtomicBool::new(false)),
+            payload: Arc::new(Mutex::new(None)),
+        }
+    }
 }
 
 impl TestHandler {
@@ -476,12 +506,33 @@ impl TestHandler {
         self.events_in.load(Ordering::SeqCst)
     }
 
-    /// 预置一次「挂起直到放行」，把放行句柄交给测试。
-    /// 让下一个 `on_event` 在回调任务里阻塞，直到测试丢弃返回的发送端。
-    fn arm_event_gate(self: &Arc<Self>) -> oneshot::Sender<()> {
-        let (tx, rx) = oneshot::channel();
-        self.event_gates.lock().unwrap().push(rx);
-        tx
+    /// 预置一次「`on_event` 内真实阻塞、时长由测试决定」的闸门：回调进入后用 std
+    /// 条件变量占住当前 worker，测试打开闸门后回调才返回。
+    ///
+    /// 为什么不能用 `tokio::sync::oneshot::Receiver::blocking_recv`（本夹具以前就这么写）：
+    /// 回调是 driver 在 `tokio::spawn` 的任务里**同步**调用的，而 tokio 文档明确
+    /// `blocking_recv` 在异步执行上下文中必定 panic
+    /// （`Cannot block the current thread from within a runtime`），与运行时是单线程还是
+    /// 多线程无关；这条 panic 会当场把回调任务打死。
+    fn arm_event_gate(self: &Arc<Self>) -> Arc<Gate> {
+        let gate = Arc::new(Gate::default());
+        self.event_gates.lock().unwrap().push(Arc::clone(&gate));
+        gate
+    }
+
+    /// 等到事件回调**累计**进入 `want` 次为止。许可由回调在进入时补发、在等待返回
+    /// 时原样归还，所以信号量里的许可数就是「已进入的总次数」：本方法是门槛，
+    /// 不是一次性事件，先产生后等待也不会漏掉。
+    ///
+    /// 本方法自身**不设期限**：在实时运行时的用例里调用必须套 `timeout(LONG, ..)`
+    /// （取消安全，不会吞许可），否则链路一旦回归断掉，测试就是无限挂死而不是失败。
+    async fn wait_event_entered(&self, want: usize) {
+        let permits = self
+            .event_entered
+            .acquire_many(want.try_into().expect("等待进入的次数必须在 u32 范围内"))
+            .await
+            .expect("本测试从不关闭这个信号量");
+        drop(permits);
     }
 
     fn arm_gate(self: &Arc<Self>) -> oneshot::Sender<()> {
@@ -542,6 +593,7 @@ impl SessionHandler for TestHandler {
     fn on_event(&self, _stream: StreamKind, _packet: TunnelPacket) {
         // 先进入计数，再决定慢/panic/放行：前置条件断言的是「回调真的开始了」。
         self.events_in.fetch_add(1, Ordering::SeqCst);
+        self.event_entered.add_permits(1);
         if self.panic_event.swap(false, Ordering::SeqCst) {
             panic!("handler callback panic");
         }
@@ -552,8 +604,9 @@ impl SessionHandler for TestHandler {
         }
         let gate = self.event_gates.lock().unwrap().pop();
         if let Some(gate) = gate {
-            // 只在多字节线程运行时里使用：占住一个 worker，模拟慢回调。
-            let _ = gate.blocking_recv();
+            // 回调由 driver 同步调用，运行在 `tokio::spawn` 的任务里：这里只能像
+            // `on_closed` 那样用 std 条件变量真实占住当前 worker，模拟慢回调。
+            gate.wait_until_open();
         }
         self.events.fetch_add(1, Ordering::SeqCst);
     }
@@ -1628,16 +1681,45 @@ async fn event_is_one_way_and_needs_no_pending_slot() {
     assert!(outcome.cleaned);
 }
 
-/// 事件队列有界：慢回调期间的洪峰按计数丢弃，不撑爆内存、不拖垮会话。
+/// 事件队列有界：回调被钉住时的入站洪峰按计数丢弃，不撑爆内存、不拖垮会话。
+///
+/// 三处同步都不靠 sleep 猜，也不放宽 `Busy`：
+/// * 第一条事件先走完整链路，测试等到「回调已进入并卡在闸门里」才发洪峰；
+/// * 洪峰只有 9 条，整体塞得进发送侧业务队列（默认容量 32）：以前一次灌 64 条，
+///   「发送侧 Event 入队」实际上是在赌 writer 有没有被调度到，机器一紧就被回 `Busy`
+///   （CI 上正是这样），而本用例要观察的只有接收侧的丢弃；
+/// * 收尾在**同一条 Data 流**上做一次 echo 往返作 happens-before 屏障，链条是：
+///   洪峰的每条 Event 帧都在设备侧 Data 流唯一的业务发送队列里入队（`send_event`
+///   的 ack 即入队完成）；echo 的 Request 在洪峰全部 ack 之后才由中控发出，所以
+///   设备 echo 的回包帧必然排在同一条 Data 流队列的 9 条事件帧**之后**，经同一条
+///   半流 FIFO 上线；中控只有一个 reader、一个 owner 循环，按上线顺序逐帧处理，
+///   回包被结清时 9 条事件的入站分支（入队或丢弃计数）已全部是既成事实。
+///   方向核验：屏障的因果锚在**回包帧与事件帧共享设备侧同一发送队列与同一条
+///   Data 半流**上，与 Request 命令方向相反是设计使然（实测：按住设备写方向后
+///   回包确定到不了，放开后计数立即精确；去掉屏障 50 次单核跑 42 次计数不足）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn inbound_event_burst_is_dropped_with_counter() {
+    // 接收侧回调通道总容量 = event_queue + notify_queue；钉住的回调另外占着 1 条。
+    const EVENT_QUEUE: u8 = 1;
+    const NOTIFY_QUEUE: u8 = 1;
+    const IN_CALLBACK: u64 = 1;
+    const BURST: u8 = 9;
+
     let controller = TestHandler::new();
     let board = TestHandler::new();
     let tight = SessionConfig {
-        event_queue: 1,
-        notify_queue: 1,
+        event_queue: EVENT_QUEUE as usize,
+        notify_queue: NOTIFY_QUEUE as usize,
         ..SessionConfig::default()
     };
+    // 发送侧（设备）用的是默认配置：洪峰必须能整体塞进它的业务队列，否则
+    // 「发送侧 Event 入队」这条期望就变成在赌 writer 有没有被调度到。
+    assert!(
+        usize::from(BURST) <= SessionConfig::default().business_queue,
+        "洪峰 {} 不得超过发送侧业务队列容量 {}",
+        BURST,
+        SessionConfig::default().business_queue
+    );
     let mut harness = Harness::build(
         Arc::clone(&controller).into_dyn(),
         Arc::clone(&board).into_dyn(),
@@ -1645,39 +1727,88 @@ async fn inbound_event_burst_is_dropped_with_counter() {
         SessionConfig::default(),
     );
     harness.ready().await;
-    // 第一个事件把回调任务钉住：之后的事件只能在有界队列门口被丢弃。
-    let blocker = controller.arm_event_gate();
+    // 前置条件：`on_ready` 这条生命周期通知已被回调消费掉，回调通道是空的——
+    // 下面那个精确的丢弃期望依赖这一点。
+    wait_until("on_ready 必须已送达 handler", || {
+        controller.ready_calls() >= 1
+    })
+    .await;
 
-    for i in 0..64_u8 {
+    // 第一个事件把回调任务钉住：之后的事件只能在有界队列门口被丢弃。
+    let gate = controller.arm_event_gate();
+    // 兜底：用例在任何一步失败都要开闸，否则钉住的 worker 永不归还（实测会挂死进程）。
+    let gate_guard = GateGuard(Arc::clone(&gate));
+
+    harness
+        .board
+        .send_event(StreamKind::Data, "board.metric", vec![1u8; 8])
+        .await
+        .expect("首个事件入队");
+    // 有界等待：本用例是实时多线程运行时，没有暂停时钟兜底。信号量门槛一旦等不到
+    // （回归丢事件），必须按 LONG 期限失败快退，而不是把整个测试进程挂死。
+    // `acquire_many` 取消安全：超时丢弃等待不会吞掉已发放的许可。
+    tokio::time::timeout(LONG, controller.wait_event_entered(1))
+        .await
+        .expect("事件回调必须在期限内进入闸门");
+    assert_eq!(controller.events(), 0, "前置条件：回调必须还卡在闸门里");
+
+    for i in 2..=BURST {
         harness
             .board
             .send_event(StreamKind::Data, "board.metric", vec![i; 8])
             .await
             .expect("发送侧 Event 入队");
     }
-    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 同流往返 = 接收侧 owner 的屏障：回包一到，9 条事件都已过完入站分支。
+    let echo = harness
+        .controller
+        .request(StreamKind::Data, "biz.echo", b"flush".to_vec())
+        .await
+        .expect("同流 echo 往返必须成功");
+    assert_eq!(echo.status_code, 0, "echo 回包状态码");
+    assert_eq!(echo.payload, Bytes::from_static(b"flush"), "echo 原样回显");
+
     assert_eq!(
         *harness.controller.subscribe_state().borrow_and_update(),
         SessionState::Ready,
         "事件丢弃不是会话故障"
     );
-    assert!(
-        controller.events() <= 2,
+    assert_eq!(
+        controller.events_entered(),
+        1,
+        "只有第一条事件进得了被钉住的回调"
+    );
+    assert_eq!(
+        controller.events(),
+        0,
         "被钉住的回调不应继续消费事件: {}",
         controller.events()
     );
 
-    drop(blocker);
+    gate.open();
+    drop(gate_guard);
+    wait_until("闸门打开后被钉住的回调必须返回", || {
+        controller.events() >= 1
+    })
+    .await;
+
     harness.board.abort();
     harness.controller.abort();
     let owner = tokio::time::timeout(LONG, &mut harness.controller_task)
         .await
         .expect("中控 owner 退出")
         .expect("owner 不 panic");
-    assert!(
-        owner.dropped_events > 0,
-        "必须记录丢弃的事件数，实测 {}",
-        owner.dropped_events
+    // 9 条入站事件：1 条被钉住的回调持有 + 通道里压着 2 条（容量 = event_queue +
+    // notify_queue），其余必须在队列门口被真实丢弃并计数。
+    let expected_dropped = u64::from(BURST) - IN_CALLBACK - u64::from(EVENT_QUEUE + NOTIFY_QUEUE);
+    assert_eq!(
+        owner.dropped_events,
+        expected_dropped,
+        "丢弃计数必须是接收侧真实计数：{} 发 - {} 在回调里 - {} 在队",
+        BURST,
+        IN_CALLBACK,
+        EVENT_QUEUE + NOTIFY_QUEUE
     );
     assert!(owner.cleaned);
 }
@@ -2578,8 +2709,24 @@ async fn stuck_callback_exits_bounded_and_reports_cleaned_honestly() {
     // 第一个事件把回调任务真实阻塞 6s：长于 SYSTEM_GRACE(0.5s)+CLEANUP_GRACE(2s)。
     controller.arm_slow_events(Duration::from_millis(6_000));
     let board = TestHandler::new();
+    // 接收侧回调通道总容量 = event_queue + notify_queue = 2：1 条被慢回调持有、2 条压进
+    // 通道，第 4 条起**必然**被丢弃。「队列真的被打满」由容量与发送条数钉死，不再依赖
+    // 「发送侧挤进去多少条」这种调度偶然（旧形状：`let _ =` 吞掉 Busy 后实际入网的条数
+    // 只有 ≤ 发送管线容量，可以一条都不丢）。
+    const EVENT_QUEUE: usize = 1;
+    const NOTIFY_QUEUE: usize = 1;
+    const IN_CALLBACK: u64 = 1;
+    const BURST: u8 = 5;
+    // 洪峰必须整体塞得进发送侧默认业务队列，每条 send_event 才能可靠拿到入队 ack。
+    assert!(
+        usize::from(BURST) <= SessionConfig::default().business_queue,
+        "洪峰 {} 不得超过发送侧业务队列容量 {}",
+        BURST,
+        SessionConfig::default().business_queue
+    );
     let tight = SessionConfig {
-        notify_queue: 1,
+        event_queue: EVENT_QUEUE,
+        notify_queue: NOTIFY_QUEUE,
         ..SessionConfig::default()
     };
     let mut harness = Harness::build(
@@ -2590,22 +2737,44 @@ async fn stuck_callback_exits_bounded_and_reports_cleaned_honestly() {
     );
     harness.ready().await;
 
-    // 先让回调任务真的进入 handler（占住消费者，之后队列不会自己腾出空位）……
+    // 第一个事件走完整链路进入 handler，在那里被真实阻塞 6s，从此不腾出消费者名额。
     harness
         .board
         .send_event(StreamKind::Data, "board.metric", vec![0u8; 8])
         .await
         .expect("第一个事件先入队");
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    // ……再把通知队列灌满：消费者不会腾位，多出来的只能被丢弃并计数。
-    for i in 1..240_u16 {
-        let _ = harness
+    // 真实屏障而不是 sleep(200ms) 赌「这会儿回调应该开始了」：进入许可由回调在**进入
+    // handler 时**补发，等到它即证明回调确实已占住消费者。本用例跑在实时运行时上，
+    // 屏障自身必须套 timeout(LONG)（`acquire_many` 取消安全），回归时快退而不是挂死。
+    tokio::time::timeout(LONG, controller.wait_event_entered(1))
+        .await
+        .expect("慢回调必须在期限内进入 handler");
+    assert_eq!(controller.events(), 0, "前置条件：回调必须还卡在 6s 阻塞里");
+
+    // 其余事件逐条发送并确认入队（不吞 Busy）：入队条数、接收侧通道容量与被钉住的
+    // 回调一起把「必然有丢弃」变成确定结论。
+    for i in 2..=BURST {
+        harness
             .board
-            .send_event(StreamKind::Data, "board.metric", vec![i as u8; 8])
-            .await;
+            .send_event(StreamKind::Data, "board.metric", vec![i; 8])
+            .await
+            .expect("发送侧 Event 入队");
     }
 
-    // 此刻：通知队列满 + 回调任务被 handler 钉住。旧实现在这里
+    // 同一条 Data 流上的 echo 往返 = 接收侧 owner 的 happens-before 屏障（与
+    // `inbound_event_burst_is_dropped_with_counter` 已核验的链条同一条）：echo 回包帧
+    // 在设备侧 Data 流同一个业务发送队列里排在洪峰事件帧**之后**、经同一条半流 FIFO
+    // 上线，而中控只有一个 owner 按上线顺序逐帧处理——回包被结清时，每条洪峰事件的
+    // 入站分支（入队或丢弃计数）都已是既成事实。丢弃计数从这一刻起才是可读证据，
+    // 不再赌「发送循环跑完时 owner 恰好处理够了」。
+    let echo = harness
+        .controller
+        .request(StreamKind::Data, "biz.echo", b"flush".to_vec())
+        .await
+        .expect("同流 echo 往返必须成功");
+    assert_eq!(echo.status_code, 0, "echo 回包状态码");
+
+    // 此刻：通知队列满 + 回调任务被 handler 钉住，且计数已随屏障结清。旧实现在这里
     // `notify_tx.send(Closed).await` 无限等下去，只能等慢回调跑完才走。
     harness.controller.abort();
     let started = std::time::Instant::now();
@@ -2614,9 +2783,19 @@ async fn stuck_callback_exits_bounded_and_reports_cleaned_honestly() {
         .expect("慢回调不能把 owner 钉死")
         .expect("owner 不 panic");
     let elapsed = started.elapsed();
+    // 5 条洪峰：1 条被慢回调持有 + 2 条压在通道里，其余必然在队列门口被真实计数。
+    let expected_dropped = u64::from(BURST) - IN_CALLBACK - (EVENT_QUEUE + NOTIFY_QUEUE) as u64;
     assert!(
         owner.dropped_events > 0,
         "前置条件：通知队列必须真的被打满（否则本用例没测到东西）"
+    );
+    assert_eq!(
+        owner.dropped_events,
+        expected_dropped,
+        "丢弃计数必须是接收侧真实计数：{} 发 - {} 在回调里 - {} 在队",
+        BURST,
+        IN_CALLBACK,
+        EVENT_QUEUE + NOTIFY_QUEUE
     );
     assert!(
         elapsed < Duration::from_millis(4_000),

@@ -179,6 +179,19 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
+      # 根因（CI run 40109395224）：Debian trixie 的 apt rustc/cargo 版本低于源码所需
+      # 下限——let-chains（issue #53667）与 slice_as_chunks（issue #74985）都在 1.88.0
+      # 才稳定，用 trixie 打包的 apt rustc 编译 rsetup-core 会刷 27 条 E0658，arm64 直接
+      # 失败、amd64 同源。Trixie 主仓没有不低于 1.88 的 rustc 可依赖，故与其余 Rust 作业
+      # 同口径：在同一个 Trixie 容器里**显式**装一支 stable 工具链，让 debian/rules 里裸
+      # `cargo` 解析到它（rustup 的 bin 目录经 GITHUB_PATH 排到 apt 的 /usr/bin 之前），
+      # 而不是换基础镜像、跳过打包/测试，或把 stable 降级到不兼容版本。apt 的 cargo/rustc
+      # 仍留在上面的安装清单里，只用于满足 Build-Depends 的存在性检查，不再充当实际构建
+      # 编译器。本步骤排在离线缓存预热与 dpkg-buildpackage 之前，保证 cargo fetch 与打包
+      # 编译共用同一支 stable。本仓统一以 stable 管理 Rust 版本、不在构建配置里钉死具体
+      # 版本号，这里也只装 stable：let-chains 与 slice_as_chunks 自 1.88.0 起就是 stable
+      # 的固定能力，stable 恒满足，无需在本仓写死某个具体版本。
+      - uses: dtolnay/rust-toolchain@stable
       # 前端产物 apps/controller-web/dist 不入库，而 debian/rules 的
       # override_dh_auto_build 会在 cargo 之前用 npm 现生成它
       # （crates/rsetup-controller/build.rs 编译期读取该目录，缺失即失败关闭）。本作业先

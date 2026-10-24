@@ -730,10 +730,10 @@ fn valid_pick_handle(handle: &str) -> bool {
 /// lookup, never by the handle alone.
 fn pick_handle_random() -> [u8; PICK_HANDLE_RANDOM_BYTES] {
     let mut bytes = [0u8; PICK_HANDLE_RANDOM_BYTES];
-    if let Ok(mut urandom) = File::open("/dev/urandom") {
-        if urandom.read_exact(&mut bytes).is_ok() {
-            return bytes;
-        }
+    if let Ok(mut urandom) = File::open("/dev/urandom")
+        && urandom.read_exact(&mut bytes).is_ok()
+    {
+        return bytes;
     }
     let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
     std::process::id().hash(&mut hasher);

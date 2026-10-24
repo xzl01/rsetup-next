@@ -1317,3 +1317,57 @@ test('生产 CI 不得打开非实测模板槽位', () => {
     '--allow-unobserved-template 只用于本地实验，CI 里出现即等于放行未实测形状',
   );
 });
+
+// ---------------------------------------------------------------------------
+// Debian 打包作业的 Rust 工具链下限（CI run 40109395224 的根因回归）
+// ---------------------------------------------------------------------------
+//
+// 根因：Debian trixie 的 apt `rustc`/`cargo` 是 1.85.x（本仓日志里安装的是
+// 1.85.1+dfsg1-1+deb13u1），而源码用了 1.88.0 才稳定的 let-chains（issue #53667）
+// 与 slice_as_chunks（issue #74985）。dpkg-buildpackage 用 apt 的 1.85 编译
+// rsetup-core 时刷出 27 条 E0658，arm64 直接失败，amd64 同源。
+// 修法与其它 Rust 作业同口径：在 Trixie 容器里**显式**装一支 stable Rust 工具链
+// 覆盖 apt 的 1.85，而不是换基础镜像、跳过打包/测试，或把 stable 降级到不兼容版本。
+// 此处验证与其余 CI 作业一致的 stable 工具链选择与安装顺序，不宣称完整 workspace
+// 的最低版本为 1.88；例如 tunnel 使用的 AtomicU64::try_update 需要更新的 Rust。
+test('Debian trixie 作业显式装兼容的 stable Rust 工具链，不把 apt 的 1.85 当唯一编译器', () => {
+  const debian = jobCalled('debian-package');
+  assert.ok(debian, 'ci.yml 里找不到 debian-package 作业');
+
+  // 保留 Debian trixie：不换基础镜像，兼容工具链在容器内装。
+  assert.match(
+    debian.rawText,
+    /container:[ \t]*debian:trixie-slim/,
+    'Debian 打包必须继续在 debian:trixie-slim 容器里进行（保留 Trixie）',
+  );
+
+  // 必须显式安装 stable Rust 工具链（与其余 Rust 作业同一 @stable 口径），
+  // 让 debian/rules 里裸 `cargo` 解析到它，而不是 apt 的 1.85。
+  assert.match(
+    debian.text,
+    /uses:[ \t]*dtolnay\/rust-toolchain@stable\b/,
+    'debian-package 必须显式安装 dtolnay/rust-toolchain@stable，覆盖 apt 的 1.85 编译器',
+  );
+
+  // apt 清单仍带上 cargo 与 rustc：Build-Depends 声明了它们，dpkg-checkbuilddeps
+  // 在任何构建规则前只核对存在性；这里只是不再让它充当实际构建编译器。
+  assert.match(
+    debian.text,
+    /apt-get install[\s\S]*?\bcargo\b[\s\S]*?\brustc\b/,
+    'apt 安装清单必须继续带上 cargo 与 rustc（满足 Build-Depends 存在性检查）',
+  );
+
+  // 兼容工具链必须**先于**离线缓存预热与打包编译：cargo fetch 与 dpkg-buildpackage
+  // 里的 cargo rustc 必须共用同一支 stable，不能让 fetch/编译退回 apt 的 1.85。
+  const toolchainAt = debian.text.search(/uses:[ \t]*dtolnay\/rust-toolchain@stable\b/);
+  const fetchAt = debian.text.search(/cargo fetch\b/);
+  const dpkgAt = debian.text.search(/dpkg-buildpackage\b/);
+  assert.ok(
+    debian.text.includes('CARGO_HOME="$GITHUB_WORKSPACE/debian/cargo-home"'),
+    '离线 Cargo 缓存边界必须保留：cargo fetch 仍预热到 debian/cargo-home',
+  );
+  assert.ok(toolchainAt >= 0, '必须存在 stable 工具链安装步骤');
+  assert.ok(fetchAt >= 0, 'debian-package 必须继续用 cargo fetch --locked 预热离线缓存');
+  assert.ok(toolchainAt < fetchAt, 'stable 工具链安装必须早于 cargo fetch：两者用同一支编译器');
+  assert.ok(toolchainAt < dpkgAt, 'stable 工具链安装必须早于 dpkg-buildpackage：打包编译用兼容工具链');
+});
