@@ -1,8 +1,11 @@
 //! 内存预算定向回归（gRPC 编帧 + 信封，独立测试二进制）。
 //!
-//! 为什么单独一个二进制：`#[global_allocator]` 对整个测试二进制生效，且并发分配会互相污染，
-//! 因此这里**必须**以 `--test-threads=1` 运行，并用 `MEASURE_LOCK` 串行化度量段。断言只针对
-//! "是否出现 ≥ 某阈值的分配"与"分配总量"，不使用对并发敏感的小数精确值。
+//! 为什么单独一个二进制：`#[global_allocator]` 对整个测试二进制生效。度量计数器是
+//! **线程局部**的（const 初始化的 thread-local `Cell`）：只统计 `measure` 闭包所在线程
+//! 自身的分配，其他线程（并发 fixture、被度量代码 spawn 的线程）的分配一律不计入，
+//! 互不污染（CI run 40121877892 的串扰根因）。`MEASURE_LOCK` 仅串行化度量段本身，
+//! 不阻塞段外的并发 fixture。断言只针对"是否出现 ≥ 某阈值的分配"与"分配总量"，
+//! 不使用对并发敏感的小数精确值。
 //!
 //! 本文件唯一的 `unsafe` 是实现 `GlobalAlloc`（unsafe trait）以观测分配请求大小；
 //! 生产代码 `envelope.rs` / `grpc.rs` 不含任何 `unsafe`。
@@ -12,33 +15,60 @@ use rsetup_tunnel::grpc::{
     GRPC_HEADER_SIZE, GrpcDecoder, GrpcError, MAX_PACKETS_PER_PUSH, encode_message,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Mutex, MutexGuard};
+use std::thread;
 
 /// 视为"大分配"的阈值：1 MiB。
 const BIG_ALLOC_THRESHOLD: usize = 1024 * 1024;
 
-static MAX_REQUEST: AtomicUsize = AtomicUsize::new(0);
-static TOTAL_BYTES: AtomicUsize = AtomicUsize::new(0);
-static BIG_REQUESTS: AtomicUsize = AtomicUsize::new(0);
-static MEASURING: AtomicBool = AtomicBool::new(false);
 static MEASURE_LOCK: Mutex<()> = Mutex::new(());
+
+/// 仅对当前线程生效的计数器。`const` 初始化且不含 `Drop`：访问走静态 thread-local
+/// 快路径，不懒初始化堆分配、不注册析构函数，因此 allocator 回调内的读写既不
+/// 递归分配也不 panic；析构期 `try_with` 只会静默返回 `Err`。
+struct TlsCounters {
+    enabled: Cell<bool>,
+    max_request: Cell<usize>,
+    total_bytes: Cell<usize>,
+    big_requests: Cell<usize>,
+}
+
+thread_local! {
+    static COUNTERS: TlsCounters = const {
+        TlsCounters {
+            enabled: Cell::new(false),
+            max_request: Cell::new(0),
+            total_bytes: Cell::new(0),
+            big_requests: Cell::new(0),
+        }
+    };
+}
 
 struct CountingAlloc;
 
+/// 记录一次分配：仅当**当前线程**处于度量中。allocator 回调内的无锁、无分配、
+/// 无 panic 路径（`try_with` + `Cell`，失败即静默跳过）。
 fn record(size: usize) {
-    if MEASURING.load(Ordering::Relaxed) {
-        MAX_REQUEST.fetch_max(size, Ordering::Relaxed);
-        TOTAL_BYTES.fetch_add(size, Ordering::Relaxed);
-        if size >= BIG_ALLOC_THRESHOLD {
-            BIG_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    let _ = COUNTERS.try_with(|c| {
+        if !c.enabled.get() {
+            return;
         }
-    }
+        if size > c.max_request.get() {
+            c.max_request.set(size);
+        }
+        c.total_bytes.set(c.total_bytes.get().saturating_add(size));
+        if size >= BIG_ALLOC_THRESHOLD {
+            c.big_requests.set(c.big_requests.get().saturating_add(1));
+        }
+    });
 }
 
-// SAFETY: 仅做计数后原样委托给 `System`，不改变对齐/大小语义，也不持有跨线程状态
-// （计数用原子量，度量段由 `MEASURE_LOCK` 串行化）。
+// SAFETY: 仅做计数后原样委托给 `System`，不改变对齐/大小语义。计数状态是该线程
+// 自己的 const 初始化 thread-local `Cell`（快路径、无锁、无递归分配、不 panic），
+// 线程隔离由 TLS 保证，度量段再由 `MEASURE_LOCK` 串行化。
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         record(layout.size());
@@ -70,25 +100,41 @@ struct Metrics {
     big_requests: usize,
 }
 
-/// 串行化并度量一次闭包内的分配行为。
+impl Metrics {
+    const ZERO: Metrics = Metrics {
+        max_request: 0,
+        total_bytes: 0,
+        big_requests: 0,
+    };
+}
+
+/// RAII：离开度量段（含 panic 展开路径）时关闭本线程的计数。
+struct MeasureGuard;
+
+impl Drop for MeasureGuard {
+    fn drop(&mut self) {
+        let _ = COUNTERS.try_with(|c| c.enabled.set(false));
+    }
+}
+
+/// 串行化并度量一次闭包内的分配行为，只统计**当前线程**的分配。
+///
+/// 契约：不得在同一线程嵌套调用（`MEASURE_LOCK` 是非重入锁，同线程嵌套会自锁死；
+/// 跨线程的并发 `measure` 由该锁串行化，且各自计数互不可见）。
 fn measure<T>(f: impl FnOnce() -> T) -> (T, Metrics) {
     let _guard: MutexGuard<'_, ()> = MEASURE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    MAX_REQUEST.store(0, Ordering::Relaxed);
-    TOTAL_BYTES.store(0, Ordering::Relaxed);
-    BIG_REQUESTS.store(0, Ordering::Relaxed);
-    MEASURING.store(true, Ordering::Relaxed);
+    COUNTERS.with(|c| {
+        c.max_request.set(0);
+        c.total_bytes.set(0);
+        c.big_requests.set(0);
+        c.enabled.set(true);
+    });
+    let _counting = MeasureGuard;
     let value = f();
-    MEASURING.store(false, Ordering::Relaxed);
-    (
-        value,
-        Metrics {
-            max_request: MAX_REQUEST.load(Ordering::Relaxed),
-            total_bytes: TOTAL_BYTES.load(Ordering::Relaxed),
-            big_requests: BIG_REQUESTS.load(Ordering::Relaxed),
-        },
-    )
+    drop(_counting);
+    (value, peek_metrics())
 }
 
 fn legal_packet(trace_id: u64) -> TunnelPacket {
@@ -276,6 +322,76 @@ fn partial_large_frame_buffer_stays_under_512kib_plus_5() {
     );
     // 512KiB 帧在此 fixture 中内容非法，出错后缓冲必须清空
     assert_eq!(decoder.buffered_len(), 0, "致命错误后不得保留缓冲");
+}
+
+/// 测试工具：直接读取当前线程的计数器（不经 `measure`），用于 panic 后的关闭自检。
+/// 读取本身不分配，故不受计数开关影响。
+fn peek_metrics() -> Metrics {
+    COUNTERS
+        .try_with(|c| Metrics {
+            max_request: c.max_request.get(),
+            total_bytes: c.total_bytes.get(),
+            big_requests: c.big_requests.get(),
+        })
+        .unwrap_or(Metrics::ZERO)
+}
+
+#[test]
+fn foreign_thread_allocations_do_not_pollute_measurement() {
+    // 跨线程隔离回归：度量窗口内借两次 channel 会合，让另一线程**严格在窗口内**分配
+    // ≥2MiB；顺序完全由同步决定，不依赖调度。度量线程自身的分配必须仍可观测，
+    // 其他线程的分配不得计入本线程度量（CI run 40121877892 的串扰根因）。
+    let (start_tx, start_rx) = mpsc::channel::<()>();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let foreign = thread::spawn(move || {
+        start_rx.recv().expect("度量线程应发出开始信号");
+        let buf: Vec<u8> = vec![0u8; 2 * 1024 * 1024];
+        std::hint::black_box(&buf);
+        done_tx.send(()).expect("度量线程应仍在等待");
+    });
+
+    let ((), m) = measure(|| {
+        let own: Vec<u8> = vec![0u8; 512 * 1024];
+        std::hint::black_box(&own);
+        start_tx.send(()).expect("外来线程不应已退出");
+        done_rx.recv().expect("外来线程应完成分配");
+    });
+    foreign.join().expect("外来线程不应 panic");
+
+    assert!(
+        m.total_bytes >= 512 * 1024,
+        "度量线程自身的分配应仍可观测: {m:?}"
+    );
+    assert_eq!(
+        m.big_requests, 0,
+        "外来线程 ≥2MiB 的分配不得计入本线程度量: {m:?}"
+    );
+    assert!(
+        m.total_bytes < BIG_ALLOC_THRESHOLD,
+        "外来线程的分配混入了本线程度量: {m:?}"
+    );
+}
+
+#[test]
+fn measure_disables_counting_after_panic() {
+    // panic 安全自检：度量中途 panic 后必须关闭计数，之后的分配不得继续污染计数器
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        measure(|| panic!("模拟度量中途 panic"))
+    }));
+    assert!(caught.is_err(), "panic 应原样穿出 measure");
+
+    let buf: Vec<u8> = vec![0u8; 2 * 1024 * 1024];
+    std::hint::black_box(&buf);
+
+    let m = peek_metrics();
+    assert_eq!(
+        m.big_requests, 0,
+        "panic 后计数应已关闭，不应再计入 ≥2MiB 分配: {m:?}"
+    );
+    assert!(
+        m.total_bytes < BIG_ALLOC_THRESHOLD,
+        "panic 后计数应已关闭，不应再计入大额分配: {m:?}"
+    );
 }
 
 #[test]
