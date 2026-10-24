@@ -3,6 +3,7 @@
 
 # Rust and desktop build output
 /target
+crates/rsetup-tunnel/target/
 /apps/desktop/node_modules
 /apps/desktop/dist
 /apps/desktop/src-tauri/target
