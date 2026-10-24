@@ -264,7 +264,21 @@ impl TimeGateHandle {
 /// 注意：startup gate 结束只表示 NTP 门结束，不替代 DB/bootstrap/恢复的 ready（05 §1）。
 pub fn start_time_gate(config: TimeGateConfig, clock_epoch: Uuid) -> TimeGateHandle {
     let deps = TimeGateDeps::production(&config);
-    start_time_gate_with(config, clock_epoch, deps)
+    start_time_gate_with_sink(config, clock_epoch, deps, None)
+}
+
+/// 生产装配 + 时间证据变化通知（06 §4）。与 [`start_time_gate`] 完全同一条装配，
+/// 只多挂一个 [`TimeChangedSink`]：driver 每次确认新权威快照后调用它，生产装配用它将
+/// 变化投递给进程内事件总线（`main.rs`），使 SSE 管理员订阅者收到 `system.time.changed`。
+///
+/// `None` 与 [`start_time_gate`] 等价（本装配未接事件线，不发任何通知）。
+pub fn start_time_gate_with_notifier(
+    config: TimeGateConfig,
+    clock_epoch: Uuid,
+    time_changed: Option<TimeChangedSink>,
+) -> TimeGateHandle {
+    let deps = TimeGateDeps::production(&config);
+    start_time_gate_with_sink(config, clock_epoch, deps, time_changed)
 }
 
 /// `start_time_gate` 的可注入装配（受控测试注入 fake 采样/源列表/墙钟/等待/审计）。
@@ -274,11 +288,25 @@ pub fn start_time_gate_with(
     clock_epoch: Uuid,
     deps: TimeGateDeps,
 ) -> TimeGateHandle {
+    start_time_gate_with_sink(config, clock_epoch, deps, None)
+}
+
+/// `start_time_gate_with` 的完整注入入口（可注入依赖 + 可选的时间证据变化通知）。
+///
+/// 这是唯一的实现点：`start_time_gate`/`start_time_gate_with`/`start_time_gate_with_notifier`
+/// 都转发到这里，`time_changed` 为 `None` 即本装配不发任何通知（生产 `main.rs` 传 `Some`，
+/// 见 [`start_time_gate_with_notifier`]）。合法性校验失败即拒绝启动。
+pub fn start_time_gate_with_sink(
+    config: TimeGateConfig,
+    clock_epoch: Uuid,
+    deps: TimeGateDeps,
+    time_changed: Option<TimeChangedSink>,
+) -> TimeGateHandle {
     config
         .validate()
         .expect("TimeGateConfig 非法，拒绝启动时间门禁");
     let handle = TimeGateHandle::new(&config, clock_epoch);
-    let driver = TimeGateDriver::new(&handle, config, deps);
+    let driver = TimeGateDriver::new(&handle, config, deps).with_time_changed_sink(time_changed);
     tokio::spawn(driver.run());
     handle
 }
@@ -393,6 +421,18 @@ pub struct NullTimeAuditSink;
 impl TimeAuditSink for NullTimeAuditSink {
     fn record(&self, _event: TimeAuditEvent) {}
 }
+
+/// 时间证据变化的通知回调（06 §4 `system.time.changed` 的可注入点）。
+///
+/// driver 每次**确认并把新的权威 `TimeEvidence` 写入快照之后**调用一次（启动采样、周期复验、
+/// 退避恢复、stale/跳钟失效都算一次变化），将写锁内那份快照证据交给装配方。
+/// 时间线本身不认识事件总线，也不知道受众：本回调只负责「证据变了」这一事实，
+/// `system.time.changed` 的形状与「仅管理员」受众由装配方的发布入口钉死
+/// （[`crate::api::system::SystemApiState::publish_system_time_changed`]）。
+///
+/// 调用发生在 driver 的任务上，因此实现**必须**不阻塞（`EventBus::publish` 满足这一点：
+/// 永不阻塞、永不上抛、无订阅者即丢弃）。
+pub type TimeChangedSink = Arc<dyn Fn(&TimeEvidence) + Send + Sync>;
 
 /// 一轮采样 future：`Some((样本, 产生该样本的源字符串))`；失败/超时/空源为 `None`。
 pub type TimeSampleFuture<'a> =
@@ -543,6 +583,8 @@ pub struct TimeGateDriver {
     sources: Arc<dyn NtpSourceList>,
     wall_clock: Arc<dyn WallClock>,
     sleeper: Arc<dyn Sleeper>,
+    /// 时间证据变化通知（06 §4）：`None` 表示本装配未接事件线。见 [`TimeChangedSink`]。
+    time_changed: Option<TimeChangedSink>,
     /// 退避尝试计数（契约 3）。
     attempt: u32,
     /// 跳钟检测基线（契约 4）。
@@ -570,9 +612,27 @@ impl TimeGateDriver {
             sources: deps.sources,
             wall_clock: deps.wall_clock,
             sleeper: deps.sleeper,
+            time_changed: None,
             attempt: 0,
             last_wall: None,
             has_ever_sampled: false,
+        }
+    }
+
+    /// 挂上时间证据变化通知（06 §4）；`None` 保持「未接事件线」语义。
+    #[must_use]
+    pub fn with_time_changed_sink(mut self, time_changed: Option<TimeChangedSink>) -> Self {
+        self.time_changed = time_changed;
+        self
+    }
+
+    /// 向装配方投递「权威快照已更新」这一事实。
+    ///
+    /// 只在**写锁之外**调用（锁内回调可能反灌同一把锁），传入的必须是刚在写锁内提交的那份
+    /// 证据；回调本身按契约不阻塞（见 [`TimeChangedSink`]），返回值在此丢弃。
+    fn notify_time_changed(&self, evidence: &TimeEvidence) {
+        if let Some(sink) = self.time_changed.as_ref() {
+            sink(evidence);
         }
     }
 
@@ -700,7 +760,7 @@ impl TimeGateDriver {
         // 本次是否首次采样，避免把失效后的恢复误判为首次采样而沿用旧纪元。
         let first_sample = !self.has_ever_sampled;
         self.has_ever_sampled = true;
-        let (from, clock_epoch, renewed) = {
+        let (from, clock_epoch, renewed, published) = {
             // 契约 6：证据与锚点在同一写锁内原子写入；换代判定也在同一写锁内基于旧快照完成。
             let mut snap = self.snapshot.write().await;
             let from = snap.evidence.quality;
@@ -741,7 +801,8 @@ impl TimeGateDriver {
             snap.evidence.offset_ms = Some(sample.offset_ms);
             snap.evidence.uncertainty_ms = Some(sample.uncertainty_ms);
             snap.sample_instant = Some(tokio::time::Instant::now());
-            (from, clock_epoch, discontinuous)
+            // 06 §4：写锁内取走刚提交的权威证据，通知在锁外发出（见 `notify_time_changed`）。
+            (from, clock_epoch, discontinuous, snap.evidence.clone())
         };
         self.set_attempt(0);
         self.retry_active.store(false, Ordering::SeqCst);
@@ -777,6 +838,9 @@ impl TimeGateDriver {
         if !self.is_ready.swap(true, Ordering::SeqCst) {
             self.ready.notify_waiters();
         }
+        // 06 §4：新权威快照已提交、审计已落、ready 已收敛，最后才对外通知
+        // （观察者在事件上看到的证据一定不旧于门禁自身的权威快照）。
+        self.notify_time_changed(&published);
     }
 
     /// 失效降级：同一写锁内清空证据（source/offset/uncertainty/age 与单调锚点）、置
@@ -786,7 +850,7 @@ impl TimeGateDriver {
     /// 契约 7（M1）：`evidence_stale` 这类不换代失效只清空证据，**不**在此处生成新纪元；
     /// 连续性断裂由下一次成功采样在 `transition` 中依据 `has_ever_sampled` 保守换代承接。
     async fn invalidate(&mut self, kind: &'static str, renew_epoch: bool) {
-        let (from, clock_epoch, wall) = {
+        let (from, clock_epoch, wall, published) = {
             let mut snap = self.snapshot.write().await;
             let from = snap.evidence.quality;
             snap.evidence.source = None;
@@ -802,7 +866,8 @@ impl TimeGateDriver {
             let wall = Utc::now();
             snap.evidence.system_wall_utc = wall;
             snap.evidence.reference_utc = wall;
-            (from, clock_epoch, wall)
+            // 06 §4：失效同样是「权威证据变了」（质量降级、必要时换代），一并通知。
+            (from, clock_epoch, wall, snap.evidence.clone())
         };
         self.set_attempt(0);
         self.retry_active.store(true, Ordering::SeqCst);
@@ -817,6 +882,7 @@ impl TimeGateDriver {
             clock_epoch,
             attempt: 0,
         });
+        self.notify_time_changed(&published);
     }
 
     fn set_attempt(&mut self, attempt: u32) {

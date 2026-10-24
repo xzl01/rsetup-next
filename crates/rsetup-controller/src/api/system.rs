@@ -70,12 +70,13 @@ pub struct SystemApiState {
 }
 
 impl SystemApiState {
-    /// 系统时间证据变化时的**唯一发布入口**（06 §4 `system.time.changed`）：调用方是时间
-    /// 采样/校准侧（`time::gate` 的新快照被业务消费的时点），管理线不自己造第二套时间源，
-    /// 也不在 `GET /system/status` 这类读路径上伪造时间事件。
+    /// 系统时间证据变化的管理线发布入口（06 §4 `system.time.changed`）：管理线不自己造第二套
+    /// 时间源，也不在 `GET /system/status` 这类读路径上伪造时间事件。
     ///
-    /// 本切片内**尚无进程内调用方**：时间线接入前本入口不被调用，事件流上因此不会出现任何
-    /// `system.time.changed`（宁可不发，也不伪造一次没有发生过的时间变化）。
+    /// 生产上真正的**触发方**是时间门禁的后台 driver：它每次确认并把新的权威快照写入后，经装配
+    /// 注入的 [`crate::time::TimeChangedSink`]（`main.rs` 的 `time_changed_sink`）用**同一个**
+    /// [`EventEnvelope::system_time_changed`] 构造投出事件；本方法是同一条线上的显式入口，供
+    /// 管理线按需复述当前证据。事件只由真实发生过的证据变化产生，绝不由读路径伪造。
     ///
     /// 受众不接受调用方给出：[`EventEnvelope::system_time_changed`] 用 `TimeEvidence`
     /// 一份数据同时钉死载荷与 [`crate::events::EventAudience::Admins`]（06 §4「时间事件仅

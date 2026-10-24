@@ -7,17 +7,17 @@
 //! 本入口不构造测试网关、`connect_lazy` 占位池、固定 offline/空能力或 authz
 //! epoch 0，也不构造任何返回伪造取值的常量源；设备实时视图、准入变更通知、板端
 //! `BoardClient` 与状态快照都由 [`TransportManager`]（连接管理器）与其
-//! [`TransportBoardClient`] 适配真实承担；唯一仍以**读取即失败**接入的是 Runtime
-//! 恢复控制器真源（见 [`UnwiredRecoveryProbe`]，按契约上抛 503，不伪造 ready/mode）。
+//! [`TransportBoardClient`] 适配真实承担；Runtime 恢复控制器真源由生产
+//! [`RuntimeRecoveryController`] 装配（见 `operations` 模块），HTTP 探针与任务调度
+//! 循环共享同一个实例，不存在第二套恢复模式快照。
 
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
 use rsetup_controller::api::adapters::build_sqlx_management_state_full;
-use rsetup_controller::api::system::{RecoveryModeProbe, RecoveryView};
 use rsetup_controller::api::{
-    ManagementFuture, install_management_cursor_secret, load_management_cursor_secret_from_env,
+    install_management_cursor_secret, load_management_cursor_secret_from_env,
 };
 use rsetup_controller::auth::service::AuthService;
 use rsetup_controller::auth::sqlx_repo::SqlxIdentityRepository;
@@ -25,6 +25,7 @@ use rsetup_controller::authz::sqlx_repo::{
     AuthorizationSnapshotRepository, SqlxAuthorizationSnapshotRepository,
 };
 use rsetup_controller::events::EventBus;
+use rsetup_controller::events::EventEnvelope;
 use rsetup_controller::http_auth::{AppState, HttpAuthState};
 use rsetup_controller::http_device_status::{DeviceStatusState, SnapshotDeviceStatusAuthorizer};
 use rsetup_controller::http_events::EventsState;
@@ -32,6 +33,7 @@ use rsetup_controller::http_live::LiveAuth;
 use rsetup_controller::http_security::HttpSecurityConfig;
 use rsetup_controller::metrics::collect::MetricsRuntime;
 use rsetup_controller::metrics::config::MetricsConfig;
+use rsetup_controller::operations::RuntimeRecoveryController;
 use rsetup_controller::polling::SnapshotStore;
 use rsetup_controller::production::{MetricsLineInputs, ProductionInputs, build_production_router};
 use rsetup_controller::tasks::SqlxTaskApi;
@@ -43,8 +45,9 @@ use rsetup_controller::tasks::repository::SqlxTaskRepository;
 use rsetup_controller::tasks::scheduler::{SchedulerPolicy, SystemMonoClock, TaskScheduler};
 use rsetup_controller::tasks::scheduler_store::SqlxSchedulerStore;
 use rsetup_controller::tasks::service::TaskService;
+use rsetup_controller::time::TimeChangedSink;
 use rsetup_controller::time::evidence::TimeEvidence;
-use rsetup_controller::time::{TimeGateConfig, TimeGateHandle, start_time_gate};
+use rsetup_controller::time::{TimeGateConfig, TimeGateHandle, start_time_gate_with_notifier};
 use rsetup_controller::transport::board_client::TransportBoardClient;
 use rsetup_controller::transport::listener::{
     ListenerError, SqlxTaskResultSink, TransportEnv, run_controller_listener_with_sink,
@@ -74,22 +77,14 @@ impl BootstrapSecretSink for LogSecretSink {
     }
 }
 
-/// Runtime 恢复控制器真源的 **fail-closed** 装配位（唯一尚未交付的 transport 相关源）。
+/// Runtime 恢复控制器真源的生产装配形态（05 §9 / 04 §5.2）。
 ///
-/// [`RecoveryModeProbe`] 的契约本身规定：`ready`/`mode` 必须来自 Runtime 当前真实快照，
-/// **不可读时上抛错误**由 handler 映射 503 `NOT_READY`。恢复控制器尚未交付，因此这里返回
-/// 固定去敏 `Config` 是契约内的正确失败形态：绝不返回伪造的 `ready = true`/`mode`，也不
-/// 造第二套恢复模式真源。[`TransportManager::current_mode`] 只委托到本装配位。
-struct UnwiredRecoveryProbe;
-
-impl RecoveryModeProbe for UnwiredRecoveryProbe {
-    fn current_mode<'a>(&'a self) -> ManagementFuture<'a, RecoveryView> {
-        Box::pin(async {
-            Err(ControllerError::Config(
-                "recovery controller not wired".into(),
-            ))
-        })
-    }
+/// [`RecoveryModeProbe`] 的契约要求 `ready`/`mode` 必须来自 Runtime 当前真实快照：
+/// [`RuntimeRecoveryController`] 就是这份快照本身（进程内唯一实例，正常模式启动，
+/// 管理员可进入/解除受控恢复模式），绝不返回伪造取值，也不造第二套恢复模式真源。
+/// [`TransportManager::current_mode`] 只委托到本装配位。
+fn build_recovery_controller() -> Arc<RuntimeRecoveryController> {
+    Arc::new(RuntimeRecoveryController::new())
 }
 
 /// 后台任务（撤销消费 / 准入复查 / 轮询驱动）的关停宽限期：三者只等 watch，不做 I/O，
@@ -111,6 +106,7 @@ const BOARD_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 fn build_transport_manager(
     db: &DbPool,
     time_gate: &TimeGateHandle,
+    recovery: Arc<RuntimeRecoveryController>,
     config: ManagerConfig,
 ) -> Result<(Arc<TransportManager>, Arc<SnapshotStore>), ControllerError> {
     let snapshot = Arc::new(SnapshotStore::new());
@@ -118,7 +114,7 @@ fn build_transport_manager(
     let manager = TransportManager::try_new(
         Arc::new(db.clone()),
         Arc::clone(&snapshot),
-        Arc::new(UnwiredRecoveryProbe),
+        recovery,
         task_time_source(time_gate),
         config,
     )
@@ -147,6 +143,21 @@ fn time_gate_config_from_env() -> TimeGateConfig {
     }
 }
 
+/// 时间门禁 → 进程内事件总线的生产挂接（06 §4 `system.time.changed`）。
+///
+/// driver 每次**确认并把新的权威时间证据写入快照**后调用它一次（启动采样、周期复验、
+/// 退避恢复、stale/跳钟失效）。这里只负责将变化投到进程内唯一通道：事件形状与
+/// 「仅管理员」受众由 [`EventEnvelope::system_time_changed`] 钉死，与
+/// `SystemApiState::publish_system_time_changed` 是同一个构造入口，不存在第二套时间字段
+/// 或第二个受众决定点。[`EventBus::publish`] 永不阻塞、永不上抛、无订阅者即丢弃，
+/// 因此在 driver 的任务上直接调用是安全的（时间线不会因为没人订阅 SSE 而变慢或失败）。
+fn time_changed_sink(bus: &EventBus) -> TimeChangedSink {
+    let bus = bus.clone();
+    Arc::new(move |evidence| {
+        bus.publish(EventEnvelope::system_time_changed(evidence));
+    })
+}
+
 /// 任务线时间源的顶层唯一装配：把**同一个** `TimeGateHandle` 交给任务适配器。
 ///
 /// `TimeGateHandle` 内部状态（权威快照 / ready / 退避计数）全在 `Arc` 后，克隆只是
@@ -170,6 +181,7 @@ fn production_inputs(
     time_gate: &TimeGateHandle,
     transport: Arc<TransportManager>,
     snapshot: Arc<SnapshotStore>,
+    event_bus: &EventBus,
 ) -> Result<ProductionInputs, ControllerError> {
     let cursor_secret = load_management_cursor_secret_from_env()?;
     install_management_cursor_secret(&cursor_secret)?;
@@ -184,22 +196,24 @@ fn production_inputs(
         HttpSecurityConfig::from_env()?,
     ));
 
-    // 事件总线：进程内唯一通道句柄（broadcast 容量 128）。SSE 读线与各条业务发布方
-    // 共享同一个句柄（`Clone` 不新建通道）：任务线在任务状态变化时投 `task.updated`，
-    // 管理线在授权变更成功时投 `permissions.changed`、并暴露
-    // `SystemApiState::publish_system_time_changed` 作为时间证据变化的发布入口
-    // （时间采样侧尚未调用它，因此当前不会有时间事件）。
+    // 事件总线：进程内唯一通道句柄（broadcast 容量 128），由 `main` 构造后传入——
+    // 它必须在时间门禁启动**之前**就位，时间证据变化的通知才能挂到同一条通道上。
+    // SSE 读线与各条业务发布方共享同一个句柄（`Clone` 不新建通道）：任务线在任务状态变化时投
+    // `task.updated`，管理线在授权变更成功时投 `permissions.changed`，时间线在 driver 每次
+    // 确认新权威快照时投 `system.time.changed`（挂接点见 `main` 的 `time_changed_sink`；
+    // 受众固定为管理员，见 `EventEnvelope::system_time_changed`）。
     // 除这些真实变化外，事件流上只会出现心跳与总线自身产生的 reset，不伪造任何事件。
     let events = EventsState {
         auth: auth.clone(),
-        bus: EventBus::new(),
+        bus: event_bus.clone(),
         // 长连接权威复核周期：空闲连接也必须按会话/authz_epoch/降权切断。
         revalidate_interval: rsetup_controller::http_events::DEFAULT_REVALIDATE_INTERVAL,
     };
 
     // 三条 transport 源都由同一个连接管理器承担（同一份登记表，不是三份互不相干的视图）：
     // 设备实时视图只报当前已认证会话的真实状态与 typed 能力，准入变更经有界通道即时
-    // 撤销活跃会话与挂起握手，恢复模式委托到 [`UnwiredRecoveryProbe`]。
+    // 撤销活跃会话与挂起握手，恢复模式委托到生产 [`RuntimeRecoveryController`]（见
+    // [`build_recovery_controller`]，与任务调度循环共享同一实例）。
     let management = build_sqlx_management_state_full(
         db.clone(),
         auth.clone(),
@@ -766,11 +780,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 指标配置门禁：在连接数据库与绑定端口之前完成（§3.6 fail-closed 无副作用）。
     let metrics_config = Arc::new(MetricsConfig::from_env()?);
     // NTP 时间门禁：在建立数据库连接与启动任何生产服务之前启动（每次进程启动只调用一次）。
-    // 单调进程时钟纪元 clock_epoch 只在此生成一次；`start_time_gate` 在 tokio 运行时内 spawn
-    // 后台 driver（startup 预算采样，就绪或超时后对外提供时间快照），本进程全程持有 handle。
+    // 事件总线**必须先于门禁**构造：它是进程内唯一通道句柄，门禁的「时间证据已变化」通知与
+    // 后面 SSE 读线、任务线、管理线用的必须是同一个句柄（Clone 不新建通道），因此不能等到
+    // `production_inputs` 里再建。
+    let event_bus = EventBus::new();
+    // 单调进程时钟纪元 clock_epoch 只在此生成一次；`start_time_gate_with_notifier` 在 tokio
+    // 运行时内 spawn 后台 driver（startup 预算采样，就绪或超时后对外提供时间快照），本进程
+    // 全程持有 handle。driver 每次确认新的权威时间证据，都经 `time_changed_sink` 向总线投
+    // `system.time.changed`（06 §4，受众固定为管理员）。
     // servers 为空（未设 NTP_SERVERS）即走 SystemFallback，安全 fail-closed 与 fallback 规则不变。
     let clock_epoch = uuid::Uuid::new_v4();
-    let time_gate = start_time_gate(time_gate_config_from_env(), clock_epoch);
+    let time_gate = start_time_gate_with_notifier(
+        time_gate_config_from_env(),
+        clock_epoch,
+        Some(time_changed_sink(&event_bus)),
+    );
     // 就绪等待**从这一刻就开始**：`StartupTimeGate::start` 立即 spawn 一次 `wait_ready`，让
     // `ready_timeout`（生产 30s）与下面的建池、schema 检查、admin bootstrap、启动恢复、
     // 生产装配全程并行消耗，任一步失败即随栈展开取消（见 `StartupTimeGate` 的时序说明）。
@@ -804,8 +828,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         TransportEnv::Enabled(config) => config.manager_config(),
         TransportEnv::Disabled => ManagerConfig::default(),
     };
-    let (transport_manager, transport_snapshot) =
-        build_transport_manager(&db_handle, &task_line_gate, manager_config)?;
+    // 恢复模式唯一真源（05 §9）：transport 线探针、HTTP `/system/status` 与下面的任务
+    // 调度循环共享同一个 `Arc<RuntimeRecoveryController>`，不存在第二套模式快照。
+    let recovery_controller = build_recovery_controller();
+    let recovery_for_scheduler = Arc::clone(&recovery_controller);
+    let (transport_manager, transport_snapshot) = build_transport_manager(
+        &db_handle,
+        &task_line_gate,
+        recovery_controller,
+        manager_config,
+    )?;
     let transport_for_router = Arc::clone(&transport_manager);
     let db_for_transport = db_handle.clone();
     start_if_ready(check_identity_schema(&db), move || async move {
@@ -848,6 +880,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &task_line_gate,
                     transport_for_router,
                     transport_snapshot,
+                    // 与门禁通知同一个通道句柄：SSE 读线因此收得到时间线投出的事件。
+                    &event_bus,
                 )?)?;
                 Ok::<_, Box<dyn std::error::Error>>(router)
             },
@@ -876,6 +910,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     process_epoch,
                 ));
                 let mut sched_shutdown = shutdown_rx.clone();
+                // 恢复模式闸门：与 transport 探针、HTTP `/system/status` 是同一个
+                // `Arc<RuntimeRecoveryController>`（05 §9 唯一真源）。
+                let sched_recovery = Arc::clone(&recovery_for_scheduler);
                 // 每轮统计「已占槽」子任务（04 §5.1：dispatching/accepted/verifying 均占槽），
                 // 让跨调度周期已在看板中的任务真正计入全局 16 槽上限。
                 let sched_active_pool = sched_pool.clone();
@@ -890,6 +927,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             _ = interval.tick() => {
+                                // 受控恢复模式（05 §9）：跳过调度派发，不发任何
+                                // prepare/execute；管理写不受本闸门影响（05 §9 允许
+                                // 登录、改密、注销、审计、只读核验与退出恢复模式）。
+                                if !sched_recovery.allows_scheduling() {
+                                    continue;
+                                }
                                 let active_slots: usize = sqlx::query_scalar::<_, i64>(
                                     "SELECT COUNT(*) FROM sub_tasks WHERE state IN ('dispatching', 'accepted', 'verifying')"
                                 )

@@ -13,26 +13,30 @@
 
 本文链接均为仓库内位置；涉及代码的条目一律以**符号名**定位，不引用会随提交漂移的行号。
 
-## a) 传输线与设备业务接线现状（状态轮询、任务调度、主动结果接收已接通，恢复模式仍缺）
+## a) 传输线与设备业务接线现状（状态轮询、任务调度、主动结果接收与受控恢复已接通）
 
 - **代码位置**：[`crates/rsetup-controller/src/main.rs`](<../../crates/rsetup-controller/src/main.rs>)
   的 [`TransportManager`](<../../crates/rsetup-controller/src/transport/manager.rs>)（实现 `DeviceLiveProbe` 与 `ManagementNotificationSink`）、
   [`TransportBoardClient`](<../../crates/rsetup-controller/src/transport/board_client.rs>)（实现 `tasks::board_client::BoardClient`）、
   [`SqlxSchedulerStore`](<../../crates/rsetup-controller/src/tasks/scheduler_store.rs>)、
-  [`SqlxTaskEvidenceApplier`](<../../crates/rsetup-controller/src/tasks/evidence.rs>) 与
-  [`SqlxTaskResultSink`](<../../crates/rsetup-controller/src/transport/listener.rs>)。
+  [`SqlxTaskEvidenceApplier`](<../../crates/rsetup-controller/src/tasks/evidence.rs>)、
+  [`SqlxTaskResultSink`](<../../crates/rsetup-controller/src/transport/listener.rs>) 与
+  [`RuntimeRecoveryController`](<../../crates/rsetup-controller/src/operations/recovery.rs>)。
 - **已接通部分**：
   1. 生产入口已装配真实连接管理器与板端监听（`run_controller_listener_with_sink`），启动了轮询驱动任务（`spawn_poll_driver`），
      `GET /devices/{id}/status` 能够读取由轮询写入的真实设备状态快照；
   2. 准入吊销已可向活跃会话投递切断与停止重连信令；
   3. `TaskScheduler` 生产调度驱动已在 `main.rs` 启动后台循环，`SqlxSchedulerStore` 完成真实候选联查与短事务 CAS 意图落库，并对排队超时（`expired`）与 prepare 失败（`failed`）进行持久化收敛与设备锁释放；
   4. 中控结果接入 `SqlxTaskResultSink` 接入生产 listener 并注入 `TaskEvidenceApplier`，完成合法状态机推进与设备锁处理；板端在 `execute` 持久落盘后通过会话通道异步触发 `device.task.result` 事件；
-  5. 关停广播已联合覆盖 HTTP、板端监听、准入复查、撤销消费、状态轮询与任务调度。
+  5. 生产装配以真实 `RuntimeRecoveryController` 取代占位探针，`GET /api/v1/system/status` 能够由恢复控制器读取 `ready = true` 与当前模式（`normal` / `controlled_recovery`）；调度循环与恢复控制器联动，受控恢复模式下阻止调度派发；
+  6. 数据保留期守则 `is_safe_to_delete` 与清理框架 `clean_retention_data` 已实现并通过单元测试，严格保护 `Held`、`Unknown` 与持锁未决记录，幂等索引保留期不早于任务清理；
+  7. 关停广播已联合覆盖 HTTP、板端监听、准入复查、撤销消费、状态轮询与任务调度。
 - **仍存在的缺口**：
-  1. 恢复模式真源仍为 `UnwiredRecoveryProbe`（见 [`main.rs`](<../../crates/rsetup-controller/src/main.rs>)），管理员通过会话门禁后，`GET /api/v1/system/status` 在读取该探针时返回 503 `NOT_READY`；
-  2. 真实数据库环境下的端到端长时间任务压测与容灾验证尚未完成。
-- **影响**：任务派发、执行通知与状态持久化闭环已建立，但受控恢复模式（ControlledRecovery）仍未交付。
-- **下一步**：交付 Runtime 恢复控制器替换占位探针，不以常量成功替代。
+  1. 受控恢复模式（ControlledRecovery）机制与调度闸已建立，但生产端到端触发链（外部备份恢复检测、管理员核对退出端点）仍待接入；
+  2. 数据保留期清理 `clean_retention_data` 尚无后台定时调度任务；
+  3. 真实数据库环境下的端到端长时间任务压测与容灾验证尚未完成。
+- **影响**：任务派发、执行通知、状态持久化闭环与恢复模式探针已建立，但受控恢复模式的生产触发链与保留期周期清理仍待补齐调度驱动。
+- **下一步**：补齐受控恢复管理端点与保留期定时驱动；在具备完备隔离与备份门禁的真实数据库目标上进行长期压测与容灾演练。
 
 ## b) 真实主机重启仍未实现；板端生产连接模式已接线
 
@@ -53,24 +57,25 @@
 - **下一步**：在另获明确授权的受控板端环境交付真实 reboot 边界及负例/恢复验证；
   [生产隧道计划](<../superpowers/plans/2026-10-23-production-v3-tunnel.md>)明确不把真实重启扩为该任务的隐含授权，不能为清理文档打开执行能力。
 
-## c) SSE 业务发布方已部分接线，端到端与时间线仍有边界
+## c) SSE 业务发布方已接通系统时间与任务更新，端到端仍有边界
 
 - **代码位置**：[`crates/rsetup-controller/src/events.rs`](<../../crates/rsetup-controller/src/events.rs>)
   的 `EventBus::publish`；生产装配处 `EventBus::new()` 见
   [`crates/rsetup-controller/src/main.rs`](<../../crates/rsetup-controller/src/main.rs>)，
   分发至 `EventsState`、`HttpTasksState`、`ManagementState`；测试见
-  [`crates/rsetup-controller/tests/sse_business_events.rs`](<../../crates/rsetup-controller/tests/sse_business_events.rs>)。
+  [`crates/rsetup-controller/tests/sse_business_events.rs`](<../../crates/rsetup-controller/tests/sse_business_events.rs>)
+  与 [`crates/rsetup-controller/tests/sse_time_events.rs`](<../../crates/rsetup-controller/tests/sse_time_events.rs>)。
 - **现状**：
-  1. 任务线（`tasks/http.rs`）在任务提交、有效取消、时限复核、释放锁成功时，已接入 `task_updated` 发布；
+  1. 任务线（`tasks/http.rs` 与 `tasks/evidence.rs`）在任务提交、有效取消、时限复核、释放锁以及证据落地成功时，已接入 `task_updated` 发布；
   2. 管理线在设备改名（`devices.rs` `patch_device`）与准入状态变更（`approvals.rs` `approve`/`revoke`/`reauthorize`）成功时，已接入 `device_updated`（`EventObjectAudience::admins()`）发布；
   3. 授权变更在目标用户明确（`users.rs` 触及 active/is_admin、密码重置，以及 `grants.rs` `create_grant`）成功时，已接入 `permissions_changed` 发布；
-  4. 以上写操作与受众隔离在 [`tests/sse_business_events.rs`](<../../crates/rsetup-controller/tests/sse_business_events.rs>) 中通过 11 项进程内端到端测试。
+  4. 系统时间变更已接入生产装配：时间门禁 driver 在每次确认并更新权威快照（`NtpValid`、`SystemFallback`、跳钟换代）时，通过 `TimeChangedSink` 自动向 EventBus 广播 `system.time.changed`（受众由 envelope 钉死为 Admins），在 [`tests/sse_time_events.rs`](<../../crates/rsetup-controller/tests/sse_time_events.rs>) 中经 3 项测试验证；
+  5. 以上写操作与受众隔离在测试套件中通过端到端测试。
 - **仍存在的边界与未闭环项**：
-  - **系统时间变更的 SSE 发布方没有生产调用方**：[`SystemApiState::publish_system_time_changed`](<../../crates/rsetup-controller/src/api/system.rs>) 已提供类型化入口，事件线句柄在生产装配中已接入（`events = Some(bus)`），但时间门禁的后台 driver（`start_time_gate` 启动采样、周期复验、单调退避、跳钟换代）在证据变化处不调用它，因此事件流上当前不会出现 `system_time_changed`；同一条时间证据的 HTTP 读线缺口见 j 节；
   - **`authz_epoch` 变更与 SSE 读线复核关流的时序特性**：写事务内 `bump_authz_epoch` 后，已建立的旧连接在发送下一帧前权威复核发现 `epoch` 不等，按 06 §4「发送前验证 session 与 authz_epoch，撤权关闭旧订阅，排队旧权限数据不得发送」立即主动断开连接；受影响用户是通过断线重连拉取最新授权，而不是持续在旧连接上消费事件；
   - **受影响集合不确定的写操作不虚构受众**：角色修改、组修改、删除授权等无法单点回显具体目标用户的场景，为防止向错人广播虚假提示，遵循安全失败原则不发送 `permissions_changed`，由全局 `authz_epoch` 关流重连机制保证收敛；
   - **真实浏览器与跨网络传输端到端仍属未闭环**（AT-18 保持未验证）。
-- **下一步**：在时间门定时更新处接入 `system_time_changed` 发布；在真实网络与前端联合环境中按 AT-18 进行端到端复核。
+- **下一步**：在真实网络与前端联合环境中按 AT-18 进行端到端复核。
 
 ## d) 设备状态快照生产写入已接线，完整容量与前端验收仍缺
 
@@ -293,13 +298,12 @@
   5. 模块内已有 5 项进程内 HTTP 测试覆盖并通过测试：门禁证据与重试态、后台重试激活、无时间源回退、非管理员 403、
      未登录 401。
 - **剩余缺口**：
-  1. **时间门 driver 未调 `publish_system_time_changed`**：`SystemApiState::publish_system_time_changed` 已就绪，但时间门禁 driver 在证据变化时未调用它（见 c 节）；
-  2. **下次重试字段未审定**：响应只有 `retry_active`（后台退避重试是否在跑），未给出下次重试的具体时刻或退避时长（`retry_attempt()` 与 `next_backoff` 未进入响应），与 §7「NTP状态/下次重试」的字面要求仍有差距；是否在响应中补一个由 `next_backoff(attempt)` 派生的可机读字段尚未审定；
-  3. **无账本证据**：上述行为目前只存在于模块内进程内测试，未记入验收账本，也不构成真实环境的端到端结论。
+  1. **下次重试字段未审定**：响应只有 `retry_active`（后台退避重试是否在跑），未给出下次重试的具体时刻或退避时长（`retry_attempt()` 与 `next_backoff` 未进入响应），与 §7「NTP状态/下次重试」的字面要求仍有差距；是否在响应中补一个由 `next_backoff(attempt)` 派生的可机读字段尚未审定；
+  2. **无账本证据**：上述行为目前只存在于模块内进程内测试，未记入验收账本，也不构成真实环境的端到端结论。
 - **影响（不得据此推定的范围）**：本节只记录一条规划端点推进到「路由已提交并通过测试」，
   **不改变验收账本任何行的 `status`**：`T4-09` 仍为 `BLOCKED`；`AT-01`..`AT-18` 仍为「未验证」。在取得按行登记的账本证据前，「系统时间可读」「NTP 状态可观测」「Runtime Task 6 完整」一律不得引用为已
   实现或通过。
-- **下一步**：在时间门 driver 中补齐 `publish_system_time_changed` 调用 → 审定「下次重试」的响应字段口径 → 按行合同另记 `executed_at`/`layer`/`command_or_steps`/`evidence`，
+- **下一步**：审定「下次重试」的响应字段口径 → 按行合同另记 `executed_at`/`layer`/`command_or_steps`/`evidence`，
   至少覆盖：未登录 401、非管理员 403、响应形状与 `TimeEvidence` 一致且不含凭据、`SystemFallback`/`Stale`
   两种质量下的真实降级值、以及与门禁 `background_retry_active()`/`retry_attempt()` 的一致性。
 

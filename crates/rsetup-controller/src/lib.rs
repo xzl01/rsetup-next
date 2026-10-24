@@ -19,6 +19,7 @@ pub mod http_security;
 pub mod integrity;
 pub mod metrics;
 pub mod model;
+pub mod operations;
 pub mod polling;
 pub mod production;
 pub mod tasks;
