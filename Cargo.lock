@@ -687,6 +687,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "h2"
+version = "0.4.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c18c05b8ab635fc118"
+dependencies = [
+ "atomic-waker",
+ "bytes",
+ "fnv",
+ "futures-core",
+ "futures-sink",
+ "http",
+ "indexmap",
+ "slab",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1490,6 +1509,7 @@ dependencies = [
  "hex",
  "rsetup-core",
  "rsetup-protocol",
+ "rsetup-tunnel",
  "serde",
  "serde_json",
  "thiserror",
@@ -1510,6 +1530,7 @@ dependencies = [
  "libc",
  "rand",
  "rsetup-protocol",
+ "rsetup-tunnel",
  "serde",
  "serde_json",
  "sha2",
@@ -1564,6 +1585,21 @@ dependencies = [
  "hex",
  "ring",
  "thiserror",
+]
+
+[[package]]
+name = "rsetup-tunnel"
+version = "0.5.0"
+dependencies = [
+ "bytes",
+ "h2",
+ "hex",
+ "http",
+ "libc",
+ "ring",
+ "rsetup-protocol",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -2201,6 +2237,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a3d06f0b082ba57c26b79407372e57cf2a1e28124f78e9479fe80322cf53420b"
 dependencies = [
  "futures-core",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
+name = "tokio-util"
+version = "0.7.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e464cf451ba96ebfc6f9b6542f17ee8b8956e33f1e40d9690624e59d7a7f8a4b"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-sink",
+ "libc",
  "pin-project-lite",
  "tokio",
 ]

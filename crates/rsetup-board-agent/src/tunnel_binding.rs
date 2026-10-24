@@ -3,8 +3,9 @@
 //! 本模块用真实 [`BoardAgent`] + 真实 [`JournalStore`] + mpsc 通道在内存内装配 control/data
 //! 双流，包含所有者授权启用的业务 codec（[`BusinessCodec`]）；
 //! 仍不含真实网络 socket、不含真实加密实现、不含握手实现。
-//! 真实加密通道与真实网络监听停在 [`ApprovalGate`] 的 `network_approved` 之前：
-//! 该门默认未批准，继续 fail-closed。
+//! 本内存夹具的 [`ApprovalGate`] 默认关闭 `network_approved`，不在此组件内创建网络连接。
+//! 生产出站加密通道由 `connect` / `session_handler` / `--connect` 路径单独装配；
+//! 此夹具的默认值不是对生产隧道实现或其授权状态的结论。
 
 use rsetup_protocol::BusinessCodec;
 use rsetup_protocol::wire::BusinessPayload;
@@ -18,14 +19,15 @@ use crate::dispatch::{
 use crate::journal::Fs;
 use crate::read_only::{PeerContext, ReadOnlySource};
 
-/// 唯一允许建立真实加密通道/真实网络连接的凭证。
+/// 本内存组件的 codec / network 行为门；不是生产网络连接的全局授权凭证。
 ///
-/// 当前口径（2026-10-22）：
+/// 历史组件基线（2026-10-22，保留默认值以覆盖夹具 fail-closed 行为）：
 /// * `codec_approved` 默认 **true**：业务 codec 已按项目所有者 2026-10-22 的授权
 ///   （原话「直接实现并启用生产 codec」）启用。**这是所有者授权，不是外部专家书面决议**，
 ///   也不构成对 03 规格「待审阅」状态的批准；跨库固定测试向量、两进程互操作、
 ///   库选型三类证据仍待补齐。
-/// * `network_approved` 默认仍为 **false**：真实 socket、加密与握手仍未获授权，继续 fail-closed。
+/// * `network_approved` 默认仍为 **false**：本内存夹具不发起网络 I/O，继续 fail-closed。
+///   后续获授权的生产 socket、v3 握手与加密 h2 会话走 `connect` 路径，不依赖本夹具开门。
 ///
 /// `evidence_path` 指向所有者授权记录；它只留档「谁在什么范围内授权」这一事实，
 /// 隧道安全协议的外部专家决议仍留在
@@ -276,5 +278,17 @@ where
             return Err(StreamError::ControlStreamRequired);
         }
         Ok(BusinessPayload::TaskRecord(record.to_wire()))
+    }
+
+    /// 与生产补发路径**同一形状**的事件帧：Control 未开流一律拒绝，载荷编码复用
+    /// [`crate::session_handler::task_result_event`]（与业务回包同一条编码路径）。
+    pub fn emit_task_result_event(
+        &self,
+        record: &crate::journal::TaskRecord,
+    ) -> Result<crate::session_handler::PendingEvent, StreamError> {
+        // 先过未开流的门（与 emit_task_result 完全一致），再编码事件帧。
+        self.emit_task_result(record)?;
+        crate::session_handler::task_result_event(&record.to_wire())
+            .map_err(|status| StreamError::Serialization(status.to_string()))
     }
 }

@@ -1,8 +1,15 @@
 Source: rsetup-next
 Section: admin
 Maintainer: xzl <xiangzelong@radxa.com>
+# dh_installsystemd 自 debhelper 13.11.6 起才解析 /usr/lib/systemd/system 下的单元
+# （官方 changelog 条目 "Support units below /usr"，详见 debian/rules 注释与
+# debian/README.source）。本源码包三个包的 unit 全部装在 /usr 下：低于该版本的 helper
+# 会「没看见单元」而生成不含任何激活片段的脚本，把打包伪装成通过，所以下限绑定在构建
+# 工具上，由 dpkg-checkbuilddeps 在任何构建规则运行前失败。这是构建工具版本下限，不是
+# Rust 版本锁定；也不得用 dpkg-buildpackage -d 跳过依赖检查后再宣称打包通过。
 Build-Depends:
  cargo,
+ debhelper (>= 13.11.6~),
  debhelper-compat (= 13),
  nodejs,
  npm,
@@ -64,11 +71,14 @@ Description: Web control center (controller) for rsetup-next
  (127.0.0.1:8080 by default) on top of a MySQL/MariaDB or TiDB database. It
  terminates no TLS and is not designed for exposure to untrusted networks.
  .
- The package installs the binaries, one systemd unit and a configuration
- template, and configures or enables nothing: an operator must fill in
- /etc/default/rsetup-controller (database URL, allowed Host list, allowed
- browser Origin, management cursor secret), migrate the target database with
- rsetup-controller-migrate, and only then start the service.
+ The package installs the binaries, one systemd unit and a documentation
+ example configuration, and configures or enables nothing: an operator must
+ create /etc/default/rsetup-controller (database URL, allowed Host list, allowed
+ browser Origin, management cursor secret), bring the target database to the v4
+ schema with rsetup-controller-migrate, and only then start the service. That
+ tool is v4-only and offers no upgrade path: on an empty database it creates the
+ full v4 baseline, on a database already at v4 it only re-runs its read-only
+ verification, and any other schema version is refused.
  .
  The unit drops privileges to the static system account rsetup-controller,
  which the package creates on install (adduser --system) so that
@@ -87,9 +97,20 @@ Description: board-side agent for rsetup-next
  device status, clock, durable task journal) from a local, read-only source and
  keeps a durable task journal under its own state directory.
  .
- The shipped binary is a read-only sampling agent. The production encrypted
- tunnel is not wired up yet (the wire protocol codec is not approved), and a
- real host reboot boundary is not implemented: both reboot actions answer
- "capability unavailable" and the process never reboots the machine. The systemd
- unit runs it as root in the read-only watch loop, because reading the board's
- full hardware state requires root privileges.
+ The unit starts the production mode --connect: an active outbound TCP
+ connection to the controller, a v3 client handshake verified against explicit
+ controller public-key pins (no trust-on-first-use), an encrypted record layer,
+ then an HTTP/2 dual-stream session carrying the read-only actions and journal
+ queries. The process listens on no port. Every connection parameter, the pins
+ included, is read from a required environment file this package deliberately
+ does not ship, and the durable journal plus the board identity key live in a
+ state directory created 0700.
+ .
+ The unit is installed disabled and starts nothing on its own: an operator must
+ create that configuration file and enable the service by hand, and installing
+ or upgrading never enables, starts, restarts or stops it. It runs as root
+ because reading the board's full hardware state requires root privileges. A
+ real host reboot boundary is still not implemented: the unit injects no reboot
+ dispatcher, both reboot actions answer "capability unavailable", the advertised
+ capability list does not claim reboot, and neither the binary nor the unit
+ reboots the machine.

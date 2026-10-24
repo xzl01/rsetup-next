@@ -4,8 +4,8 @@
 // 因此其余辅助条目必然在部分测试目标中呈现为未使用，此处统一豁免 dead_code。
 //
 // 基线约定：所有真库用例以**当前受支持的身份 schema v4 为唯一基线**，v4 库由操作员
-// 预先迁移预置；用例只连接、断言与写入业务数据，绝不在用例内构造 v1/v2/v3 中间态，
-// 也不再调用显式 test migration 工具（migrate-identity-test）搭建夹具。
+// 由操作员显式 v4 入口创建或预先迁移预置；用例只连接、断言与写入业务数据，
+// 绝不构造 v1/v2/v3 中间态：v4-only 基线已删除旧版本夹具与任何续迁入口。
 #![allow(dead_code)]
 use rsetup_controller::{ControllerConfig, DbPool, TestMigrationConfig};
 use std::sync::Mutex;
@@ -106,8 +106,8 @@ pub async fn assert_actor_fixture_v4_without_check_or_fk(db: &DbPool) {
 }
 
 /// 夹具健康检查（v4 口径）：夹具由操作员预置为 v4（当前受支持版本），任何
-/// 「夹具仍然健康」的中途复核都必须用 v4 普通启动门禁；沿用 v3 终态门禁
-/// `check_v3_ready` 会在 v4 库上必然 `SchemaNotReady { required: 3 }` 而误报。
+/// 「夹具仍然健康」的中途复核都必须用 v4 普通启动门禁。v3 终态门禁已随 v4-only
+/// 基线删除，不再存在任何"按旧版本复核夹具"的入口。
 pub async fn assert_v4_fixture_healthy(db: &DbPool) {
     rsetup_controller::check_identity_schema(db)
         .await
@@ -775,18 +775,15 @@ pub async fn admission_polluted_combinations_are_readonly_rejected(db: &DbPool) 
         );
         assert_admission_failure(
             // 污染行必须被就绪门禁拒绝为 `identity data devices.state`。
-            // v3→v4 校验链路差异：v4 普通启动门禁 check_identity_schema 依次执行
-            // 版本决策（identity_schema_decision，required=4）→ identity 结构
-            // （validate_v2_shape）→ runtime 五表齐备 → identity 数据
+            // v4 门禁链路：check_identity_schema 依次执行版本决策
+            // （identity_schema_decision，required=4）→ 16 表完整结构
+            // （validate_v4_shape）→ runtime 五表齐备 → identity 数据
             // （validate_data = integrity::check_identity_data，期望版本 4）→
-            // runtime 数据 → 无 FK；v3 终态门禁 check_v3_ready 只到
-            // validate_data_at_v3。两条链路对 devices 的 state/decision 组合复用
-            // 同一个 validate_device_fields + scan_error("devices.state")，因此
-            // 错误串完全等价，仍是 Config("identity data devices.state")，断言
-            // 强度不降。唯一差异是到达数据扫描之前的前置阶段：v3 夹具会被 v4 门禁
-            // 在版本决策处 SchemaNotReady{required:4} 直接挡掉，永远走不到数据
-            // 扫描，因此本用例必须直接以操作员预置的 v4 库为夹具，才能在 v4 门禁上真正复现
-            // 「污染被拒绝且零写入」的语义。
+            // runtime 数据 → 无 FK。devices 的 state/decision 组合复用同一个
+            // validate_device_fields + scan_error("devices.state")，因此错误串仍是
+            // Config("identity data devices.state")，断言强度不变。非 v4 库会在版本
+            // 决策处 SchemaNotReady{required:4} 直接挡掉，永远走不到数据扫描，因此本用例
+            // 必须直接以操作员预置的 v4 库为夹具，才能真正复现「污染被拒绝且零写入」的语义。
             rsetup_controller::check_identity_schema(db).await,
             AdmissionFailure::ReadinessCombination,
         );

@@ -587,7 +587,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// 插入给定 `admission_state` 取值的 fixture 行，返回主键以便收尾**定点**删除。
-/// 列名取自 `migrations/0003_identity_application_integrity.sql` 的 `devices` 实表
+/// 列名取自唯一基线 `schema/v4.sql` 的 `devices` 实表
 /// （主键 `public_key BINARY(32)`、`display_name`/`review_decision`/`revision` 均
 /// NOT NULL 且无默认值）。F5：主键与 display_name 都是随机唯一值；普通
 /// `INSERT INTO`——若 32 字节随机主键真的撞库必须**报错暴露**，MUST NOT 用
@@ -614,7 +614,7 @@ async fn fixture_rows(db: &DbPool, values: &[&str]) -> Vec<Vec<u8>> {
 
 /// 同上（F5）：`main_tasks` fixture，主键 `id BINARY(16)` 随机唯一，
 /// `idempotency_key` 随机 hex 保证 `(actor_user_id, idempotency_key)` 唯一键不碰撞。
-/// NOT NULL 列的取值口径与 `migrations/0004_tasks.sql` 一致。
+/// NOT NULL 列的取值口径与唯一基线 `schema/v4.sql` 的 runtime 五表一致。
 async fn task_fixture_rows(db: &DbPool, rows: &[(&str, Option<&str>)]) -> Vec<Vec<u8>> {
     let mut ids = Vec::new();
     for (state, outcome) in rows {

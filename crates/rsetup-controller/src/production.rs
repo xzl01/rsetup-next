@@ -61,8 +61,8 @@ pub struct ProductionInputs {
     /// SSE 事件读线（1 条 `GET /api/v1/events` 路由 + 事件总线订阅面）。
     ///
     /// 其 `bus` 与生产进程内唯一的 [`crate::events::EventBus`] 是同一通道句柄；各条线的发布方
-    /// 通过同一个句柄投递命名事件（本切片尚无业务发布方，事件流因此真实地
-    /// 只有心跳，不伪造任何事件）。
+    /// 通过同一个句柄投递已接线的任务与管理事件；心跳与 reset 由 SSE 读线自身处理，
+    /// 不把尚未接线的业务变化伪造为已发布事件。
     pub events: EventsState,
     /// Prometheus 指标线（1 条路由，独立 Basic 认证边界）。
     pub metrics: MetricsLineInputs,

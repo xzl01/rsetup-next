@@ -18,8 +18,10 @@
 // 随仓库提供之后，「先构建前端」从 CI 的额外保险变回编译的必要前提，所以每一条编译
 // controller 的作业都要为它负责。
 import { test } from 'node:test';
-import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import assert from 'node:assert/strict';
 
 const make = readFileSync('Makefile', 'utf8');
@@ -803,5 +805,515 @@ test('no build configuration or doc hardcodes a generated asset file name', () =
     buildScript,
     ASSET_HASH_PATTERN,
     'build 侧资产表不得写死某个 hash 的文件名',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// systemd 打包合同：构建工具下限 + 维护脚本断言的意图守门人
+// ---------------------------------------------------------------------------
+//
+// 事实依据（debhelper 官方 changelog，
+// https://metadata.ftp-master.debian.org/changelogs/main/d/debhelper/unstable_changelog ，
+// 已由维护者独立核对）：
+//   * 13.11.6 条目 "Support units below /usr"：dh_installsystemd 从该版本起才解析
+//     /usr/lib/systemd/system 下的单元。本源码包三个包的单元**全部**装在 /usr 下，
+//     所以构建工具链必须有下限，否则旧 helper「没看见单元」生成的空脚本会伪装成功。
+//   * 13.25 条目 "Always stop the service on remove (#1079181)"：≥13.25 的生成脚本在
+//     prerm 的 remove 分支总会 stop。产物侧断言必须区分动作与生命周期分支，不能把
+//     任何 stop 都当成安装/升级违规（scripts/tests/systemd-maintainer-audit.test.mjs
+//     钉住审计脚本本身的行为）。
+
+// 提取一个作业内某个 step 的正文：从 `- name: <needle>` 行起到下一个同级 step 边界，
+// 输入必须是 parseJobs 已剔除注释的 text，注释不得替 run 脚本喂饱断言。
+const extractStepBlock = (jobText, needle) => {
+  const lines = jobText.split('\n');
+  const start = lines.findIndex((line) => /^\s*- name:/.test(line) && line.includes(needle));
+  assert.ok(start >= 0, `ci.yml 作业里找不到名为 ${needle} 的步骤`);
+  const block = [lines[start]];
+  for (const line of lines.slice(start + 1)) {
+    if (/^\s*- (name|uses|with|run|env):/.test(line) && !/^\s{8,}\S/.test(line)) break;
+    block.push(line);
+  }
+  return block.join('\n');
+};
+
+// 构建工具下限：debhelper (>= 13.11.6~) 与 debhelper-compat (= 13) 并存。
+// 这是**构建前**的门禁（dpkg-checkbuilddeps 在任何构建规则运行前失败），不是 Rust
+// 版本锁定；用 -d 绕过依赖检查后再宣称打包通过，恰好是该下限要防止的假阳性。
+test('debian/control pins the debhelper build-tool floor for /usr unit discovery', () => {
+  const control = readFileSync('debian/control', 'utf8');
+  const items = controlField(control, 'Build-Depends')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const debhelper = items.find((item) => /^debhelper\s*\(/.test(item));
+  assert.ok(
+    debhelper,
+    `Build-Depends 必须有一条显式带版本约束的 debhelper（13.11.6 起才解析 /usr 下单元），实际：${items.join(', ')}`,
+  );
+  assert.match(
+    debhelper,
+    /\(\s*>=\s*13\.11\.6~\s*\)/,
+    `debhelper 的版本下限必须是 >= 13.11.6~（~ 允许上游补丁号），实际：${debhelper}`,
+  );
+  assert.ok(
+    items.some((item) => /^debhelper-compat\s*\(\s*=\s*13\s*\)$/.test(item)),
+    'debhelper-compat (= 13) 必须保留：版本下限是工具门禁，compat 等级另行声明',
+  );
+});
+
+// rules 侧的生命周期口径（CI 在产物侧另有核对，这里是源码守门人）：
+//   * 三包都有 --no-start（安装/升级不 start/restart）与 --no-stop-on-upgrade
+//     （升级不 stop）；
+//   * controller 与 board-agent 有 --no-enable；
+//   * rsetup-next **不得**带 --no-enable：热策略/风扇曲线/LED 单元按默认口径随包
+//     enable，这是板卡下次重启后热安全的前提。
+test('dh_installsystemd lifecycle options are explicit per package', () => {
+  const byPkg = {};
+  for (const match of rulesCode.matchAll(/^[ \t]*dh_installsystemd -p(\S+)(.*)$/gm)) {
+    byPkg[match[1]] = match[2];
+  }
+  for (const pkg of ['rsetup-next', 'rsetup-controller', 'rsetup-board-agent']) {
+    assert.ok(byPkg[pkg], `debian/rules 必须显式调用 dh_installsystemd -p${pkg}`);
+    assert.match(byPkg[pkg], /--no-start/, `${pkg} 必须带 --no-start`);
+    assert.match(byPkg[pkg], /--no-stop-on-upgrade/, `${pkg} 必须带 --no-stop-on-upgrade`);
+  }
+  for (const pkg of ['rsetup-controller', 'rsetup-board-agent']) {
+    assert.match(byPkg[pkg], /--no-enable/, `${pkg} 必须带 --no-enable`);
+  }
+  assert.doesNotMatch(
+    byPkg['rsetup-next'],
+    /--no-enable/,
+    'rsetup-next 不得带 --no-enable：三个硬件策略单元必须随包 enable',
+  );
+});
+
+// 产物侧断言的**机制**合同：CI 只用严格模板门禁，不再留任何「grep 字样」或旧启发式
+// 入口。为什么禁止 grep 字样：真实产物里 `--no-enable` 包的 postinst 同样含
+// `deb-systemd-helper enable` 字样（整块在 debian-installed 守卫内），而「有没有字样」
+// 也证明不了单元、动作与守卫的关系；模板门禁把这三件事一次性钉住（行为合同见
+// scripts/tests/systemd-maintainer-audit.test.mjs）。
+test('CI asserts maintainer scripts only through the strict template gate', () => {
+  const debian = jobCalled('debian-package');
+  assert.ok(debian, 'ci.yml 里找不到 debian-package 作业');
+  const step = extractStepBlock(debian.text, 'Assert Debian systemd maintainer scripts');
+  assert.match(
+    step,
+    /scripts\/lib\/systemd-maintainer-audit\.mjs/,
+    'CI 步骤必须调用 scripts/lib/systemd-maintainer-audit.mjs 审计解包后的维护脚本',
+  );
+  // 逐包 × 逐脚本：三包各 postinst/postrm，共 6 条调用。
+  assert.equal(
+    gateCalls(step).length,
+    6,
+    '必须恰好 6 条门禁调用（3 包 × postinst/postrm），逐包逐脚本显式传参',
+  );
+  // 旧口径一律不得回潮：启发式 CLI、字样 grep、以及「任何 deb-systemd-invoke 即失败」
+  // 的一刀切（debhelper 若在 prerm 生成 remove 守卫下的 stop，一刀切会把合法产物判红）。
+  for (const forbidden of [
+    '--enable-guard',
+    '--enable-guard-unit',
+    '--require-active-enable',
+    '--require-active-enable-unit',
+    '--allow-unobserved-template',
+  ]) {
+    assert.ok(
+      !step.includes(forbidden),
+      `旧或非生产用的选项 ${forbidden} 不得出现在 CI 步骤里`,
+    );
+  }
+  assert.doesNotMatch(
+    step,
+    /grep[^\n]*(deb-systemd-helper|deb-systemd-invoke|_dh_action)/,
+    '维护脚本的 systemd 断言不得再用 grep 字样，必须走模板门禁',
+  );
+  assert.doesNotMatch(
+    step,
+    /deb-systemd-invoke\|_dh_action=/,
+    '不得保留「任何 deb-systemd-invoke 或 _dh_action 一律失败」的一刀切断言',
+  );
+  // 「安装/升级不 stop」的结构体现：13.24.2 下三包都**不得生成** preinst/prerm。
+  const loops = findLoops(step, 'kind').filter((loop) =>
+    loop.body.includes('[ -e "$tmp/$pkg/$kind" ]'));
+  assert.equal(
+    loops.length,
+    1,
+    '必须有一条按 kind 检查 preinst/prerm 是否存在的循环（存在即失败）',
+  );
+  assert.deepEqual([...loops[0].list].sort(), ['preinst', 'prerm']);
+});
+
+// Bookworm 安装后的实证断言不得被删：rsetup-next 三个单元的 enable 符号链接必须
+// 存在（deb-systemd-helper 直接写链接，不受 policy-rc.d=101 影响），controller 与
+// board-agent 必须继续没有链接。
+test('Bookworm install step asserts the enable symlinks per unit', () => {
+  const runtime = jobCalled('debian-12-runtime');
+  assert.ok(runtime, 'ci.yml 里找不到 debian-12-runtime 作业');
+  assert.match(runtime.text, /test -L "\$link"/, '必须保留 enable 符号链接的正断言 test -L');
+  assert.match(runtime.text, /test ! -e "\$link"/, '必须保留 --no-enable 两包的反向断言');
+  for (const unit of ['rsetup-next-thermal-policy', 'rsetup-next-fan-curve', 'rsetup-next-led-state']) {
+    assert.ok(runtime.text.includes(unit), `Bookworm 步骤必须覆盖 ${unit} 的 enable 链接断言`);
+  }
+  for (const unit of ['rsetup-controller', 'rsetup-board-agent']) {
+    assert.ok(runtime.text.includes(unit), `Bookworm 步骤必须覆盖 ${unit} 的无链接断言`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// round2：container 作业的 shell 口径 + 逐单元 enable 断言的绑定强度
+// ---------------------------------------------------------------------------
+//
+// 事实依据（GitHub Actions 文档 “Customize the shell used”）：作业跑在 **container**
+// 里时默认 shell 是 `sh -e {0}`（不是 ubuntu-latest 上的 bash），debian:trixie-slim 的
+// /bin/sh 是 dash。因此 POSIX sh 不支持的写法必须显式 `shell: bash`。
+// 这里的判据**只取 here-string `<<<`**：dash（含 Trixie 的 Debian 补丁版）支持
+// `set -o pipefail`，用「本机旧 dash 不认 pipefail」去外推 Trixie 的行为不构成依据，
+// 所以本合同也**不**把 pipefail 当 bashism 触发条件。
+const parseSteps = (jobText) => {
+  const lines = jobText.split('\n');
+  const starts = [];
+  lines.forEach((line, index) => {
+    if (/^\s*- (name|uses|run):/.test(line)) starts.push(index);
+  });
+  return starts.map((start, index) => ({
+    head: lines[start],
+    block: lines.slice(start, index + 1 < starts.length ? starts[index + 1] : lines.length).join('\n'),
+  }));
+};
+
+test('every container-job step using a bash here-string declares shell: bash', () => {
+  const containerJobs = jobs.filter((job) => /(?:^|\n)[ \t]*container:/.test(job.text));
+  assert.ok(containerJobs.length >= 2, 'CI 里应有 debian-package 与 debian-12-runtime 两个 container 作业');
+  for (const job of containerJobs) {
+    for (const step of parseSteps(job.text)) {
+      if (!step.block.includes('<<<')) continue;
+      assert.match(
+        step.block,
+        /^[ \t]*shell:[ \t]*bash[ \t]*$/m,
+        `${job.name} 里使用 <<< 的步骤必须显式 shell: bash（container 作业默认 sh，dash 不认 here-string）：${step.head.trim()}`,
+      );
+    }
+  }
+});
+
+test('Bookworm policy recorder logs timestamp phase and every argument before denying actions', () => {
+  const job = jobCalled('debian-12-runtime');
+  const setup = extractStepBlock(job.text, 'Configure recording policy-rc.d');
+  const match = /<<'RSETUP_POLICY_EOF'\n([\s\S]*?)\n[ \t]*RSETUP_POLICY_EOF/.exec(setup);
+  assert.ok(match, 'CI 必须在安装之前部署真实记录型 policy-rc.d');
+  const script = match[1].split('\n').map((line) => line.replace(/^ {10}/, '')).join('\n') + '\n';
+  const temp = mkdtempSync(join(tmpdir(), 'rsetup-policy-test-'));
+  try {
+    const log = join(temp, 'policy.log');
+    for (const args of [
+      ['rsetup-controller.service', 'start'],
+      ['--quiet', 'rsetup-board-agent.service', 'restart'],
+    ]) {
+      const result = spawnSync('sh', ['-s', '--', ...args], {
+        input: script,
+        encoding: 'utf8',
+        env: { ...process.env, RSETUP_POLICY_LOG: log, RSETUP_PACKAGE_PHASE: 'install-test' },
+      });
+      assert.equal(result.status, 101, result.stderr);
+    }
+    const records = readFileSync(log, 'utf8').trimEnd().split('\n');
+    assert.equal(records.length, 2);
+    assert.match(records[0], /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\tinstall-test\trsetup-controller\.service\tstart$/);
+    assert.match(records[1], /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\tinstall-test\t--quiet\trsetup-board-agent\.service\trestart$/);
+  } finally {
+    // temp 是本测试 mkdtemp 创建的绝对目录，删除前再次验证固定父目录/前缀。
+    assert.ok(temp.startsWith(join(tmpdir(), 'rsetup-policy-test-')));
+    rmSync(temp, { recursive: true, force: true });
+  }
+  const install = extractStepBlock(job.text, 'Install on Debian 12');
+  assert.ok(job.text.indexOf(setup) < job.text.indexOf(install));
+  assert.match(install, /RSETUP_PACKAGE_PHASE:[ \t]*install/);
+  assert.match(install, /RSETUP_POLICY_LOG:[ \t]*\/var\/log\/rsetup-package-policy\.log/);
+  const output = extractStepBlock(job.text, 'Report package service action log');
+  assert.match(output, /if:[ \t]*always\(\)/);
+  assert.match(output, /\/var\/log\/rsetup-package-policy\.log/);
+});
+
+const NEXT_UNITS = [
+  'rsetup-next-thermal-policy.service',
+  'rsetup-next-fan-curve.service',
+  'rsetup-next-led-state.service',
+];
+
+test('the systemd assert step declares shell: bash (container default sh + <<< usage)', () => {
+  const debian = jobCalled('debian-package');
+  assert.ok(debian, 'ci.yml 里找不到 debian-package 作业');
+  const step = extractStepBlock(debian.text, 'Assert Debian systemd maintainer scripts');
+  assert.match(
+    step,
+    /^[ \t]*shell:[ \t]*bash[ \t]*$/m,
+    '该步骤用了 <<<，container 作业默认 sh → 必须 shell: bash（防删）',
+  );
+});
+
+// 逐单元绑定的**结构**合同：名字出现在 CI 文本里不等于断言绑定到该单元。旧写法是
+// 「awk 收集 enable 命令 + grep 名字」+ 一条全局 --require-active-enable，因此一个单元
+// 活跃、另两个只有 debian-installed 守卫时依然全绿。合同按 shell 结构提取 for 循环
+// （循环头 + 到匹配 `done` 的循环体），要求：目标单元写在循环列表里，循环体内对该单元
+// 执行逐单元的审计断言；名字 grep、注释里的清单与全局 exists 断言都不能充数。
+const findLoops = (stepText, variable) => {
+  const lines = stepText.split('\n');
+  const loops = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const header = new RegExp(`^[ \t]*for ${variable} in ([^\n;]+); do[ \t]*$`).exec(lines[index]);
+    if (!header) continue;
+    const body = [];
+    let closed = false;
+    for (const line of lines.slice(index + 1)) {
+      if (/^[ \t]*done[ \t]*$/.test(line)) {
+        closed = true;
+        break;
+      }
+      body.push(line);
+    }
+    assert.ok(closed, `for ${variable} in … 的循环体没有闭合的 done`);
+    loops.push({ list: header[1].trim().split(/\s+/), body: body.join('\n') });
+  }
+  return loops;
+};
+
+// ---------------------------------------------------------------------------
+// 严格模板门禁的 CI 绑定合同（round4）
+// ---------------------------------------------------------------------------
+//
+// 门禁的 CLI 将「审计哪一份脚本」「该脚本属于哪个包」「该包的 dh_installsystemd 包型」
+// 「期望哪些单元」「仓库源在哪」全部变成显式参数，因此合同可以按**结构**提取每条调用，
+// 并核对绑定关系；名字出现在 CI 文本里不再构成证据。
+//
+// 为什么必须有这组结构合同：备审三轮的共性问题不是「断言写错」而是「断言打在谁身上」——
+// 把审计对象换成 `$tmp/unrelated/postinst`、把单元换成 `unrelated.service`、把文件换成
+// `postinst.unrelated`，presence 型合同全都照样绿。下面的断言函数从 CI 文本里解析出
+// 每条门禁调用，并用同一函数现场演示这些 mutation 必须被拦下。
+
+// 把一条 `node "$gate" …` 的反斜杠续行折叠成单行，便于按结构核对绑定。
+const gateCalls = (stepText) => {
+  const calls = [];
+  let buffer = null;
+  for (const line of stepText.split('\n')) {
+    if (buffer === null) {
+      if (!/^[ \t]*node "\$gate" /.test(line)) continue;
+      buffer = line.trim();
+    } else {
+      buffer += ' ' + line.trim();
+    }
+    if (line.trimEnd().endsWith('\\')) continue; // 续行未结束，继续累积
+    calls.push(buffer.replace(/\\\s+/g, ' ').replace(/\s+/g, ' ').trim());
+    buffer = null;
+  }
+  assert.ok(buffer === null, '存在未闭合的 node "$gate" 续行');
+  return calls;
+};
+
+const GATE_EXPECT = [
+  {
+    pkg: 'rsetup-next',
+    kind: 'postinst',
+    mode: 'default-enable',
+    units: NEXT_UNITS,
+    source: 'debian/postinst',
+  },
+  { pkg: 'rsetup-next', kind: 'postrm', mode: 'default-enable', units: NEXT_UNITS, source: null },
+  {
+    pkg: 'rsetup-controller',
+    kind: 'postinst',
+    mode: 'no-enable',
+    units: ['rsetup-controller.service'],
+    source: 'debian/rsetup-controller.postinst',
+  },
+  {
+    pkg: 'rsetup-controller',
+    kind: 'postrm',
+    mode: 'no-enable',
+    units: ['rsetup-controller.service'],
+    source: null,
+  },
+  {
+    pkg: 'rsetup-board-agent',
+    kind: 'postinst',
+    mode: 'no-enable',
+    units: ['rsetup-board-agent.service'],
+    source: null,
+  },
+  {
+    pkg: 'rsetup-board-agent',
+    kind: 'postrm',
+    mode: 'no-enable',
+    units: ['rsetup-board-agent.service'],
+    source: null,
+  },
+];
+
+// 单条调用的结构断言：参数齐全、绑定自洽。
+const assertGateCall = (call, expected) => {
+  const option = (name) => {
+    const m = new RegExp(`${name}[ \\t]+("([^"]*)"|\\S+)`).exec(call);
+    return m === null ? null : (m[2] ?? m[1]);
+  };
+  const repeated = (name) => {
+    const out = [];
+    const re = new RegExp(`${name}[ \\t]+(?:"([^"]*)"|([^\\s"]+))`, 'g');
+    for (const m of call.matchAll(re)) out.push(m[1] ?? m[2]);
+    return out;
+  };
+  const flag = (name) => new RegExp(`(^|[ \\t])${name}([ \\t]|$)`).test(call);
+
+  assert.equal(option('--package'), expected.pkg, `${expected.pkg}/${expected.kind}：--package 必须显式`);
+  assert.equal(option('--script-kind'), expected.kind, `${expected.pkg}/${expected.kind}：--script-kind 必须显式`);
+  assert.equal(
+    option('--mode'),
+    expected.mode,
+    `${expected.pkg}/${expected.kind}：--mode 必须是 ${expected.mode}（对应 debian/rules 的 --no-enable 口径）`,
+  );
+  // 待审计文件 = 最后一个参数，必须正是 $tmp/<pkg>/<kind>：包目录与脚本种类都要与
+  // --package/--script-kind 自洽（换成 $tmp/unrelated/postinst 或 postinst.unrelated
+  // 都会在这里断掉）。
+  assert.equal(
+    (call.match(/\$tmp\//g) ?? []).length,
+    1,
+    `${expected.pkg}/${expected.kind}：一条调用只能审计一个文件（出现两个 $tmp 路径即审计对象不确定）`,
+  );
+  const tail = /"\$tmp\/([^/]+)\/([^"]+)"$/.exec(call);
+  assert.ok(tail, `${expected.pkg}/${expected.kind}：审计对象必须是 "$tmp/<pkg>/<kind>" 形式，实际结尾：${call.slice(-60)}`);
+  assert.equal(tail[1], expected.pkg, `${expected.kind} 的审计对象目录必须等于 --package`);
+  assert.equal(tail[2], expected.kind, `审计对象文件名必须等于 --script-kind（postinst.unrelated 之类不认）`);
+
+  const units = repeated('--require-unit');
+  assert.ok(units.length > 0, `${expected.pkg}/${expected.kind}：必须显式声明 --require-unit（空集合会让断言空洞通过）`);
+  assert.deepEqual(
+    [...units].sort(),
+    [...expected.units].sort(),
+    `${expected.pkg}/${expected.kind}：--require-unit 集合必须恰好是 ${expected.units.join(', ')}`,
+  );
+  const source = option('--source-script');
+  if (expected.source === null) {
+    assert.equal(source, null, `${expected.pkg}/${expected.kind}：该脚本没有仓库源，不得凭空指一个`);
+    assert.ok(
+      !flag('--allow-unobserved-template'),
+      '生产 CI 不得接受非实测槽位模板',
+    );
+  } else {
+    assert.equal(
+      source,
+      expected.source,
+      `${expected.pkg}/${expected.kind}：--source-script 必须指向该脚本的仓库源（模板外内容的唯一预期来源）`,
+    );
+  }
+};
+
+const assertStepGateWiring = (stepText) => {
+  const calls = gateCalls(stepText);
+  assert.equal(calls.length, 6, '必须恰好 6 条门禁调用（3 包 × postinst/postrm）');
+  for (const expected of GATE_EXPECT) {
+    const matched = calls.filter((call) => {
+      const m = /--package[ \t]+"?([A-Za-z0-9._-]+)"?[ \t]+--script-kind[ \t]+"?([A-Za-z0-9._-]+)"?/.exec(call);
+      return m !== null && m[1] === expected.pkg && m[2] === expected.kind;
+    });
+    assert.equal(
+      matched.length,
+      1,
+      `${expected.pkg}/${expected.kind} 必须恰好有一条门禁调用（实际 ${matched.length} 条）`,
+    );
+    assertGateCall(matched[0], expected);
+  }
+};
+
+test('CI 的每条门禁调用都把包、脚本种类、包型、单元集合与审计对象绑成一条', () => {
+  const debian = jobCalled('debian-package');
+  assert.ok(debian, 'ci.yml 里找不到 debian-package 作业');
+  assertStepGateWiring(extractStepBlock(debian.text, 'Assert Debian systemd maintainer scripts'));
+});
+
+test('审计对象、单元、包型、仓库源任一处被改写都会破坏合同（现场演示 mutation）', () => {
+  const debian = jobCalled('debian-package');
+  const step = extractStepBlock(debian.text, 'Assert Debian systemd maintainer scripts');
+  const mutations = [
+    {
+      label: '审计对象换成无关包的 postinst',
+      text: step.replace('"$tmp/rsetup-controller/postinst"', '"$tmp/unrelated/postinst"'),
+    },
+    {
+      label: '审计对象换成同目录下的后缀文件',
+      text: step.replace('"$tmp/rsetup-board-agent/postinst"', '"$tmp/rsetup-board-agent/postinst.unrelated"'),
+    },
+    {
+      label: '单元换成无关单元',
+      text: step.replace('--require-unit rsetup-next-led-state.service', '--require-unit unrelated.service'),
+    },
+    {
+      label: 'rsetup-next 的包型改成 no-enable（等于允许 --no-enable 漂移）',
+      text: step.replace('--package rsetup-next --script-kind postinst --mode default-enable', '--package rsetup-next --script-kind postinst --mode no-enable'),
+    },
+    {
+      label: '去掉仓库源（模板外内容就失去了唯一预期来源）',
+      text: step.replace('\\\n            --source-script debian/postinst \\\n', '\n'),
+    },
+    {
+      label: 'postrm 不再审计',
+      text: step.replace('"$tmp/rsetup-next/postrm"', '"$tmp/rsetup-next/postinst"'),
+    },
+  ];
+  for (const mutation of mutations) {
+    assert.notEqual(mutation.text, step, `mutation 模板必须能命中当前 CI 文本：${mutation.label}`);
+    assert.throws(
+      () => assertStepGateWiring(mutation.text),
+      undefined,
+      `${mutation.label} 必须被结构合同拦下`,
+    );
+  }
+});
+
+// CI 步骤是**文本里的 shell**：引号或续行写错要等真实流水线跑起来才暴露（本仓上一轮
+// 就真的写丢过一个收尾单引号）。这里用 `bash -n` 只做**语法检查**（不执行任何命令、
+// 不联网、不碰产物），并把 `${{ … }}` 表达式换成常量。
+const stepRunScript = (jobText, needle) => {
+  const lines = jobText.split('\n');
+  const start = lines.findIndex((line) => line.includes(`- name: ${needle}`));
+  assert.ok(start >= 0, `ci.yml 里找不到步骤：${needle}`);
+  let end = lines.length;
+  for (let index = start + 1; index < lines.length; index += 1) {
+    if (/^[ \t]*- (name|uses):/.test(lines[index])) {
+      end = index;
+      break;
+    }
+  }
+  const block = lines.slice(start, end);
+  const runAt = block.findIndex((line) => /^[ \t]*run:[ \t]*\|[ \t]*$/.test(line));
+  assert.ok(runAt >= 0, `步骤 ${needle} 必须有 run: | 块`);
+  const body = block.slice(runAt + 1).filter((line, index) => index >= 0 || line.trim() !== '');
+  const first = body.find((line) => line.trim() !== '');
+  const indent = /^[ \t]*/.exec(first)[0];
+  return body
+    .map((line) => (line.startsWith(indent) ? line.slice(indent.length) : line))
+    .join('\n')
+    .replace(/\$\{\{[^}]*\}\}/g, 'x');
+};
+
+test('CI 步骤的 shell 文本必须能通过 bash -n 语法检查', () => {
+  const debian = jobCalled('debian-package');
+  assert.ok(debian, 'ci.yml 里找不到 debian-package 作业');
+  const script = stepRunScript(debian.rawText, 'Assert Debian systemd maintainer scripts');
+  assert.match(script, /^set -euo pipefail/, 'run 块必须从 set -euo pipefail 开始（提取本身也要对）');
+  const dir = mkdtempSync(join(tmpdir(), 'ci-step-syntax-'));
+  try {
+    const file = join(dir, 'step.sh');
+    writeFileSync(file, `${script}\n`);
+    execFileSync('bash', ['-n', file], { stdio: 'pipe' });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('生产 CI 不得打开非实测模板槽位', () => {
+  const debian = jobCalled('debian-package');
+  const step = extractStepBlock(debian.text, 'Assert Debian systemd maintainer scripts');
+  assert.doesNotMatch(
+    step,
+    /--allow-unobserved-template/,
+    '--allow-unobserved-template 只用于本地实验，CI 里出现即等于放行未实测形状',
   );
 });

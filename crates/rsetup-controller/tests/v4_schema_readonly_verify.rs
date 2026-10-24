@@ -1,6 +1,10 @@
-// v4 基线校验用例：测试库由操作员预先迁移到当前受支持版本 v4，本文件不再从空库或
-// v3 基线升级（不调用 migrate-identity-test，也不调用 run_schema_v4_migration），
-// 只连接当前 v4 库并做只读校验。
+// v4 基线只读核验用例：目标库由操作员预先准备为受支持版本 v4（空库经
+// `rsetup-controller-migrate --apply` 建满，或本就是 v4）。本文件不建表、不迁移、
+// 不构造任何旧版本夹具，只用 `check_identity_schema` 这条只读门禁复核：
+// 版本恰为 4、16 张表、0 FOREIGN KEY、0 CHECK。
+//
+// 这是 Task 3「外部授权的真实重建」验收用的手工用例：默认 `#[ignore]`，本任务不运行它，
+// 因此它的通过状态不构成"真实库已重建"的证据。
 use rsetup_controller::{ControllerConfig, DbPool, TestMigrationConfig};
 
 async fn required_v4_test_db() -> DbPool {

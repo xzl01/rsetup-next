@@ -1280,4 +1280,3 @@ git commit -m "test(controller): 新增门禁化双引擎身份管理集成测�
 1. **子代理驱动（推荐）：** 每项派新的子代理，任务间审查，快速迭代。使用 `superpowers:subagent-driven-development`。
 2. **当前会话执行：** 使用 `superpowers:executing-plans`，分批落实并设置审查检查点。
 你选哪种？
-

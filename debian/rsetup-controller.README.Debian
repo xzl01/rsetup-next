@@ -8,7 +8,7 @@ What this package provides
   /usr/bin/rsetup-controller-migrate    explicit, operator-only schema migration
   /usr/bin/rsetup-admin                   local root emergency admin recovery
   /usr/lib/systemd/system/rsetup-controller.service
-  /etc/default/rsetup-controller        configuration template, 0644, no secrets
+  /usr/share/doc/rsetup-controller/rsetup-controller.default  configuration example, 0644, no secrets
 
 The controller talks to MySQL/TiDB, serves the embedded web UI, and listens on
 127.0.0.1:8080 unless told otherwise. It does not terminate TLS.
@@ -18,23 +18,51 @@ are operator actions. Nothing in this package has connected to a real database,
 migrated one, or enabled the service: no step below should be read as already
 done, and the package deliberately does not do any of them on your behalf.
 
-The package installs the unit but does not enable or start it
-(dh_installsystemd --no-enable). The unit additionally refuses to run while
-/etc/default/rsetup-controller is missing. Until you complete step 1 below, the
-service is simply inactive.
+The package installs the unit but does not enable it, does not start it, and does
+not restart or stop it on upgrade (dh_installsystemd --no-enable --no-start
+--no-stop-on-upgrade): the generated maintainer scripts carry no start, restart
+or stop call on the install and upgrade paths (neither `deb-systemd-invoke
+start`/`restart`/`stop` nor the `_dh_action` variant), and beyond debhelper's
+unit state bookkeeping the only thing installing does is create the service
+account. The configuration example ships as documentation at
+/usr/share/doc/rsetup-controller/rsetup-controller.default only — the package
+installs no file under /etc — and until you create the configuration under its
+real name (section 1, one `install -m0600` command), the unit's
+ConditionPathExists=/etc/default/rsetup-controller keeps the service inactive:
+a start request is skipped rather than failing loudly, and `systemctl status`
+shows `inactive (dead)` with the failed `ConditionPathExists` in its output.
+
+One lifecycle is deliberately outside that promise: *removing* the package
+(`dpkg --remove` / `--purge`) may stop a running controller. That branch is
+debhelper's own bookkeeping, not this package's choice — from debhelper 13.25
+the generated prerm always stops the service on remove (official changelog,
+Debian bug #1079181) — and it is why upgrades, unlike removals, never touch the
+running process.
 
 1. Configure the service
 ------------------------
 
+  sudo install -m0600 -o root -g root \
+    /usr/share/doc/rsetup-controller/rsetup-controller.default \
+    /etc/default/rsetup-controller
   sudoedit /etc/default/rsetup-controller
-  sudo chmod 0600 /etc/default/rsetup-controller
+
+Create the file with its final ownership and mode in one step, then edit it in
+place: sudoedit keeps the mode of the file it opens, so the file never exists at
+0644 while it already carries a DSN. Do NOT `cp` it first and tighten the mode
+afterwards — between the copy and the chmod the future EnvironmentFile is world
+readable, and an operator who fills the database URL before that chmod exposes it.
 
 Uncomment and fill in the four required variables (CONTROLLER_DATABASE_URL,
 CONTROLLER_ALLOWED_HOSTS, CONTROLLER_ALLOWED_ORIGIN,
-CONTROLLER_MANAGEMENT_CURSOR_SECRET_HEX). The shipped template is 0644 and
-carries no secrets precisely so that the packaged conffile is not sensitive;
-the moment you put a real DSN in it, tighten it to 0600. Keep it out of any
-backup or ticket that is not secret-handling.
+CONTROLLER_MANAGEMENT_CURSOR_SECRET_HEX). The shipped documentation example is
+0644 and carries no secrets; the package deliberately does not install any file
+into /etc, so nothing at /etc/default/rsetup-controller exists until you create
+it. Verify before and after editing:
+
+  ls -l /etc/default/rsetup-controller     # -rw------- root root (0600)
+
+Keep the file out of any backup or ticket that is not secret-handling.
 
 2. Back up the target database, then set the migration gates
 ------------------------------------------------------------
@@ -75,14 +103,37 @@ It never reads /dev/tty and prompts for nothing.
 
   sudo rsetup-controller-migrate --apply
 
---check is read-only and needs only CONTROLLER_DATABASE_URL. --apply is
-idempotent per version: an already-migrated (v4) database only gets the
-read-only consistency pass; an empty database or a v1/v2/v3 database is brought
-to v3 and then to v4. An unrecognised version fails closed. Migration steps are
-not transactional — if a step fails, the tool stops and leaves the partial
-schema for you to inspect; it never auto-repairs and never reports success it
-did not verify. Failures print fixed, de-identified messages: no DSN, database
-name, backup path or driver text.
+--check is read-only, needs only CONTROLLER_DATABASE_URL, and prints a version
+number. That is a version probe, not the full shape check: it does not tell you
+whether every table, column and foreign key is present and correct.
+
+--apply is v4-only, and its decision is taken from the version row before any DDL
+runs, with exactly three outcomes:
+
+  * no version row and zero existing tables — the complete v4 baseline is
+    created. The fresh-create entry refuses a database that already carries any
+    table, so it never builds on top of an unknown starting point;
+  * version 4 — a read-only verification pass, zero DDL and zero writes, which is
+    why re-running it is a repeatable no-op;
+  * any other version (v1, v2, v3, 0, a negative number, v5 or later) — refused.
+    There is no upgrade path, no legacy fixture mode and no in-place repair of a
+    partially created schema; the tool never drops a database either.
+
+The fresh create is a sequence of separate DDL statements, not one transaction. If
+a statement fails, or a created object disagrees with the schema metadata, the tool
+stops where it is, reports the failure and leaves behind the tables it had already
+made. It does not roll them back, and it does not continue that build on a later
+run: the next --apply is refused at the zero-tables gate above. It never
+auto-repairs and never reports a success it did not verify. Getting out of that
+state is a manual, separately authorised decision by you, taken against the backup
+from step 2 — clearing the objects of that isolated database is not something this
+tool will do on your behalf.
+
+All failures print fixed, de-identified messages: no DSN, database name, backup
+path or driver text. And none of the above happens by itself: this command is the
+only thing that runs DDL, and starting the service performs no schema DDL work.
+First-start administrator bootstrap still writes application data as described in
+section 5; the read-only schema check must pass before that bootstrap runs.
 
 4. Start the service
 --------------------
@@ -93,6 +144,13 @@ name, backup path or driver text.
 
 Start it manually on purpose. To have it start at boot once everything is in
 place: sudo systemctl enable --now rsetup-controller.
+
+Installing or upgrading the package never starts, restarts or stops this
+service: if it was running it keeps running on the old process until you
+restart it yourself (sudo systemctl restart rsetup-controller), and if it was
+stopped it stays stopped. That is deliberate — a restart means reconnecting to
+a real database with a configuration the upgrade may not match. Only removing
+the package stops it (see the note at the top of this file).
 
 5. First boot: read the one-time administrator credential
 --------------------------------------------------------
@@ -136,11 +194,26 @@ Unit hardening you should know about
 ------------------------------------
 
 The unit runs as the static system account rsetup-controller (User= and
-Group=, plus StateDirectory=rsetup-controller). The package creates that
-account and its private group on install with
-`adduser --system --group --no-create-home --disabled-login`, and removes
-nothing on purge beyond the account itself. The uid/gid is allocated once and
-then stays put: /var/lib/rsetup-controller has one stable owner (mode 0700,
+Group=, plus StateDirectory=rsetup-controller with StateDirectoryMode=0700).
+The package creates that account and its private group on install with
+`adduser --system --group --home /var/lib/rsetup-controller --no-create-home
+--disabled-login`, idempotently.
+The package never removes that account: there is no `deluser` step anywhere in its
+maintainer scripts (the only generated postrm content is debhelper's systemd state
+cleanup for the unit file), so after
+`dpkg --remove` and even after `dpkg --purge` the account, its private group and
+its uid/gid stay in the system databases, and so does the persistent state under
+/var/lib/rsetup-controller (kept on purpose for forensics and data
+preservation — the purge does not delete a database, and it does not delete what
+the service wrote next to it). A later reinstall reuses that same account, which
+is what keeps the state directory's owner stable. To clean the identity up
+yourself once you are sure you will not reinstall:
+
+  sudo deluser --system rsetup-controller      # removes the account, then the group
+  sudo rm -rf /var/lib/rsetup-controller       # only once the data is really unwanted
+
+The uid/gid is allocated once and then stays put: /var/lib/rsetup-controller has
+one stable owner (mode 0700, from StateDirectoryMode=0700,
 rsetup-controller:rsetup-controller) across restarts and upgrades, so backup
 and rsync policies, ACLs and "who wrote this file" forensics keep working.
 That stability is exactly why the unit does not use DynamicUser=yes — a dynamic
@@ -151,5 +224,7 @@ creates and owns it. If you take over an installation that used a dynamic user,
 chown the existing state once:
 `sudo chown -R rsetup-controller:rsetup-controller /var/lib/rsetup-controller`.
 ProtectSystem=strict makes /usr and /etc read-only for the service, so
-/etc/default/rsetup-controller is its only configuration input, and
-RestrictAddressFamilies limits it to IPv4/IPv6/Unix sockets.
+/etc/default/rsetup-controller is its only configuration input,
+RestrictAddressFamilies limits it to IPv4/IPv6/Unix sockets, and UMask=0077 makes
+every file the process creates owner-readable-only by default (the one-time
+bootstrap credential is created 0600 explicitly and is unaffected by the mask).

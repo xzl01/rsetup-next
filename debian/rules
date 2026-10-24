@@ -16,8 +16,10 @@ export CARGO_PROFILE_RELEASE_DEBUG := 1
 #                        policy, the thermal/fan-curve/LED units and the tmpfiles.d rule;
 #   rsetup-controller  — the loopback Web control centre, its two operator CLIs
 #                        (rsetup-controller-migrate, rsetup-admin), the systemd unit and the
-#                        /etc/default/rsetup-controller template;
-#   rsetup-board-agent — the board-side read-only agent binary and its systemd unit.
+#                        example configuration file (installed to doc);
+#   rsetup-board-agent — the board-side agent binary (its systemd unit starts the
+#                        production --connect mode: outbound encrypted session,
+#                        read-only business) and that unit.
 #
 # The controller embeds its web UI at compile time (crates/rsetup-controller/build.rs
 # reads apps/controller-web/dist), and that dist is a generated artifact: it does not
@@ -30,12 +32,14 @@ export CARGO_PROFILE_RELEASE_DEBUG := 1
 # workspace, controller crate included, against that freshly generated dist, and
 # `node --test ui/*.test.mjs` covers the browser side of this repository.
 #
-# The controller and the board agent units are installed but neither enabled nor
-# started (override_dh_installsystemd below, plus the controller unit's own
-# ConditionPathExists). Connecting to a real database, running a migration and writing
-# /etc/default/rsetup-controller are operator actions; see
-# debian/rsetup-controller.README.Debian, and so is deciding whether a board should run
-# the read-only agent at all; see debian/rsetup-board-agent.README.Debian.
+# The controller and the board agent units are installed but neither enabled,
+# started nor restarted on upgrade (override_dh_installsystemd below, plus the controller
+# unit's own ConditionPathExists). Connecting to a real database, running a migration and
+# writing /etc/default/rsetup-controller are operator actions; see
+# debian/rsetup-controller.README.Debian. On the board side the unit ships the
+# production --connect mode (outbound encrypted session, read-only business), so
+# deciding whether a board should run the agent at all is likewise an operator
+# decision; see debian/rsetup-board-agent.README.Debian.
 #
 # deviceinfo is a Git submodule linked as a Cargo path dependency. A Debian
 # build must start from a recursive clone; GitHub source archives omit it.
@@ -104,26 +108,75 @@ override_dh_auto_install:
 	install -Dm755 target/release/rsetup-controller-migrate debian/rsetup-controller/usr/bin/rsetup-controller-migrate
 	install -Dm755 target/release/rsetup-admin debian/rsetup-controller/usr/bin/rsetup-admin
 	install -Dm644 data/rsetup-controller.service debian/rsetup-controller/usr/lib/systemd/system/rsetup-controller.service
-	# Configuration template: a conffile, 0644, and secret-free by construction. The
-	# operator is told to chmod 0600 it as soon as a real DSN goes in.
-	install -Dm644 debian/rsetup-controller.default debian/rsetup-controller/etc/default/rsetup-controller
+	# Configuration example: 0644 documentation file, secret-free by construction.
+	# The operator copies it to /etc/default/rsetup-controller, populates secrets,
+	# and tightens permissions to 0600 before starting the service.
+	install -Dm644 debian/rsetup-controller.default debian/rsetup-controller/usr/share/doc/rsetup-controller/rsetup-controller.default
 	install -Dm644 debian/rsetup-controller.README.Debian debian/rsetup-controller/usr/share/doc/rsetup-controller/README.Debian
 	install -Dm755 target/release/rsetup-board-agent debian/rsetup-board-agent/usr/bin/rsetup-board-agent
 	install -Dm644 data/rsetup-board-agent.service debian/rsetup-board-agent/usr/lib/systemd/system/rsetup-board-agent.service
 	install -Dm644 debian/rsetup-board-agent.README.Debian debian/rsetup-board-agent/usr/share/doc/rsetup-board-agent/README.Debian
 
-# The controller and the board agent are shipped disabled: dh_installsystemd would
-# otherwise symlink them into multi-user.target, which would put a service that needs a
+# The controller and the board agent are shipped disabled *and* never started.
+# --no-enable alone is not enough: dh_installsystemd(1) documents that it "does not affect
+# whether the services are started", so without --no-start the generated postinst still
+# carries `deb-systemd-invoke start` and dpkg would bring up a service that needs a
 # configured database and a migrated schema — and, on the board side, an always-on
-# root-owned sampler that cannot yet be reached over the production tunnel — into the boot
-# path of every machine that installs this package. An override replaces the helper for
-# every binary package, so rsetup-next is passed through with the default handling (its
-# thermal/fan-curve/LED units keep being enabled) and only the controller and the board
-# agent packages opt out.
+# root-owned agent that would dial the controller over the production tunnel the
+# moment a site configuration file exists. --no-start
+# drops every start/restart snippet (postinst-systemd-start, postinst-systemd-restart,
+# prerm-systemd-restart), and --no-stop-on-upgrade additionally drops the preinst stop, so
+# upgrading the package neither starts, restarts nor stops anything: a service an operator
+# started by hand keeps running across upgrades, and one they stopped stays stopped.
+# --no-enable keeps the units out of the boot path and out of the purge-time disable list.
+#
+# An override replaces the helper for **every** binary package — dh does not fall back to
+# the default sequence for the packages an override omits — so rsetup-next has to be
+# invoked explicitly. Its thermal/fan-curve/LED units keep the default enable (that is what
+# makes the board thermally safe after the next reboot) and only opt out of the automatic
+# start; they are ordinary hardware-policy units with no operator configuration step in
+# front of them. --no-stop-on-upgrade is there for the same reason taken one step further:
+# without it dh_installsystemd emits `deb-systemd-invoke stop` in the preinst, and since
+# --no-start removes the matching start, an upgrade would leave the fan-curve daemon stopped
+# and the thermal policy inactive until the next boot.
+#
+# What the helper *sees* is the other half of the promise. These units ship in
+# /usr/lib/systemd/system, and dh_installsystemd resolves that path only from debhelper
+# 13.11.6 — the changelog entry "Support units below /usr" at
+# https://metadata.ftp-master.debian.org/changelogs/main/d/debhelper/unstable_changelog.
+# That is why debian/control pins Build-Depends: debhelper (>= 13.11.6~) next to
+# debhelper-compat (= 13): with an older helper the calls above would be a plain no-op
+# (units never found, scripts generated without any snippet), and scripts that merely
+# "contain no activation" would prove nothing. The floor fails dpkg-checkbuilddeps before
+# any build rule runs; building with dpkg-buildpackage -d to step over that failure and
+# then pointing at the generated scripts is exactly the false positive this floor exists
+# to prevent, and it is not a Rust version pin — it constrains the build tool only.
+#
+# With the floor in place (Debian 13 builds with debhelper 13.24.x) the assertions on the
+# built .deb files are not vacuous: the rsetup-next postinst really carries the
+# deb-systemd-helper enable snippet covering all three units, and the
+# `Assert Debian systemd maintainer scripts` step of .github/workflows/ci.yml asserts
+# that positively, alongside the audit that no start/restart snippet exists. One boundary
+# stays documented: from debhelper 13.25 the generated prerm always stops a running
+# service on remove ("Always stop the service on remove", Debian bug #1079181 in the same
+# changelog). That remove-branch stop is an allowed lifecycle action; this source package
+# promises that *installation and upgrades* never start, restart or stop anything, not
+# that removing the package leaves a running service alone. The CI audit script
+# (scripts/lib/systemd-maintainer-audit.mjs) encodes exactly that split — it does not
+# treat every deb-systemd-invoke stop as a violation, and it does not ignore stops either.
+#
+# dh_installinit would install debian/rsetup-controller.default as /etc/default/rsetup-controller
+# (conffile). The controller package intentionally ships its configuration template only under
+# /usr/share/doc/rsetup-controller/rsetup-controller.default, so override dh_installinit to exclude
+# rsetup-controller (running only for rsetup-next and rsetup-board-agent).
+override_dh_installinit:
+	dh_installinit -prsetup-next
+	dh_installinit -prsetup-board-agent
+
 override_dh_installsystemd:
-	dh_installsystemd -prsetup-next
-	dh_installsystemd -prsetup-controller --no-enable
-	dh_installsystemd -prsetup-board-agent --no-enable
+	dh_installsystemd -prsetup-next --no-start --no-stop-on-upgrade
+	dh_installsystemd -prsetup-controller --no-enable --no-start --no-stop-on-upgrade
+	dh_installsystemd -prsetup-board-agent --no-enable --no-start --no-stop-on-upgrade
 
 override_dh_auto_clean:
 	cargo clean

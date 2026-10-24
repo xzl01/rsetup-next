@@ -6,12 +6,22 @@ What this package provides
 
   /usr/bin/rsetup-board-agent                board-side agent binary
   /usr/lib/systemd/system/rsetup-board-agent.service
-  /var/lib/rsetup-board-agent                durable task journal (state, mode 0700)
+  /var/lib/rsetup-board-agent                durable task journal and board identity
+                                             key (state directory, mode 0700)
 
-The unit is installed but neither enabled nor started
-(dh_installsystemd --no-enable), and because of that the package carries no
-systemd maintainer snippet either — installing or upgrading it does not run
-`systemctl daemon-reload` for you. To run the read-only sampler on this board:
+Not shipped on purpose: /etc/default/rsetup-board-agent (controller address and trust
+pins) — see the configuration section below.
+
+The unit is installed but neither enabled, started, nor restarted on upgrade
+(dh_installsystemd --no-enable --no-start --no-stop-on-upgrade): no maintainer
+script of this package runs `deb-systemd-invoke start`/`restart`/`stop` on the
+install or upgrade paths, so installing or upgrading never brings the agent up
+and never stops an agent you are already running. Removing the package may stop
+a running agent — that is the prerm remove branch, which this package does not
+control (from debhelper 13.25 the generated snippet always stops the service on
+remove; official debhelper changelog, Debian bug #1079181). Installing and
+upgrading do not reload the systemd manager either, so reload it yourself before
+the first enable:
 
   sudo systemctl daemon-reload
   sudo systemctl enable --now rsetup-board-agent
@@ -20,20 +30,67 @@ systemd maintainer snippet either — installing or upgrading it does not run
 Read this before you enable it
 ------------------------------
 
-This package delivers the agent's read-only half, and nothing more:
+This package delivers the agent's read-only half over the real tunnel, and nothing
+more:
 
-  * The production encrypted tunnel is NOT wired up. The unit starts the binary's
-    --watch loop, i.e. a local read-only sampling of device.status.get every 10
-    seconds written to journald. The process opens no session with a controller —
-    the wire protocol codec has not been approved, so there is nothing to connect
-    to yet.
-  * A real host reboot boundary is NOT implemented. Both device.reboot.prepare
-    and device.reboot.execute answer "capability unavailable"; the binary and the
-    unit never reboot the machine.
+  * The unit starts the production mode --connect: an active outbound TCP connection
+    to the controller, a v3 client handshake that verifies the controller against the
+    pins you configure, an encrypted record layer, then the dual-stream session
+    (read-only actions plus journal queries). Business requests are accepted on the
+    control stream only, only for the six allow-listed actions, and the controller
+    identity is the one authenticated by the handshake — a key self-declared in a
+    packet or in the payload is never trusted. A disconnected session is retried with
+    exponential backoff 1/2/4…60 seconds plus sub-second jitter, reset only after a
+    session actually reaches Ready.
+  * A signed revocation or an approval denial stops the reconnect loop and exits 0, so
+    Restart=on-failure does not bring the agent back; the agent also records an
+    UNAUTHORIZED marker (mode 0600) next to its identity key. A kick is not a
+    revocation: it reconnects after backoff.
+  * A real host reboot boundary is NOT implemented. The unit injects no reboot
+    dispatcher, so device.reboot.prepare and device.reboot.execute answer "capability
+    unavailable" (1004) and the advertised capability list does not claim reboot is
+    executable; the binary and the unit never reboot the machine.
 
-Enabling the unit therefore gives you an always-on local probe, not a controllable
-board. Do not record the control path (in particular reboot) as closed-loop on the
-strength of this package.
+Enabling the unit therefore gives you a board that answers read-only queries from a
+pinned controller, not a controllable board. Do not record the control path (in
+particular reboot) as closed-loop on the strength of this package.
+
+Required configuration: /etc/default/rsetup-board-agent
+-------------------------------------------------------
+
+The package deliberately does not ship this file — the controller address and the
+trust pins are site material. The unit declares it as a *required* EnvironmentFile
+(no leading "-"), which fails closed in two different ways that must not be confused:
+until you create the file, systemd fails the unit before ExecStart (the log line is
+"Failed to load environment files: No such file or directory") — the agent binary
+never runs, so it produces no exit status of its own. Exit status 78 (configuration
+error) is what the binary itself returns once the file exists but a required variable
+is missing or invalid. Both are fail-closed behaviour, not a warning to ignore, and the
+unit deliberately does not make the file optional. systemd reads it literally, line by
+line: no shell, no $expansion, no command substitution; anything that is not KEY=VALUE
+must be a # comment.
+
+  # /etc/default/rsetup-board-agent — template, replace every PLACEHOLDER
+  RSETUP_CONTROLLER_ADDR=controller.example.internal:8443
+  # Required. Comma-separated 64-char lowercase hex public keys you trust. There is
+  # no trust-on-first-use: with no pin configured the agent refuses to start rather
+  # than trusting whatever answers.
+  RSETUP_CONTROLLER_PUBLIC_KEYS=<64-hex-pin>[,<64-hex-pin>]
+  RSETUP_BOARD_KEY_FILE=/var/lib/rsetup-board-agent/board.key
+  RSETUP_BOARD_JOURNAL_DIR=/var/lib/rsetup-board-agent
+  RSETUP_BOARD_DEVICE_SN=<serial>
+  RSETUP_BOARD_DEVICE_MODEL=<model>
+  RSETUP_BOARD_FW_VERSION=<firmware-version>
+  RSETUP_BOARD_EXTRA_INFO=<free-form>
+
+Notes on the two paths: RSETUP_BOARD_JOURNAL_DIR must already exist (the agent never
+creates its state root; StateDirectory creates /var/lib/rsetup-board-agent as 0700)
+and holds the durable task journal written with real fsync/rename persistence.
+RSETUP_BOARD_KEY_FILE is loaded once at startup as mode 0600 inside a 0700 directory;
+a symlink or a foreign owner is rejected. Per-connection handshakes still generate
+fresh randomness every time — the loaded key is identity, not a session key. After
+editing the file: sudo systemctl daemon-reload && sudo systemctl restart
+rsetup-board-agent.
 
 Running user: root
 ------------------
@@ -50,20 +107,32 @@ ProtectSystem=strict makes /usr and /etc read-only for it, ProtectHome=yes hides
 home directories, PrivateTmp=yes, NoNewPrivileges=yes and LockPersonality=yes are
 set, and /var/lib/rsetup-board-agent (created 0700 by StateDirectory) is the only
 path it may write to. RestrictAddressFamilies permits IPv4/IPv6/Unix sockets only —
-the current --watch mode binds no socket at all; the allowance is there so the unit
-needs no change once the tunnel is actually connected.
+--connect needs outbound IPv4/IPv6 to the controller and binds no listening socket at
+all; every other address family (packet, bluetooth, …) stays forbidden.
+
+Stopping is graceful: SIGTERM drains in-flight requests for up to 5 seconds, joins the
+session task and exits 0 within TimeoutStopSec=30s. Joining is only claimed when it is
+confirmed: if the session task still cannot be confirmed reclaimed after the abort
+escalation, the agent emits a driver-unreclaimed event instead of pretending the task
+was joined. On the SIGTERM path it still exits 0 (a graceful stop must not turn into a
+failure that Restart=on-failure would relaunch); an unconfirmed reclaim outside a
+requested shutdown is reported as a local fault with exit status 78 and the loop stops
+instead of opening another session with a task that may still be running.
 
 Local, non-systemd runs
 -----------------------
 
 Run by hand, the binary runs as whoever invokes it (no privilege elevation of any
-kind), for example:
+kind). Besides --connect, three local modes remain available and are **not** the
+production path:
 
   rsetup-board-agent --once
   rsetup-board-agent --watch --interval-secs 10
   rsetup-board-agent --loopback-test-server --listen 127.0.0.1:39876
 
 The last mode is a test-only JSON-lines console on loopback; it is not the
-production wire protocol and must not be exposed. Some readings require root to be
+production wire protocol, it authenticates nothing, and it must not be exposed. The
+three modes and --connect are mutually exclusive — a local mode never opens a tunnel,
+and --connect never serves the JSON console. Some readings require root to be
 meaningful, which is why the packaged unit runs as root while a manual run stays
 with the invoking user.

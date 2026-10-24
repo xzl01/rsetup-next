@@ -612,9 +612,34 @@ fn task_result_event_is_emitted_only_after_control_is_open() {
         f.binding.emit_task_result(&record),
         Err(StreamError::ControlStreamRequired)
     );
+    // 生产形状的事件帧同样受 Control 未开流的门（与 emit_task_result 同一判定）。
+    assert_eq!(
+        f.binding.emit_task_result_event(&record),
+        Err(StreamError::ControlStreamRequired)
+    );
     f.binding.open_control().expect("control");
     let payload = f.binding.emit_task_result(&record).expect("event");
     assert!(matches!(payload, BusinessPayload::TaskRecord(_)));
+    // 与生产补发链路同形状：TYPE_EVENT 走 Control，动作固定，载荷可解码为同一份记录。
+    let event = f
+        .binding
+        .emit_task_result_event(&record)
+        .expect("event frame");
+    assert_eq!(event.stream, rsetup_tunnel::envelope::StreamKind::Control);
+    assert_eq!(event.action, "device.task.result");
+    assert!(!event.payload.is_empty());
+    let decoded = rsetup_protocol::wire::decode_business(
+        &rsetup_protocol::BusinessCodec,
+        Some(&approved_codec_witness()),
+        rsetup_protocol::wire::BusinessPayloadKind::TaskRecord,
+        &event.payload,
+    )
+    .expect("事件载荷必须可解码");
+    assert_eq!(
+        decoded,
+        BusinessPayload::TaskRecord(record.to_wire()),
+        "事件载荷必须就是同一份记录"
+    );
     // 板端事件不得回包
     assert!(matches!(
         f.binding

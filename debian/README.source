@@ -47,6 +47,33 @@ Bookworm is therefore a tested runtime target, not the source-build environment.
 The final executable uses static C runtime linkage so it does not inherit
 Trixie's newer glibc requirement.
 
+Build-tool floor: debhelper (>= 13.11.6~)
+=========================================
+
+`debian/control` declares `debhelper (>= 13.11.6~)` next to
+`debhelper-compat (= 13)`. All three binary packages ship their systemd units in
+`/usr/lib/systemd/system`, and `dh_installsystemd` resolves that path only from
+debhelper 13.11.6 — the changelog entry "Support units below /usr" at
+<https://metadata.ftp-master.debian.org/changelogs/main/d/debhelper/unstable_changelog>.
+With an older helper the units are never seen, the generated maintainer scripts
+contain no activation snippet at all, and "the scripts look clean" is a false
+positive rather than evidence. The floor is therefore enforced before anything
+is built: `dpkg-checkbuilddeps` fails on an older toolchain. Building with
+`dpkg-buildpackage -d` steps over that failure and voids the packaging claim; it
+must not be used to then point at the generated scripts as proof. The floor is a
+**build-tool** minimum, not a Rust version pin — no minimum supported Rust
+version is declared anywhere in this workspace.
+
+The CI boundary this floor protects is asserted positively, not vacuously: the
+built `rsetup-next` postinst must carry the `deb-systemd-helper enable` snippet
+covering all three units (see the `Assert Debian systemd maintainer scripts`
+step of `.github/workflows/ci.yml`). Separately, from debhelper 13.25 the
+generated prerm always stops a running service on remove (changelog entry
+"Always stop the service on remove", Debian bug #1079181): package removal
+stopping a running service is an allowed lifecycle action, and the CI audit
+distinguishes that branch from the install/upgrade paths, which must stay free
+of any start, restart or stop.
+
 Vendor marks
 ============
 

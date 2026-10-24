@@ -1,12 +1,13 @@
-# /etc/default/rsetup-controller — rsetup-controller.service 的唯一配置入口（EnvironmentFile）。
+# /usr/share/doc/rsetup-controller/rsetup-controller.default — rsetup-controller 示例配置。
 #
-# 本样例随包安装，权限 0644 且**不含任何秘密**；它只是模板。填入真实值后请立刻收紧权限：
+# 本样例作为文档示例随包安装，权限 0644 且**不含任何秘密**。
+# 部署时请复制为 /etc/default/rsetup-controller 并填入真实值，随后立刻收紧权限：
 #
+#     sudo cp /usr/share/doc/rsetup-controller/rsetup-controller.default /etc/default/rsetup-controller
 #     sudo chmod 0600 /etc/default/rsetup-controller
 #
 # systemd 的 EnvironmentFile 语法是 KEY=VALUE 逐行赋值：不认识的行必须是注释（以 # 开头），
 # 值不要加 shell 的 $、反引号或命令替换（EnvironmentFile 不经过 shell，写了也不会展开）。
-# 文件本身被 dpkg 当作 conffile 维护；改成 0600 不影响 dpkg 的摘要比对。
 #
 # 修改后需要 `sudo systemctl restart rsetup-controller` 生效。完整安装后步骤见
 # /usr/share/doc/rsetup-controller/README.Debian。

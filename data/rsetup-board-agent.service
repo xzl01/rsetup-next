@@ -1,10 +1,18 @@
 [Unit]
-# 板端代理（board agent）：在被管理板卡上周期采样只读指标，供中控侧查询。
-# 默认不随包启用（dh_installsystemd --no-enable），由运维显式 systemctl enable。
+# 板端代理（board agent）：在被管理板卡上主动出站连接中控，提供只读状态与受控动作。
+# 默认不随包启用，也不随包启动或随升级重启/停止
+# （dh_installsystemd --no-enable --no-start --no-stop-on-upgrade），
+# 由运维显式 systemctl enable。
 Description=rsetup-next board agent
 Documentation=file:/usr/share/doc/rsetup-board-agent/README.Debian
 After=network-online.target
 Wants=network-online.target
+# 连接循环自带退避重连（1/2/4…60s + 抖动），因此这里只对**反复快速失败**给一个很松的
+# 上限：本端配置、journal 或会话驱动收尾不可确认等故障以 78 退出（属 on-failure，计入启动
+# 限速），避免无休止
+# 热循环；而合法吊销/审批拒绝以 0 退出，永远不落入启动限速窗口，systemd 不会拉起它。
+StartLimitIntervalSec=3600s
+StartLimitBurst=20
 
 [Service]
 Type=simple
@@ -16,15 +24,40 @@ Type=simple
 # 权限因此来自「进程本身即 root + 下方 sandbox 限制」，而不是靠账户降权。
 User=root
 Group=root
-# 持久任务 journal 目录：systemd 创建为 0700 并归属 User/Group。
+# 持久任务 journal 与板端身份密钥所在目录：systemd 创建为 0700 并归属 User/Group。
+# RSETUP_BOARD_JOURNAL_DIR 必须指向**已存在**的目录（进程不静默创建状态根，缺失即 78）；
+# RSETUP_BOARD_KEY_FILE 必须落在 0700 目录内（密钥文件自身 0600，符号链接或属主不符
+# 一律拒绝）。吊销或审批拒绝时，进程在该密钥文件的父目录落 UNAUTHORIZED 标记（0600）。
 StateDirectory=rsetup-board-agent
 StateDirectoryMode=0700
 WorkingDirectory=/var/lib/rsetup-board-agent
-# 只读采样循环：每 10s 一次 device.status.get，样本写 stdout（进 journald），
-# journal 落盘在 StateDirectory 下。
-ExecStart=/usr/bin/rsetup-board-agent --watch --interval-secs 10 --journal-dir /var/lib/rsetup-board-agent
+# 连接参数全部来自下面这个**必需**的 EnvironmentFile（本包不携带该文件：地址与信任 pin
+# 属站点资料，由运维创建，模板见 README.Debian）。失败关闭分两级，别混为一谈：
+#   * 该文件不存在 → systemd 在执行 ExecStart **之前**就因加载环境文件失败而拒绝本次启动
+#     （journal 里是 `Failed to load environment files: No such file or directory`），
+#     二进制根本没有运行，因此**不会**得到它的退出码 78；
+#   * 该文件存在但缺任何必填项——尤其是缺显式中控公钥 pin——或取值非法 → 二进制启动后
+#     以 78 失败关闭。
+# 两级都是预期的失败关闭，绝不 TOFU 自动信任。这里刻意不加 '-' 前缀（不放宽成可选）：
+#   RSETUP_CONTROLLER_ADDR          中控地址 host:port（不是 URL，不含凭据）
+#   RSETUP_CONTROLLER_PUBLIC_KEYS   显式中控信任 pin，逗号分隔 64 位 hex（必填）
+#   RSETUP_BOARD_KEY_FILE           板端身份密钥文件（启动期载入一次，0600）
+#   RSETUP_BOARD_JOURNAL_DIR        持久 journal 目录（真实 RealFs 恢复/落盘）
+#   RSETUP_BOARD_DEVICE_SN / RSETUP_BOARD_DEVICE_MODEL / RSETUP_BOARD_FW_VERSION /
+#   RSETUP_BOARD_EXTRA_INFO         握手设备描述符四项
+EnvironmentFile=/etc/default/rsetup-board-agent
+# 生产连接模式：主动出站 TCP → v3 客户端握手（校验上面的显式 pin）→ 加密记录层 →
+# 双流会话（只读动作 + journal 查询）。断线按 1/2/4…60s 加 [0,1s) 抖动退避重连，
+# 且只有会话真正 Ready 后才把退避档位复位。
+ExecStart=/usr/bin/rsetup-board-agent --connect
+# 停止语义：SIGTERM → 排空在途请求（5s）→ 等待会话任务 join → 退出码 0。
+# join 确认不了时不谎称已回收：进程记一条 driver-unreclaimed 事件后仍按 SIGTERM 退出 0
+# （否则一次正常停止会被下面的 on-failure 重新拉起）。
+# 永久停止（合法签名吊销 / 审批拒绝）同样退出 0，因此下面的 Restart=on-failure
+# 不会把它拉起：systemd 的重启策略无法绕过「停止自动重连」这一语义。
 Restart=on-failure
 RestartSec=5s
+TimeoutStopSec=30s
 # ── 沙箱 ────────────────────────────────────────────────────────────────────
 # root 运行下这些限制尤其重要：/usr 与 /etc 对本进程只读，唯一可写路径是下面的
 # ReadWritePaths；/root 与 /home 不可见；不获得新特权；私有 /tmp。
@@ -34,18 +67,21 @@ ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=/var/lib/rsetup-board-agent
 LockPersonality=yes
-# 当前 --watch 模式不打开任何监听套接字；保留 IPv4/IPv6/Unix 三类地址族，是为后续
-# 接线加密隧道时不必修改本单元，其余地址族（packet/bluetooth 等）一律禁止。
+# --connect 需要主动出站 IPv4/IPv6 连接（以及本机 Unix 套接字）；其余地址族
+# （packet/bluetooth 等）一律禁止。本进程不监听任何端口。
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 [Install]
 WantedBy=multi-user.target
 
 # ── 交付边界（务必先读）─────────────────────────────────────────────────────
-# 1) 生产加密隧道尚未接线：本单元启动的是二进制自带的 --watch 只读采样循环，
-#    样本只写本地 journald，进程不与中控建立任何加密会话（业务 codec 已按所有者授权
-#    启用，但加密隧道与双流传输仍未接线）。
-# 2) 真实重启边界仍未实现：device.reboot.prepare / device.reboot.execute 一律返回
-#    capability unavailable，本单元与二进制都不会重启主机。
-# 3) 因此本单元当前的实际作用是在板卡上长期跑只读探针与本地 journal 验收，
-#    不得据此声称板端控制链路（含重启）已闭环。
+# 1) 生产连接已接线：--connect 走真实 TCP + v3 加密握手（显式 pin，缺 pin 直接失败
+#    关闭，无 TOFU）+ 双流会话。业务只允许控制流、只允许 6 个白名单动作；身份取握手
+#    认证的中控公钥，报文自报身份一律无效。
+# 2) 真实重启边界仍未实现：本单元不注入 reboot dispatcher，device.reboot.prepare /
+#    device.reboot.execute 一律返回 capability unavailable（1004），能力清单也不申报
+#    可执行重启；本单元与二进制都不会重启主机。要闭环必须由人工接线真实调度器。
+# 3) 本包不携带 /etc/default/rsetup-board-agent，而上面的 EnvironmentFile 是必需的：
+#    未创建该文件时 systemd 在执行 ExecStart 前就拒绝本次启动（环境文件加载失败），
+#    二进制未被执行，所以**不是**它自己的 78；文件存在但缺必填项或取值非法时，才是
+#    二进制以 78 退出。两种表现同向失败关闭，都是预期行为，不是可被忽略的告警。

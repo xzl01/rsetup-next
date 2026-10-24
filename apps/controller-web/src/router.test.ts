@@ -500,4 +500,3 @@ describe('client router hash synchronization & guards', () => {
     })
   })
 })
-

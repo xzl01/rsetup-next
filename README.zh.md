@@ -324,8 +324,8 @@ cargo run -p rsetup-controller
 | `/usr/bin/rsetup-controller` | 控制面进程（单元 `rsetup-controller.service`） |
 | `/usr/bin/rsetup-controller-migrate` | 显式 schema 迁移，`--check` / `--apply` |
 | `/usr/bin/rsetup-admin` | 本机 root 管理员应急恢复（cargo bin 名与交付名一致；源文件 `src/bin/reset-admin.rs`） |
-| `/etc/default/rsetup-controller` | `EnvironmentFile` 模板，0644，不含任何秘密 |
-| `/usr/lib/systemd/system/rsetup-controller.service` | 单元：`User=rsetup-controller`（静态系统账户）、`StateDirectory=rsetup-controller` |
+| `/usr/share/doc/rsetup-controller/rsetup-controller.default` | `EnvironmentFile` 示例，0644，不含任何秘密。**不装到 `/etc`**：`/etc/default/rsetup-controller` 由操作员据它创建 |
+| `/usr/lib/systemd/system/rsetup-controller.service` | 单元：`User=rsetup-controller`（静态系统账户）、`StateDirectory=rsetup-controller`、`StateDirectoryMode=0700` |
 | `/usr/share/doc/rsetup-controller/README.Debian` | 完整的安装后操作步骤 |
 
 单元显式降权到静态系统账户 `rsetup-controller`（`User=`/`Group=`）：该账户与同名私有组由
@@ -334,17 +334,25 @@ cargo run -p rsetup-controller
 因此跨重启、跨升级保持稳定（0700，`rsetup-controller:rsetup-controller`），备份、rsync 与
 ACL 策略都有稳定锚点。不再使用 `DynamicUser=yes`：动态用户每次启动换一个临时 uid/gid，
 systemd 每次都要重新 chown 状态目录，持久状态的属主随重启漂移，事后取证与授权策略失去锚点。
-安装脚本只建账户，不启动也不 enable 任何服务。
+安装脚本只建账户，不启动也不 enable 任何服务；purge 时账户同样保留（不执行 `deluser`），
+详见 `debian/rsetup-controller.README.Debian`。
 
-软件包既不 enable 也不启动服务：`dh_installsystemd --no-enable` 让单元不进启动路径，单元
-自身的 `ConditionPathExists=/etc/default/rsetup-controller` 又保证未写配置时保持 inactive，
+软件包既不 enable 也不启动服务：`dh_installsystemd --no-enable --no-start
+--no-stop-on-upgrade` 让单元不进启动路径，并把生成的 maintainer script 里所有
+start/restart 片段一并去掉——只写 `--no-enable` 是不够的，postinst 里仍会留下
+`deb-systemd-invoke` 的启动/重启激活片段（升级时是 `_dh_action=restart`）。单元自身的
+`ConditionPathExists=/etc/default/rsetup-controller`
+又保证未写配置时保持 inactive，
 因此装完包只是一堆未启动的文件。后续步骤一律由操作员执行，且没有任何一步已代表你对真实
 数据库做过：
 
-1. 填写 `/etc/default/rsetup-controller`：`CONTROLLER_DATABASE_URL`、
-   `CONTROLLER_ALLOWED_HOSTS`、`CONTROLLER_ALLOWED_ORIGIN`、
-   `CONTROLLER_MANAGEMENT_CURSOR_SECRET_HEX`，随后 `chmod 0600`。随包的模板之所以是
-   0644，正因为它不含秘密。
+1. 先按最终权限创建配置，再填写内容：`sudo install -m0600 -o root -g root
+   /usr/share/doc/rsetup-controller/rsetup-controller.default
+   /etc/default/rsetup-controller`，随后 `sudoedit /etc/default/rsetup-controller` 填入
+   `CONTROLLER_DATABASE_URL`、`CONTROLLER_ALLOWED_HOSTS`、`CONTROLLER_ALLOWED_ORIGIN`、
+   `CONTROLLER_MANAGEMENT_CURSOR_SECRET_HEX`。随包的示例之所以是 0644，正因为它不含秘密；
+   用 `install -m0600` 而不是「先 `cp` 再 `chmod`」，才能让这个将来放数据库连接串的文件
+   从创建那一刻起就不是任意账户可读，不存在填好 DSN 却还 world-readable 的窗口。
 2. 先对目标库做一份**真实可恢复**的备份，再在 `CONTROLLER_DATABASE_URL` 旁导出四个迁移
    门禁：`CONTROLLER_MIGRATION_ALLOW_DESTRUCTIVE=1`、
    `CONTROLLER_MIGRATION_EXPECTED_DATABASE`（必须等于服务端真实返回的库名）、
@@ -352,8 +360,10 @@ systemd 每次都要重新 chown 状态目录，持久状态的属主随重启�
    `CONTROLLER_MIGRATION_ACK=isolated-exclusive-backed-up-disposable`。这四项是操作员的
    显式确认，工具不会替你猜：声明库名与真实连接不一致即 fail-closed。
 3. 先 `rsetup-controller-migrate --check`（只读，只打印 `schema_version=<数字>` 或
-   `schema_version=missing`），再 `rsetup-controller-migrate --apply`。已是受支持版本只做
-   只读一致性复核（幂等）；空库或 v1/v2/v3 先升到 v3 再升到 v4；未识别版本直接拒绝。
+   `schema_version=missing`），再 `rsetup-controller-migrate --apply`。**v4 是唯一基线**：空库
+   直接建满 v4；已是 v4 则只做只读一致性复核（幂等）。v1/v2/v3、未来版本与未识别版本都在首次
+   写入之前被拒绝——没有升级路线，也没有旧版本夹具模式；已有旧版本库要先由操作员按表级重置
+   （上文第 2 步的真实可恢复备份正是这一步的兜底）。
    它不需要 root（写权限来自连接串里的数据库账号），也从不读写 `/dev/tty`。
 4. `systemctl start rsetup-controller`（需要在开机拉起时再 `enable`）。
 5. 首次启动把一次性管理员凭据写到
@@ -391,8 +401,9 @@ JSON-lines 协议与边界见 [crates/rsetup-board-agent/README.md](crates/rsetu
 
 板侧交付与运行用户：`rsetup-board-agent` 是同源码包构建的独立 Debian 包，装
 `/usr/bin/rsetup-board-agent` 与单元
-`/usr/lib/systemd/system/rsetup-board-agent.service`（`dh_installsystemd --no-enable`，默认
-不启用）。单元固定以 `User=root`/`Group=root` 运行只读采样 watch 循环
+`/usr/lib/systemd/system/rsetup-board-agent.service`（`dh_installsystemd --no-enable
+--no-start --no-stop-on-upgrade`，默认不启用，包也不会启动它）。单元固定以
+`User=root`/`Group=root` 运行只读采样 watch 循环
 （`--interval-secs 10 --journal-dir /var/lib/rsetup-board-agent`，状态目录由
 `StateDirectory` 建为 0700）：整机硬件与系统状态来源并非一律对非特权用户可读，因此板端的
 生产与测试部署口径统一为 root，配合 `ProtectSystem=strict`、`NoNewPrivileges=yes`、
@@ -424,14 +435,15 @@ scripts/import-pinouts.mjs 用于本地 pin-out checkout 的可复现导入器
 
 同一源码包另会构建两个包。`rsetup-controller`：控制面进程、两个操作员 CLI
 （`rsetup-controller-migrate`、`rsetup-admin`）、一个 systemd 单元与
-`/etc/default/rsetup-controller` 模板；单元降权到安装时创建的静态系统账户
+`/usr/share/doc/rsetup-controller/` 下的无秘密配置示例（**不写 `/etc/default`**，创建该文件是操作员的一步）；单元降权到安装时创建的静态系统账户
 `rsetup-controller`。它装了什么、以及操作员仍需亲自执行的迁移与配置步骤，
 见「控制器」章节下的「从 Debian 软件包安装」。`rsetup-board-agent`：板端代理二进制与
 自己的 systemd 单元，以 root 运行只读采样 watch，生产加密隧道与真实重启尚未接线。
 三个包的构建都需要 Node.js 与 npm（两者都在 `Build-Depends` 里）：`debian/rules` 在
 cargo 之前用 `npm ci` + `npm run build` 现生成 controller 嵌入的前端产物，Rust 侧才保持
-`CARGO_NET_OFFLINE` 与包内 Cargo 缓存离线。两个 systemd 单元都以关闭状态
-安装（`dh_installsystemd --no-enable`），controller 单元另外在未写配置文件时自身拒绝启动，因此装包不拉起任何
+`CARGO_NET_OFFLINE` 与包内 Cargo 缓存离线。两个 systemd 单元都以关闭状态安装
+（`dh_installsystemd --no-enable --no-start --no-stop-on-upgrade`，包既不启动也不因升级而重启），controller
+单元另外在未写配置文件时自身拒绝启动，因此装包不拉起任何
 服务、也不触碰任何数据库。
 
 该软件包依赖 `xz-utils`：写入压缩的 `.img.xz` 系统镜像时通过 `xz -dc` 解压。选择硬依赖

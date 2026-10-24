@@ -124,4 +124,3 @@ Task 13 依赖 Runtime Task 3（版本化 guard）与 Runtime Task 6 的路由�
 - [05-adapters-matrix.md](2026-10-16-identity/05-adapters-matrix.md)：管理适配器与 26 路由矩阵专用规范（~488 行）
 
 ---
-

@@ -12,11 +12,22 @@ pub mod crypto;
 pub mod ed25519;
 pub mod frame;
 pub mod handshake;
+pub mod handshake_adapter;
+pub mod handshake_msg;
 pub mod sig;
 pub mod wire;
 
 pub use codec::BusinessCodec;
-pub use crypto::{CryptoError, EphemeralKeyPair, RecordLayer, RecordLayerPair, SessionKeys};
+pub use crypto::{
+    CryptoError, EphemeralKeyPair, PendingOwner, PreparedRecord, RecordLayerPair, RxRecordLayer,
+    SessionKeys, TxRecordLayer,
+};
+pub use handshake_adapter::{EstablishedTunnel, HandshakeMessage, RecordReassembler};
+pub use handshake_msg::{
+    ClientAuthRequest, ClientHello, DeviceDescriptor, HandshakeMsgError,
+    MAX_DEVICE_DESCRIPTOR_BYTES, MAX_HANDSHAKE_MESSAGE_BYTES, PENDING_WAIT_HINT_MS, PendingPong,
+    ServerAuthResponse, ServerChallenge, ServerPending,
+};
 pub use wire::{
     ApprovedCodecWitness, BUSINESS_SCHEMA_VERSION, BusinessMessage, BusinessPayload,
     BusinessPayloadKind, Capabilities, ClockSample, Codec, CodecError, DeviceStatus, DtoError,

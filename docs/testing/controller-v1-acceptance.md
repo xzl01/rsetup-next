@@ -77,8 +77,10 @@ Spec: 06 §6
   单调接收年龄、旧会话/旧序号不覆盖；真实源未接线不挂载、不常量伪 PASS。
   该端点的 `device.status.read` 对象级权限与设备可见性门禁由本轮修复补齐，实现见
   `crates/rsetup-controller/src/http_device_status.rs`（对应 T4-06 行的 `cargo test -p rsetup-controller
-  --lib http_device_status`）。快照写入方（transport 轮询）尚未接线这一点未因此改变，见
-  [`controller-v1-known-gaps.md`](<controller-v1-known-gaps.md>) 的 d 节。
+  --lib http_device_status`）。快照写入方现已由生产 transport 轮询接线，与状态读线共享同一个
+  `Arc<SnapshotStore>`；[2026-10-24 双进程报告](<tunnel-two-process-real-verification-report.md>)
+  记录了真实 `fresh` 样本。当前剩余边界见
+  [`controller-v1-known-gaps.md`](<controller-v1-known-gaps.md>) 的 d 节；本段更新不改变上方账本行。
 - T4-07 intent 至多一次 execute / 恢复只 query / 迟到证据：恢复对 dispatching/accepted/verifying 仅
   `task.get` 只读；迟到有效证据更新旧任务 outcome/counts 并递增 revision，不删新 generation 设备锁。
 - T4-08 板端 B04 故障：accepted/attempted 两阶段持久化与 OS 调用边界故障分类（以 03 §5 B-04 完整
@@ -118,6 +120,10 @@ Spec: 06 §6
   实际 PASS 证据来自以 `-- --ignored` 显式执行该门禁用例、且**逐引擎串行单 case**（③ 层）分别跑通两台引擎；
   不带 `-- --ignored` 的普通执行只会把该用例记为 ignored，不构成该行的 PASS 证据。
   用户已决定跳过的仅 root 锁观察一项，单独留痕，不阻断 Task 4，也不改变上述证据覆盖范围。
+  **2026-10-24 当前基线说明**：按 [v4-only 计划](<../superpowers/plans/2026-10-23-v4-only-database-baseline.md>)，
+  旧迁移测试入口已移除；上面的命令与测试路径仅说明历史执行，不是当前可运行的复验命令。
+  当前 v4 结构/数据及限定准入 CAS 的双引擎记录见 [v4 真实引擎报告](<v4-real-engine-verification.md>)；
+  不要求恢复 v1–v3 升级路线，也不以局部复验改写历史账本或推定完整任务事务验收通过。
 
 后续索引（完整 V1 目标，本轮从 Task 4 执行范围移出，保留原强度，全部未验证）：
 

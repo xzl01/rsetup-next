@@ -159,11 +159,13 @@ async fn migration_does_not_repair_missing_table() {
     // 被破坏的 v4 夹具必须由 v4 启动门禁的表集合/列形状校验拒绝：schema_version 行
     // 仍为 4，版本决策先放行，拒绝来自结构校验本身，而不是只凭版本号 fail-closed。
     assert!(rsetup_controller::check_identity_schema(&db).await.is_err());
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_migrate-identity-test"))
-        .args(["--mode", "upgrade"])
+    // v4-only 基线：`--check` 是纯只读入口，既不建表也不修表。它必须照常报告版本 4
+    // 并成功退出，同时被破坏的结构原样保留——修复只可能来自操作员的显式核查。
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_rsetup-controller-migrate"))
+        .arg("--check")
         .status()
         .unwrap();
-    assert!(!status.success());
+    assert!(status.success(), "--check 只读入口必须成功退出");
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'role_permissions'")
         .fetch_one(&db.0).await.unwrap();
     assert_eq!(count, 0);
@@ -180,11 +182,13 @@ async fn migration_rejects_wrong_named_table_before_bootstrap() {
     // 同 migration_does_not_repair_missing_table：版本行仍为 4，v4 启动门禁必须凭
     // 列形状校验拒绝被破坏的夹具。
     assert!(rsetup_controller::check_identity_schema(&db).await.is_err());
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_migrate-identity-test"))
-        .args(["--mode", "upgrade"])
+    // v4-only 基线：`--check` 是纯只读入口，既不建表也不修表。它必须照常报告版本 4
+    // 并成功退出，同时被破坏的结构原样保留——修复只可能来自操作员的显式核查。
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_rsetup-controller-migrate"))
+        .arg("--check")
         .status()
         .unwrap();
-    assert!(!status.success());
+    assert!(status.success(), "--check 只读入口必须成功退出");
 }
 
 #[tokio::test]

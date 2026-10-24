@@ -70,7 +70,7 @@ WEB_SRCS := $(WEB_DIR)/index.html $(WEB_DIR)/vite.config.ts \
 # and `cargo fmt --package rsetup-desktop` would not resolve. It is covered by
 # the desktop-test/desktop-check targets below instead, which go through
 # --manifest-path, and by the desktop-tauri-ipc CI job.
-FMT_PACKAGES := rsetup-core rsetup-next rsetup-controller rsetup-protocol rsetup-board-agent
+FMT_PACKAGES := rsetup-core rsetup-next rsetup-controller rsetup-protocol rsetup-board-agent rsetup-tunnel
 
 build: web-dist-check
 	cargo build --workspace --locked

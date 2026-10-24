@@ -212,8 +212,9 @@ async fn get_system_time(State(state): State<SystemApiState>, headers: HeaderMap
 
 /// 挂载 system 的 2 条管理路由：`GET /api/v1/system/status` 与
 /// `GET /api/v1/system/time` 的唯一注册锚点。
-/// 恢复探针是 Runtime 真实控制器的可失败读取：未接线时不构造 probe、不挂载 router，
-/// 本函数只接受显式装配的 `SystemApiState`。
+/// 本函数只接受显式装配的 `SystemApiState`，其中恢复探针是可失败读取。
+/// 生产恢复控制器尚未接线时仍挂载路由，由占位探针返回错误，
+/// `/system/status` handler 将其映射为 503 `NOT_READY`，不伪造恢复模式。
 pub fn system_router(state: SystemApiState) -> Router<()> {
     Router::new()
         .route("/api/v1/system/status", get(get_system_status))

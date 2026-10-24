@@ -1,8 +1,11 @@
 //! `migrate-controller`：中控**生产**库的显式迁移 CLI（操作员专用，非服务启动路径）。
 //!
-//! 只做两件事：`--check` 只读地报告当前 schema 版本；`--apply` 按固定决策表把目标库
-//! 迁移到受支持版本（见 `rsetup_controller::db::run_production_migration`）。它**不**是
-//! Web 端点，**不**接受任何 DSN/库名/备份路径参数——这些一律只从进程环境读取。
+//! 只做两件事：`--check` 只读地报告当前 schema 版本；`--apply` 按固定决策表处理目标库
+//! （见 `rsetup_controller::db::run_production_migration`）：**空库直接建满 v4 基线**，
+//! **已经是 v4 则只做只读闭合校验**（可重复执行）。除此之外的一切版本（v1/v2/v3、未来
+//! 版本、未知版本）在首次写入之前就被拒绝——没有升级路线、没有旧版本夹具模式、不就地
+//! 修复半成品。它**不**是 Web 端点，**不**接受任何 DSN/库名/备份路径参数——这些一律只从
+//! 进程环境读取。
 //!
 //! 顺序即门禁：解析参数 → 读取配置与门禁 → 连接数据库 → 由库内共享授权器复核
 //! （声明库名必须等于服务端真实返回的库名、账号必须真的有 schema 元数据可见性）→ 迁移。
@@ -31,7 +34,14 @@ rsetup-controller-migrate - explicit schema migration for the controller databas
 
 Usage:
   rsetup-controller-migrate --check    read-only: print the current schema version
-  rsetup-controller-migrate --apply    migrate the database to the supported version
+  rsetup-controller-migrate --apply    create the v4 baseline in an empty database,
+                                       or verify read-only when it already is v4
+
+This entry point is v4-only: an empty database is created directly with the full v4
+baseline, a database already at v4 is verified read-only (re-running is a no-op). Any
+other version - v1, v2, v3, a future or unknown one - is rejected before the first write.
+There is no upgrade path, no legacy fixture mode and no in-place repair of a partially
+created schema.
 
 Environment (--check):
   CONTROLLER_DATABASE_URL                     required, the controller database URL

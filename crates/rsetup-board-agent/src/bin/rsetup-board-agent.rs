@@ -1,36 +1,49 @@
-//! 板端代理 amd64 本地可执行入口（仅本地测试，不是生产隧道传输）。
+//! 板端代理 amd64 可执行入口。
 //!
-//! 用途：
-//! - `--once`：通过 `BoardAgent::handle_typed_action` 执行三条只读动作并输出 JSON；
-//! - `--watch`：周期性输出最新 `device.status.get` 样本，作为本机长期运行的探针；
-//! - `--loopback-test-server`：在回环地址上提供**仅测试用**的逐行 JSON 控制台，
-//!   用于在本机驱动器上验证白名单、DTO 校验、journal 查询与错误映射。
+//! 模式：
+//! - `--connect`：**生产模式**。从环境读取 validated 连接配置（显式中控公钥 pin，
+//!   无 TOFU），载入一次身份密钥（0600），用真实 `RealFs` journal 与真实 /proc
+//!   只读来源装配 `BoardAgent`，然后进入 `rsetup_board_agent::connect` 的连接循环：
+//!   TCP → v3 客户端握手 → 加密记录层 → 会话驱动（业务 handler、退避重连、
+//!   kick/revoke 分流、优雅排空）。退出码：正常停止/永久停止 0（因此
+//!   `Restart=on-failure` 不会绕过停止语义），本端配置或 journal 故障 78。
+//! - `--once`：执行三条只读动作并输出 JSON（本机验收）。
+//! - `--watch`：周期性输出最新 `device.status.get` 样本（本机探针）。
+//! - `--loopback-test-server`：回环地址上的**仅测试用**逐行 JSON 控制台，
+//!   用于本机验证白名单、DTO 校验、journal 查询与错误映射。
 //!
-//! 本入口**不实现**生产加密隧道（协议 codec 尚未获批），也绝不触发真实主机重启。
-//! 回环 JSON 协议是为了本地验收而存在的最小测试接口，不能当作生产 wire 协议。
+//! 后三个模式是**本地非生产**通道，不构成与中控互通的证据。本入口在任何模式下
+//! 都不触发真实主机重启：`device.reboot.*` 需要由人工接线真实 dispatcher，
+//! 未接线时能力申报与执行都返回 1004。
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
+use rsetup_board_agent::connect::{ConnectEvent, SharedAgentFactory};
+use rsetup_board_agent::connect::{
+    Observer, ReconnectPolicy, RunOutcome, Shutdown, TunnelConnector, UnauthorizedState,
+    board_connect_config_from_env, descriptor_from_env, run_board_connection, state_dir_of,
+};
 use rsetup_board_agent::dispatch::{
     BoardAgent, BusinessResponse, BusinessStatus, JournalEpochSource, TaskJournalReader,
 };
+use rsetup_board_agent::host_source::SystemReadOnlySource;
 use rsetup_board_agent::journal::{JournalStore, RealFs};
-use rsetup_board_agent::read_only::{PeerContext, ReadOnlySource};
-use rsetup_protocol::wire::{
-    BUSINESS_SCHEMA_VERSION, BusinessPayload, Capabilities, ClockSample, DeviceStatus, Metric,
-    Query, TaskQuery,
-};
+use rsetup_board_agent::read_only::PeerContext;
+use rsetup_board_agent::session_handler::BusinessDispatch;
+use rsetup_protocol::handshake_msg::DeviceDescriptor;
+use rsetup_protocol::wire::{BUSINESS_SCHEMA_VERSION, BusinessPayload, Query, TaskQuery};
+use rsetup_tunnel::identity::IdentityKey;
 
 const DEFAULT_JOURNAL_DIR: &str = "/tmp/rsetup-board-agent-journal";
 const DEFAULT_INTERVAL_SECS: u64 = 10;
 const MAX_REQUEST_LINE: usize = 4096;
 
 struct Options {
+    connect: bool,
     once: bool,
     watch: bool,
     loopback: bool,
@@ -44,6 +57,7 @@ fn usage() -> String {
     "rsetup-board-agent <mode>\n\
      \n\
      Modes:\n\
+       --connect                      production mode: dial the controller from env config\n\
        --once                         run three read-only actions once and print JSON\n\
        --watch                        run device.status.get in a loop\n\
        --loopback-test-server         expose a JSON-lines test console on --listen\n\
@@ -54,13 +68,15 @@ fn usage() -> String {
        --controller-key <64-hex>      controller key used for journal queries (default random)\n\
        -h, --help                     print this help\n\
      \n\
-     This binary is a local test harness. It does not provide the production encrypted tunnel\n\
-     and never performs a real host reboot."
+     --connect reads RSETUP_CONTROLLER_ADDR, RSETUP_CONTROLLER_PUBLIC_KEYS (explicit pins,\n\
+     no TOFU), RSETUP_BOARD_KEY_FILE and RSETUP_BOARD_JOURNAL_DIR, and fails closed when a\n\
+     pin is missing or a value is unusable. Every mode never performs a real host reboot."
         .to_string()
 }
 
 fn parse_args() -> Result<Options, String> {
     let mut args = std::env::args().skip(1);
+    let mut connect = false;
     let mut once = false;
     let mut watch = false;
     let mut loopback = false;
@@ -72,6 +88,7 @@ fn parse_args() -> Result<Options, String> {
     controller_key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--connect" => connect = true,
             "--once" => once = true,
             "--watch" => watch = true,
             "--loopback-test-server" => loopback = true,
@@ -129,13 +146,13 @@ fn parse_args() -> Result<Options, String> {
             _ => return Err("unknown argument".to_string()),
         }
     }
-    let modes = once as u8 + watch as u8 + loopback as u8;
+    let modes = connect as u8 + once as u8 + watch as u8 + loopback as u8;
     if modes != 1 {
-        return Err(
-            "exactly one of --once, --watch or --loopback-test-server is required".to_string(),
-        );
+        return Err("exactly one of --connect, --once, --watch or --loopback-test-server                     is required"
+            .to_string());
     }
     Ok(Options {
+        connect,
         once,
         watch,
         loopback,
@@ -144,162 +161,6 @@ fn parse_args() -> Result<Options, String> {
         interval,
         controller_key,
     })
-}
-
-/// 本机只读来源：读取 /proc 与 kernel boot_id；任何读数失败都标 quality=unavailable，
-/// 绝不把未知回填 0。
-struct SystemReadOnlySource {
-    boot_id: String,
-    agent_epoch: String,
-    clock_epoch: String,
-    journal_epoch: String,
-    sample_seq: AtomicU64,
-    started: Instant,
-}
-
-impl SystemReadOnlySource {
-    fn new(journal_epoch: String) -> Self {
-        Self {
-            boot_id: read_boot_id(),
-            agent_epoch: uuid::Uuid::new_v4().to_string(),
-            clock_epoch: uuid::Uuid::new_v4().to_string(),
-            journal_epoch,
-            sample_seq: AtomicU64::new(0),
-            started: Instant::now(),
-        }
-    }
-
-    fn monotonic_ns(&self) -> u64 {
-        self.started
-            .elapsed()
-            .as_nanos()
-            .try_into()
-            .unwrap_or(u64::MAX)
-    }
-
-    fn metrics(&self) -> Vec<Metric> {
-        let mut metrics = Vec::new();
-        if let Some(value) = read_loadavg() {
-            metrics.push(metric("cpu.load1", value, "1m"));
-        }
-        if let Some(value) = read_mem_used_percent() {
-            metrics.push(metric("memory.used_percent", value, "%"));
-        }
-        if let Some(value) = read_uptime_secs() {
-            metrics.push(metric("system.uptime", value, "s"));
-        }
-        metrics
-    }
-}
-
-fn metric(key: &str, value: f64, unit: &str) -> Metric {
-    Metric {
-        key: key.to_string(),
-        value: Some(value),
-        unit: unit.to_string(),
-        quality: "ok".to_string(),
-    }
-}
-
-fn read_boot_id() -> String {
-    let raw = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| uuid::Uuid::parse_str(s).is_ok());
-    raw.unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
-}
-
-fn read_loadavg() -> Option<f64> {
-    std::fs::read_to_string("/proc/loadavg")
-        .ok()?
-        .split_whitespace()
-        .next()?
-        .parse::<f64>()
-        .ok()
-        .filter(|v| v.is_finite())
-}
-
-fn read_uptime_secs() -> Option<f64> {
-    std::fs::read_to_string("/proc/uptime")
-        .ok()?
-        .split_whitespace()
-        .next()?
-        .parse::<f64>()
-        .ok()
-        .filter(|v| v.is_finite())
-}
-
-fn read_mem_used_percent() -> Option<f64> {
-    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let mut total = None;
-    let mut available = None;
-    for line in info.lines() {
-        let mut fields = line.split_whitespace();
-        match fields.next() {
-            Some("MemTotal:") => total = fields.next().and_then(|v| v.parse::<f64>().ok()),
-            Some("MemAvailable:") => available = fields.next().and_then(|v| v.parse::<f64>().ok()),
-            _ => {}
-        }
-    }
-    let (total, available) = (total?, available?);
-    if total <= 0.0 || available < 0.0 || available > total {
-        return None;
-    }
-    let value = (total - available) / total * 100.0;
-    value.is_finite().then_some(value)
-}
-
-impl ReadOnlySource for SystemReadOnlySource {
-    fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            schema_version: BUSINESS_SCHEMA_VERSION,
-            boot_id: self.boot_id.clone(),
-            agent_version: env!("CARGO_PKG_VERSION").to_string(),
-            supported_actions: rsetup_board_agent::allowed_action_names()
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            durable_task_journal: true,
-            max_status_bytes: 65536,
-            journal_epoch: self.journal_epoch.clone(),
-        }
-    }
-
-    fn status(&self) -> DeviceStatus {
-        let seq = self.sample_seq.fetch_add(1, Ordering::SeqCst) + 1;
-        DeviceStatus {
-            schema_version: BUSINESS_SCHEMA_VERSION,
-            boot_id: self.boot_id.clone(),
-            agent_epoch: self.agent_epoch.clone(),
-            sample_seq: seq,
-            sampled_unix_ms: unix_ms(),
-            sampled_monotonic_ns: self.monotonic_ns(),
-            clock_epoch: self.clock_epoch.clone(),
-            metrics: self.metrics(),
-            clock_quality: "observed".to_string(),
-        }
-    }
-
-    fn clock(&self) -> ClockSample {
-        let now = unix_ms();
-        ClockSample {
-            schema_version: BUSINESS_SCHEMA_VERSION,
-            boot_id: self.boot_id.clone(),
-            clock_epoch: self.clock_epoch.clone(),
-            receive_unix_ms: now,
-            send_unix_ms: now,
-            receive_monotonic_ns: self.monotonic_ns(),
-            send_monotonic_ns: self.monotonic_ns(),
-            quality: "observed".to_string(),
-        }
-    }
-}
-
-fn unix_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis().try_into().unwrap_or(i64::MAX))
-        .unwrap_or(0)
 }
 
 struct JournalReader {
@@ -338,8 +199,11 @@ fn open_agent(
         .map_err(|e| format!("cannot open journal: {e}"))?;
     let epoch = store.journal_epoch().to_string();
     let store = Arc::new(store);
+    // boot_id 只来自真实内核读数；读不到就是失败，绝不伪造。
+    let source = SystemReadOnlySource::from_system(epoch.clone(), false, true)
+        .map_err(|e| format!("cannot read host identity: {e}"))?;
     Ok(BoardAgent::new(
-        SystemReadOnlySource::new(epoch.clone()),
+        source,
         JournalReader { store },
         JournalEpoch { epoch },
     ))
@@ -594,6 +458,16 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if options.connect {
+        // 生产模式：配置、身份、journal 全部 fail-closed，不进入本地 JSON 通道。
+        match run_connect() {
+            Ok(code) => std::process::exit(code),
+            Err((code, message)) => {
+                eprintln!("{message}");
+                std::process::exit(code);
+            }
+        }
+    }
     if !options.once && !options.watch && !options.loopback {
         eprintln!("{}", usage());
         std::process::exit(2);
@@ -621,37 +495,173 @@ fn main() {
     }
 }
 
+/// 生产模式装配与运行。返回进程退出码（0 = 正常停止/永久停止，78 = 本端故障）。
+///
+/// 任何一步失败都只打印**去敏**原因：不打印地址、公钥、路径与环境值内容。
+fn run_connect() -> Result<i32, (i32, String)> {
+    let config = board_connect_config_from_env()
+        .map_err(|_| (78, "connection configuration is invalid".to_string()))?;
+    let descriptor: DeviceDescriptor =
+        descriptor_from_env().map_err(|_| (78, "device descriptor is invalid".to_string()))?;
+    // 身份密钥：**启动期载入一次**（0600/owner/symlink 由 IdentityKey 校验），
+    // 每条 connection 的 random 与 X25519 临时密钥由握手库每次重新生成。
+    let identity = IdentityKey::load_or_generate(&config.identity_file)
+        .map_err(|_| (78, "board identity key is unavailable".to_string()))?;
+    // journal 必须是真实目录（不接受符号链接），持久失败绝不降级为内存假 durable。
+    let metadata = std::fs::symlink_metadata(&config.journal_dir)
+        .map_err(|_| (78, "journal directory is unavailable".to_string()))?;
+    if !metadata.is_dir() {
+        return Err((78, "journal directory is not a real directory".to_string()));
+    }
+    let store = JournalStore::open(&config.journal_dir, RealFs)
+        .map_err(|_| (78, "journal cannot be opened or recovered".to_string()))?;
+    let epoch = store.journal_epoch().to_string();
+    let store = Arc::new(store);
+    let source = SystemReadOnlySource::from_system(epoch.clone(), false, true)
+        .map_err(|_| (78, "host identity is unavailable".to_string()))?;
+    let agent = BoardAgent::new(
+        source,
+        JournalReader {
+            store: Arc::clone(&store),
+        },
+        JournalEpoch { epoch },
+    );
+    let dispatch: Arc<dyn BusinessDispatch> = Arc::new(agent);
+    let connector = TunnelConnector::new(
+        config.clone(),
+        Arc::new(identity),
+        descriptor,
+        Arc::new(SharedAgentFactory::new(dispatch)),
+    )
+    .with_unauthorized_state(UnauthorizedState::in_state_dir(state_dir_of(
+        &config.identity_file,
+    )));
+
+    let observer: Observer = Arc::new(|event: ConnectEvent| {
+        // 只打类别与尝试次数：无地址、无公钥、无路径。
+        eprintln!(
+            "board-connect event={:?} attempt={} stop={:?}",
+            event.kind,
+            event.attempt,
+            event.stop.map(|stop| stop.label())
+        );
+    });
+    let policy = ReconnectPolicy::system();
+    let shutdown = Shutdown::new();
+    {
+        let shutdown = shutdown.clone();
+        // SIGTERM（systemd stop）与 SIGINT（前台调试）走同一条优雅排空路径。
+        std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(_) => return,
+            };
+            runtime.block_on(async {
+                use tokio::signal::unix::{SignalKind, signal};
+                let Ok(mut term) = signal(SignalKind::terminate()) else {
+                    return;
+                };
+                let Ok(mut int) = signal(SignalKind::interrupt()) else {
+                    return;
+                };
+                tokio::select! {
+                    _ = term.recv() => {}
+                    _ = int.recv() => {}
+                }
+                shutdown.signal();
+            });
+        });
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .map_err(|_| (78, "cannot start runtime".to_string()))?;
+    let outcome = runtime.block_on(run_board_connection(
+        Arc::new(connector),
+        policy,
+        shutdown,
+        observer,
+    ));
+    match outcome {
+        RunOutcome::Shutdown => {
+            eprintln!("board-connect stopped by shutdown signal");
+        }
+        RunOutcome::Stopped {
+            stop,
+            state_written,
+        } => {
+            // 合法吊销/拒绝：不再自动重连；未授权状态未落盘必须显式喊人。
+            eprintln!(
+                "board-connect permanently stopped ({}), unauthorized state written={}",
+                stop.label(),
+                state_written
+            );
+        }
+        RunOutcome::Fault(reason) => {
+            eprintln!("board-connect fault: {reason:?}");
+        }
+    }
+    Ok(outcome.exit_code())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rsetup_protocol::wire::BusinessMessage;
+    use rsetup_board_agent::read_only::ReadOnlySource;
+    use rsetup_protocol::wire::validate_dto;
 
     #[test]
-    fn usage_lists_all_three_modes() {
+    fn usage_lists_every_mode_including_production_connect() {
         let text = usage();
-        for mode in ["--once", "--watch", "--loopback-test-server"] {
-            assert!(text.contains(mode));
+        for mode in ["--connect", "--once", "--watch", "--loopback-test-server"] {
+            assert!(text.contains(mode), "usage 缺少 {mode}");
         }
         assert!(text.contains("never performs a real host reboot"));
+        // 生产模式必须写明显式 pin 且缺 pin 直接失败关闭。
+        assert!(text.contains("no TOFU"));
     }
 
     #[test]
-    fn metric_reading_fails_closed_to_no_value() {
-        // 解析失败路径由 Option 表达；不得把未知回填 0。
-        assert!(read_loadavg().is_some());
-        assert!(read_uptime_secs().is_some());
-        assert!(read_mem_used_percent().is_some());
+    fn missing_mode_is_rejected_and_names_the_production_mode() {
+        // 测试进程的 argv 不带模式标志：必须报「恰好一个模式」并列出 --connect。
+        let message = match parse_args() {
+            Ok(_) => panic!("无模式必须失败"),
+            Err(message) => message,
+        };
+        assert!(message.contains("exactly one of --connect"), "{message}");
+    }
+
+    #[test]
+    fn metric_readings_come_from_the_real_system_or_are_absent() {
+        // 读数失败时该指标**缺席**，绝不回填 0（host_source 的失败路径）。
+        let metrics = rsetup_board_agent::host_source::read_metrics();
+        for metric in &metrics {
+            assert!(metric.value.is_some() || metric.quality == "unavailable");
+        }
     }
 
     #[test]
     fn system_source_produces_valid_typed_dtos() {
-        let source = SystemReadOnlySource::new(uuid::Uuid::new_v4().to_string());
+        // 生产入口的只读来源：boot_id 必须真实可读，DTO 必须通过 wire 自检。
+        let source =
+            SystemReadOnlySource::from_system(uuid::Uuid::new_v4().to_string(), false, true)
+                .expect("本机内核 boot_id 必须真实可读");
         let caps = source.capabilities();
-        caps.validate().unwrap();
+        validate_dto(&caps).unwrap();
+        // 未接线 reboot dispatcher：能力清单不得虚报可执行重启。
+        assert!(
+            !caps
+                .supported_actions
+                .iter()
+                .any(|action| action.starts_with("device.reboot."))
+        );
         let status = source.status();
-        status.validate().unwrap();
-        let clock = source.clock();
-        clock.validate().unwrap();
+        validate_dto(&status).unwrap();
+        validate_dto(&source.clock()).unwrap();
         assert_eq!(status.sample_seq, 1);
         assert_eq!(source.status().sample_seq, 2);
     }
@@ -667,6 +677,7 @@ mod tests {
     #[test]
     fn request_handler_rejects_unknown_and_never_reboots() {
         let options = Options {
+            connect: false,
             once: true,
             watch: false,
             loopback: false,

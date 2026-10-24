@@ -1,0 +1,30 @@
+[package]
+name = "rsetup-tunnel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rsetup-protocol = { path = "../rsetup-protocol" }
+tokio = { workspace = true, features = ["net", "io-util", "test-util"] }
+ring.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+libc.workspace = true
+bytes = "1"
+http = "1"
+h2 = "0.4"
+
+[dev-dependencies]
+# Task 1 的目标测试需要"指定起始序号"的记录层（末有效序号、期望序号 2^64-1
+# 等内部状态），该入口在 rsetup-protocol 里默认关闭，只有测试目标显式启用
+# `test-util` 才存在。正常 `[dependencies]` 保持默认 feature 组合不变，因此
+# `cargo build` / `cargo build --release` 的产物里没有任何测试专用 API（实测
+# 默认组合的 rlib 里 `at_seq_for_test` 符号计数为 0）。
+# 注意边界：本条 dev-dependency 会经 feature 统一，让**测试组合**（含 workspace
+# 范围的 `cargo test`）里的 rsetup-protocol 以 `test-util` 编译；这只说明测试
+# 组合有该入口，不代表生产组合有——不要把结论写成"任何不带 `--features` 的
+# `cargo test` 都不会编译它"。生产可见性由 protocol 侧的 `compile_fail` 文档
+# 测试把守（见 rsetup-protocol/Cargo.toml 的同一说明）。
+rsetup-protocol = { path = "../rsetup-protocol", features = ["test-util"] }

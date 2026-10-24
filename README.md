@@ -457,8 +457,8 @@ installs
 | `/usr/bin/rsetup-controller` | the control-plane process (unit `rsetup-controller.service`) |
 | `/usr/bin/rsetup-controller-migrate` | explicit schema migration, `--check` / `--apply` |
 | `/usr/bin/rsetup-admin` | local root emergency admin recovery (cargo bin name equals the delivered name; source `src/bin/reset-admin.rs`) |
-| `/etc/default/rsetup-controller` | `EnvironmentFile` template, 0644, secret-free |
-| `/usr/lib/systemd/system/rsetup-controller.service` | unit: `User=rsetup-controller` (static system account), `StateDirectory=rsetup-controller` |
+| `/usr/share/doc/rsetup-controller/rsetup-controller.default` | `EnvironmentFile` example, 0644, secret-free — **not** installed to `/etc`; the operator creates `/etc/default/rsetup-controller` from it |
+| `/usr/lib/systemd/system/rsetup-controller.service` | unit: `User=rsetup-controller` (static system account), `StateDirectory=rsetup-controller`, `StateDirectoryMode=0700` |
 | `/usr/share/doc/rsetup-controller/README.Debian` | the full post-install walkthrough |
 
 The unit drops privileges to the static system account `rsetup-controller` (`User=` and
@@ -471,17 +471,26 @@ ACL policies have a stable anchor. `DynamicUser=yes` is deliberately gone: a dyn
 gets a fresh temporary uid on every start, systemd re-chowns the state directory each time,
 and the owner of persistent state drifts across restarts, which leaves forensics and
 authorization policy without an anchor. The maintainer script only creates the account; it
-never starts or enables a service.
+never starts or enables a service, and the account is kept on purge (no `deluser`) — see
+`debian/rsetup-controller.README.Debian`.
 
-The package enables and starts nothing. `dh_installsystemd --no-enable` keeps the unit
-out of the boot path, and the unit also refuses to run while its `EnvironmentFile` is
-missing, so an unconfigured install is simply inactive. Completing the setup is an
+The package enables and starts nothing.
+`dh_installsystemd --no-enable --no-start --no-stop-on-upgrade` keeps the unit out of the
+boot path and out of every start/restart snippet of the generated maintainer scripts —
+`--no-enable` alone would still leave the `deb-systemd-invoke` activation snippet (a start,
+or on upgrade a `_dh_action=restart`) in the postinst — and the
+unit also refuses to run while its `EnvironmentFile` is missing, so an unconfigured install
+is simply inactive. Completing the setup is an
 operator action, and nothing below has been run against a real database on your behalf:
 
-1. Fill in `/etc/default/rsetup-controller` — `CONTROLLER_DATABASE_URL`,
+1. Create the configuration file with its final permissions, then fill it in:
+   `sudo install -m0600 -o root -g root /usr/share/doc/rsetup-controller/rsetup-controller.default /etc/default/rsetup-controller`
+   followed by `sudoedit /etc/default/rsetup-controller` with `CONTROLLER_DATABASE_URL`,
    `CONTROLLER_ALLOWED_HOSTS`, `CONTROLLER_ALLOWED_ORIGIN`,
-   `CONTROLLER_MANAGEMENT_CURSOR_SECRET_HEX` — then `chmod 0600` it. The packaged
-   template is 0644 precisely because it holds no secrets.
+   `CONTROLLER_MANAGEMENT_CURSOR_SECRET_HEX`. The packaged example is 0644 precisely
+   because it holds no secrets; `install -m0600` (rather than `cp` then `chmod`) is what
+   keeps the future `EnvironmentFile` from ever existing world-readable while it is being
+   filled with a DSN.
 2. Take a real, restorable backup of the target database, then export the four
    migration gates next to `CONTROLLER_DATABASE_URL`:
    `CONTROLLER_MIGRATION_ALLOW_DESTRUCTIVE=1`,
@@ -492,10 +501,13 @@ operator action, and nothing below has been run against a real database on your 
    declared database is not the one the server reports.
 3. `rsetup-controller-migrate --check` (read-only, prints only
    `schema_version=<number>` or `schema_version=missing`), then
-   `rsetup-controller-migrate --apply`. Already-migrated databases only get the
-   read-only consistency pass; an empty, v1, v2 or v3 database is brought to v3 and then
-   to v4; an unknown version is refused. It needs no root — privileges come from the
-   database account — and never reads `/dev/tty`.
+   `rsetup-controller-migrate --apply`. Schema v4 is the only baseline: an empty database
+   is created with the full v4 schema, a database already at v4 only gets the read-only
+   consistency pass (idempotent). A v1, v2, v3 or unknown database is refused before the
+   first write — there is no upgrade path and no legacy fixture mode, so a pre-v4 database
+   must first be reset at table level by the operator (the real, restorable backup in step
+   2 is what makes that safe). It needs no root — privileges come from the database account
+   — and never reads `/dev/tty`.
 4. `systemctl start rsetup-controller` (add `enable` once you want it at boot).
 5. On first boot the one-time administrator credential lands in
    `/var/lib/rsetup-controller/bootstrap-secret.log` (`0600`, `O_EXCL`); read it, log in,
@@ -538,8 +550,9 @@ JSON-lines protocol and its scope limits.
 
 Board-side delivery and running user: `rsetup-board-agent` is its own Debian binary package
 built from this source package, installing `/usr/bin/rsetup-board-agent` and the unit
-`/usr/lib/systemd/system/rsetup-board-agent.service` (`dh_installsystemd --no-enable`, so
-disabled by default). The unit runs the read-only sampling watch loop as
+`/usr/lib/systemd/system/rsetup-board-agent.service` (`dh_installsystemd --no-enable
+--no-start --no-stop-on-upgrade`, so disabled by default and never started by the
+package). The unit runs the read-only sampling watch loop as
 `User=root`/`Group=root` (`--interval-secs 10 --journal-dir /var/lib/rsetup-board-agent`,
 with the state directory created 0700 by `StateDirectory`): the board's hardware and system
 state sources are not uniformly readable by an unprivileged user, so both the production
@@ -584,7 +597,9 @@ corresponding hardware tools.
 
 The same source package also builds two more packages. `rsetup-controller`: the
 control-centre process, its two operator CLIs (`rsetup-controller-migrate` and
-`rsetup-admin`), one systemd unit and the `/etc/default/rsetup-controller` template; the
+`rsetup-admin`), one systemd unit and a secret-free configuration example under
+`/usr/share/doc/rsetup-controller/` (nothing is written to `/etc/default` — creating that
+file is the operator's step); the
 unit drops privileges to the static system account `rsetup-controller` created on install.
 What it installs, and the migration and configuration steps an operator still has to
 perform, are in "Install from the Debian package" under "Controller". `rsetup-board-agent`:
@@ -593,7 +608,8 @@ watch loop; the production encrypted tunnel and a real reboot boundary are not w
 Building any of them needs Node.js and npm, both Build-Depends: `debian/rules` generates
 the controller's web UI with `npm ci` + `npm run build` before cargo runs, while the Rust
 side keeps `CARGO_NET_OFFLINE` and the package-local Cargo cache.
-Both systemd units are installed disabled (`dh_installsystemd --no-enable`), and the
+Both systemd units are installed disabled and are never started by the package
+(`dh_installsystemd --no-enable --no-start --no-stop-on-upgrade`), and the
 controller unit additionally refuses to run while its configuration file is missing, so
 installing the packages starts nothing
 and touches no database.

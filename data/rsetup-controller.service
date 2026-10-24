@@ -4,7 +4,9 @@ Description=rsetup-next Web control center (controller)
 Documentation=file:/usr/share/doc/rsetup-controller/README.Debian
 After=network-online.target
 Wants=network-online.target
-# 未写下例配置（含数据库连接串）时，本单元保持 inactive 而不是启动失败：
+# 未由操作员创建配置（含数据库连接串）时，本单元保持 inactive 而不是启动失败：
+# 配置模板不再由包安装到 /etc（见 /usr/share/doc/rsetup-controller/rsetup-controller.default），
+# ConditionPathExists 真正由操作员创建 /etc/default/rsetup-controller 触发；
 # 包安装不会带着空配置去连库，也不会生成任何状态。
 ConditionPathExists=/etc/default/rsetup-controller
 
@@ -20,8 +22,16 @@ Type=simple
 # 因此本单元显式降权到下面的 User/Group，其余 hardening 全部保留。
 User=rsetup-controller
 Group=rsetup-controller
-# StateDirectory 仍由 systemd 创建为 0700 并归属上面的 User/Group。
+# StateDirectory 仍由 systemd 创建并归属上面的 User/Group；Mode 显式写死 0700，
+# 不依赖 systemd 版本对 StateDirectory 的默认权限约定：状态目录里是数据库连接串派生的
+# 会话、journal 与审计落盘，任何本机其他账户都不应读到。
 StateDirectory=rsetup-controller
+StateDirectoryMode=0700
+# 进程新建文件/目录的默认掩码：0077 让任何未显式指定权限的落盘文件默认只有属主可读写，
+# 不会因某个路径忘记 chmod 就把状态文件暴露给同机其他账户（/var/lib 默认 0755 下的 world-readable 文件）。
+# 对首启动的一次性凭据无副作用：bootstrap-secret.log 由程序以 O_CREAT|O_EXCL + 0600 显式创建，
+# 0600 & ~0077 == 0600，权限既不被放宽也不被收紧，读取与删除路径不变。
+UMask=0077
 WorkingDirectory=/var/lib/rsetup-controller
 # 唯一配置入口：0600 的 root-only 文件，见 /usr/share/doc/rsetup-controller/README.Debian。
 EnvironmentFile=/etc/default/rsetup-controller

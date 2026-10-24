@@ -1,28 +1,67 @@
 //! 传输加密核心（第 1 层）行为测试：protocol_spec.md §4.4、§5。
 //!
-//! 覆盖：X25519 协商与公钥拒绝、HKDF-SHA256 派生一致性与方向区分、
+//! 覆盖：X25519 协商与公钥拒绝、HKDF-SHA256 双方派生一致性与方向绑定、
 //! 双向记录 roundtrip（空/1B/最大/多条交错）、篡改（tag/密文/长度/AAD-seq）、
-//! 重放、乱序、截断/多余字节、长度 15/65537、序号末值耗尽、fatal 粘滞，
-//! 以及记录线格式与按 §5.2 公式独立实现的"规范参考实现"逐字节互通。
+//! 重放、乱序、截断/多余字节、长度 15/65537，以及 pair 共享 fatal 熔断位
+//! 语义（单侧失败 ⇒ 对向 `seal`/`open` 必拒绝，整对不可用）。
 //!
-//! 序号耗尽与参考实现使用 `#[doc(hidden)]` 测试专用入口
-//! `record_layer_at_seq` / `key_material_for_test`，不经生产 API。
+//! 本文件**只使用生产 API**（`SessionKeys::derive` + 按值消耗 `self` 的
+//! `into_client_record_layers`/`into_server_record_layers` + `seal`/`open`）：
+//! 一份 `SessionKeys` 是一次性消耗品，只能产出一个 `RecordLayerPair`，既不
+//! 导出密钥四元组，也没有把序号重置回 0 或复制 key/IV 再启发送器的入口。
+//! 需要内部状态的用例（HKDF 逐字节钉死、序号末值、线格式参考实现互通、
+//! `mark_write_failed`）位于 `src/crypto.rs` 的 `#[cfg(test)] mod tests`。
+//!
+//! 需要"另一个全新方向"的用场，一律从同一共享密钥**重新 derive**（HKDF 是
+//! 确定性的：重新派生得到相同 key 材料、seq 从 0 起、fatal 位独立），不依赖
+//! 已删除的"同一份密钥重复产出 pair"能力。
+//!
+//! fatal 语义：pair 两方向共享同一个熔断位，任一侧失败 ⇒ 两个方向的
+//! `seal`/`open` 一律 `Fatal`（由代码强制，不依赖调用方先检查
+//! `RecordLayerPair::is_fatal()`）⇒ 调用方必须关闭整条 TCP。因此本文件不断言
+//! "对向仍可用"；跨 pair 的"不受影响"对照只用于证明熔断位不是进程级全局。
 
-use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use rsetup_protocol::crypto::{
-    CryptoError, EphemeralKeyPair, KeyMaterial, MAX_PLAINTEXT_LEN, RecordLayer, RecordLayerPair,
-    SessionKeys, record_layer_at_seq,
+    CryptoError, EphemeralKeyPair, MAX_PLAINTEXT_LEN, PreparedRecord, RecordLayerPair,
+    RxRecordLayer, SessionKeys, TxRecordLayer,
+};
+// 序号可指定的构造器只在 `test-util` 下存在（默认关闭）：生产 feature 组合下
+// 本文件不导入它，`cargo test -p rsetup-protocol` 编译通过本身就说明"生产构建
+// 里没有这个入口"；依赖它的用例整体 cfg 掉。
+#[cfg(feature = "test-util")]
+use rsetup_protocol::crypto::{
+    client_record_layers_at_seq_for_test, server_record_layers_at_seq_for_test,
 };
 
 const CLIENT_RANDOM: [u8; 32] = [0x11; 32];
 const SERVER_RANDOM: [u8; 32] = [0x22; 32];
 
-// ---------- 公共辅助 ----------
+// ---------- 公共辅助（全部经生产 API 构造） ----------
 
+/// client 视角记录层对：tx = c2s、rx = s2c。`into_client_record_layers`
+/// 消耗 `SessionKeys`，一份密钥只出一个 pair。
+fn client_pair(shared: &[u8; 32]) -> RecordLayerPair {
+    SessionKeys::derive(shared, &CLIENT_RANDOM, &SERVER_RANDOM)
+        .expect("derive")
+        .into_client_record_layers()
+}
+
+/// server 视角记录层对：tx = s2c、rx = c2s。一次性语义同上。
+fn server_pair(shared: &[u8; 32]) -> RecordLayerPair {
+    SessionKeys::derive(shared, &CLIENT_RANDOM, &SERVER_RANDOM)
+        .expect("derive")
+        .into_server_record_layers()
+}
+
+/// 一次完整握手的产物：两端已建立的记录层对 + 共享密钥。
+///
+/// 这里存的是**共享密钥**而不是 `SessionKeys`：后者一次性消耗，无法重复产出
+/// pair。负面用例需要互不干扰的"全新方向"时，从 `shared` 重新 derive 一份
+/// （确定性 ⇒ key 材料一致、seq 从 0 起、fatal 位独立）。
 struct Established {
+    shared: [u8; 32],
     client: RecordLayerPair,
     server: RecordLayerPair,
-    material: KeyMaterial,
 }
 
 /// 完整走一遍 §4.4/§5.1：X25519 → 共享密钥 → HKDF 派生 → 双向记录层。
@@ -34,77 +73,50 @@ fn established() -> Established {
     let shared_c = client_eph.agree(&pub_s).expect("client agree");
     let shared_s = server_eph.agree(&pub_c).expect("server agree");
     assert_eq!(shared_c, shared_s, "两端共享密钥必须一致");
-    let keys = SessionKeys::derive(&shared_c, &CLIENT_RANDOM, &SERVER_RANDOM).expect("derive");
-    Established {
-        client: keys.client_record_layer(),
-        server: keys.server_record_layer(),
-        material: keys.key_material_for_test(),
-    }
+    Established::from_shared(&shared_c)
 }
 
-/// 以 c2s key/iv 构造序号从 0 起的独立接收层（互不干扰的负面用例）。
-fn fresh_c2s_rx(material: &KeyMaterial) -> RecordLayer {
-    record_layer_at_seq(&material.c2s_key, &material.c2s_iv, 0)
+impl Established {
+    fn from_shared(shared: &[u8; 32]) -> Self {
+        let shared = *shared;
+        Self {
+            client: client_pair(&shared),
+            server: server_pair(&shared),
+            shared,
+        }
+    }
+
+    /// 全新的 c2s 接收方向（等价于"另一个中控端刚从序号 0 开始收"）。
+    ///
+    /// 返回类型是**只读方向** [`RxRecordLayer`]：它结构上没有 `seal`，
+    /// 接收方向封箱在编译期就不可能（见 `rx_layer_has_no_seal_primitive`）。
+    fn fresh_c2s_rx(&self) -> RxRecordLayer {
+        server_pair(&self.shared).rx
+    }
+
+    /// 全新的 c2s 发送方向（另一个板端从序号 0 开始发）：**只发方向**
+    /// [`TxRecordLayer`]，结构上没有 `open`。
+    fn fresh_c2s_tx(&self) -> TxRecordLayer {
+        client_pair(&self.shared).tx
+    }
+
+    /// 全新的完整 client pair（与本会话密钥材料一致、状态独立的另一对）。
+    fn fresh_client_pair(&self) -> RecordLayerPair {
+        client_pair(&self.shared)
+    }
+
+    /// 一条对本会话 c2s 接收方向（seq 0）**完全合法**的记录：用于证明
+    /// 对向的拒绝来自共享熔断位，而不是记录本身不可解。
+    fn valid_c2s_record(&self) -> Vec<u8> {
+        let mut tx = self.fresh_c2s_tx();
+        tx.seal(b"valid c2s record at seq 0").expect("seal")
+    }
 }
 
 fn with_body_len(record: &[u8], new_body_len: u32) -> Vec<u8> {
     let mut out = record.to_vec();
     out[..4].copy_from_slice(&new_body_len.to_be_bytes());
     out
-}
-
-// ---------- §5.2 规范参考实现（独立于被测模块、直接按文档公式拼装） ----------
-
-/// Nonce[0:4] = IV[0:4]；Nonce[4:12] = IV[4:12] XOR BE64(seq)。
-fn ref_nonce(iv: &[u8; 12], seq: u64) -> [u8; 12] {
-    let mut n = [0u8; 12];
-    n[..4].copy_from_slice(&iv[..4]);
-    let mut tail = [0u8; 8];
-    tail.copy_from_slice(&iv[4..]);
-    let xored = u64::from_be_bytes(tail) ^ seq;
-    n[4..].copy_from_slice(&xored.to_be_bytes());
-    n
-}
-
-/// AAD = BE32(Record Length) || BE64(SeqID)。
-fn ref_aad(body_len: u32, seq: u64) -> [u8; 12] {
-    let mut a = [0u8; 12];
-    a[..4].copy_from_slice(&body_len.to_be_bytes());
-    a[4..].copy_from_slice(&seq.to_be_bytes());
-    a
-}
-
-/// 按 §5.2 拼装：4B BE(密文+Tag 长度) || 密文 || Tag。
-fn ref_seal(key: &[u8; 32], iv: &[u8; 12], seq: u64, plaintext: &[u8]) -> Vec<u8> {
-    let body_len = (plaintext.len() + 16) as u32;
-    let key = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).expect("ref key"));
-    let mut out = plaintext.to_vec();
-    let tag = key
-        .seal_in_place_separate_tag(
-            Nonce::assume_unique_for_key(ref_nonce(iv, seq)),
-            Aad::from(ref_aad(body_len, seq)),
-            &mut out,
-        )
-        .expect("ref seal");
-    let mut record = body_len.to_be_bytes().to_vec();
-    record.extend_from_slice(&out);
-    record.extend_from_slice(tag.as_ref());
-    record
-}
-
-fn ref_open(key: &[u8; 32], iv: &[u8; 12], seq: u64, record: &[u8]) -> Option<Vec<u8>> {
-    let mut len_be = [0u8; 4];
-    len_be.copy_from_slice(&record[..4]);
-    let body_len = u32::from_be_bytes(len_be);
-    let key = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).expect("ref key"));
-    let mut buf = record[4..].to_vec();
-    key.open_in_place(
-        Nonce::assume_unique_for_key(ref_nonce(iv, seq)),
-        Aad::from(ref_aad(body_len, seq)),
-        &mut buf,
-    )
-    .ok()
-    .map(|pt| pt.to_vec())
 }
 
 // ---------- §4.4 X25519 ----------
@@ -166,50 +178,48 @@ fn x25519_rejects_zero_and_low_order_public_keys() {
     }
 }
 
-// ---------- §5.1 HKDF ----------
+// ---------- §5.1 HKDF（仅经可观察行为断言；逐字节钉死见单元测试） ----------
 
 #[test]
-fn hkdf_derivation_deterministic_and_direction_distinct() {
+fn hkdf_derivation_is_deterministic_across_independent_instances() {
+    // 同输入两次完整派生：两侧记录层必须跨实例互通 ⇒ 四组 key/iv 逐字节一致。
     let shared = [0x5Au8; 32];
-    let k1 = SessionKeys::derive(&shared, &CLIENT_RANDOM, &SERVER_RANDOM).expect("derive 1");
-    let k2 = SessionKeys::derive(&shared, &CLIENT_RANDOM, &SERVER_RANDOM).expect("derive 2");
-    let m1 = k1.key_material_for_test();
-    let m2 = k2.key_material_for_test();
-    assert_eq!(m1, m2, "同输入重复派生必须逐字节一致");
+    let a = Established::from_shared(&shared);
+    let b = Established::from_shared(&shared);
 
-    // 方向区分：c2s 与 s2c 的 key/iv 互不相同。
-    assert_ne!(m1.c2s_key, m1.s2c_key);
-    assert_ne!(m1.c2s_iv, m1.s2c_iv);
+    let mut a_client = a.client;
+    let mut b_server = b.server;
+    let rec = a_client.tx.seal(b"determinism").expect("seal a");
+    assert_eq!(b_server.rx.open(&rec).expect("open b"), b"determinism");
 
-    // Salt 绑定 random 顺序：交换 client/server random 必须得到不同材料。
-    let swapped = SessionKeys::derive(&shared, &SERVER_RANDOM, &CLIENT_RANDOM).expect("derive s");
-    assert_ne!(k1.key_material_for_test(), swapped.key_material_for_test());
-
-    // 不同共享密钥 → 不同材料。
-    let other =
-        SessionKeys::derive(&[0x5Bu8; 32], &CLIENT_RANDOM, &SERVER_RANDOM).expect("derive o");
-    assert_ne!(k1.key_material_for_test(), other.key_material_for_test());
+    let rec = b_server.tx.seal(b"determinism s2c").expect("seal b");
+    assert_eq!(a_client.rx.open(&rec).expect("open a"), b"determinism s2c");
 }
 
 #[test]
-fn layers_from_independent_derivations_interoperate() {
-    // 同输入两次独立派生：一侧 client 层封箱，另一侧 server 层解封，
-    // 验证 HKDF 双方派生出的 c2s/s2c key/iv 一致且方向绑定正确。
+fn hkdf_salt_order_and_direction_are_bound() {
     let shared = [0x77u8; 32];
-    let k1 = SessionKeys::derive(&shared, &CLIENT_RANDOM, &SERVER_RANDOM).expect("derive k1");
-    let k2 = SessionKeys::derive(&shared, &CLIENT_RANDOM, &SERVER_RANDOM).expect("derive k2");
-    let mut c1 = k1.client_record_layer();
-    let mut s2 = k2.server_record_layer();
 
-    let r = c1.tx.seal(b"cross-derive c2s").expect("seal");
-    assert_eq!(s2.rx.open(&r).expect("cross open c2s"), b"cross-derive c2s");
-
-    let r = s2.tx.seal(b"cross-derive s2c").expect("seal");
-    assert_eq!(c1.rx.open(&r).expect("cross open s2c"), b"cross-derive s2c");
-
-    // 方向不可混用：拿 c2s 记录去 client.rx（s2c 方向）解封必须认证失败。
-    let r_c2s = c1.tx.seal(b"direction probe").expect("seal");
-    assert_eq!(c1.rx.open(&r_c2s), Err(CryptoError::AuthFailed));
+    // Salt 顺序绑定：交换 client/server random 派生的密钥必须完全不互通
+    // （四元组不同），且失败是认证级的。
+    let mut swapped_client = SessionKeys::derive(&shared, &SERVER_RANDOM, &CLIENT_RANDOM)
+        .expect("derive swapped")
+        .into_client_record_layers();
+    let mut normal_server = server_pair(&shared);
+    let rec = swapped_client.tx.seal(b"salt order matters").expect("seal");
+    assert_eq!(
+        normal_server.rx.open(&rec),
+        Err(CryptoError::AuthFailed),
+        "交换 random 顺序后的记录必须无法被本会话解封"
+    );
+    // 方向不互换（server 侧同理）：拿 s2c 记录去 server.rx（c2s 方向）解封。
+    let mut other_server = server_pair(&shared);
+    let s2c = other_server.tx.seal(b"direction probe").expect("seal s2c");
+    assert_eq!(
+        other_server.rx.open(&s2c),
+        Err(CryptoError::AuthFailed),
+        "c2s/s2c 方向不可互换"
+    );
 }
 
 // ---------- §5.2 记录层 roundtrip ----------
@@ -238,7 +248,9 @@ fn record_roundtrip_bidirectional_mixed_sizes() {
         assert_eq!(es.server.rx.open(&rec_c).expect("s open"), out_c);
         assert_eq!(es.client.rx.open(&rec_s).expect("c open"), out_s);
     }
-    assert!(!es.client.tx.is_fatal() && !es.server.rx.is_fatal());
+    // 全程无失败：两侧 pair 都不得进入 fatal。
+    assert!(!es.client.is_fatal());
+    assert!(!es.server.is_fatal());
 }
 
 #[test]
@@ -269,57 +281,33 @@ fn record_length_prefix_is_big_endian_body_only() {
     assert_eq!(rec.len(), 65_540);
 }
 
-#[test]
-fn wire_format_matches_spec_reference_implementation() {
-    // 与按 §5.2 公式独立实现的参考封装逐字节互通：锁定 Nonce、AAD、
-    // 大端长度前缀的确切线格式。
-    let es = established();
-    let m = &es.material;
-    for seq in [0u64, 1, 2, 7, 1000] {
-        let msg = format!("spec-fidelity-{seq}");
-        let mine = {
-            let mut layer = record_layer_at_seq(&m.c2s_key, &m.c2s_iv, seq);
-            layer.seal(msg.as_bytes()).expect("seal")
-        };
-        let theirs = ref_seal(&m.c2s_key, &m.c2s_iv, seq, msg.as_bytes());
-        assert_eq!(mine, theirs, "seq={seq} 线格式必须与规范参考实现一致");
-
-        // 反向：参考实现封箱 → 被测层解封（并验证 ref_open 本身可用）。
-        let mut layer = record_layer_at_seq(&m.s2c_key, &m.s2c_iv, seq);
-        let rec = ref_seal(&m.s2c_key, &m.s2c_iv, seq, msg.as_bytes());
-        assert_eq!(layer.open(&rec).expect("open ref"), msg.as_bytes());
-        assert_eq!(
-            ref_open(&m.s2c_key, &m.s2c_iv, seq, rec.as_slice()).as_deref(),
-            Some(msg.as_bytes())
-        );
-    }
-}
-
-// ---------- 篡改 / 重放 / 乱序 / 截断 ----------
+// ---------- 篡改 / 重放 / 乱序 / 截断（失败 ⇒ 整对共享熔断位拉闸） ----------
 
 #[test]
-fn tampered_tag_rejected_and_layer_fatal() {
+fn tampered_tag_rejected_and_whole_pair_fatal() {
     let mut es = established();
     let mut rec = es.client.tx.seal(b"payload under tag").expect("seal");
     let last = rec.len() - 1;
     rec[last] ^= 0x80;
     let err = es.server.rx.open(&rec).expect_err("tampered tag must fail");
     assert_eq!(err, CryptoError::AuthFailed);
-    assert!(es.server.rx.is_fatal(), "认证失败后必须进入 fatal");
 
-    // fatal 粘滞：该方向后续 open/seal 一律拒绝。
-    let fresh = es.client.tx.seal(b"next").expect("seal next");
-    assert_eq!(es.server.rx.open(&fresh), Err(CryptoError::Fatal));
-    assert_eq!(es.server.rx.seal(b"x"), Err(CryptoError::Fatal));
-
-    // 另一方向（server.tx）不受影响。
-    assert!(es.server.tx.seal(b"other direction ok").is_ok());
+    // 单侧 rx 认证失败 ⇒ 共享熔断位拉闸：未直接失败的 tx 也立即 fatal，
+    // 且对向 `seal` 必拒绝——不存在"一侧失败、另一侧仍可用"的状态。
+    assert!(es.server.rx.is_fatal(), "认证失败后 rx 必须 fatal");
+    assert!(es.server.tx.is_fatal(), "共享熔断位：rx 失败 ⇒ tx 必 fatal");
+    assert!(es.server.is_fatal(), "任一方向失败 ⇒ pair fatal");
+    // fatal 粘滞：失败方向此后一律拒绝。
+    assert_eq!(es.server.rx.open(&rec), Err(CryptoError::Fatal));
+    // 单侧 rx.open 失败后，tx.seal 必拒绝（对向同样已被拉闸）。
+    assert_eq!(es.server.tx.seal(b"one more"), Err(CryptoError::Fatal));
+    // 本端 pair 已作废 ⇒ 关闭整条 TCP、丢弃会话密钥，重新握手才能继续。
 }
 
 #[test]
 fn tampered_ciphertext_rejected() {
     let mut es = established();
-    let mut rx = fresh_c2s_rx(&es.material);
+    let mut rx = es.fresh_c2s_rx();
     let mut rec = es
         .client
         .tx
@@ -349,7 +337,7 @@ fn tampered_length_field_variants_rejected() {
         (with_body_len(&rec, u32::MAX), CryptoError::RecordTooLarge),
     ];
     for (tampered, expected) in variants {
-        let mut rx = fresh_c2s_rx(&es.material);
+        let mut rx = es.fresh_c2s_rx();
         assert_eq!(rx.open(&tampered), Err(expected), "长度字段变体");
         assert!(rx.is_fatal(), "长度违规同样致命");
     }
@@ -359,7 +347,7 @@ fn tampered_length_field_variants_rejected() {
 fn out_of_order_record_rejected() {
     // 乱序即 AAD(seq)/nonce 不匹配：先投第 2 条必须失败并 fatal。
     let mut es = established();
-    let mut rx = fresh_c2s_rx(&es.material);
+    let mut rx = es.fresh_c2s_rx();
     let _r0 = es.client.tx.seal(b"first").expect("seal r0");
     let r1 = es.client.tx.seal(b"second").expect("seal r1");
     assert_eq!(rx.open(&r1), Err(CryptoError::AuthFailed));
@@ -369,7 +357,7 @@ fn out_of_order_record_rejected() {
 #[test]
 fn replay_of_consumed_record_rejected() {
     let mut es = established();
-    let mut rx = fresh_c2s_rx(&es.material);
+    let mut rx = es.fresh_c2s_rx();
     let r0 = es.client.tx.seal(b"zero").expect("seal r0");
     let r1 = es.client.tx.seal(b"one").expect("seal r1");
     assert_eq!(rx.open(&r0).expect("open r0"), b"zero");
@@ -391,22 +379,24 @@ fn truncated_or_extended_record_rejected() {
         ("空输入", Vec::new()),
     ];
     for (name, bad) in cases {
-        let mut rx = fresh_c2s_rx(&es.material);
+        let mut rx = es.fresh_c2s_rx();
         assert_eq!(rx.open(&bad), Err(CryptoError::BadFrame), "{name}");
+        assert!(rx.is_fatal(), "{name} 后必须 fatal");
     }
     // 多余尾随字节同样不是"恰好一条完整记录"。
     let mut extended = rec;
     extended.push(0x00);
-    let mut rx = fresh_c2s_rx(&es.material);
+    let mut rx = es.fresh_c2s_rx();
     assert_eq!(
         rx.open(&extended),
         Err(CryptoError::BadFrame),
         "多余尾随字节"
     );
+    assert!(rx.is_fatal());
 }
 
 #[test]
-fn plaintext_too_large_rejected_and_fatal() {
+fn plaintext_too_large_rejected_and_pair_fatal() {
     let mut es = established();
     let too_big = vec![0u8; MAX_PLAINTEXT_LEN + 1];
     assert_eq!(
@@ -414,81 +404,371 @@ fn plaintext_too_large_rejected_and_fatal() {
         Err(CryptoError::RecordTooLarge)
     );
     assert!(es.client.tx.is_fatal(), "明文超限后该方向必须 fatal");
-    // 同一方向的新实例可用；另一方向不受影响。
-    let mut tx = record_layer_at_seq(&es.material.c2s_key, &es.material.c2s_iv, 0);
-    assert!(
-        tx.seal(&[0u8; MAX_PLAINTEXT_LEN]).is_ok(),
-        "65520B 恰为上限"
-    );
-    let mut c_rx = record_layer_at_seq(&es.material.s2c_key, &es.material.s2c_iv, 0);
-    let mut server = es.server;
-    let r = server.tx.seal(b"still fine").expect("s2c still works");
-    assert_eq!(c_rx.open(&r).expect("open"), b"still fine");
-}
+    // 单侧 tx.seal 失败 ⇒ 共享熔断位拉闸：未直接失败的 rx 同样 fatal。
+    assert!(es.client.rx.is_fatal(), "共享熔断位：tx 失败 ⇒ rx 必 fatal");
+    assert!(es.client.is_fatal(), "任一方向失败 ⇒ pair fatal");
 
-// ---------- §5.2 序号末值 ----------
-
-#[test]
-fn send_side_sequence_last_valid_then_exhausted() {
-    // 序号 2^64-2 是最后一个可发送序号；再发返回 SequenceExhausted，随后 Fatal。
-    let es = established();
-    let m = &es.material;
-    let mut tx = record_layer_at_seq(&m.c2s_key, &m.c2s_iv, u64::MAX - 1);
-    let record = tx
-        .seal(b"tail record")
-        .expect("seq 2^64-2 must be sendable");
-    assert_eq!(&record[..4], &27u32.to_be_bytes(), "11B 明文 + 16B Tag");
-
-    // 对端从同序号起可正常解封（AAD 里的 SeqID 一致）。
-    let mut rx = record_layer_at_seq(&m.c2s_key, &m.c2s_iv, u64::MAX - 1);
-    assert_eq!(rx.open(&record).expect("open last"), b"tail record");
-
+    // 单侧 tx 失败后 rx.open 必拒绝——喂给它的记录**完全合法**（本会话
+    // c2s、seq 0）：先对照证明该记录在未拉闸的新 pair 上可正常解封，
+    // 拒绝只可能来自熔断位，而不是记录本身不可解。
+    let good = es.valid_c2s_record();
+    let mut fresh_rx = es.fresh_c2s_rx();
     assert_eq!(
-        tx.seal(b"one too many"),
-        Err(CryptoError::SequenceExhausted)
+        fresh_rx
+            .open(&good)
+            .expect("合法记录在未拉闸的新 pair 上可解"),
+        b"valid c2s record at seq 0"
     );
-    assert_eq!(tx.seal(b"and again"), Err(CryptoError::Fatal));
-    assert!(tx.is_fatal());
+    let mut killed_rx_pair = es.fresh_client_pair();
+    let too_big_again = vec![0u8; MAX_PLAINTEXT_LEN + 1];
+    assert_eq!(
+        killed_rx_pair.tx.seal(&too_big_again),
+        Err(CryptoError::RecordTooLarge)
+    );
+    assert_eq!(killed_rx_pair.rx.open(&good), Err(CryptoError::Fatal));
 }
 
-#[test]
-fn receive_side_sequence_exhausted_at_max() {
-    let es = established();
-    let m = &es.material;
-
-    // 情形 1：RcvSeq 已是 2^64-1 → 任何记录立即拒绝（序号耗尽，连接级致命）。
-    let mut rx = record_layer_at_seq(&m.c2s_key, &m.c2s_iv, u64::MAX);
-    let bogus = ref_seal(&m.c2s_key, &m.c2s_iv, u64::MAX, b"never acceptable");
-    assert_eq!(rx.open(&bogus), Err(CryptoError::SequenceExhausted));
-    assert_eq!(rx.open(&bogus), Err(CryptoError::Fatal));
-
-    // 情形 2：成功解封 2^64-2 后 RcvSeq 推到 2^64-1，下一条即便合法也拒绝。
-    // （发送端自身已不可能再封出记录，这里用参考实现构造"序号越界记录"。）
-    let mut tx = record_layer_at_seq(&m.c2s_key, &m.c2s_iv, u64::MAX - 1);
-    let last = tx.seal(b"last").expect("seal last");
-    let beyond = ref_seal(&m.c2s_key, &m.c2s_iv, u64::MAX, b"beyond");
-    let mut rx2 = record_layer_at_seq(&m.c2s_key, &m.c2s_iv, u64::MAX - 1);
-    assert_eq!(rx2.open(&last).expect("open seq 2^64-2"), b"last");
-    assert_eq!(rx2.open(&beyond), Err(CryptoError::SequenceExhausted));
-}
-
-// ---------- fatal 粘滞（跨操作类型） ----------
+// ---------- fatal 粘滞（跨操作类型）与共享熔断位 ----------
 
 #[test]
 fn fatal_layer_rejects_everything_after_bad_frame() {
     let es = established();
-    let mut rx = fresh_c2s_rx(&es.material);
+    let mut rx = es.fresh_c2s_rx();
     // 不足 4B 前缀 → BadFrame。
     assert_eq!(rx.open(b"abc"), Err(CryptoError::BadFrame));
     assert_eq!(rx.open(&[]), Err(CryptoError::Fatal));
-    assert_eq!(rx.seal(b"also dead"), Err(CryptoError::Fatal));
+    // 接收方向**结构上没有** `seal`（`RxRecordLayer` 不提供封箱原语）：
+    // "rx 还能不能 seal" 已不是运行时问题而是编译期问题，见
+    // `direction_primitives_are_not_interchangeable` 与 `src/crypto.rs`
+    // 中 `TxRecordLayer::seal` / `RxRecordLayer::open` 的 `compile_fail` 示例。
 
-    // 独立对照：同 key/iv 的新实例不受 fatal 实例影响。
-    let mut fresh = fresh_c2s_rx(&es.material);
-    let mut tx = record_layer_at_seq(&es.material.c2s_key, &es.material.c2s_iv, 0);
-    let rec = tx.seal(b"alive").expect("seal alive");
+    // 独立对照：**独立 derive 的另一对 pair** 不受该 pair 的熔断位影响
+    // （熔断位是 pair 级共享状态，不是进程级全局；同一 pair 内两个方向
+    // 则必须一起停用，见 tampered_tag / plaintext_too_large 用例）。
+    let mut fresh_pair = es.fresh_client_pair();
+    let rec = fresh_pair.tx.seal(b"alive").expect("seal alive");
+    let mut peer_rx = es.fresh_c2s_rx();
     assert_eq!(
-        fresh.open(&rec).expect("open on fresh layer"),
+        peer_rx.open(&rec).expect("open on fresh pair"),
         b"alive".to_vec()
     );
+    assert!(!fresh_pair.is_fatal());
+}
+
+#[test]
+fn pair_is_fatal_is_false_only_while_both_directions_are_clean() {
+    let es = established();
+    let mut pair = es.fresh_client_pair();
+    assert!(!pair.is_fatal());
+
+    // 一次正常往返后仍不 fatal。
+    let rec = pair.tx.seal(b"clean").expect("seal");
+    let mut peer = server_pair(&es.shared);
+    assert_eq!(peer.rx.open(&rec).expect("open"), b"clean");
+    assert!(!pair.is_fatal() && !peer.is_fatal());
+
+    // rx 方向被非法长度打挂 ⇒ 共享熔断位：tx 从未失败，但读值与实际操作
+    // 都必须是"已死"。
+    assert_eq!(
+        pair.rx.open(&8u32.to_be_bytes()),
+        Err(CryptoError::RecordTooSmall)
+    );
+    assert!(
+        pair.tx.is_fatal(),
+        "任一方向失败 ⇒ 两个方向共享 fatal 熔断位"
+    );
+    assert!(pair.is_fatal(), "任一方向失败 ⇒ pair fatal");
+    assert_eq!(pair.tx.seal(b"after kill"), Err(CryptoError::Fatal));
+}
+
+#[test]
+fn pair_directions_share_single_fatal_bit_both_ways() {
+    let es = established();
+    let good = es.valid_c2s_record();
+
+    // 方向一：tx.seal 失败（序号无关的长度违规）⇒ 同 pair 的 rx.open 必拒绝，
+    // 哪怕喂给它的记录本身完全合法。
+    let mut pair = es.fresh_client_pair();
+    let too_big = vec![0u8; MAX_PLAINTEXT_LEN + 1];
+    assert_eq!(pair.tx.seal(&too_big), Err(CryptoError::RecordTooLarge));
+    assert!(pair.rx.is_fatal(), "tx 失败 ⇒ rx 共享 fatal");
+    assert_eq!(pair.rx.open(&good), Err(CryptoError::Fatal));
+
+    // 方向二：rx.open 失败（帧不完整）⇒ 同 pair 的 tx.seal 必拒绝。
+    let mut pair = es.fresh_client_pair();
+    assert_eq!(pair.rx.open(&[0u8; 3]), Err(CryptoError::BadFrame));
+    assert!(pair.tx.is_fatal(), "rx 失败 ⇒ tx 共享 fatal");
+    assert_eq!(pair.tx.seal(b"too late"), Err(CryptoError::Fatal));
+
+    // 独立 pair 不受影响：熔断位随 pair 独立（每份 SessionKeys 各自一个）。
+    let mut clean = es.fresh_client_pair();
+    assert!(!clean.is_fatal());
+    assert!(clean.tx.seal(b"still alive").is_ok());
+}
+
+// =====================================================================
+// Task 1：方向类型（Tx 仅封箱 / Rx 仅解封）+ 两阶段发送（prepare → commit）
+// =====================================================================
+
+/// 用"同名 fallback trait"探测**内在方法是否长出**：Rust 的方法解析规则是
+/// 内在方法优先于 trait 方法。若 `RxRecordLayer` 哪天又长出内在 `seal`，
+/// 调用点会解析到内在方法，下面的标志位保持 false，断言立刻失败；若两个方向
+/// 又合并成同一个"可 seal 又可 open"的类型，字段类型与 `type_name` 断言同样
+/// 失败。这就是"方向不能误用"的回归约束（编译期能力的运行时哨兵）。
+mod direction_probe {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use rsetup_protocol::crypto::{RxRecordLayer, TxRecordLayer};
+
+    static RX_FELL_BACK_SEAL: AtomicBool = AtomicBool::new(false);
+    static RX_FELL_BACK_PREPARE: AtomicBool = AtomicBool::new(false);
+    static TX_FELL_BACK_OPEN: AtomicBool = AtomicBool::new(false);
+
+    // fallback 实现的返回类型由本模块自定，调用点一律写成 `let _ = ...`，
+    // 因此"内在方法存在"与"回落到 trait 方法"两种情况都能编译。
+    pub trait RxSealFallback {
+        fn seal(&mut self, _plaintext: &[u8]);
+    }
+    pub trait RxPrepareFallback {
+        fn prepare(&mut self, _plaintext: &[u8]);
+    }
+    pub trait TxOpenFallback {
+        fn open(&mut self, _record: &[u8]);
+    }
+    impl RxSealFallback for RxRecordLayer {
+        fn seal(&mut self, _plaintext: &[u8]) {
+            RX_FELL_BACK_SEAL.store(true, Ordering::Relaxed);
+        }
+    }
+    impl RxPrepareFallback for RxRecordLayer {
+        fn prepare(&mut self, _plaintext: &[u8]) {
+            RX_FELL_BACK_PREPARE.store(true, Ordering::Relaxed);
+        }
+    }
+    impl TxOpenFallback for TxRecordLayer {
+        fn open(&mut self, _record: &[u8]) {
+            TX_FELL_BACK_OPEN.store(true, Ordering::Relaxed);
+        }
+    }
+    pub fn rx_seal_fell_back() -> bool {
+        RX_FELL_BACK_SEAL.swap(false, Ordering::Relaxed)
+    }
+    pub fn rx_prepare_fell_back() -> bool {
+        RX_FELL_BACK_PREPARE.swap(false, Ordering::Relaxed)
+    }
+    pub fn tx_open_fell_back() -> bool {
+        TX_FELL_BACK_OPEN.swap(false, Ordering::Relaxed)
+    }
+}
+
+#[test]
+fn direction_primitives_are_not_interchangeable() {
+    // 只有 fallback trait 在作用域内时，`rx.seal(..)` 这类调用才可编译；
+    // 若内在方法存在则优先解析到内在方法（哨兵位保持 false）。
+    use direction_probe::{RxPrepareFallback, RxSealFallback, TxOpenFallback};
+
+    let es = established();
+
+    // 正向 API 面钉死：seal 只挂在发送方向，open 只挂在接收方向。
+    let _: fn(&mut TxRecordLayer, &[u8]) -> Result<Vec<u8>, CryptoError> = TxRecordLayer::seal;
+    let _: fn(&mut TxRecordLayer, &[u8]) -> Result<PreparedRecord, CryptoError> =
+        TxRecordLayer::prepare;
+    let _: fn(&mut TxRecordLayer, PreparedRecord) -> Result<u64, CryptoError> =
+        TxRecordLayer::commit;
+    let _: fn(&mut RxRecordLayer, &[u8]) -> Result<Vec<u8>, CryptoError> = RxRecordLayer::open;
+    // 两个方向的字段类型各自独立，不是同一个"两用"类型的别名。
+    fn pin_fields(pair: &RecordLayerPair) -> (&TxRecordLayer, &RxRecordLayer) {
+        (&pair.tx, &pair.rx)
+    }
+    let mut pair = es.fresh_client_pair();
+    let (tx, rx) = pin_fields(&pair);
+    assert_ne!(
+        std::any::type_name::<TxRecordLayer>(),
+        std::any::type_name::<RxRecordLayer>(),
+        "两个方向又变成同一个类型 = 两用原语回归"
+    );
+    // 两个方向的序号计数器互相独立（TxSeq 推进不得带动 RcvSeq）。
+    assert_eq!((tx.tx_seq(), rx.rx_seq()), (0, 0));
+    pin_fields(&pair).0.tx_seq();
+    assert_eq!(pair.tx.seal(b"advance tx").map(|_| pair.tx.tx_seq()), Ok(1));
+    assert_eq!(pair.rx.rx_seq(), 0, "发送方向推进不得带动接收序号");
+
+    // 反向不存在（哨兵见 direction_probe 模块 + src/crypto.rs 的 compile_fail 文档）：
+    // 接收方向 seal/prepare、发送方向 open 都必须走 fallback trait。
+    let mut rx_pair = es.fresh_client_pair();
+    rx_pair.rx.seal(b"rx must not seal");
+    assert!(
+        direction_probe::rx_seal_fell_back(),
+        "RxRecordLayer 又长出了内在 seal：接收方向可封箱"
+    );
+    rx_pair.rx.prepare(b"rx must not prepare");
+    assert!(
+        direction_probe::rx_prepare_fell_back(),
+        "RxRecordLayer 又长出了内在 prepare：接收方向可消耗发送序号"
+    );
+    pair.tx.open(&[0, 0, 0, 16]);
+    assert!(
+        direction_probe::tx_open_fell_back(),
+        "TxRecordLayer 又长出了内在 open：发送方向可被喂对端字节"
+    );
+}
+
+#[test]
+fn commit_is_the_only_point_where_tx_seq_advances() {
+    let es = established();
+    let mut tx = es.fresh_c2s_tx();
+    assert_eq!(tx.tx_seq(), 0, "新记录层发送序号从 0 起");
+
+    let first = tx.prepare(b"first").expect("prepare seq0");
+    assert_eq!(first.seq(), 0);
+    assert_eq!(first.wire().len(), 4 + 5 + 16);
+    // prepare **不**推进序号：nonce/AAD 只是被预留，还没被写出确认。
+    assert_eq!(tx.tx_seq(), 0, "prepare 之后、commit 之前不得推进 TxSeq");
+
+    // 未 commit 之前，第二条预封箱必须被拒绝（同一序号的 nonce 只允许存在一份）。
+    assert_eq!(
+        tx.prepare(b"one too many").map(|_dup| ()),
+        Err(CryptoError::PendingOutstanding),
+        "允许同时存在两条同序号 pending = nonce 重用入口"
+    );
+
+    assert_eq!(tx.commit(first).expect("commit seq0"), 0);
+    assert_eq!(tx.tx_seq(), 1, "整条记录写出确认后才推进");
+
+    let second = tx.prepare(b"second").expect("prepare seq1");
+    assert_eq!(second.seq(), 1);
+    assert_eq!(tx.commit(second).expect("commit seq1"), 1);
+    assert_eq!(tx.tx_seq(), 2);
+    assert!(!tx.is_fatal(), "正常两阶段提交不得拉闸");
+
+    // 预封箱输出的字节必须与原子 seal **逐字节相同**（同 key/iv/seq ⇒ 同
+    // 密文/tag），且长度前缀与 AAD 仍按 §5.2 绑定该序号。
+    let mut other = es.fresh_c2s_tx();
+    let prepared = other.prepare(b"same").expect("prepare");
+    let prepared_bytes = prepared.wire().to_vec();
+    assert_eq!(other.commit(prepared).expect("commit"), 0);
+    let mut atomic = es.fresh_c2s_tx();
+    assert_eq!(
+        prepared_bytes,
+        atomic.seal(b"same").expect("atomic seal"),
+        "prepare/commit 与 seal 的输出必须一致（同一实现，不是两套线格式）"
+    );
+    let mut rx = es.fresh_c2s_rx();
+    assert_eq!(rx.open(&prepared_bytes).expect("open"), b"same");
+}
+
+#[test]
+fn pending_dropped_or_aborted_without_commit_kills_the_pair() {
+    let es = established();
+
+    // ① 忘记 commit（pending 被 drop）⇒ 整对作废：绝不允许"这条没写就再发一条"。
+    let mut pair = es.fresh_client_pair();
+    let pending = pair.tx.prepare(b"written unknown").expect("prepare");
+    assert!(!pair.is_fatal(), "pending 在途期间仍可正常 commit");
+    drop(pending);
+    assert!(pair.is_fatal(), "pending 未 commit 被丢弃必须拉闸整对");
+    assert_eq!(pair.tx.seal(b"retry"), Err(CryptoError::Fatal));
+    assert_eq!(
+        pair.rx.open(&es.valid_c2s_record()),
+        Err(CryptoError::Fatal)
+    );
+
+    // ② 显式 abort（写出结果不确定）⇒ 同样整对作废，且返回 true 供调用方判定。
+    let mut pair = es.fresh_client_pair();
+    let pending = pair.tx.prepare(b"half written").expect("prepare");
+    let wire_len = pending.wire().len();
+    assert!(wire_len > 4);
+    drop(pending);
+    assert!(pair.tx.abort_pending());
+
+    // ③ 没有 pending 时 abort 返回 false（不谎报"作废了一条"）。
+    let mut clean = es.fresh_client_pair();
+    assert!(!clean.tx.abort_pending());
+    assert!(!clean.is_fatal(), "无 pending 的 abort 不应拉闸");
+}
+
+#[test]
+fn commit_rejects_foreign_or_stale_pending_record() {
+    let es = established();
+
+    // 别的 pair 的 pending：即使密钥材料完全相同（确定性 HKDF）也不得 commit
+    // —— 否则等于把 A 连接的记录塞进 B 连接的序号空间。
+    let mut a = es.fresh_client_pair();
+    let mut b = es.fresh_client_pair();
+    let foreign = b.tx.prepare(b"foreign").expect("prepare on b");
+    assert_eq!(a.tx.tx_seq(), 0);
+    assert!(
+        a.tx.commit(foreign).is_err(),
+        "跨 pair 的 pending 必须被拒绝"
+    );
+    assert!(
+        a.is_fatal() || b.is_fatal(),
+        "跨 pair commit 之后至少一侧必须拉闸"
+    );
+
+    // 同 pair 但序号已不匹配（stale）：commit 只能消费当前 pending 的那一条。
+    let mut pair = es.fresh_client_pair();
+    let p0 = pair.tx.prepare(b"p0").expect("prepare p0");
+    pair.tx.commit(p0).expect("commit p0");
+    let p1 = pair.tx.prepare(b"p1").expect("prepare p1");
+    assert_eq!(p1.seq(), 1);
+    assert_eq!(pair.tx.commit(p1).expect("commit p1"), 1);
+    // 现在再拿"序号 1"的构造体去 commit 已无对应 pending ⇒ 拒绝 + 拉闸。
+    let stale = pair.tx.prepare(b"p2").expect("prepare p2");
+    assert_eq!(pair.tx.commit(stale).expect("commit p2"), 2);
+    let orphan = {
+        let mut other = es.fresh_client_pair();
+        other.tx.prepare(b"orphan").expect("prepare orphan")
+    };
+    assert!(
+        pair.tx.commit(orphan).is_err(),
+        "已 commit 之后再消费同一序号的 pending 必须失败"
+    );
+    assert!(pair.is_fatal(), "commit 不匹配必须拉闸");
+}
+
+#[cfg(feature = "test-util")]
+#[test]
+fn test_seq_constructor_still_consumes_session_keys() {
+    // 序号末值只能由**消耗 SessionKeys** 的入口构造：函数指针签名钉死，
+    // 有人把它改成 `&SessionKeys`（可反复造同密钥同序号的发送器）即编译失败。
+    let _client: fn(SessionKeys, u64, u64) -> RecordLayerPair =
+        client_record_layers_at_seq_for_test;
+    let _server: fn(SessionKeys, u64, u64) -> RecordLayerPair =
+        server_record_layers_at_seq_for_test;
+
+    // 发送方向序号末值：2^64-2 仍可发一条，其后即 SequenceExhausted ⇒ Fatal。
+    let keys = SessionKeys::derive(&[0x5a; 32], &CLIENT_RANDOM, &SERVER_RANDOM).expect("derive");
+    let mut pair = client_record_layers_at_seq_for_test(keys, u64::MAX - 1, 0);
+    let pending = pair.tx.prepare(b"tail").expect("prepare last valid seq");
+    assert_eq!(pending.seq(), u64::MAX - 1);
+    assert_eq!(
+        pair.tx.commit(pending).expect("commit last valid"),
+        u64::MAX - 1
+    );
+    assert_eq!(
+        pair.tx.prepare(b"one too many").map(|_p| ()),
+        Err(CryptoError::SequenceExhausted)
+    );
+    assert_eq!(pair.tx.seal(b"and again"), Err(CryptoError::Fatal));
+
+    // 接收方向期望序号 2^64-1 ⇒ 任何来帧一律 SequenceExhausted。
+    let keys = SessionKeys::derive(&[0x5a; 32], &CLIENT_RANDOM, &SERVER_RANDOM).expect("derive");
+    let mut pair = server_record_layers_at_seq_for_test(keys, 0, u64::MAX);
+    assert_eq!(pair.rx.rx_seq(), u64::MAX);
+    let valid = es_valid_record();
+    assert_eq!(
+        pair.rx.open(valid.as_slice()),
+        Err(CryptoError::SequenceExhausted),
+        "记录本身合法，仅期望序号已耗尽 ⇒ 仍须终止"
+    );
+}
+
+/// 一条对 c2s 方向 seq 0 合法的记录（用于 seq 末值负例的"记录本身没问题"对照）。
+#[cfg(feature = "test-util")]
+fn es_valid_record() -> Vec<u8> {
+    let mut pair = SessionKeys::derive(&[0x5a; 32], &CLIENT_RANDOM, &SERVER_RANDOM)
+        .expect("derive")
+        .into_client_record_layers();
+    pair.tx.seal(b"valid at seq 0").expect("seal")
 }

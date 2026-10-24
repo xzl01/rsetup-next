@@ -10,11 +10,17 @@
 | --- | --- | --- |
 | [`src/frame.rs`](<src/frame.rs>) | 握手帧 8B 帧头编解码与有界长度（`protocol_spec.md` §4.1） | 解析 payload 内容；判定消息顺序是否合法 |
 | [`src/sig.rs`](<src/sig.rs>) | §4.3 两种签名输入的 raw wire bytes 拼接与长度/状态字节守卫 | 解析或重序列化 `device_descriptor` |
-| [`src/ed25519.rs`](<src/ed25519.rs>) | ring Ed25519 签/验薄封装（本 crate 唯一真实密码学入口） | 密钥生成、加载与文件权限 |
-| [`src/handshake.rs`](<src/handshake.rs>) | 服务端握手帧序列状态机与 PENDING 在途 probe 约束 | payload 级 pong token / `status_nonce` 核验 |
+| [`src/ed25519.rs`](<src/ed25519.rs>) | ring 0.17.14 Ed25519 签/验薄封装——本 crate 的 **Ed25519 签名入口**（§4.3 握手身份签名），不是唯一的真实密码学入口 | 密钥生成、加载与文件权限；X25519/HKDF/AES-GCM（见 `crypto` 模块） |
+| [`src/crypto.rs`](<src/crypto.rs>) | §4.4/§5 传输加密核心：X25519 ECDH + HKDF-SHA256 四条 `info` 派生 + AES-256-GCM 记录层（`RecordLayer`/`RecordLayerPair` 序号、AAD、fatal 语义） | 网络 socket、握手消息编解码、`seal`/`open` 的串行化（由调用方保证）；密钥落盘与轮换 |
+| [`src/handshake_msg.rs`](<src/handshake_msg.rs>) | §4.2 七种握手消息（`ClientHello`/`ServerChallenge`/`ClientAuthRequest`/`DeviceDescriptor`/`ServerAuthResponse`/`ServerPending`/`PendingPong`）的 proto3 canonical wire 编解码与严格校验，`device_descriptor` 原字节保留 | 解析帧头（见 `frame`）、构造签名输入（见 `sig`）、状态机迁移（见 `handshake`） |
+| [`src/handshake.rs`](<src/handshake.rs>) | 服务端握手帧序列状态机与 PENDING 在途 probe 约束 | payload 级 pong token / `status_nonce` 核验；记录层加解密（见 `crypto`） |
 | [`src/admission.rs`](<src/admission.rs>) | 准入与连接限额分类纯模型 | 持久化准入决定、修改快照 |
 | [`src/wire.rs`](<src/wire.rs>) | `TunnelPacket` 信封结构校验 + 03 §2 业务 DTO + codec 边界（`Codec`、`ApprovedCodecWitness`、`CodecError`） | 真实网络读写；含 action/metadata 的整包 wire 长度终审 |
 | [`src/codec.rs`](<src/codec.rs>) | `BusinessCodec`：03 §2 九个业务消息的 proto3 canonical wire 编解码（手写实现，不引入 protobuf/prost 依赖，不用 `unsafe`） | 信封编解码、网络、DTO 之外的业务判定 |
+
+密码学入口因此有两个：`ed25519`（Ed25519 签名/验签）与 `crypto`（X25519 密钥协商、HKDF-SHA256
+密钥派生、AES-256-GCM 记录层），两者都只到「纯字节进、纯字节出」为止；握手完成、互通成立仍属
+第 ③/④ 层证据，本 crate 不得宣称。
 
 ## 业务 codec 边界
 
@@ -119,7 +125,8 @@
 cargo test -p rsetup-protocol
 ```
 
-测试位于 [`tests/`](<tests/>)，覆盖帧边界与序列、签名输入、Ed25519、准入分类、wire 信封合同、业务 DTO
+测试位于 [`tests/`](<tests/>)，覆盖帧边界与序列、签名输入、Ed25519、§4.2 握手消息编解码、
+§5 记录层（派生向量、序号/AAD/tag 篡改与 fatal 语义）、准入分类、wire 信封合同、业务 DTO
 以及 codec 的 fail-closed 与严格解码边界。这些属验收分层里的**第 ① / ② 层**（纯逻辑与进程内），
 不得冒充第 ③ 层真库或第 ④ 层「外部决议 + 用户复审 + 获批 codec 后的真实 wire」证据。
 

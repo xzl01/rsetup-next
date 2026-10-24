@@ -71,14 +71,6 @@ const ORPHAN_SCANS: &[(&str, &str)] = &[
     ),
 ];
 
-fn legacy_expected_version(version: i32) -> Result<i32, ControllerError> {
-    if matches!(version, 1 | 2) {
-        Ok(version)
-    } else {
-        Err(scan_error("meta.singleton"))
-    }
-}
-
 fn validate_meta_row(
     singleton: i8,
     version: i32,
@@ -184,22 +176,27 @@ pub async fn check_identity_data(db: &DbPool) -> Result<(), ControllerError> {
     validate_identity_rows(db, true).await
 }
 
+/// `main_tasks.counts_json` 只读扫描的固定语句（`check_runtime_data` 第 (5) 项）。
+/// 提到模块级只为让离线形状回归能直接钉住投影口径：v4 schema 该列是 `JSON`
+/// （wire 245），workspace sqlx 未启用 `json` feature，索引 1 上的 `String` 取列必须按
+/// `CAST(counts_json AS CHAR) AS counts_json` 的文本投影读取；列顺序、别名与索引序号不变。
+const MAIN_TASKS_COUNTS_JSON_SQL: &str =
+    "SELECT id, CAST(counts_json AS CHAR) AS counts_json FROM main_tasks";
+
 /// v4 运行时数据只读扫描：任一违规返回 `Err(Config)`，登录/启动路径据此
 /// fail-closed。全部 SQL 为函数内固定字面量，绝不从外部输入插值表名或列名；
 /// 不加 `FOR UPDATE`、不写库。必须在版本 guard 通过后调用（此时
 /// `version == SUPPORTED_SCHEMA_VERSION` 已被确认）。期望版本来自编译期
-/// 配置，未识别版本（0、负数、v5 及以上）直接 `SchemaNotReady`，绝不静默放行。
+/// 配置，可识别版本恰为 4；未识别版本（v1/v2/v3、0、负数、v5 及以上）直接
+/// `SchemaNotReady`，绝不静默放行。
 pub async fn check_runtime_data(db: &DbPool, version: i32) -> Result<(), ControllerError> {
-    // 未识别版本 fail-closed：本函数不接受编译期区间之外的期望版本。
+    // 未识别版本 fail-closed：`is_recognized_schema_version` 只认编译期的
+    // `SUPPORTED_SCHEMA_VERSION`，通过后不存在"旧版本先放行"的分支。
     if !is_recognized_schema_version(version) {
         return Err(ControllerError::SchemaNotReady {
             found: Some(version),
             required: SUPPORTED_SCHEMA_VERSION,
         });
-    }
-    // v1..=3 尚未建五张 runtime 表，保持只读放行。
-    if version != SUPPORTED_SCHEMA_VERSION {
-        return Ok(());
     }
 
     // (1) `sub_tasks.main_task_id` 无孤儿主任务
@@ -262,8 +259,7 @@ pub async fn check_runtime_data(db: &DbPool, version: i32) -> Result<(), Control
     }
 
     // (5) `counts_json` 必须解析为合法 JSON 对象（固定语句 + 应用层扫描，精确区分“解析失败/非 object”）
-    const COUNTS_JSON: &str = "SELECT id, counts_json FROM main_tasks";
-    let rows = sqlx::query(COUNTS_JSON)
+    let rows = sqlx::query(MAIN_TASKS_COUNTS_JSON_SQL)
         .fetch_all(&db.0)
         .await
         .map_err(|_| scan_error("runtime.main_tasks_counts_json"))?;
@@ -271,17 +267,23 @@ pub async fn check_runtime_data(db: &DbPool, version: i32) -> Result<(), Control
         let raw: String = row
             .try_get(1)
             .map_err(|_| scan_error("runtime.main_tasks_counts_json"))?;
-        let value: Value = serde_json::from_str(&raw).map_err(|_| {
-            ControllerError::Config("runtime data main_tasks invalid counts_json".into())
-        })?;
-        if !value.is_object() {
-            return Err(ControllerError::Config(
-                "runtime data main_tasks invalid counts_json".into(),
-            ));
-        }
+        validate_counts_json_text(&raw)?;
     }
 
     Ok(())
+}
+
+/// `main_tasks.counts_json` 文本（`CAST(counts_json AS CHAR)` 投影后的列值）的应用层
+/// 门禁：只接受合法 JSON **对象**；数组、`null`、标量、空文本与坏 JSON 一律同一条去敏
+/// `Config`。提取为纯函数只为让这条边界可离线断言，判定与提取前逐字一致。
+fn validate_counts_json_text(raw: &str) -> Result<(), ControllerError> {
+    let invalid = || ControllerError::Config("runtime data main_tasks invalid counts_json".into());
+    let value: Value = serde_json::from_str(raw).map_err(|_| invalid())?;
+    if value.is_object() {
+        Ok(())
+    } else {
+        Err(invalid())
+    }
 }
 
 pub(crate) async fn validate_identity_rows(
@@ -289,27 +291,6 @@ pub(crate) async fn validate_identity_rows(
     require_meta: bool,
 ) -> Result<(), ControllerError> {
     scan_identity_rows(db, require_meta.then_some(SUPPORTED_SCHEMA_VERSION)).await
-}
-
-/// 显式迁移 preflight 专用：以调用方给定的精确期望版本扫描身份数据完整性。
-/// v4 迁移入口用它对 v3 库做迁移前完整性检查；普通启动路径不得调用，
-/// 期望版本绝不从数据库行本身推断。
-pub(crate) async fn validate_identity_rows_at_version(
-    db: &DbPool,
-    expected_version: i32,
-) -> Result<(), ControllerError> {
-    scan_identity_rows(db, Some(expected_version)).await
-}
-
-// Only the explicit legacy preflight may call this; normal startup remains
-// pinned to `SUPPORTED_SCHEMA_VERSION` and fresh migration remains pinned to
-// an empty meta table.
-#[allow(dead_code)] // consumed by the following legacy preflight task
-pub(crate) async fn validate_identity_rows_for_version(
-    db: &DbPool,
-    expected_version: i32,
-) -> Result<(), ControllerError> {
-    scan_identity_rows(db, Some(legacy_expected_version(expected_version)?)).await
 }
 
 async fn scan_identity_rows(
@@ -353,9 +334,11 @@ async fn scan_identity_rows(
         }
     );
     validate_meta_count(meta_count, expected_version)?;
-    // The caller's strict shape check establishes a full UNIQUE(username) index;
-    // valid lowercase ASCII usernames cannot have identical raw bytes under it.
-    // Do not remove the separate v1/v2 migration collision preflight in db.rs.
+    // Duplicate raw usernames cannot exist in a gated database: the strict v4 shape
+    // check requires the UNIQUE index uq_users_username on the ascii_bin
+    // users.username column, so two rows never carry identical username bytes. The
+    // scan below is the guarantee it relies on — every stored username is checked
+    // row by row against the lowercase ASCII rule.
     scan!(
         "SELECT CAST(username AS BINARY) AS username FROM users",
         "users.read",
@@ -632,13 +615,15 @@ fn validate_identity_fixture_with_meta(
     }
     Ok(())
 }
+/// 数据库 schema 的唯一受支持基线：**只有 v4**。
+/// 这里不再有"最低兼容版本"区间——v1..=3 的升级与只读放行路线已随 v4-only 基线移除。
+/// 注意：数据库 schema 版本与隧道协议 v3、业务 DTO `schema_version = 1` 无关，互不影响。
 pub const SUPPORTED_SCHEMA_VERSION: i32 = 4;
-pub const MIN_SUPPORTED_SCHEMA_VERSION: i32 = 1;
 
-/// 编译期可识别的 schema 版本区间：`MIN_SUPPORTED_SCHEMA_VERSION..=SUPPORTED_SCHEMA_VERSION`。
-/// 区间外（0、负数、`SUPPORTED_SCHEMA_VERSION + 1` 及以上）一律不识别，fail-closed。
+/// 编译期可识别的 schema 版本：**恰为** `SUPPORTED_SCHEMA_VERSION`。
+/// v1..=3、v5 及以上、0 与负数一律不识别，fail-closed。
 pub fn is_recognized_schema_version(version: i32) -> bool {
-    (MIN_SUPPORTED_SCHEMA_VERSION..=SUPPORTED_SCHEMA_VERSION).contains(&version)
+    version == SUPPORTED_SCHEMA_VERSION
 }
 
 /// 版本化 Guard 纯函数：仅接受编译期配置 `SUPPORTED_SCHEMA_VERSION`。
@@ -656,8 +641,7 @@ pub fn validate_schema_version(found: Option<i32>) -> Result<(), ControllerError
 }
 
 /// 普通启动决策：与 `validate_schema_version` 同一 fail-closed 契约。
-/// 旧版（v1..=3）仅在显式迁移前置检查（preflight）路径中按版本单独校验，
-/// 普通启动不接受任何非编译期配置版本。
+/// 已不存在"显式迁移 preflight 放行旧版本"的任何路线：非 v4 一律拒绝。
 pub fn startup_guard_decision(db_version: Option<i32>) -> Result<(), ControllerError> {
     validate_schema_version(db_version)
 }
@@ -679,9 +663,9 @@ pub fn validate_guard_rows_for_version(
     }
 }
 
-/// 运行时五表存在性校验：v4 必须五表齐备；v1..=3 必须五表皆无（历史库仍可
-/// 只读通过）；未识别版本直接拒绝。存在性快照来自固定字面量的
-/// information_schema 探测，本函数不接触数据库。
+/// runtime 五表存在性校验：v4 必须五表齐备，缺一即 `Config` 失败；
+/// 非受支持版本直接 `SchemaNotReady`（不再有"旧库五表必须皆无"的放行分支）。
+/// 存在性快照来自固定字面量的 information_schema 探测，本函数不接触数据库。
 pub fn validate_runtime_tables_for_version(
     version: i32,
     present: &crate::db::RuntimeTablePresence,
@@ -699,18 +683,9 @@ pub fn validate_runtime_tables_for_version(
         ("device_operation_locks", present.device_operation_locks),
         ("recovery_checks", present.recovery_checks),
     ];
-    if version == SUPPORTED_SCHEMA_VERSION {
-        if let Some((name, _)) = tables.iter().find(|(_, exists)| !exists) {
-            return Err(ControllerError::Config(format!(
-                "runtime schema table missing: {name}"
-            )));
-        }
-        return Ok(());
-    }
-    if let Some((name, _)) = tables.iter().find(|(_, exists)| *exists) {
+    if let Some((name, _)) = tables.iter().find(|(_, exists)| !exists) {
         return Err(ControllerError::Config(format!(
-            "runtime schema table {name} must not exist before v{}",
-            SUPPORTED_SCHEMA_VERSION
+            "runtime schema table missing: {name}"
         )));
     }
     Ok(())
@@ -741,22 +716,22 @@ mod tests {
     }
 
     #[test]
-    fn guard_accepts_supported_versions_and_rejects_unknown() {
-        assert!(is_recognized_schema_version(MIN_SUPPORTED_SCHEMA_VERSION)); // 1
-        assert!(is_recognized_schema_version(2));
-        assert!(is_recognized_schema_version(3));
+    fn guard_recognizes_only_the_supported_version() {
+        // v4-only：可识别版本恰为一个，旧 v1..=3 与未来版本一律不识别。
         assert!(is_recognized_schema_version(SUPPORTED_SCHEMA_VERSION)); // 4
-        assert!(!is_recognized_schema_version(0));
-        assert!(!is_recognized_schema_version(5));
-        assert!(!is_recognized_schema_version(999));
-        assert!(!is_recognized_schema_version(-1));
+        for version in [1, 2, 3, 0, 5, 999, -1, i32::MIN, i32::MAX] {
+            assert!(
+                !is_recognized_schema_version(version),
+                "{version} 必须不识别"
+            );
+        }
     }
 
     #[test]
     fn startup_guard_rejects_old_unknown_and_dirty_versions() {
         // 普通启动期望版本来自编译期配置 = 4，而不是从数据库行本身推断期望。
         assert!(startup_guard_decision(Some(SUPPORTED_SCHEMA_VERSION)).is_ok());
-        // 旧版本（v1..=3）仅能用于显式迁移 preflight，普通启动坚决拒绝。
+        // 旧版本（v1..=3）已无任何放行路线（既不能启动，也没有显式迁移入口）。
         assert!(startup_guard_decision(Some(3)).is_err());
         assert!(startup_guard_decision(Some(2)).is_err());
         assert!(startup_guard_decision(Some(1)).is_err());
@@ -813,107 +788,69 @@ mod tests {
         };
         assert!(validate_runtime_tables_for_version(4, &full).is_ok());
         assert!(validate_runtime_tables_for_version(4, &empty).is_err());
-        // v1..=v3 不得要求 runtime 表存在（历史库仍可只读通过）。
-        assert!(validate_runtime_tables_for_version(3, &empty).is_ok());
-        assert!(validate_runtime_tables_for_version(3, &full).is_err());
-        // 未识别版本一律拒绝。
-        assert!(validate_runtime_tables_for_version(5, &full).is_err());
-        assert!(validate_runtime_tables_for_version(0, &full).is_err());
-        // v4 逐张缺失都必须拒绝，且点名缺失的表；普通启动据此 fail-closed。
-        let missing = [
-            (
-                "main_tasks",
-                RuntimeTablePresence {
-                    main_tasks: false,
-                    ..full
-                },
-            ),
-            (
-                "sub_tasks",
-                RuntimeTablePresence {
-                    sub_tasks: false,
-                    ..full
-                },
-            ),
-            (
-                "task_previews",
-                RuntimeTablePresence {
-                    task_previews: false,
-                    ..full
-                },
-            ),
-            (
-                "device_operation_locks",
-                RuntimeTablePresence {
-                    device_operation_locks: false,
-                    ..full
-                },
-            ),
-            (
-                "recovery_checks",
-                RuntimeTablePresence {
-                    recovery_checks: false,
-                    ..full
-                },
-            ),
-        ];
-        for (name, presence) in missing {
+        // 非受支持版本（含旧 v1..=v3 与其"五表皆无"的历史形状）一律 SchemaNotReady，
+        // 不再存在"旧库五表皆无即可只读通过"的分支。
+        for version in [1, 2, 3, 5, 0, -1] {
             assert!(
                 matches!(
-                    validate_runtime_tables_for_version(4, &presence),
-                    Err(ControllerError::Config(ref reason))
-                        if reason == &format!("runtime schema table missing: {name}")
+                    validate_runtime_tables_for_version(version, &empty),
+                    Err(ControllerError::SchemaNotReady { found: Some(f), required: 4 }) if f == version
                 ),
-                "v4 缺 {name} 必须拒绝"
+                "版本 {version} 必须以 SchemaNotReady 拒绝"
+            );
+            assert!(validate_runtime_tables_for_version(version, &full).is_err());
+        }
+        // v4 逐张缺失都必须拒绝，且点名缺失的表；普通启动据此 fail-closed。
+        let full_presence = RuntimeTablePresence {
+            main_tasks: true,
+            sub_tasks: true,
+            task_previews: true,
+            device_operation_locks: true,
+            recovery_checks: true,
+        };
+        for name in [
+            "main_tasks",
+            "sub_tasks",
+            "task_previews",
+            "device_operation_locks",
+            "recovery_checks",
+        ] {
+            let missing = match name {
+                "main_tasks" => RuntimeTablePresence {
+                    main_tasks: false,
+                    ..full_presence
+                },
+                "sub_tasks" => RuntimeTablePresence {
+                    sub_tasks: false,
+                    ..full_presence
+                },
+                "task_previews" => RuntimeTablePresence {
+                    task_previews: false,
+                    ..full_presence
+                },
+                "device_operation_locks" => RuntimeTablePresence {
+                    device_operation_locks: false,
+                    ..full_presence
+                },
+                _ => RuntimeTablePresence {
+                    recovery_checks: false,
+                    ..full_presence
+                },
+            };
+            let error = validate_runtime_tables_for_version(4, &missing)
+                .expect_err("缺任一张 runtime 表都必须拒绝");
+            assert!(
+                matches!(&error, ControllerError::Config(reason) if reason == &format!("runtime schema table missing: {name}")),
+                "必须点名缺失的表 {name}，实际：{error}"
             );
         }
-        // v3 逐张残留都必须拒绝：半成品库不得被当作可只读放行的历史库。
-        let leftover = [
-            (
-                "main_tasks",
-                RuntimeTablePresence {
-                    main_tasks: true,
-                    ..empty
-                },
-            ),
-            (
-                "sub_tasks",
-                RuntimeTablePresence {
-                    sub_tasks: true,
-                    ..empty
-                },
-            ),
-            (
-                "task_previews",
-                RuntimeTablePresence {
-                    task_previews: true,
-                    ..empty
-                },
-            ),
-            (
-                "device_operation_locks",
-                RuntimeTablePresence {
-                    device_operation_locks: true,
-                    ..empty
-                },
-            ),
-            (
-                "recovery_checks",
-                RuntimeTablePresence {
-                    recovery_checks: true,
-                    ..empty
-                },
-            ),
-        ];
-        for (name, presence) in leftover {
-            assert!(
-                matches!(
-                    validate_runtime_tables_for_version(3, &presence),
-                    Err(ControllerError::Config(ref reason))
-                        if reason == &format!("runtime schema table {name} must not exist before v4")
-                ),
-                "v3 残留 {name} 必须拒绝"
-            );
+        // 旧库残留（五表皆无的旧形状之外，任何非 v4 版本）在版本判定处即拒绝，
+        // 不再按"表存在与否"细分。
+        for version in [1, 2, 3] {
+            assert!(matches!(
+                validate_runtime_tables_for_version(version, &full),
+                Err(ControllerError::SchemaNotReady { found: Some(f), required: 4 }) if f == version
+            ));
         }
     }
 
@@ -1367,12 +1304,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_fixture_reuses_full_scan_with_exact_v1_v2_meta() {
-        // The pre-existing v4 gate rejects clean legacy data. All cases below
-        // exercise the same fixture row validators, not a database connection.
-        fn legacy_scan(rows: &IdentityRows, expected_version: i32) -> Result<(), ControllerError> {
-            let version = legacy_expected_version(expected_version)?;
-            validate_identity_fixture_with_meta(rows, Some(version))
+    fn fixture_scan_uses_supported_version_and_rejects_other_meta_versions() {
+        // v4-only：同一套夹具行校验器只以唯一受支持版本运行；任何其它元数据版本
+        // （含旧 v1/v2/v3、0 与未来版本）都必须被同一入口拒绝。全程不连数据库。
+        fn v4_scan(rows: &IdentityRows) -> Result<(), ControllerError> {
+            validate_identity_fixture_with_meta(rows, Some(SUPPORTED_SCHEMA_VERSION))
         }
         let clean = |version| IdentityRows {
             meta: vec![(1, version)],
@@ -1419,16 +1355,20 @@ mod tests {
                 .map(|&(code, _)| (code, false))
                 .collect(),
         };
-        for version in [1, 2] {
+        {
+            // 唯一受支持版本；旧版本已无夹具语义。
+            let version = SUPPORTED_SCHEMA_VERSION;
             let rows = clean(version);
-            assert!(legacy_scan(&rows, version).is_ok(), "clean v{version}");
-            assert!(validate_identity_fixture(&rows, true).is_err(), "v4 gate");
+            assert!(v4_scan(&rows).is_ok(), "clean v{version}");
+            assert!(validate_identity_fixture(&rows, true).is_ok(), "v4 gate");
             assert!(
                 validate_identity_fixture(&rows, false).is_err(),
                 "fresh gate"
             );
-            for wrong in [0, 3, 4, if version == 1 { 2 } else { 1 }] {
-                assert!(legacy_scan(&rows, wrong).is_err(), "expected v{wrong}");
+            // 元数据行版本 ≠ 受支持版本：即使是"结构看起来干净"的旧版本行也拒绝。
+            for wrong in [0, 1, 2, 3, 5, 999] {
+                let wrong_rows = clean(wrong);
+                assert!(v4_scan(&wrong_rows).is_err(), "元数据版本 {wrong} 必须拒绝");
             }
             for meta in [
                 vec![],
@@ -1438,49 +1378,116 @@ mod tests {
             ] {
                 let mut rows = clean(version);
                 rows.meta = meta;
-                assert!(
-                    legacy_scan(&rows, version).is_err(),
-                    "meta cardinality/value"
-                );
+                assert!(v4_scan(&rows).is_err(), "meta cardinality/value");
             }
             let mut rows = clean(version);
             rows.booleans[0].1 = vec![2];
             assert_eq!(
-                legacy_scan(&rows, version).unwrap_err().to_string(),
+                v4_scan(&rows).unwrap_err().to_string(),
                 "configuration: identity data schema_meta.initialized"
             );
             let mut rows = clean(version);
             rows.usernames[0] = "BadUser".into();
-            assert!(legacy_scan(&rows, version).is_err());
+            assert!(v4_scan(&rows).is_err());
             let mut rows = clean(version);
             rows.devices[0] = ("APPROVED".into(), "none".into());
-            assert!(legacy_scan(&rows, version).is_err());
+            assert!(v4_scan(&rows).is_err());
             let mut rows = clean(version);
             rows.permissions[0] = "unknown".into();
-            assert!(legacy_scan(&rows, version).is_err());
+            assert!(v4_scan(&rows).is_err());
             for invalid_json in ["broken", "null", "[]", "[\"unknown\"]"] {
                 let mut rows = clean(version);
                 rows.grants[1].permissions_json = Some(invalid_json.into());
-                assert!(legacy_scan(&rows, version).is_err(), "invalid grant JSON");
+                assert!(v4_scan(&rows).is_err(), "invalid grant JSON");
             }
             let mut rows = clean(version);
             rows.grants[0].permissions_json = Some("null".into());
-            assert!(
-                legacy_scan(&rows, version).is_err(),
-                "JSON null != SQL NULL"
-            );
+            assert!(v4_scan(&rows).is_err(), "JSON null != SQL NULL");
             for (role, group, device) in [(2, 0, 0), (0, 2, 0), (0, 0, 2)] {
                 let mut rows = clean(version);
                 rows.grants[1].has_role = role;
                 rows.grants[1].has_group = group;
                 rows.grants[1].has_device = device;
-                assert!(legacy_scan(&rows, version).is_err(), "invalid presence");
+                assert!(v4_scan(&rows).is_err(), "invalid presence");
             }
             for category in 0..ORPHAN_SCANS.len() {
                 let mut rows = clean(version);
                 rows.orphans[category].1 = true;
-                assert!(legacy_scan(&rows, version).is_err(), "orphan {category}");
+                assert!(v4_scan(&rows).is_err(), "orphan {category}");
             }
+        }
+    }
+
+    /// RC2 读侧收口回归（必修 2/2）：`check_runtime_data` 第 (5) 项的 `counts_json` 扫描
+    /// 必须把 v4 `JSON` 列（wire 245）投影成 `CAST(counts_json AS CHAR) AS counts_json`。
+    /// workspace 的 sqlx 0.8.6 未启用 `json` feature，`String` 的兼容类型白名单不含
+    /// `Json`，索引 1 上的 `row.try_get::<String, _>(1)` 在裸列名上被 sqlx 以类型不匹配
+    /// 拒绝 → 完整性 gate 与 audit 页同形失败（库内存在任一非空 main_tasks 行即触发）。
+    /// 列顺序、别名、索引序号与"无 WHERE / 无排序 / 无 LIMIT / 零绑定"的全表只读口径不变。
+    #[test]
+    fn main_tasks_counts_scan_projects_counts_json_as_char_text() {
+        use crate::authz::sqlx_repo::sql_shape;
+
+        let (items, tail) = sql_shape::split_select(MAIN_TASKS_COUNTS_JSON_SQL);
+        let got: Vec<&str> = items.iter().map(String::as_str).collect();
+        assert_eq!(
+            got,
+            vec!["id", "CAST(counts_json AS CHAR) AS counts_json"],
+            "counts 扫描的 select 列表必须恰是主键 + CHAR 文本投影（索引 1 即 counts_json）：{got:?}"
+        );
+        assert_eq!(
+            tail, "FROM main_tasks",
+            "counts 扫描必须保持全表只读（无 WHERE/排序/LIMIT/行锁）：{tail}"
+        );
+        assert_eq!(
+            sql_shape::normalize_sql(MAIN_TASKS_COUNTS_JSON_SQL)
+                .matches('?')
+                .count(),
+            0,
+            "counts 扫描不得引入绑定参数"
+        );
+    }
+
+    /// 执行位门禁：`check_runtime_data` 必须消费被钉常量，本文件生产段内不得出现第二条
+    /// 读 `counts_json` 的内联 SELECT 字面量（内联副本会绕过形状回归）。
+    #[test]
+    fn counts_json_scan_consumes_pinned_const_without_inline_duplicates() {
+        use crate::authz::sqlx_repo::sql_shape;
+
+        let src = sql_shape::production_source(include_str!("integrity.rs"));
+        assert!(
+            src.contains("sqlx::query(MAIN_TASKS_COUNTS_JSON_SQL)"),
+            "check_runtime_data 必须消费 MAIN_TASKS_COUNTS_JSON_SQL 常量"
+        );
+        for literal in sql_shape::select_string_literals(src) {
+            if literal.contains("counts_json") {
+                assert_eq!(
+                    literal,
+                    sql_shape::normalize_sql(MAIN_TASKS_COUNTS_JSON_SQL),
+                    "本文件生产段内读 main_tasks.counts_json 的 SQL 必须是 \
+                     MAIN_TASKS_COUNTS_JSON_SQL 本体：{literal}"
+                );
+            }
+        }
+    }
+
+    /// 下游纯解码回归：counts 扫描的应用层门禁只接受合法 JSON **对象**文本。数组、
+    /// `null`、标量、空文本与坏 JSON 一律同一个去敏 `Config`（本 RC 只改投影口径，
+    /// 门禁语义逐字不变），绝不因解析失败当成"没有 counts"放行。
+    #[test]
+    fn counts_json_gate_accepts_object_and_rejects_array_null_scalar_or_malformed() {
+        // `empty_counts_json()` 委托 `tasks::service::counts_json_of(&[])` 的实际对象形状必须通过。
+        assert!(validate_counts_json_text(&crate::tasks::service::empty_counts_json()).is_ok());
+        assert!(validate_counts_json_text("{\"queued\":\"1\",\"held\":\"0\"}").is_ok());
+        assert!(validate_counts_json_text("{}").is_ok());
+        for raw in ["[]", "[1]", "null", "1", "\"queued\"", "", "broken", "{"] {
+            let error = validate_counts_json_text(raw)
+                .expect_err("数组/null/标量/坏 JSON 必须失败关闭，不得当空 counts");
+            assert!(
+                matches!(error, ControllerError::Config(ref code)
+                    if code == "runtime data main_tasks invalid counts_json"),
+                "必须保持既有去敏码：{error:?}"
+            );
         }
     }
 }

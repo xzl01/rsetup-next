@@ -229,6 +229,120 @@ jobs:
             exit 1
           fi
           lintian --fail-on error ../*.changes
+      # 只读断言（不改动产物）：维护脚本必须**逐字**等于「仓库源维护脚本 + 已登记的
+      # debhelper 自动片段」，且片段来源、所在脚本种类与单元集合都在白名单内。判定方式是
+      # **严格模板匹配**，不是 shell 解释：不建 AST、不算条件真值与可达性，因此不提供
+      # 「这段 shell 运行时会怎样」的语义证明，只提供一条更强的静态事实——模板外的任何
+      # 字节变化（多一条命令、移动 guard、换单元、改注释、没登记过的 helper 或版本）都判红。
+      # 为什么从「解释 shell」收缩到「匹配模板」，以及前三轮各自的绕过，见
+      # docs/testing/tunnel-packaging-fix-report.md。
+      #
+      # 口径与 debian/rules 的 override_dh_installsystemd 一致：三包 --no-start +
+      # --no-stop-on-upgrade；controller 与 board-agent 另带 --no-enable。模板表只登记
+      # debhelper **13.24.2**（= 本作业镜像 debian:trixie-slim 的实际版本）的上游原文，
+      # **不做 >= 放宽**：将来换版本或换 helper 时这里必须变红，先人工核对上游原文再登记。
+      #
+      # 生命周期承诺如何被结构保证：登记表里唯一会调用 deb-systemd-invoke 的形状只允许
+      # 出现在 prerm，因此 postinst/postrm 通过门禁即意味着其文本里没有任何服务激活调用，
+      # 「安装/升级不 start/restart/stop」是该条的推论；purge 记账与 remove 后的
+      # daemon-reload 都不激活服务。正常 remove 允许 stop，但 13.24.2 在 --no-start
+      # --no-stop-on-upgrade 下**不生成任何 prerm 片段**（见下面 preinst/prerm 必须不存在），
+      # 而 debhelper 14.5 的真实 prerm-systemd 是**不带 $1 守卫**的 stop，与本承诺冲突，
+      # 故意不登记（真到那天由人决定改 rules 还是改承诺）。
+      #
+      # 静态门禁不证明运行行为：安装/升级不激活服务、enable 符号链接真的建立或不建立，
+      # 属动态证据，由下面的 debian-12-runtime 作业（Bookworm 真实 dpkg 安装 +
+      # policy-rc.d 动作记录 + test -L / test ! -e 链接断言）提供，两个通道各自如实声明。
+      #
+      # 末尾钉住 controller 单元的 StateDirectoryMode=0700 与 UMask=0077：状态目录与进程新建
+      # 文件的默认权限属交付契约，不随 systemd 默认值漂移。
+      # 显式 shell: bash：container 作业的默认 shell 是 `sh -e {0}`（GitHub Actions 对
+      # container 作业不注入 bash），而本步骤用了 POSIX sh 没有的 here-string `<<<`。
+      # 判据只取 `<<<`：Trixie 的 dash 带 Debian 补丁、支持 set -o pipefail，用「本机旧
+      # dash 不认 pipefail」外推 Trixie 的行为不构成依据，所以也不把 pipefail 当 bashism
+      # 触发条件（合同同口径，见 scripts/tests/controller-ci-contract.test.mjs）。
+      - name: Assert Debian systemd maintainer scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          for pkg in rsetup-next rsetup-controller rsetup-board-agent; do
+            line="$(grep -E "dh_installsystemd -p${pkg}( |\$)" debian/rules)"
+            grep -q -- '--no-start' <<<"$line" || {
+              echo "debian/rules 里 $pkg 的 dh_installsystemd 缺 --no-start"
+              exit 1
+            }
+          done
+          for pkg in rsetup-controller rsetup-board-agent; do
+            line="$(grep -E "dh_installsystemd -p${pkg}( |\$)" debian/rules)"
+            grep -q -- '--no-enable' <<<"$line" || {
+              echo "debian/rules 里 $pkg 的 dh_installsystemd 缺 --no-enable"
+              exit 1
+            }
+          done
+          if grep -E "dh_installsystemd -prsetup-next( |\$)" debian/rules | grep -q -- '--no-enable'; then
+            echo 'rsetup-next 不得带 --no-enable：热策略/风扇曲线/LED 单元必须随包 enable（板卡热安全）'
+            exit 1
+          fi
+          echo 'ok: debian/rules 三个 dh_installsystemd 调用的生命周期口径符合预期'
+          tmp="$(mktemp -d)"
+          for pkg in rsetup-next rsetup-controller rsetup-board-agent; do
+            deb="$(ls "../${pkg}"_*_"${{ matrix.architecture }}".deb | head -n1)"
+            dpkg-deb --control "$deb" "$tmp/$pkg"
+          done
+          # 13.24.2 + --no-start --no-stop-on-upgrade 不生成 preinst/prerm：「升级不 stop」
+          # 就体现在这两个脚本**不存在**上。工具链若开始生成，这里必须变红重新审查，
+          # 而不是把断言改成「存在也行」。
+          for pkg in rsetup-next rsetup-controller rsetup-board-agent; do
+            for kind in preinst prerm; do
+              if [ -e "$tmp/$pkg/$kind" ]; then
+                echo "$pkg 生成了 $kind：--no-start --no-stop-on-upgrade 下不该有这个脚本"
+                exit 1
+              fi
+            done
+          done
+          echo 'ok: 三个包都没有 preinst/prerm（安装/升级/移除路径不 stop 服务）'
+          # 逐包 × 逐脚本调用严格模板门禁：--package / --script-kind / --mode /
+          # --source-script 与被审计文件路径一一对应，模板参数位上的单元必须正是本条命令
+          # 声明的 --require-unit（拿别的包或别的脚本冒充、把单元只写进注释、少一个单元
+          # 都过不了）。--source-script 指向该脚本的仓库源；board-agent 没有源脚本，
+          # 其产物是 debhelper 纯生成脚本，门禁只允许 #!/bin/sh + set -e 骨架。
+          gate="scripts/lib/systemd-maintainer-audit.mjs"
+          node "$gate" --package rsetup-next --script-kind postinst --mode default-enable \
+            --source-script debian/postinst \
+            --require-unit rsetup-next-thermal-policy.service \
+            --require-unit rsetup-next-fan-curve.service \
+            --require-unit rsetup-next-led-state.service \
+            "$tmp/rsetup-next/postinst"
+          node "$gate" --package rsetup-next --script-kind postrm --mode default-enable \
+            --require-unit rsetup-next-thermal-policy.service \
+            --require-unit rsetup-next-fan-curve.service \
+            --require-unit rsetup-next-led-state.service \
+            "$tmp/rsetup-next/postrm"
+          node "$gate" --package rsetup-controller --script-kind postinst --mode no-enable \
+            --source-script debian/rsetup-controller.postinst \
+            --require-unit rsetup-controller.service \
+            "$tmp/rsetup-controller/postinst"
+          node "$gate" --package rsetup-controller --script-kind postrm --mode no-enable \
+            --require-unit rsetup-controller.service \
+            "$tmp/rsetup-controller/postrm"
+          node "$gate" --package rsetup-board-agent --script-kind postinst --mode no-enable \
+            --require-unit rsetup-board-agent.service \
+            "$tmp/rsetup-board-agent/postinst"
+          node "$gate" --package rsetup-board-agent --script-kind postrm --mode no-enable \
+            --require-unit rsetup-board-agent.service \
+            "$tmp/rsetup-board-agent/postrm"
+          echo 'ok: 六个维护脚本全部逐字匹配已登记的 13.24.2 模板（无模板外内容、无服务激活调用）'
+          unit="$(dpkg-deb --fsys-tarfile "$(ls ../rsetup-controller_*_"${{ matrix.architecture }}".deb | head -n1)" \
+            | tar -xO ./usr/lib/systemd/system/rsetup-controller.service)"
+          grep -qx 'StateDirectoryMode=0700' <<<"$unit" || {
+            echo 'rsetup-controller.service 缺 StateDirectoryMode=0700'
+            exit 1
+          }
+          grep -qx 'UMask=0077' <<<"$unit" || {
+            echo 'rsetup-controller.service 缺 UMask=0077'
+            exit 1
+          }
+          echo 'ok: rsetup-controller.service 带 StateDirectoryMode=0700 与 UMask=0077'
       - name: Export Debian package
         run: |
           mkdir -p artifacts
@@ -257,10 +371,30 @@ jobs:
         with:
           name: rsetup-next-debian-${{ matrix.architecture }}
           path: artifacts
-      - name: Install on Debian 12
+      - name: Configure recording policy-rc.d
         run: |
+          # 只在此一次性容器中替换抑制器；记录请求，不执行任何服务动作。
+          cat > /usr/sbin/policy-rc.d <<'RSETUP_POLICY_EOF'
+          #!/bin/sh
+          log="${RSETUP_POLICY_LOG:-/var/log/rsetup-package-policy.log}"
+          {
+            printf '%s\t%s' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${RSETUP_PACKAGE_PHASE:-unknown}"
+            printf '\t%s' "$@"
+            printf '\n'
+          } >> "$log"
+          exit 101
+          RSETUP_POLICY_EOF
+          chmod 0755 /usr/sbin/policy-rc.d
+          : > /var/log/rsetup-package-policy.log
+      - name: Install on Debian 12
+        env:
+          RSETUP_POLICY_LOG: /var/log/rsetup-package-policy.log
+          RSETUP_PACKAGE_PHASE: install
+        run: |
+          printf '%s\tinstall-begin\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$RSETUP_POLICY_LOG"
           apt-get update
           apt-get install -y ./artifacts/rsetup-next_*_${{ matrix.architecture }}.deb ./artifacts/rsetup-controller_*_${{ matrix.architecture }}.deb ./artifacts/rsetup-board-agent_*_${{ matrix.architecture }}.deb
+          printf '%s\tinstall-end\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$RSETUP_POLICY_LOG"
       - name: Smoke test on Debian 12
         run: |
           rsetup-next --demo status --json | grep -q '"identity"'
@@ -276,7 +410,40 @@ jobs:
           test -x /usr/bin/rsetup-board-agent
           test -f /usr/lib/systemd/system/rsetup-board-agent.service
           test -f /usr/lib/systemd/system/rsetup-controller.service
-          test -f /etc/default/rsetup-controller
+          test -f /usr/share/doc/rsetup-controller/rsetup-controller.default
+          test ! -e /etc/default/rsetup-controller
           /usr/bin/rsetup-controller-migrate --help | grep -q "rsetup-controller-migrate"
           /usr/bin/rsetup-admin --help | grep -q "rsetup-admin"
           /usr/bin/rsetup-board-agent --help | grep -q "rsetup-board-agent"
+          # C1：证明 debian/rules 的 override_dh_installsystemd 里
+          # `dh_installsystemd -prsetup-next --no-start --no-stop-on-upgrade` 这一路真的
+          # 生效。override 会替掉整个 helper 的默认调用（dh 不为被省略的包回落默认序列），
+          # 少写一行 rsetup-next 就完全没有 enable 记账，板卡重启后热策略/风扇曲线/LED
+          # 单元不再随多用户目标启动。rsetup-next 的三个单元按默认口径随包 enable，
+          # 装包后 /etc/systemd/system/multi-user.target.wants/ 下必有指向单元文件的
+          # 符号链接；debhelper 的 enable 片段走 deb-systemd-helper 直接写符号链接
+          # （不像 start 那样经 deb-systemd-invoke，后者会被镜像里的 policy-rc.d=101
+          # 整体跳过），所以容器里没有跑起的 systemd 也能用 test -L 断言。
+          # 反向断言同一步就地完成：controller 与 board-agent 带 --no-enable，
+          # 装包后必须继续没有任何 enable 符号链接。
+          for unit in rsetup-next-thermal-policy rsetup-next-fan-curve rsetup-next-led-state; do
+            link="/etc/systemd/system/multi-user.target.wants/${unit}.service"
+            test -L "$link" || {
+              echo "缺少 enable 符号链接：$link（dh_installsystemd -prsetup-next 未生效？）"
+              exit 1
+            }
+            echo "ok: 已随包 enable $unit.service"
+          done
+          for unit in rsetup-controller rsetup-board-agent; do
+            link="/etc/systemd/system/multi-user.target.wants/${unit}.service"
+            test ! -e "$link" || {
+              echo "不该出现 enable 符号链接：$link（--no-enable 未生效？）"
+              exit 1
+            }
+            echo "ok: 未随包 enable $unit.service"
+          done
+      - name: Report package service action log
+        if: always()
+        run: |
+          test -f /var/log/rsetup-package-policy.log
+          cat /var/log/rsetup-package-policy.log

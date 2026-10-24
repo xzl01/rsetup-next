@@ -9,3 +9,24 @@ repository.workspace = true
 hex.workspace = true
 ring.workspace = true
 thiserror.workspace = true
+
+[features]
+# 测试专用构造入口（`crypto::client_record_layers_at_seq_for_test` /
+# `crypto::server_record_layers_at_seq_for_test`）的开关：**默认关闭**。
+#
+# 这两个入口能指定记录层的起始序号，只用于回归测试构造"序号末值"等内部状态。
+# 生产构建组合（`cargo build` / `cargo build --release`，以及任何不引入测试
+# 目标的构建）不启用本 feature，产物里没有这两个函数：实测默认组合的
+# `librsetup_protocol-*.rlib` 上 `nm --defined-only | grep -c at_seq_for_test`
+# 命中 0，启用本 feature 后命中 2。这条门禁本身由 `crypto` 模块文档里的
+# `compile_fail` 文档测试把守，不是靠 `#[doc(hidden)]` 之类的可见性装饰。
+#
+# 测试是否启用取决于本次选中的测试根：显式 --features test-util，或同时构建
+# rsetup-tunnel 测试目标（其 dev-dependency 显式启用），会统一启用本 feature。
+# 单独 `cargo test -p rsetup-protocol --tests` 的隔离复审未启用它：仅出现
+# --check-cfg 的允许值不是实际 --cfg feature="test-util"，不可混淆。可复核：
+#   * 生产无入口：cargo build -p rsetup-protocol --locked + nm计数；
+#   * 默认doc组合：cargo test -p rsetup-protocol --doc --locked 通过compile_fail；
+#   * 显式测试组合：--features test-util 包含并运行test_seq_*；tunnel/workspace
+#     测试组合是否统一启用，应以当次rustc --cfg/目标列表为准。
+test-util = []

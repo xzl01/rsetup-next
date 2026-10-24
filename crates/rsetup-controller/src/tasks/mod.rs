@@ -2,11 +2,13 @@
 
 pub mod adapter;
 pub mod board_client;
+pub mod evidence;
 pub mod http;
 pub mod model;
 pub mod preview;
 pub mod recovery;
 pub mod scheduler;
+pub mod scheduler_store;
 
 /// 位置绑定宏：宏实参顺序 = SQL `?` 顺序，逐位调用 `sqlx::Arguments::add`。
 ///

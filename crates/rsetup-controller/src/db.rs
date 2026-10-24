@@ -9,84 +9,18 @@ impl DbPool {
     }
 }
 
-const MIGRATION: &str = include_str!("../migrations/0001_identity_devices.sql");
-const IDENTITY_MIGRATION: &str = include_str!("../migrations/0002_identity_contract.sql");
-const V3_MIGRATION: &str = include_str!("../migrations/0003_identity_application_integrity.sql");
-/// Schema v4 运行时五表 DDL：仅由显式迁移入口消费，普通启动路径绝不隐式执行。
-pub const TASKS_MIGRATION: &str = include_str!("../migrations/0004_tasks.sql");
+/// v4 唯一基线 DDL（`schema/v4.sql`，恰好 16 张表、无 FOREIGN KEY、无 CHECK）。
+///
+/// 数据库 schema 只有 v4 一个基线：空库经显式受控入口直接建完整 v4，已是 v4 只做只读
+/// 校验，其余任何版本或半成品状态一律拒绝——仓库中不再有 0001..0004 历史执行链，也没有
+/// 「先建旧版再 ALTER」的升级路径。本常量对外可见只用于离线契约测试；运行期绝不把整段
+/// SQL 当作一条语句执行，所有写入都用 [`v4_schema_statements`] 的白名单解析结果。
+pub const V4_SCHEMA_SQL: &str = include_str!("../schema/v4.sql");
+
 const STATISTICS_QUERY: &str = "SELECT CAST(index_name AS CHAR) AS index_name, CAST(column_name AS CHAR) AS column_name, CAST(non_unique AS SIGNED) AS non_unique, CAST(seq_in_index AS SIGNED) AS seq_in_index, CAST(sub_part AS SIGNED) AS sub_part FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? ORDER BY index_name, seq_in_index";
 const FK_CONSTRAINTS_QUERY: &str = "SELECT CAST(table_name AS CHAR) AS table_name, CAST(constraint_name AS CHAR) AS constraint_name FROM information_schema.table_constraints WHERE table_schema = DATABASE() AND constraint_type = 'FOREIGN KEY'";
 const FK_REFERENCES_QUERY: &str = "SELECT CAST(COUNT(*) AS SIGNED) AS fk_count FROM information_schema.referential_constraints WHERE constraint_schema = DATABASE()";
 const FK_COLUMNS_QUERY: &str = "SELECT CAST(COUNT(*) AS SIGNED) AS fk_count FROM information_schema.key_column_usage WHERE table_schema = DATABASE() AND referenced_table_schema IS NOT NULL";
-// Fixed statements and identifiers: never interpolate database-supplied table/column names.
-const IDENTITY_COLUMNS: &[(&str, &str, &str, &str)] = &[
-    (
-        "schema_meta",
-        "authz_epoch",
-        "SELECT 1 FROM schema_meta WHERE authz_epoch < 0 LIMIT 1",
-        "ALTER TABLE schema_meta MODIFY COLUMN authz_epoch BIGINT UNSIGNED NOT NULL DEFAULT 0",
-    ),
-    (
-        "schema_meta",
-        "admin_guard_revision",
-        "SELECT 1 FROM schema_meta WHERE admin_guard_revision < 0 LIMIT 1",
-        "ALTER TABLE schema_meta MODIFY COLUMN admin_guard_revision BIGINT UNSIGNED NOT NULL DEFAULT 0",
-    ),
-    (
-        "users",
-        "revision",
-        "SELECT 1 FROM users WHERE revision < 0 LIMIT 1",
-        "ALTER TABLE users MODIFY COLUMN revision BIGINT UNSIGNED NOT NULL",
-    ),
-    (
-        "roles",
-        "revision",
-        "SELECT 1 FROM roles WHERE revision < 0 LIMIT 1",
-        "ALTER TABLE roles MODIFY COLUMN revision BIGINT UNSIGNED NOT NULL",
-    ),
-    (
-        "device_groups",
-        "revision",
-        "SELECT 1 FROM device_groups WHERE revision < 0 LIMIT 1",
-        "ALTER TABLE device_groups MODIFY COLUMN revision BIGINT UNSIGNED NOT NULL",
-    ),
-    (
-        "devices",
-        "revision",
-        "SELECT 1 FROM devices WHERE revision < 0 LIMIT 1",
-        "ALTER TABLE devices MODIFY COLUMN revision BIGINT UNSIGNED NOT NULL",
-    ),
-    (
-        "grants",
-        "revision",
-        "SELECT 1 FROM grants WHERE revision < 0 LIMIT 1",
-        "ALTER TABLE grants MODIFY COLUMN revision BIGINT UNSIGNED NOT NULL",
-    ),
-    (
-        "admission_decisions",
-        "previous_revision",
-        "SELECT 1 FROM admission_decisions WHERE previous_revision < 0 LIMIT 1",
-        "ALTER TABLE admission_decisions MODIFY COLUMN previous_revision BIGINT UNSIGNED NOT NULL",
-    ),
-    (
-        "admission_decisions",
-        "new_revision",
-        "SELECT 1 FROM admission_decisions WHERE new_revision < 0 LIMIT 1",
-        "ALTER TABLE admission_decisions MODIFY COLUMN new_revision BIGINT UNSIGNED NOT NULL",
-    ),
-    (
-        "audit_events",
-        "event_seq",
-        "SELECT 1 FROM audit_events WHERE event_seq < 0 LIMIT 1",
-        "ALTER TABLE audit_events MODIFY COLUMN event_seq BIGINT UNSIGNED NOT NULL",
-    ),
-    (
-        "users",
-        "username",
-        "",
-        "ALTER TABLE users MODIFY COLUMN username VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL",
-    ),
-];
 const TABLES: &[(&str, &[&str], &[&str])] = &[
     (
         "schema_meta",
@@ -209,6 +143,111 @@ const TABLES: &[(&str, &[&str], &[&str])] = &[
         ],
     ),
 ];
+/// Schema v4 runtime 五表的形状契约（列名与索引名），与 `schema/v4.sql` 一一对应。
+/// 它与 [`TABLES`] 的 11 张 identity 表共同构成 v4 的 16 表完整形状校验。
+const RUNTIME_TABLES: &[(&str, &[&str], &[&str])] = &[
+    (
+        "task_previews",
+        &[
+            "token_nonce",
+            "actor_user_id",
+            "target_hash",
+            "targets_json",
+            "preview_token_hash",
+            "preview_generation",
+            "created_at",
+            "expires_at",
+            "consumed_at",
+        ],
+        &[
+            "PRIMARY",
+            "ix_task_previews_actor",
+            "uq_task_previews_token_hash",
+            "ix_task_previews_expires",
+        ],
+    ),
+    (
+        "main_tasks",
+        &[
+            "id",
+            "actor_user_id",
+            "idempotency_key",
+            "request_hash",
+            "target_hash",
+            "preview_token_hash",
+            "state",
+            "outcome",
+            "revision",
+            "counts_json",
+            "created_time_json",
+            "created_at",
+            "updated_at",
+        ],
+        &[
+            "PRIMARY",
+            "uq_main_tasks_actor_idem",
+            "ix_main_tasks_actor_created",
+            "ix_main_tasks_state",
+        ],
+    ),
+    (
+        "sub_tasks",
+        &[
+            "id",
+            "main_task_id",
+            "device_id",
+            "state",
+            "reason_code",
+            "revision",
+            "lock_generation",
+            "pre_boot_id",
+            "controller_epoch",
+            "session_epoch",
+            "stream_epoch",
+            "ticket_digest",
+            "request_digest",
+            "queue_deadline",
+            "observe_deadline",
+            "evidence_json",
+            "created_at",
+            "updated_at",
+        ],
+        &[
+            "PRIMARY",
+            "uq_sub_tasks_main_device",
+            "ix_sub_tasks_main",
+            "ix_sub_tasks_device_state",
+        ],
+    ),
+    (
+        "device_operation_locks",
+        &[
+            "device_id",
+            "main_task_id",
+            "owner_sub_task_id",
+            "generation",
+            "acquired_at",
+            "released_at",
+        ],
+        &["PRIMARY", "uq_device_locks_owner", "ix_device_locks_main"],
+    ),
+    (
+        "recovery_checks",
+        &[
+            "id",
+            "process_epoch",
+            "subtask_id",
+            "outcome",
+            "detail_redacted",
+            "checked_at",
+        ],
+        &[
+            "PRIMARY",
+            "ix_recovery_checks_subtask",
+            "uq_recovery_checks_epoch_subtask",
+        ],
+    ),
+];
 
 #[derive(Clone, Debug)]
 struct ColumnMeta {
@@ -221,7 +260,7 @@ struct ColumnMeta {
     default: Option<String>,
 }
 
-// Task 2 consumes this from the migration preflight; Task 1 only tests the pure rule.
+// v4 形状校验与数据扫描共用的用户名纯规则；不提供旧版升级预检入口。
 #[allow(dead_code)]
 pub(crate) fn valid_username(s: &str) -> bool {
     let bytes = s.as_bytes();
@@ -414,420 +453,144 @@ fn ddl_parts_from(migration: &str, table: &str) -> Vec<String> {
     parts
 }
 
+/// `schema/v4.sql` 去掉整行 `--` 注释后的纯 DDL 文本。形状校验的列/索引声明全部
+/// 从这里解析，因此注释绝不影响契约解析结果。**只支持整行注释**：行内注释由
+/// [`v4_comment_form_check`] 在使用前直接拒绝。
+fn v4_schema_body() -> String {
+    V4_SCHEMA_SQL
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// v4 基线的注释形态门禁：**只支持整行 `--` 注释**。
+///
+/// 出现行内 `--`、任何 `#` 注释或 `/* … */` 块注释都直接 fail-closed。原因是
+/// [`ddl_parts_from`] 只按顶层逗号切分片段，行内注释会被并入**下一个**片段，使该片段以
+/// 注释文本开头，于是形状校验报出 `v4 schema DDL missing column <表>.<列>` 这种"编译期基线
+/// 与自身解析契约不兼容"的错误（真实 MySQL 8.0 只读核验正是这样失败的）。修复方式是修基线
+/// SQL 的注释布局，而不是把这里扩成通用 SQL 解释器——本函数只识别 SQL 注释的三个起始标记，
+/// 字符串字面量内的同名标记不算注释，绝不把合法 SQL 文本误判成注释。
+fn v4_comment_form_check(sql: &str) -> Result<(), ControllerError> {
+    let bytes = sql.as_bytes();
+    let mut index = 0;
+    let mut line_has_code = false;
+    let mut in_string = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_string {
+            match byte {
+                b'\\' => index += 1,
+                b'\'' => {
+                    if bytes.get(index + 1) == Some(&b'\'') {
+                        index += 1;
+                    } else {
+                        in_string = false;
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'\n' => {
+                line_has_code = false;
+                index += 1;
+            }
+            b' ' | b'\t' | b'\r' => index += 1,
+            b'\'' => {
+                line_has_code = true;
+                in_string = true;
+                index += 1;
+            }
+            b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                if line_has_code {
+                    return Err(v4_schema_error("unsupported inline comment"));
+                }
+                // 整行注释：整行跳到行尾，注释体不再参与扫描（注释里的引号也不误判）。
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'#' => return Err(v4_schema_error("unsupported comment form")),
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                return Err(v4_schema_error("unsupported comment form"));
+            }
+            _ => {
+                line_has_code = true;
+                index += 1;
+            }
+        }
+    }
+    if in_string {
+        return Err(v4_schema_error("unterminated string literal"));
+    }
+    Ok(())
+}
+
+/// v4 唯一 fresh DDL 的白名单解析：16 条 `CREATE TABLE IF NOT EXISTS`，每条一个已知
+/// 表名，顺序固定，绝不包含 FOREIGN KEY / REFERENCES / CHECK。
+/// 任何偏差（少一条、多一条、重名、未知表、出现被禁止的约束）都说明编译期契约被改坏，
+/// 直接 fail-closed，绝不"顺手"执行。
+pub fn v4_schema_statements() -> Result<Vec<(&'static str, String)>, ControllerError> {
+    let body = v4_schema_body();
+    v4_comment_form_check(&body)?;
+    parse_v4_statements(&body)
+}
+
+/// 纯解析器（输入已是去注释后的 DDL）：便于离线测试注入被篡改的文本来验证拒绝路径。
+fn parse_v4_statements(sql: &str) -> Result<Vec<(&'static str, String)>, ControllerError> {
+    let known = |name: &str| {
+        TABLES
+            .iter()
+            .map(|(table, _, _)| *table)
+            .chain(RUNTIME_TABLES.iter().map(|(table, _, _)| *table))
+            .find(|table| *table == name)
+    };
+    let mut statements = Vec::new();
+    for statement in sql
+        .split(';')
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
+    {
+        let table = statement
+            .strip_prefix("CREATE TABLE IF NOT EXISTS ")
+            .and_then(|rest| rest.split_once(" ("))
+            .map(|(name, _)| name)
+            .ok_or_else(|| v4_schema_error("baseline SQL shape"))?;
+        let upper = statement.to_ascii_uppercase();
+        let Some(known) = known(table) else {
+            return Err(v4_schema_error("baseline SQL table whitelist"));
+        };
+        if statements.iter().any(|(seen, _)| *seen == known)
+            || upper.contains("FOREIGN KEY")
+            || upper.contains("REFERENCES")
+            || upper.contains("CHECK (")
+        {
+            return Err(v4_schema_error("baseline SQL constraint whitelist"));
+        }
+        statements.push((known, statement.to_owned()));
+    }
+    let expected = TABLES.len() + RUNTIME_TABLES.len();
+    if statements.len() != expected {
+        return Err(v4_schema_error("baseline SQL table count"));
+    }
+    Ok(statements)
+}
+
+fn v4_schema_error(code: &'static str) -> ControllerError {
+    // 固定去敏文案：只含编译期字面量，绝不拼接 SQL 片段、表之外的标识符或任何凭据。
+    ControllerError::Config(format!("v4 schema baseline rejected: {code}"))
+}
+
+/// 解析 v4 DDL 中某张表的列/索引声明片段（已剥离整行注释）。
+/// 前置条件：调用方必须先通过 [`v4_comment_form_check`]（生产两条入口
+/// [`validate_v4_shape`] 与 [`v4_schema_statements`] 都已执行），否则行内注释会被并入片段。
 fn ddl_parts(table: &str) -> Vec<String> {
-    ddl_parts_from(V3_MIGRATION, table)
-}
-
-fn normalize_check(value: &str) -> String {
-    // Normalize SQL formatting, not the bytes of quoted string literals. MySQL may
-    // introduce _utf8mb4 on readback; other introducers have different semantics.
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let byte = bytes[i];
-        if bytes.get(i..i + 2) == Some(b"/*")
-            && bytes.get(i + 2) != Some(&b'!')
-            && let Some(end) = bytes[i + 2..].windows(2).position(|pair| pair == b"*/")
-        {
-            i += end + 4;
-            continue;
-        }
-        if byte == b'#'
-            || (bytes.get(i..i + 2) == Some(b"--")
-                && bytes.get(i + 2).is_some_and(u8::is_ascii_whitespace))
-        {
-            i += if byte == b'#' { 1 } else { 2 };
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if byte == b'_'
-            && (i == 0
-                || !matches!(bytes[i - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$'))
-            && bytes
-                .get(i..i + 8)
-                .is_some_and(|word| word.eq_ignore_ascii_case(b"_utf8mb4"))
-            && bytes.get(i + 8) == Some(&b'\'')
-        {
-            i += 8;
-            continue;
-        }
-        if matches!(byte, b'\'' | b'"' | b'`') {
-            let delimiter = byte;
-            if delimiter != b'`' {
-                out.push(byte);
-            }
-            i += 1;
-            while i < bytes.len() {
-                let current = bytes[i];
-                if current == delimiter {
-                    if bytes.get(i + 1) == Some(&delimiter) {
-                        if delimiter == b'`' {
-                            out.push(current.to_ascii_lowercase());
-                        } else {
-                            out.extend_from_slice(&bytes[i..i + 2]);
-                        }
-                        i += 2;
-                        continue;
-                    }
-                    if delimiter != b'`' {
-                        out.push(current);
-                    }
-                    i += 1;
-                    break;
-                }
-                if current == b'\\' && delimiter != b'`' && i + 1 < bytes.len() {
-                    out.extend_from_slice(&bytes[i..i + 2]);
-                    i += 2;
-                    continue;
-                }
-                out.push(if delimiter == b'`' {
-                    current.to_ascii_lowercase()
-                } else {
-                    current
-                });
-                i += 1;
-            }
-            continue;
-        }
-        if !byte.is_ascii_whitespace() {
-            out.push(byte.to_ascii_lowercase());
-        }
-        i += 1;
-    }
-    let mut text = String::from_utf8(out).expect("ASCII normalization preserves UTF-8");
-    while text.starts_with('(') && text.ends_with(')') {
-        let mut depth = 0;
-        let fully_wrapped = text.char_indices().all(|(i, c)| {
-            if c == '(' {
-                depth += 1;
-            }
-            if c == ')' {
-                depth -= 1;
-            }
-            depth > 0 || i == text.len() - 1
-        });
-        if !fully_wrapped {
-            break;
-        }
-        text = text[1..text.len() - 1].to_owned();
-    }
-    text
-}
-
-fn check_clause_matches(table: &str, name: &str, stored: &str, declared: &str) -> bool {
-    if normalize_check(stored) == normalize_check(declared) {
-        return true;
-    }
-    // MySQL 8.0.46 with CAST(check_clause AS CHAR) was observed returning
-    // literal backslashes before each quote. Accept only these two complete
-    // readbacks against their unchanged fixed 0001 declarations.
-    match (table, name, stored) {
-        (
-            "devices",
-            "chk_devices_state",
-            "(`admission_state` in (_utf8mb4\\'PENDING\\',_utf8mb4\\'APPROVED\\',_utf8mb4\\'REVOKED\\'))",
-        ) => declared == "(admission_state IN ('PENDING','APPROVED','REVOKED'))",
-        (
-            "devices",
-            "chk_devices_decision",
-            "(`review_decision` in (_utf8mb4\\'none\\',_utf8mb4\\'approved\\',_utf8mb4\\'denied\\',_utf8mb4\\'revoked\\'))",
-        ) => declared == "(review_decision IN ('none','approved','denied','revoked'))",
-        _ => false,
-    }
-}
-
-// Treat a stored CHECK as the 0001 expression only when its tokens can be
-// compared without changing SQL string-literal bytes or joining identifiers.
-// Unknown metadata spellings fail closed; this is not a general SQL parser.
-fn legacy_check_tokens(value: &str) -> Option<Vec<String>> {
-    let bytes = value.as_bytes();
-    let mut tokens = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_whitespace() {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        if bytes[i] == b'`' {
-            i += 1;
-            let name_start = i;
-            while i < bytes.len() && bytes[i] != b'`' {
-                if !(bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                    return None;
-                }
-                i += 1;
-            }
-            if i == bytes.len()
-                || i == name_start
-                || !matches!(
-                    &value[name_start..i].to_ascii_lowercase()[..],
-                    "singleton"
-                        | "admission_state"
-                        | "review_decision"
-                        | "source_kind"
-                        | "role_id"
-                        | "permissions"
-                        | "scope_kind"
-                        | "scope_group_id"
-                        | "scope_device_id"
-                )
-            {
-                return None;
-            }
-            tokens.push(value[name_start..i].to_ascii_lowercase());
-            i += 1;
-        } else if bytes[i] == b'\''
-            || bytes
-                .get(i..i + 8)
-                .is_some_and(|part| part.eq_ignore_ascii_case(b"_utf8mb4"))
-                && bytes.get(i + 8) == Some(&b'\'')
-        {
-            if bytes[i] != b'\'' {
-                i += 8;
-            }
-            let quote_start = i;
-            i += 1;
-            loop {
-                if i == bytes.len() {
-                    return None;
-                }
-                if bytes[i] == b'\\' {
-                    return None;
-                }
-                if bytes[i] == b'\'' {
-                    if bytes.get(i + 1) == Some(&b'\'') {
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            tokens.push(value[quote_start..i].to_owned());
-        } else if bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' {
-            i += 1;
-            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                i += 1;
-            }
-            tokens.push(value[start..i].to_ascii_lowercase());
-        } else if matches!(bytes[i], b'(' | b')' | b',' | b'=') {
-            tokens.push(value[i..i + 1].to_owned());
-            i += 1;
-        } else {
-            return None;
-        }
-    }
-    while tokens.first().is_some_and(|s| s == "(") && tokens.last().is_some_and(|s| s == ")") {
-        let mut depth = 0;
-        let wrapped = tokens.iter().enumerate().all(|(idx, token)| {
-            if token == "(" {
-                depth += 1;
-            }
-            if token == ")" {
-                depth -= 1;
-            }
-            depth > 0 || idx == tokens.len() - 1
-        });
-        if !wrapped {
-            break;
-        }
-        tokens.remove(0);
-        tokens.pop();
-    }
-    Some(tokens)
-}
-
-fn known_legacy_check(table: &str, name: &str) -> Option<(&'static str, &'static str)> {
-    let (table, name) = match (table, name) {
-        ("schema_meta", "chk_schema_singleton") => ("schema_meta", "chk_schema_singleton"),
-        ("devices", "chk_devices_state") => ("devices", "chk_devices_state"),
-        ("devices", "chk_devices_decision") => ("devices", "chk_devices_decision"),
-        ("grants", "chk_grants_source") => ("grants", "chk_grants_source"),
-        ("grants", "chk_grants_scope") => ("grants", "chk_grants_scope"),
-        _ => return None,
-    };
-    Some((table, name))
-}
-
-// These two layouts are a closed MySQL 8.0.46 serialization of the fixed
-// 0001 predicate trees: each = / IS [NOT] NULL atom is parenthesized, and
-// AND/OR retain the original grouping. print_expr introduces _utf8mb4 and
-// the I_S view's print escapes each quote once more. Neither observed text
-// nor the legacy tokenizer is used to construct the accepted bytes.
-fn mysql_8046_grant_clause(table: &str, name: &str, stored: &str, declared: &str) -> bool {
-    let (original, serialized) = match (table, name) {
-        ("grants", "chk_grants_source") => (
-            "((source_kind = 'role' AND role_id IS NOT NULL AND permissions IS NULL) OR (source_kind = 'direct' AND role_id IS NULL AND permissions IS NOT NULL))",
-            concat!(
-                "(((`source_kind` = _utf8mb4'role') AND (`role_id` IS NOT NULL) AND (`permissions` IS NULL)) OR ",
-                "((`source_kind` = _utf8mb4'direct') AND (`role_id` IS NULL) AND (`permissions` IS NOT NULL)))",
-            ),
-        ),
-        ("grants", "chk_grants_scope") => (
-            "((scope_kind = 'all' AND scope_group_id IS NULL AND scope_device_id IS NULL) OR (scope_kind = 'group' AND scope_group_id IS NOT NULL AND scope_device_id IS NULL) OR (scope_kind = 'device' AND scope_group_id IS NULL AND scope_device_id IS NOT NULL))",
-            concat!(
-                "(((`scope_kind` = _utf8mb4'all') AND (`scope_group_id` IS NULL) AND (`scope_device_id` IS NULL)) OR ",
-                "((`scope_kind` = _utf8mb4'group') AND (`scope_group_id` IS NOT NULL) AND (`scope_device_id` IS NULL)) OR ",
-                "((`scope_kind` = _utf8mb4'device') AND (`scope_group_id` IS NULL) AND (`scope_device_id` IS NOT NULL)))",
-            ),
-        ),
-        _ => return false,
-    };
-    if declared != original {
-        return false;
-    }
-    let expected = serialized.replace('\'', "\\'");
-    let expected = expected.as_bytes();
-    let actual = stored.as_bytes();
-    if actual.len() != expected.len() {
-        return false;
-    }
-    // Only whole, fixed SQL keyword words may vary in ASCII case. All other
-    // bytes, including quoting, spaces, introducers and wrappers, are exact.
-    let mut pos = 0;
-    while pos < expected.len() {
-        if expected[pos].is_ascii_alphabetic() {
-            let end = pos
-                + expected[pos..]
-                    .iter()
-                    .take_while(|b| b.is_ascii_alphabetic())
-                    .count();
-            let word = &expected[pos..end];
-            let keyword = [b"AND".as_slice(), b"OR", b"IS", b"NOT", b"NULL"].contains(&word);
-            if if keyword {
-                !actual[pos..end].eq_ignore_ascii_case(word)
-            } else {
-                actual[pos..end] != *word
-            } {
-                return false;
-            }
-            pos = end;
-        } else {
-            if actual[pos] != expected[pos] {
-                return false;
-            }
-            pos += 1;
-        }
-    }
-    true
-}
-
-fn legacy_check_metadata_error() -> ControllerError {
-    ControllerError::Config("legacy CHECK metadata unavailable or incompatible".into())
-}
-
-type LegacyCheckVersionRow = (
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-);
-
-// Only the caller which read VERSION(), ENFORCED and the complete clauses on
-// one held connection can supply this context. The older pure comparison has
-// no path to the new permission.
-fn validate_legacy_check_metadata_with_version(
-    rows: &[LegacyCheckVersionRow],
-    version: Result<Option<&str>, ()>,
-) -> Result<Vec<(&'static str, &'static str)>, ControllerError> {
-    let version = version
-        .map_err(|_| legacy_check_metadata_error())?
-        .ok_or_else(legacy_check_metadata_error)?;
-    let mut confirmed = Vec::new();
-    for (table, name, clause, enforced) in rows {
-        let (table, name) = known_legacy_check(
-            table.as_deref().ok_or_else(legacy_check_metadata_error)?,
-            name.as_deref().ok_or_else(legacy_check_metadata_error)?,
-        )
-        .ok_or_else(legacy_check_metadata_error)?;
-        if confirmed.contains(&(table, name)) {
-            return Err(legacy_check_metadata_error());
-        }
-        let stored = clause.as_deref().ok_or_else(legacy_check_metadata_error)?;
-        let old_row = (
-            Some(table.to_owned()),
-            Some(name.to_owned()),
-            Some(stored.to_owned()),
-        );
-        if validate_legacy_check_metadata(&[old_row]).is_err() {
-            let declared = ddl_parts_from(MIGRATION, table)
-                .into_iter()
-                .find(|part| part.starts_with(&format!("CONSTRAINT {name} CHECK ")))
-                .ok_or_else(legacy_check_metadata_error)?;
-            let expression = declared
-                .split_once("CHECK ")
-                .ok_or_else(legacy_check_metadata_error)?
-                .1;
-            if version != "8.0.46"
-                || enforced.as_deref() != Some("YES")
-                || !mysql_8046_grant_clause(table, name, stored, expression)
-            {
-                return Err(legacy_check_metadata_error());
-            }
-        }
-        confirmed.push((table, name));
-    }
-    Ok(confirmed)
-}
-
-fn validate_legacy_check_metadata(
-    rows: &[(Option<String>, Option<String>, Option<String>)],
-) -> Result<Vec<(&'static str, &'static str)>, ControllerError> {
-    let mut confirmed = Vec::new();
-    for (table, name, clause) in rows {
-        let proof = (|| {
-            let (table, name) = known_legacy_check(table.as_deref()?, name.as_deref()?)?;
-            if confirmed.contains(&(table, name)) { return None; }
-            let declared = ddl_parts_from(MIGRATION, table).into_iter()
-                .find(|part| part.starts_with(&format!("CONSTRAINT {name} CHECK ")))?;
-            let expression = declared.split_once("CHECK ")?.1;
-            let stored = clause.as_deref()?;
-            let tokens_match = legacy_check_tokens(stored)
-                .zip(legacy_check_tokens(expression))
-                .is_some_and(|(stored, expected)| stored == expected);
-            if !tokens_match && !check_clause_matches(table, name, stored, expression) {
-                return None;
-            }
-            // The old comparator also normalizes arbitrary outside-literal
-            // whitespace. Only its two exact, observed escaped forms are safe.
-            if !tokens_match && !matches!((table, name, stored),
-                ("devices", "chk_devices_state", "(`admission_state` in (_utf8mb4\\'PENDING\\',_utf8mb4\\'APPROVED\\',_utf8mb4\\'REVOKED\\'))") |
-                ("devices", "chk_devices_decision", "(`review_decision` in (_utf8mb4\\'none\\',_utf8mb4\\'approved\\',_utf8mb4\\'denied\\',_utf8mb4\\'revoked\\'))")) {
-                return None;
-            }
-            Some((table, name))
-        })().ok_or_else(|| ControllerError::Config("legacy CHECK metadata unavailable or incompatible".into()))?;
-        confirmed.push(proof);
-    }
-    Ok(confirmed)
-}
-
-fn validate_legacy_column(
-    version: i32,
-    table: &str,
-    column: &str,
-    actual: &ColumnMeta,
-) -> Result<bool, ControllerError> {
-    match version {
-        1 => classify_identity_column(table, column, actual),
-        2 => {
-            let old = classify_identity_column(table, column, actual)?;
-            if old {
-                return Err(ControllerError::Config(format!(
-                    "migration target column not ready {table}.{column}"
-                )));
-            }
-            Ok(false)
-        }
-        _ => Err(ControllerError::Config(
-            "unsupported legacy shape version".into(),
-        )),
-    }
+    ddl_parts_from(&v4_schema_body(), table)
 }
 
 fn expected_indexes(parts: &[String], names: &[&str]) -> Result<Vec<IndexMeta>, ControllerError> {
@@ -869,57 +632,38 @@ fn expected_indexes(parts: &[String], names: &[&str]) -> Result<Vec<IndexMeta>, 
     Ok(expected)
 }
 
+/// v4 只读门禁探针：真实实现仅由 `DbPool` 提供，离线测试注入受控 fake 验证决策顺序。
+/// 方法集合就是 v4 门禁的全部步骤，没有任何旧版本或续迁入口。
 trait IdentitySchemaProbe {
     fn read_version(
         &self,
     ) -> impl std::future::Future<Output = Result<Option<i32>, ControllerError>> + Send;
-    fn validate_v2_shape(
-        &self,
-    ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
-    #[cfg(test)]
-    fn validate_legacy_v2_shape(
+    /// v4 完整形状（16 表列/索引/字符集/无 CHECK）。
+    fn validate_shape(
         &self,
     ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
     fn validate_data(
         &self,
     ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
-    /// v3 终态门禁专用：以精确版本 3 扫描身份数据。普通启动（v4）不得调用。
-    fn validate_data_at_v3(
-        &self,
-    ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
-    /// v4 运行时五表存在性快照：仅由固定字面量的 information_schema 探测
-    /// 填充。普通启动（v4）门禁必须调用；v3 终态门禁不得调用。
+    /// runtime 五表存在性快照：仅由固定字面量的 information_schema 探测填充。
     fn runtime_table_presence(
         &self,
     ) -> impl std::future::Future<Output = Result<RuntimeTablePresence, ControllerError>> + Send;
-    /// v4 运行时数据只读扫描（`integrity::check_runtime_data`，期望版本取
-    /// 编译期 `SUPPORTED_SCHEMA_VERSION`）。普通启动门禁必须调用。
+    /// runtime 数据只读扫描（期望版本取编译期 `SUPPORTED_SCHEMA_VERSION`）。
     fn validate_runtime_data(
         &self,
     ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
     fn validate_fk(&self) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
 }
 
-// Retain the historical v2 probe solely as a unit-test reference: Upgrade
-// cannot call it until Task3B adds a separately reviewed legacy preflight.
-#[cfg(test)]
-async fn check_legacy_v2_ready(probe: &impl IdentitySchemaProbe) -> Result<(), ControllerError> {
-    if probe.read_version().await? != Some(2) {
-        return Err(ControllerError::Config(
-            "legacy identity migration requires schema version 2".into(),
-        ));
-    }
-    probe.validate_legacy_v2_shape().await
-}
-/// 普通启动门禁（v4）：版本决策 → identity 结构 → runtime 五表齐备 →
-/// identity 数据 → runtime 数据 → FK。`identity_schema_decision` 已把期望
-/// 版本锁定为编译期 `SUPPORTED_SCHEMA_VERSION`（v4），因此五张 runtime 表
-/// 必须全部存在，缺一即 fail-closed，绝不放行半成品 v4 库。
+/// v4 唯一门禁（普通启动与显式入口共用）：版本决策 → 16 表完整形状 →
+/// runtime 五表齐备 → identity 数据 → runtime 数据 → 无 FK。期望版本恒为编译期
+/// `SUPPORTED_SCHEMA_VERSION`，绝不从数据库行本身推断；任何缺失或漂移都 fail-closed。
 async fn check_identity_schema_with_probe(
     probe: &impl IdentitySchemaProbe,
 ) -> Result<(), ControllerError> {
     identity_schema_decision(probe.read_version().await?)?;
-    probe.validate_v2_shape().await?;
+    probe.validate_shape().await?;
     let presence = probe.runtime_table_presence().await?;
     crate::integrity::validate_runtime_tables_for_version(
         crate::integrity::SUPPORTED_SCHEMA_VERSION,
@@ -930,30 +674,9 @@ async fn check_identity_schema_with_probe(
     probe.validate_fk().await
 }
 
-/// v3 终态门禁：仅供显式 v3 测试迁移（fresh/legacy 升级）在收尾时校验
-/// “已建成 v3 且数据完整”，不是普通启动门禁。期望版本固定为编译期常量
-/// `IDENTITY_SCHEMA_VERSION`，绝不从数据库行本身推断；v4 启动门禁是
-/// `check_identity_schema_with_probe`。
-async fn check_v3_ready_with_probe(
-    probe: &impl IdentitySchemaProbe,
-) -> Result<(), ControllerError> {
-    let version = probe.read_version().await?;
-    if version != Some(IDENTITY_SCHEMA_VERSION) {
-        return Err(ControllerError::SchemaNotReady {
-            found: version,
-            required: IDENTITY_SCHEMA_VERSION,
-        });
-    }
-    probe.validate_v2_shape().await?;
-    probe.validate_data_at_v3().await?;
-    probe.validate_fk().await
-}
-
-const IDENTITY_SCHEMA_VERSION: i32 = 3;
-
 /// Schema v4 运行时五表的存在性快照：仅由固定字面量的 information_schema
 /// 探测填充，绝不接受外部输入拼装的表名。`integrity::validate_runtime_tables_for_version`
-/// 依据它判定「v4 必须五表齐备、v1..=3 必须五表皆无」。
+/// 依据它判定「v4 必须五表齐备」。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeTablePresence {
     pub main_tasks: bool,
@@ -963,45 +686,35 @@ pub struct RuntimeTablePresence {
     pub recovery_checks: bool,
 }
 
-/// v4 运行时五表的固定名单：仅用于表集合判定与显式迁移 DDL 白名单，
-/// 绝不从数据库返回值或外部输入拼装。
-const RUNTIME_TABLE_NAMES: [&str; 5] = [
-    "main_tasks",
-    "sub_tasks",
-    "task_previews",
-    "device_operation_locks",
-    "recovery_checks",
-];
-
-/// 表集合判定纯函数：11 张 identity 表必须齐备、不得出现重复行；未知表
-/// 一律拒绝。`allow_runtime_tables` 仅在 v3 契约（v4 启动共用）下放行
-/// `RUNTIME_TABLE_NAMES` 五张固定运行时表，其余契约路径仍要求恰好 11 表。
-fn validate_table_set(
-    present: &[String],
-    allow_runtime_tables: bool,
-) -> Result<(), ControllerError> {
+/// 表集合判定纯函数：v4 的 11 张 identity 表 + 5 张 runtime 表必须**恰好**齐备，
+/// 不得重复、不得缺表，未知表一律拒绝（fail-closed，绝不"顺手"忽略多余表）。
+fn validate_table_set(present: &[String]) -> Result<(), ControllerError> {
     let table_set_error = || {
         ControllerError::Config(
-            "identity schema has missing or unexpected tables; manual inspection required".into(),
+            "v4 schema has missing or unexpected tables; manual inspection required".into(),
         )
     };
     let mut seen = std::collections::HashSet::new();
     for name in present {
         let known = TABLES.iter().any(|(table, _, _)| name == table)
-            || (allow_runtime_tables && RUNTIME_TABLE_NAMES.contains(&name.as_str()));
+            || RUNTIME_TABLES.iter().any(|(table, _, _)| name == table);
         if !known || !seen.insert(name.as_str()) {
             return Err(table_set_error());
         }
     }
-    if TABLES.iter().any(|(table, _, _)| !seen.contains(table)) {
+    if TABLES
+        .iter()
+        .chain(RUNTIME_TABLES)
+        .any(|(table, _, _)| !seen.contains(table))
+    {
         return Err(table_set_error());
     }
     Ok(())
 }
 
 /// 普通启动版本决策：委托 `integrity::startup_guard_decision`，仅接受编译期
-/// 配置 `SUPPORTED_SCHEMA_VERSION`（v4）。v1..=3 只能经显式迁移 preflight
-/// （如 `run_schema_v4_migration`）放行，普通启动一律 `SchemaNotReady`。
+/// 配置 `SUPPORTED_SCHEMA_VERSION`（v4）。旧版本、未知版本、缺失元数据一律
+/// `SchemaNotReady`；空库由显式入口的 `ProductionMigrationPlan::CreateV4` 处理。
 fn identity_schema_decision(version: Option<i32>) -> Result<(), ControllerError> {
     crate::integrity::startup_guard_decision(version)
 }
@@ -1036,7 +749,7 @@ impl TestMigrationConfig {
             migration_ack: String::new(),
         }
     }
-    // Raw URL equality here and in run_identity_test_migration only rejects literal reuse;
+    // Raw URL equality here only rejects literal reuse of the very same URL string;
     // different URLs do not prove physical isolation. The operator must confirm the target.
     pub fn from_test_env() -> Result<Self, ControllerError> {
         let test_url = std::env::var("CONTROLLER_TEST_DATABASE_URL").unwrap_or_default();
@@ -1171,53 +884,6 @@ async fn require_schema_metadata_privilege(
     validate_schema_metadata_grants(&grants, expected_database)
 }
 
-#[cfg(test)]
-fn preflight_usernames<'a>(
-    values: impl IntoIterator<Item = &'a str>,
-) -> Result<(), ControllerError> {
-    let mut seen = std::collections::HashSet::new();
-    for name in values {
-        if !valid_username(name) || !seen.insert(name.as_bytes().to_vec()) {
-            return Err(ControllerError::Config(
-                "invalid or conflicting stored username".into(),
-            ));
-        }
-    }
-    Ok(())
-}
-fn classify_identity_column(
-    table: &str,
-    name: &str,
-    actual: &ColumnMeta,
-) -> Result<bool, ControllerError> {
-    let (old, target) = identity_column_declarations(table, name)?;
-    if validate_column_shape(table, target, actual).is_ok() {
-        return Ok(false);
-    }
-    validate_column_shape(table, old, actual)?;
-    Ok(true)
-}
-fn identity_column_declarations(
-    table: &str,
-    name: &str,
-) -> Result<(&'static str, &'static str), ControllerError> {
-    match (table, name) {
-        ("users", "username") => Ok((
-            "VARCHAR(128) CHARACTER SET utf8mb4 NOT NULL",
-            "VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL",
-        )),
-        ("schema_meta", "authz_epoch" | "admin_guard_revision") => Ok((
-            "BIGINT NOT NULL DEFAULT 0",
-            "BIGINT UNSIGNED NOT NULL DEFAULT 0",
-        )),
-        ("users" | "roles" | "device_groups" | "devices" | "grants", "revision")
-        | ("admission_decisions", "previous_revision" | "new_revision")
-        | ("audit_events", "event_seq") => Ok(("BIGINT NOT NULL", "BIGINT UNSIGNED NOT NULL")),
-        _ => Err(ControllerError::Config(
-            "unknown identity migration column".into(),
-        )),
-    }
-}
 async fn run_authorized_migration_with<D, E, C, CF, G, GF, U, UF>(
     config: &TestMigrationConfig,
     connect_and_name: C,
@@ -1239,67 +905,8 @@ where
     upgrade(db).await
 }
 
-fn validate_v3_table_collation(table: &str, table_collation: &str) -> Result<(), ControllerError> {
-    if table_collation.to_ascii_lowercase().starts_with("utf8mb4_") {
-        Ok(())
-    } else {
-        Err(ControllerError::Config(format!(
-            "migration incompatible table charset {table}"
-        )))
-    }
-}
-
-fn validate_v3_column_charset(
-    table: &str,
-    declaration: &str,
-    actual: &ColumnMeta,
-    table_collation: &str,
-) -> Result<(), ControllerError> {
-    let declared_type = declaration
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .to_ascii_lowercase();
-    let character_column = matches!(
-        declared_type.split('(').next().unwrap(),
-        "varchar" | "char" | "text" | "tinytext" | "mediumtext" | "longtext"
-    );
-    if !character_column {
-        return Ok(());
-    }
-    // The old username declaration is annotated with its inherited utf8mb4
-    // charset for classification, but does not declare its own collation.
-    // It must still inherit the table collation from the original 0001 DDL.
-    if declaration.contains("CHARACTER SET ") && !declaration.contains("CHARACTER SET utf8mb4") {
-        return Ok(());
-    }
-    if actual.character_set_name.as_deref() != Some("utf8mb4")
-        || !actual
-            .collation_name
-            .as_deref()
-            .is_some_and(|found| found.eq_ignore_ascii_case(table_collation))
-    {
-        return Err(ControllerError::Config(format!(
-            "migration incompatible character metadata {table}.{}",
-            actual.name
-        )));
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-async fn validate_schema_shape(db: &DbPool, target: Option<bool>) -> Result<(), ControllerError> {
-    validate_schema_shape_with_contract(db, target, MIGRATION).await
-}
-
-async fn validate_v3_schema_shape(db: &DbPool) -> Result<(), ControllerError> {
-    validate_schema_shape_with_contract(db, Some(true), V3_MIGRATION).await
-}
-
-// Reusable by Task 3's legacy preflight before its first DDL. Call only after
-// confirming full schema visibility/shape with the same DbPool identity; zero
-// metadata rows alone cannot establish that the account can see all objects.
-#[allow(dead_code)]
+/// v4 无外键门禁：三条彼此独立的 information_schema 视角必须**同时**可信且为空。
+/// 读失败/NULL/不完整一律视为"有外键或不可信"，绝不把错误当成空集。
 pub(crate) async fn require_no_identity_foreign_keys(db: &DbPool) -> Result<(), ControllerError> {
     let constraints = sqlx::query(FK_CONSTRAINTS_QUERY)
         .fetch_optional(&db.0)
@@ -1346,60 +953,74 @@ fn validate_fk_metadata(
     Ok(())
 }
 
-async fn validate_schema_shape_with_contract(
-    db: &DbPool,
-    target: Option<bool>,
-    migration: &str,
-) -> Result<(), ControllerError> {
-    validate_schema_shape_with_policy(db, target, migration, None)
-        .await
-        .map(|_| ())
-}
-
-// Private SELECT-only entry point for Task 3B1B; not wired to Upgrade.
-#[allow(dead_code)]
-async fn validate_legacy_shape(
-    db: &DbPool,
-    version: i32,
-) -> Result<Vec<(&'static str, &'static str)>, ControllerError> {
-    if !matches!(version, 1 | 2) {
-        return Err(ControllerError::Config(
-            "unsupported legacy shape version".into(),
-        ));
+/// v4 表级 collation 门禁：字符表必须继承 utf8mb4 系列 collation。
+fn validate_table_collation(table: &str, table_collation: &str) -> Result<(), ControllerError> {
+    if table_collation.to_ascii_lowercase().starts_with("utf8mb4_") {
+        Ok(())
+    } else {
+        Err(ControllerError::Config(format!(
+            "v4 schema incompatible table charset {table}"
+        )))
     }
-    validate_schema_shape_with_policy(db, None, MIGRATION, Some(version)).await
 }
 
-async fn validate_schema_shape_with_policy(
-    db: &DbPool,
-    target: Option<bool>,
-    migration: &str,
-    legacy_version: Option<i32>,
-) -> Result<Vec<(&'static str, &'static str)>, ControllerError> {
-    let mut confirmed_checks = Vec::new();
-    let present: Vec<String> = sqlx::query_scalar(
-        "SELECT CAST(table_name AS CHAR) AS table_name FROM information_schema.tables WHERE table_schema = DATABASE()",
-    )
-    .fetch_all(&db.0)
-    .await?;
-    // The v3 contract is shared with v4 startup, where the five fixed runtime
-    // tables additionally exist; every other contract still demands exactly
-    // the eleven identity tables. Unknown tables always fail closed.
-    validate_table_set(&present, migration == V3_MIGRATION)?;
-    for &(table, columns, indexes) in TABLES {
-        let table_collation = if migration == V3_MIGRATION || legacy_version.is_some() {
-            let table_collation: String = sqlx::query_scalar("SELECT CAST(table_collation AS CHAR) AS table_collation FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?")
-                .bind(table).fetch_one(&db.0).await?;
-            validate_v3_table_collation(table, &table_collation)?;
-            Some(table_collation)
-        } else {
-            None
-        };
-        let parts = if migration == V3_MIGRATION {
-            ddl_parts(table)
-        } else {
-            ddl_parts_from(migration, table)
-        };
+/// v4 字符列门禁：列若自身声明了字符集（如 `users.username` 的
+/// `CHARACTER SET ascii COLLATE ascii_bin`），其精确字符集/collation 已由
+/// [`validate_column_shape`] 比对；其余字符列必须继承表的 utf8mb4 collation。
+fn validate_column_charset(
+    table: &str,
+    declaration: &str,
+    actual: &ColumnMeta,
+    table_collation: &str,
+) -> Result<(), ControllerError> {
+    let declared_type = declaration
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let character_column = matches!(
+        declared_type.split('(').next().unwrap_or_default(),
+        "varchar" | "char" | "text" | "tinytext" | "mediumtext" | "longtext"
+    ) || declared_type.starts_with("enum")
+        || declared_type.starts_with("set");
+    if !character_column || declaration.contains("CHARACTER SET ") {
+        return Ok(());
+    }
+    if actual.character_set_name.as_deref() != Some("utf8mb4")
+        || !actual
+            .collation_name
+            .as_deref()
+            .is_some_and(|found| found.eq_ignore_ascii_case(table_collation))
+    {
+        return Err(ControllerError::Config(format!(
+            "v4 schema incompatible character metadata {table}.{}",
+            actual.name
+        )));
+    }
+    Ok(())
+}
+
+/// v4 完整形状校验（只读、无写入）：
+/// 1. 表集合恰好是 11 identity + 5 runtime，未知表拒绝；
+/// 2. 每张表的列名集合、逐列形状（类型/长度/UNSIGNED/NULL/字符集/collation/默认值）、
+///    索引集合（名称、列顺序、唯一性、前缀长度）都必须与 `schema/v4.sql` 一致；
+/// 3. 每张表都不得存在任何 CHECK 约束（v4 DDL 不声明 CHECK，出现即为漂移）；
+///
+/// 外键由 [`require_no_identity_foreign_keys`] 单独做全库校验，不在本函数内。
+async fn validate_v4_shape(db: &DbPool) -> Result<(), ControllerError> {
+    let present: Vec<String> =
+        sqlx::query_scalar("SELECT CAST(table_name AS CHAR) AS table_name FROM information_schema.tables WHERE table_schema = DATABASE()")
+            .fetch_all(&db.0).await?;
+    validate_table_set(&present)?;
+    // 形状解析（[`ddl_parts`]）与白名单解析（[`v4_schema_statements`]）消费同一份 DDL，
+    // 两条路径都必须先过注释形态门禁：行内注释会让 [`ddl_parts_from`] 把注释文本并入下一个
+    // 片段，从而报出"库里缺列"这种把源码缺陷伪装成数据库漂移的误导性诊断。
+    v4_comment_form_check(&v4_schema_body())?;
+    for &(table, columns, indexes) in TABLES.iter().chain(RUNTIME_TABLES) {
+        let table_collation: String = sqlx::query_scalar("SELECT CAST(table_collation AS CHAR) AS table_collation FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?")
+            .bind(table).fetch_one(&db.0).await?;
+        validate_table_collation(table, &table_collation)?;
+        let parts = ddl_parts(table);
         let actual_columns: Vec<String> = sqlx::query_scalar("SELECT CAST(column_name AS CHAR) AS column_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ?")
             .bind(table).fetch_all(&db.0).await?;
         validate_object_names(
@@ -1414,58 +1035,12 @@ async fn validate_schema_shape_with_policy(
                 .find_map(|part| part.strip_prefix(&format!("{column} ")))
                 .ok_or_else(|| {
                     ControllerError::Config(format!(
-                        "migration DDL missing column {table}.{column}"
+                        "v4 schema DDL missing column {table}.{column}"
                     ))
                 })?;
             let actual = read_column(db, table, column).await?;
-            if migration == V3_MIGRATION {
-                validate_column_shape(table, declaration, &actual)?;
-            } else if IDENTITY_COLUMNS
-                .iter()
-                .any(|&(t, c, _, _)| t == table && c == column)
-            {
-                if let Some(version) = legacy_version {
-                    validate_legacy_column(version, table, column, &actual)?;
-                } else {
-                    match target {
-                        Some(true) => {
-                            if classify_identity_column(table, column, &actual)? {
-                                return Err(ControllerError::Config(format!(
-                                    "migration target column not ready {table}.{column}"
-                                )));
-                            }
-                        }
-                        Some(false) => validate_column_shape(
-                            table,
-                            identity_column_declarations(table, column)?.0,
-                            &actual,
-                        )?,
-                        None => {
-                            classify_identity_column(table, column, &actual)?;
-                        }
-                    }
-                }
-            } else {
-                validate_column_shape(table, declaration, &actual)?;
-            }
-            if migration == V3_MIGRATION || legacy_version.is_some() {
-                let charset_declaration = if legacy_version.is_some()
-                    && (table, column) == ("users", "username")
-                    && !classify_identity_column(table, column, &actual)?
-                {
-                    identity_column_declarations(table, column)?.1
-                } else {
-                    declaration
-                };
-                validate_v3_column_charset(
-                    table,
-                    charset_declaration,
-                    &actual,
-                    table_collation.as_deref().unwrap(),
-                )?;
-            }
-            // Every column's default is checked by validate_column_shape,
-            // including the legacy old/target classification above.
+            validate_column_shape(table, declaration, &actual)?;
+            validate_column_charset(table, declaration, &actual, &table_collation)?;
         }
         let expected = expected_indexes(&parts, indexes)?;
         let rows = sqlx::query(STATISTICS_QUERY)
@@ -1482,7 +1057,7 @@ async fn validate_schema_shape_with_policy(
             if let Some(index) = actual.iter_mut().find(|entry| entry.name == name) {
                 if seq != index.columns.len() as i64 + 1 || index.unique != (non_unique == 0) {
                     return Err(ControllerError::Config(format!(
-                        "migration incompatible index order {table}.{name}"
+                        "v4 schema incompatible index order {table}.{name}"
                     )));
                 }
                 index.columns.push(column);
@@ -1490,7 +1065,7 @@ async fn validate_schema_shape_with_policy(
             } else {
                 if seq != 1 {
                     return Err(ControllerError::Config(format!(
-                        "migration incompatible index order {table}.{name}"
+                        "v4 schema incompatible index order {table}.{name}"
                     )));
                 }
                 actual.push(IndexMeta {
@@ -1502,108 +1077,27 @@ async fn validate_schema_shape_with_policy(
             }
         }
         validate_indexes(table, &expected, &actual)?;
-        if legacy_version.is_some() {
-            confirmed_checks.extend(read_legacy_checks_for_table(db, table).await?);
-            continue;
-        }
-        let expected_checks: Vec<String> = parts
-            .iter()
-            .filter(|part| part.starts_with("CONSTRAINT "))
-            .map(|part| part.split_whitespace().nth(1).unwrap().to_owned())
-            .collect();
+        // v4 DDL 不声明任何 CHECK 约束：实际存在一条即视为漂移，直接拒绝。
         let actual_checks: Vec<String> = sqlx::query_scalar("SELECT CAST(constraint_name AS CHAR) AS constraint_name FROM information_schema.table_constraints WHERE table_schema = DATABASE() AND table_name = ? AND constraint_type = 'CHECK'")
             .bind(table).fetch_all(&db.0).await?;
-        validate_object_names(table, "check", &expected_checks, &actual_checks)?;
-        for part in parts.iter().filter(|part| part.starts_with("CONSTRAINT ")) {
-            let name = part.split_whitespace().nth(1).unwrap();
-            let stored: Option<String> = sqlx::query_scalar("SELECT CAST(cc.check_clause AS CHAR) AS check_clause FROM information_schema.table_constraints tc JOIN information_schema.check_constraints cc ON cc.constraint_schema = tc.constraint_schema AND cc.constraint_name = tc.constraint_name WHERE tc.table_schema = DATABASE() AND tc.table_name = ? AND tc.constraint_name = ? AND tc.constraint_type = 'CHECK'")
-                .bind(table).bind(name).fetch_optional(&db.0).await?;
-            let declared = part.split_once("CHECK ").unwrap().1;
-            if !stored
-                .as_deref()
-                .is_some_and(|value| check_clause_matches(table, name, value, declared))
-            {
-                return Err(ControllerError::Config(format!(
-                    "migration incompatible check constraint {table}.{name}"
-                )));
-            }
-        }
+        validate_object_names(table, "check", &[], &actual_checks)?;
     }
-    Ok(confirmed_checks)
+    Ok(())
 }
 
-// The grants branch acquires once. VERSION(), ENFORCED and the complete
-// check_clause rows are read on that very connection; no second sample can
-// turn an interrupted or incompatible read into permission to drop a CHECK.
-async fn read_legacy_checks_for_table(
-    db: &DbPool,
-    table: &str,
-) -> Result<Vec<(&'static str, &'static str)>, ControllerError> {
-    const BASIC: &str = "SELECT CAST(tc.table_name AS CHAR) AS table_name, CAST(tc.constraint_name AS CHAR) AS constraint_name, CAST(cc.check_clause AS CHAR) AS check_clause FROM information_schema.table_constraints tc LEFT JOIN information_schema.check_constraints cc ON cc.constraint_schema = tc.constraint_schema AND cc.constraint_name = tc.constraint_name WHERE tc.table_schema = DATABASE() AND tc.table_name = ? AND tc.constraint_type = 'CHECK'";
-    if table == "grants" {
-        let mut connection =
-            db.0.acquire()
-                .await
-                .map_err(|_| legacy_check_metadata_error())?;
-        let version: Option<String> = sqlx::query_scalar("SELECT CAST(VERSION() AS CHAR)")
-            .fetch_one(&mut *connection)
+/// 16 张 v4 表在元数据可见时必须全部为空（fresh 建库后置数据门禁）。
+/// 表名只取自 [`TABLES`]/[`RUNTIME_TABLES`] 编译期常量，绝不来自数据库返回值。
+async fn validate_v4_tables_are_empty(db: &DbPool) -> Result<(), ControllerError> {
+    for &(table, ..) in TABLES.iter().chain(RUNTIME_TABLES) {
+        let rows: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM `{table}`"))
+            .fetch_one(&db.0)
             .await
-            .map_err(|_| legacy_check_metadata_error())?;
-        let version = version.ok_or_else(legacy_check_metadata_error)?;
-        if version == "8.0.46" {
-            let rows = sqlx::query("SELECT CAST(tc.table_name AS CHAR) AS table_name, CAST(tc.constraint_name AS CHAR) AS constraint_name, CAST(cc.check_clause AS CHAR) AS check_clause, CAST(tc.enforced AS CHAR) AS enforced FROM information_schema.table_constraints tc LEFT JOIN information_schema.check_constraints cc ON cc.constraint_schema = tc.constraint_schema AND cc.constraint_name = tc.constraint_name WHERE tc.table_schema = DATABASE() AND tc.table_name = ? AND tc.constraint_type = 'CHECK'")
-                .bind(table).fetch_all(&mut *connection).await.map_err(|_| legacy_check_metadata_error())?;
-            let mut metadata = Vec::with_capacity(rows.len());
-            for row in rows {
-                metadata.push((
-                    row.try_get("table_name")
-                        .map_err(|_| legacy_check_metadata_error())?,
-                    row.try_get("constraint_name")
-                        .map_err(|_| legacy_check_metadata_error())?,
-                    row.try_get("check_clause")
-                        .map_err(|_| legacy_check_metadata_error())?,
-                    row.try_get("enforced")
-                        .map_err(|_| legacy_check_metadata_error())?,
-                ));
-            }
-            return validate_legacy_check_metadata_with_version(&metadata, Ok(Some(&version)));
+            .map_err(|_| v4_schema_error("fresh schema data scan failed"))?;
+        if rows != 0 {
+            return Err(v4_schema_error("fresh schema must contain no rows"));
         }
-        let rows = sqlx::query(BASIC)
-            .bind(table)
-            .fetch_all(&mut *connection)
-            .await
-            .map_err(|_| legacy_check_metadata_error())?;
-        let mut metadata = Vec::with_capacity(rows.len());
-        for row in rows {
-            metadata.push((
-                row.try_get("table_name")
-                    .map_err(|_| legacy_check_metadata_error())?,
-                row.try_get("constraint_name")
-                    .map_err(|_| legacy_check_metadata_error())?,
-                row.try_get("check_clause")
-                    .map_err(|_| legacy_check_metadata_error())?,
-            ));
-        }
-        return validate_legacy_check_metadata(&metadata);
     }
-    // Preserve old behavior and TiDB compatibility for all non-grants tables.
-    let rows = sqlx::query(BASIC)
-        .bind(table)
-        .fetch_all(&db.0)
-        .await
-        .map_err(|_| legacy_check_metadata_error())?;
-    let mut metadata = Vec::with_capacity(rows.len());
-    for row in rows {
-        metadata.push((
-            row.try_get("table_name")
-                .map_err(|_| legacy_check_metadata_error())?,
-            row.try_get("constraint_name")
-                .map_err(|_| legacy_check_metadata_error())?,
-            row.try_get("check_clause")
-                .map_err(|_| legacy_check_metadata_error())?,
-        ));
-    }
-    validate_legacy_check_metadata(&metadata)
+    Ok(())
 }
 
 async fn read_column(
@@ -1688,21 +1182,14 @@ impl IdentitySchemaProbe for DbPool {
     async fn read_version(&self) -> Result<Option<i32>, ControllerError> {
         read_version(self).await
     }
-    async fn validate_v2_shape(&self) -> Result<(), ControllerError> {
-        validate_v3_schema_shape(self).await
-    }
-    #[cfg(test)]
-    async fn validate_legacy_v2_shape(&self) -> Result<(), ControllerError> {
-        validate_schema_shape(self, Some(true)).await
+    async fn validate_shape(&self) -> Result<(), ControllerError> {
+        validate_v4_shape(self).await
     }
     async fn validate_data(&self) -> Result<(), ControllerError> {
         crate::integrity::check_identity_data(self).await
     }
-    async fn validate_data_at_v3(&self) -> Result<(), ControllerError> {
-        crate::integrity::validate_identity_rows_at_version(self, IDENTITY_SCHEMA_VERSION).await
-    }
     async fn runtime_table_presence(&self) -> Result<RuntimeTablePresence, ControllerError> {
-        SchemaV4MigrationProbe::runtime_table_presence(self).await
+        read_runtime_table_presence(self).await
     }
     async fn validate_runtime_data(&self) -> Result<(), ControllerError> {
         crate::integrity::check_runtime_data(self, crate::integrity::SUPPORTED_SCHEMA_VERSION).await
@@ -1715,71 +1202,6 @@ impl IdentitySchemaProbe for DbPool {
 pub async fn check_identity_schema(db: &DbPool) -> Result<(), ControllerError> {
     check_identity_schema_with_probe(db).await
 }
-
-pub async fn check_v3_ready(db: &DbPool) -> Result<(), ControllerError> {
-    check_v3_ready_with_probe(db).await
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum TestMigrationMode {
-    Upgrade,
-    FixtureV1,
-    FixturePartialV1,
-    FixtureV2,
-}
-
-pub async fn run_identity_test_migration(
-    config: &TestMigrationConfig,
-    mode: TestMigrationMode,
-) -> Result<(), ControllerError> {
-    if std::env::var("CONTROLLER_DATABASE_URL").is_ok_and(|service| service == config.test_url) {
-        return Err(ControllerError::Config(
-            "test migration cannot reuse service URL".into(),
-        ));
-    }
-    run_authorized_migration_with(
-        config,
-        || async {
-            let db = DbPool(
-                sqlx::MySqlPool::connect(&config.test_url)
-                    .await
-                    .map_err(|_| {
-                        ControllerError::Config("test database connection failed".into())
-                    })?,
-            );
-            let mut connection = db.0.acquire().await.map_err(|_| {
-                ControllerError::Config("test database identity query failed".into())
-            })?;
-            let actual: Option<String> = sqlx::query_scalar("SELECT DATABASE()")
-                .fetch_one(&mut *connection)
-                .await
-                .map_err(|_| {
-                    ControllerError::Config("test database identity query failed".into())
-                })?;
-            let actual = actual.ok_or_else(|| {
-                ControllerError::Config("test database identity query failed".into())
-            })?;
-            Ok(((db, connection), actual))
-        },
-        |(db, mut connection), actual| async move {
-            require_schema_metadata_privilege(&mut connection, &actual).await?;
-            Ok(db)
-        },
-        |db| async move { upgrade_identity_schema(&db, mode).await },
-    )
-    .await
-}
-
-// --- Production migration entry point (`migrate-controller`) ----------------
-//
-// Everything below is the operator-facing production path. It deliberately
-// reuses the one existing authorization gate (reached through
-// `run_authorized_migration_with`) instead of inventing a second, weaker one,
-// and reuses the same primitives as the reviewed test path:
-// `upgrade_identity_schema(.., Upgrade)` for the v3 target and
-// `run_schema_v4_migration` for the explicit v3 → v4 step. Nothing here is
-// reachable from the service startup path, and `run_identity_test_migration`
-// above keeps its test-only behaviour and gates unchanged.
 
 /// The single accepted migration acknowledgement literal, published for
 /// operators and documentation. The shared authorizer hard-codes the very same
@@ -1848,44 +1270,35 @@ pub fn migration_config_from_env() -> Result<TestMigrationConfig, ControllerErro
     production_migration_config_from(|name| std::env::var(name).ok())
 }
 
-/// The fixed decision table of a production migration: a pure function of the
-/// observed schema version, so it is exhaustively unit-testable with no
-/// database in sight.
+/// 显式 schema 入口的固定决策表：数据库 schema 版本 → 唯一允许的动作。
+/// 纯函数，无数据库即可穷举单测；**只**承认「空库」与「已经是 v4」两种输入。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProductionMigrationPlan {
-    /// Already the supported version: only the read-only
-    /// `check_identity_schema` pass runs, which makes re-running idempotent.
+pub enum ProductionMigrationPlan {
+    /// 真正的空库（无 `schema_meta` 版本行）：直接创建完整 v4。
+    CreateV4,
+    /// 已是受支持版本 v4：只做只读闭合校验，零 DDL、零写入，因此可重复执行。
     VerifyOnly,
-    /// Empty database, v1, v2 or v3: reach v3 through the reviewed `Upgrade`
-    /// path (fresh CREATE for an empty database, legacy upgrade for v1/v2,
-    /// read-only confirmation for v3), then run the explicit v3 → v4 migration.
-    UpgradeThenV4,
 }
 
+/// v4-only 版本决策：`None` → 建库，`Some(4)` → 只读校验，其余（v1/v2/v3、0、
+/// 负数、v5+）一律拒绝。不存在"升级后续迁"或"就地修复"的任何路线。
 fn production_migration_plan(
     version: Option<i32>,
 ) -> Result<ProductionMigrationPlan, ControllerError> {
     match version {
+        None => Ok(ProductionMigrationPlan::CreateV4),
         Some(crate::integrity::SUPPORTED_SCHEMA_VERSION) => Ok(ProductionMigrationPlan::VerifyOnly),
-        None | Some(IDENTITY_SCHEMA_VERSION) | Some(1 | 2) => {
-            Ok(ProductionMigrationPlan::UpgradeThenV4)
-        }
-        // Unknown or future versions are never migrated speculatively.
+        // 旧版本、未知版本与未来版本都不做投机处理：交由操作员核查。
         Some(_) => Err(production_migration_error("unsupported schema version")),
     }
 }
 
-/// Executes the plan on an already authorized connection. Any failing step
-/// returns immediately: the DDL steps are non-transactional, so a partial
-/// schema is left for the operator instead of being auto-repaired, and no step
-/// counts as done without its own verification.
+/// 在已授权的连接上执行决策。DDL 非事务：任一步失败即原样返回，留下未就绪的
+/// 库交由操作员核查，绝不自动修复、绝不伪造成功。
 async fn run_production_migration_at(db: &DbPool) -> Result<(), ControllerError> {
     match production_migration_plan(read_version(db).await?)? {
         ProductionMigrationPlan::VerifyOnly => check_identity_schema(db).await,
-        ProductionMigrationPlan::UpgradeThenV4 => {
-            upgrade_identity_schema(db, TestMigrationMode::Upgrade).await?;
-            run_schema_v4_migration(db).await
-        }
+        ProductionMigrationPlan::CreateV4 => create_v4_schema(db).await,
     }
 }
 
@@ -1894,8 +1307,8 @@ async fn run_production_migration_at(db: &DbPool) -> Result<(), ControllerError>
 /// and the connecting account must really see its schema metadata), then applies
 /// [`production_migration_plan`].
 ///
-/// Unlike `run_identity_test_migration` this entry point does **not** reject a
-/// target equal to the service URL — the service database is the point.
+/// This entry point does **not** reject a target equal to the service URL — the
+/// service database is exactly the point (isolation is attested by the gates).
 /// Isolation and exclusivity are attested through the gates, never inferred
 /// from URL text.
 pub async fn run_production_migration(config: &TestMigrationConfig) -> Result<(), ControllerError> {
@@ -1941,1069 +1354,139 @@ pub async fn read_schema_version(db: &DbPool) -> Result<Option<i32>, ControllerE
     read_version(db).await
 }
 
-async fn scan_legacy_usernames(db: &DbPool) -> Result<(), ControllerError> {
-    // Full UNIQUE(username) was verified in the shape gate; no unbounded name set.
-    let mut stream = sqlx::query("SELECT username FROM users").fetch(&db.0);
-    while let Some(item) = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
-        let row = item.map_err(|_| legacy_preflight_error("username.read"))?;
-        let username: &str = row
-            .try_get("username")
-            .map_err(|_| legacy_preflight_error("username.decode"))?;
-        if !valid_username(username) {
-            return Err(legacy_preflight_error("username.invalid"));
-        }
-    }
-    Ok(())
-}
+// 固定字面量的五表存在性探测：表名全部硬编码，绝不接受外部输入拼装。
+const RUNTIME_TABLE_PRESENCE_QUERY: &str = "SELECT CAST(table_name AS CHAR) AS table_name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name IN ('main_tasks','sub_tasks','task_previews','device_operation_locks','recovery_checks')";
 
-async fn username_encoding_is_lossless(db: &DbPool) -> Result<(), ControllerError> {
-    // The shared bounded scanner already validates each username as lowercase ASCII.
-    // Retain the independent server-side target conversion guard without fetching names.
-    let bad = sqlx::query(
-        "SELECT 1 FROM users WHERE BINARY username <> BINARY CONVERT(username USING ascii) LIMIT 1",
-    )
-    .fetch_optional(&db.0)
-    .await
-    .map_err(|_| legacy_preflight_error("username.encoding_read"))?;
-    if bad.is_some() {
-        return Err(legacy_preflight_error("username.encoding"));
-    }
-    Ok(())
-}
-
-async fn username_target_has_no_collision(db: &DbPool) -> Result<(), ControllerError> {
-    let collision = sqlx::query("SELECT 1 FROM users GROUP BY CONVERT(username USING ascii) COLLATE ascii_bin HAVING COUNT(*) > 1 LIMIT 1")
-        .fetch_optional(&db.0).await
-        .map_err(|_| legacy_preflight_error("username.collision_read"))?;
-    if collision.is_some() {
-        return Err(legacy_preflight_error("username.collision"));
-    }
-    Ok(())
-}
-
-// The status is only an observation of this read-only pass, never authority to
-// ALTER or DROP: Task 3B2 must re-read each column/CHECK immediately before DDL
-// and use identifiers and statements from the fixed source whitelist only.
-#[allow(dead_code)] // consumed by the subsequent legacy write phase
-struct LegacyPreflight {
-    old_columns: [bool; 11], // positional keys are IDENTITY_COLUMNS, never database names
-    observed_checks: Vec<(&'static str, &'static str)>,
-}
-
-fn legacy_preflight_error(code: &'static str) -> ControllerError {
-    ControllerError::Config(format!("legacy preflight {code}"))
-}
-
-fn validate_identity_status(version: i32, status: &[bool]) -> Result<(), ControllerError> {
-    if status.len() != 11 || IDENTITY_COLUMNS.len() != 11 {
-        return Err(legacy_preflight_error("column.count"));
-    }
-    if version == 2 && status.iter().any(|old| *old) {
-        return Err(legacy_preflight_error("column.v2_old"));
-    }
-    if !matches!(version, 1 | 2) {
-        return Err(legacy_preflight_error("version"));
-    }
-    Ok(())
-}
-
-trait LegacyPreflightProbe {
-    fn read_legacy_meta(
-        &self,
-    ) -> impl std::future::Future<Output = Result<Vec<(i8, i32)>, ControllerError>> + Send;
-    fn legacy_shape(
-        &self,
-        version: i32,
-    ) -> impl std::future::Future<
-        Output = Result<Vec<(&'static str, &'static str)>, ControllerError>,
-    > + Send;
-    fn no_foreign_keys(
-        &self,
-    ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
-    fn identity_rows(
-        &self,
-        version: i32,
-    ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
-    fn column_status(
-        &self,
-        version: i32,
-    ) -> impl std::future::Future<Output = Result<Vec<bool>, ControllerError>> + Send;
-    fn negative(
-        &self,
-        query: &'static str,
-    ) -> impl std::future::Future<Output = Result<bool, ControllerError>> + Send;
-    fn username_encoding(
-        &self,
-    ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
-    fn username_collision(
-        &self,
-    ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
-}
-
-// Reused by the strict pre-CAS v3 gate after the legacy steps have finished.
-async fn preflight_legacy_for_v3(
-    db: &DbPool,
-    version: i32,
-) -> Result<LegacyPreflight, ControllerError> {
-    preflight_legacy_with_probe(db, version).await
-}
-
-async fn preflight_legacy_with_probe(
-    probe: &impl LegacyPreflightProbe,
-    version: i32,
-) -> Result<LegacyPreflight, ControllerError> {
-    if !matches!(version, 1 | 2) {
-        return Err(legacy_preflight_error("version"));
-    }
-    let meta = probe
-        .read_legacy_meta()
+async fn read_runtime_table_presence(db: &DbPool) -> Result<RuntimeTablePresence, ControllerError> {
+    let names: Vec<String> = sqlx::query_scalar(RUNTIME_TABLE_PRESENCE_QUERY)
+        .fetch_all(&db.0)
         .await
-        .map_err(|_| legacy_preflight_error("meta.read"))?;
-    if meta.as_slice() != [(1, version)] {
-        return Err(legacy_preflight_error("meta.singleton"));
-    }
-    let observed_checks = probe
-        .legacy_shape(version)
-        .await
-        .map_err(|_| legacy_preflight_error("shape"))?;
-    let mut unique_checks = Vec::new();
-    for &(table, name) in &observed_checks {
-        if known_legacy_check(table, name) != Some((table, name))
-            || unique_checks.contains(&(table, name))
-        {
-            return Err(legacy_preflight_error("check.whitelist"));
-        }
-        unique_checks.push((table, name));
-    }
-    probe
-        .no_foreign_keys()
-        .await
-        .map_err(|_| legacy_preflight_error("foreign_keys"))?;
-    probe
-        .identity_rows(version)
-        .await
-        .map_err(|_| legacy_preflight_error("data"))?;
-    let status = probe
-        .column_status(version)
-        .await
-        .map_err(|_| legacy_preflight_error("column.read"))?;
-    validate_identity_status(version, &status)?;
-    for ((table, column, negative_query, _), old) in IDENTITY_COLUMNS.iter().zip(&status) {
-        if *old
-            && !negative_query.is_empty()
-            && probe
-                .negative(negative_query)
-                .await
-                .map_err(|_| legacy_preflight_error("counter.read"))?
-        {
-            return Err(ControllerError::Config(format!(
-                "negative identity column {table}.{column}"
-            )));
-        }
-    }
-    probe
-        .username_encoding()
-        .await
-        .map_err(|_| legacy_preflight_error("username.encoding"))?;
-    probe
-        .username_collision()
-        .await
-        .map_err(|_| legacy_preflight_error("username.collision"))?;
-    Ok(LegacyPreflight {
-        old_columns: status
-            .try_into()
-            .map_err(|_| legacy_preflight_error("column.count"))?,
-        observed_checks,
+        .map_err(|_| v4_schema_error("runtime table presence read failed"))?;
+    let present = |name: &str| names.iter().any(|seen| seen == name);
+    Ok(RuntimeTablePresence {
+        main_tasks: present("main_tasks"),
+        sub_tasks: present("sub_tasks"),
+        task_previews: present("task_previews"),
+        device_operation_locks: present("device_operation_locks"),
+        recovery_checks: present("recovery_checks"),
     })
 }
 
-impl LegacyPreflightProbe for DbPool {
-    async fn read_legacy_meta(&self) -> Result<Vec<(i8, i32)>, ControllerError> {
-        let rows = sqlx::query("SELECT singleton,schema_version FROM schema_meta LIMIT 2")
-            .fetch_all(&self.0)
-            .await
-            .map_err(|_| legacy_preflight_error("meta.read"))?;
-        rows.iter()
-            .map(|row| {
-                Ok((
-                    row.try_get("singleton")
-                        .map_err(|_| legacy_preflight_error("meta.decode"))?,
-                    row.try_get("schema_version")
-                        .map_err(|_| legacy_preflight_error("meta.decode"))?,
-                ))
-            })
-            .collect()
-    }
-    async fn legacy_shape(
-        &self,
-        version: i32,
-    ) -> Result<Vec<(&'static str, &'static str)>, ControllerError> {
-        validate_legacy_shape(self, version).await
-    }
-    async fn no_foreign_keys(&self) -> Result<(), ControllerError> {
-        require_no_identity_foreign_keys(self).await
-    }
-    async fn identity_rows(&self, version: i32) -> Result<(), ControllerError> {
-        crate::integrity::validate_identity_rows_for_version(self, version).await
-    }
-    async fn column_status(&self, version: i32) -> Result<Vec<bool>, ControllerError> {
-        let mut status = Vec::with_capacity(IDENTITY_COLUMNS.len());
-        for &(table, column, _, _) in IDENTITY_COLUMNS {
-            let actual = read_column(self, table, column)
-                .await
-                .map_err(|_| legacy_preflight_error("column.read"))?;
-            status.push(validate_legacy_column(version, table, column, &actual)?);
-        }
-        Ok(status)
-    }
-    async fn negative(&self, query: &'static str) -> Result<bool, ControllerError> {
-        if !IDENTITY_COLUMNS
-            .iter()
-            .any(|entry| entry.2 == query && !query.is_empty())
-        {
-            return Err(legacy_preflight_error("counter.query"));
-        }
-        Ok(sqlx::query(query)
-            .fetch_optional(&self.0)
-            .await
-            .map_err(|_| legacy_preflight_error("counter.read"))?
-            .is_some())
-    }
-    async fn username_encoding(&self) -> Result<(), ControllerError> {
-        username_encoding_is_lossless(self).await
-    }
-    async fn username_collision(&self) -> Result<(), ControllerError> {
-        username_target_has_no_collision(self).await
-    }
-}
-
-// Only these five 0001 CHECKs may be removed. Each SQL spelling is fixed here,
-// not formatted from metadata returned by the database.
-const LEGACY_CHECK_DROPS: &[(&str, &str, &str)] = &[
-    (
-        "schema_meta",
-        "chk_schema_singleton",
-        "ALTER TABLE schema_meta DROP CHECK chk_schema_singleton",
-    ),
-    (
-        "devices",
-        "chk_devices_state",
-        "ALTER TABLE devices DROP CHECK chk_devices_state",
-    ),
-    (
-        "devices",
-        "chk_devices_decision",
-        "ALTER TABLE devices DROP CHECK chk_devices_decision",
-    ),
-    (
-        "grants",
-        "chk_grants_source",
-        "ALTER TABLE grants DROP CHECK chk_grants_source",
-    ),
-    (
-        "grants",
-        "chk_grants_scope",
-        "ALTER TABLE grants DROP CHECK chk_grants_scope",
-    ),
-];
-
-fn legacy_check_drop_sql(table: &str, name: &str) -> Result<&'static str, ControllerError> {
-    LEGACY_CHECK_DROPS
-        .iter()
-        .find(|&&(fixed_table, fixed_name, _)| (table, name) == (fixed_table, fixed_name))
-        .map(|&(_, _, statement)| statement)
-        .ok_or_else(|| legacy_preflight_error("drop whitelist"))
-}
-
-fn same_legacy_snapshot(expected: &LegacyPreflight, actual: &LegacyPreflight) -> bool {
-    expected.old_columns == actual.old_columns
-        && expected.observed_checks.len() == actual.observed_checks.len()
-        && expected
-            .observed_checks
-            .iter()
-            .all(|check| actual.observed_checks.contains(check))
-}
-
-fn require_legacy_snapshot(
-    expected: &LegacyPreflight,
-    actual: &LegacyPreflight,
-) -> Result<(), ControllerError> {
-    if same_legacy_snapshot(expected, actual) {
-        Ok(())
-    } else {
-        Err(legacy_preflight_error("unexpected state drift"))
-    }
-}
-
-impl LegacyUpgradeProbe for DbPool {
-    async fn alter(&self, statement: &'static str) -> Result<(), ControllerError> {
-        if IDENTITY_MIGRATION
-            .split(';')
-            .map(str::trim)
-            .filter(|sql| !sql.is_empty())
-            .ne(IDENTITY_COLUMNS.iter().map(|entry| entry.3))
-            || !IDENTITY_COLUMNS.iter().any(|entry| entry.3 == statement)
-        {
-            return Err(legacy_preflight_error("alter whitelist"));
-        }
-        sqlx::query(statement)
-            .execute(&self.0)
-            .await
-            .map_err(|_| legacy_preflight_error("alter failed"))?;
-        Ok(())
-    }
-
-    async fn drop_known_check(
-        &self,
-        table: &'static str,
-        name: &'static str,
-    ) -> Result<(), ControllerError> {
-        let statement = legacy_check_drop_sql(table, name)?;
-        sqlx::query(statement)
-            .execute(&self.0)
-            .await
-            .map_err(|_| legacy_preflight_error("drop failed"))?;
-        Ok(())
-    }
-
-    async fn strict_v3_shape_without_meta_update(&self) -> Result<(), ControllerError> {
-        let version = read_version(self)
-            .await?
-            .filter(|version| matches!(version, 1 | 2))
-            .ok_or_else(|| legacy_preflight_error("version"))?;
-        validate_v3_schema_shape(self).await?;
-        require_no_identity_foreign_keys(self).await?;
-        let snapshot = preflight_legacy_for_v3(self, version).await?;
-        if snapshot.old_columns.iter().any(|old| *old) || !snapshot.observed_checks.is_empty() {
-            return Err(legacy_preflight_error("target not ready"));
-        }
-        Ok(())
-    }
-
-    async fn cas_version(&self, from: i32, to: i32) -> Result<u64, ControllerError> {
-        if !matches!(from, 1 | 2) || to != 3 {
-            return Err(legacy_preflight_error("version"));
-        }
-        let result = sqlx::query(
-            "UPDATE schema_meta SET schema_version = 3 WHERE singleton = 1 AND schema_version = ?",
-        )
-        .bind(from)
-        .execute(&self.0)
-        .await
-        .map_err(|_| legacy_preflight_error("version CAS failed"))?;
-        Ok(result.rows_affected())
-    }
-
-    async fn read_version(&self) -> Result<Option<i32>, ControllerError> {
-        read_version(self).await
-    }
-
-    async fn ready_v3(&self) -> Result<(), ControllerError> {
-        check_v3_ready_with_probe(self).await
-    }
-}
-
-trait LegacyUpgradeProbe: LegacyPreflightProbe {
-    async fn preflight(&self, version: i32) -> Result<LegacyPreflight, ControllerError>
-    where
-        Self: Sized,
-    {
-        preflight_legacy_with_probe(self, version).await
-    }
-    async fn alter(&self, statement: &'static str) -> Result<(), ControllerError>;
-    async fn drop_known_check(
-        &self,
-        table: &'static str,
-        name: &'static str,
-    ) -> Result<(), ControllerError>;
-    async fn strict_v3_shape_without_meta_update(&self) -> Result<(), ControllerError>;
-    async fn cas_version(&self, from: i32, to: i32) -> Result<u64, ControllerError>;
-    async fn read_version(&self) -> Result<Option<i32>, ControllerError>;
-    async fn ready_v3(&self) -> Result<(), ControllerError>;
-}
-
-/// 迁移期元数据查询的边界保护：TiDB 在连续 `MODIFY COLUMN` 后可能让
-/// `information_schema` 读取短暂不可用，表现为查询长时间不返回而不是报错。
-/// 这里给每次 preflight 加单次超时与有限重试，把「无限挂起」变成可观察的成功或
-/// 明确失败，绝不把超时当成资产通过。
-async fn preflight_with_retry<P>(
-    probe: &P,
-    version: i32,
-) -> Result<LegacyPreflight, ControllerError>
-where
-    P: LegacyUpgradeProbe + Sized,
-{
-    // 探测式重试：TiDB 在 DDL 之后可能让单条 `information_schema` 查询长时间
-    // 不返回。用短超时反复探测（而不是一次长超时）可以在元数据一就绪时立刻继续，
-    // 同时保证总等待有硬上限：超过上限返回明确错误，绝不冒充成功。
-    const ATTEMPTS: usize = 120;
-    const PER_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(3);
-    const BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
-    let mut last: Option<ControllerError> = None;
-    for attempt in 0..ATTEMPTS {
-        match tokio::time::timeout(PER_ATTEMPT, probe.preflight(version)).await {
-            Ok(Ok(snapshot)) => return Ok(snapshot),
-            Ok(Err(error)) => return Err(error),
-            Err(_) => {
-                last = Some(legacy_preflight_error("preflight timeout"));
-                if attempt + 1 < ATTEMPTS {
-                    tokio::time::sleep(BACKOFF).await;
-                }
-            }
-        }
-    }
-    Err(last.unwrap_or_else(|| legacy_preflight_error("preflight timeout")))
-}
-
-async fn upgrade_legacy_with_probe(
-    probe: &impl LegacyUpgradeProbe,
-    version: i32,
-) -> Result<(), ControllerError> {
-    if !matches!(version, 1 | 2) {
-        return Err(legacy_preflight_error("version"));
-    }
-    // Full version/shape/CHECK/FK/data/counter/username preflight precedes
-    // *every* DDL, not just the first; independently recheck its outcome.
-    let mut trusted = preflight_with_retry(probe, version).await?;
-    for (index, &(_, _, _, statement)) in IDENTITY_COLUMNS.iter().enumerate() {
-        if !trusted.old_columns[index] {
-            continue; // Nontransactional retry: this exact ALTER already landed.
-        }
-        let before = preflight_with_retry(probe, version).await?;
-        require_legacy_snapshot(&trusted, &before)?;
-        if !before.old_columns[index] || version != 1 {
-            return Err(legacy_preflight_error("alter precondition"));
-        }
-        let ddl = probe.alter(statement).await;
-        // Even an Err can have applied a nontransactional ALTER. Re-read for
-        // diagnosis but never convert an uncertain result into success.
-        let after = preflight_with_retry(probe, version).await;
-        ddl?;
-        let after = after?;
-        let mut expected = before;
-        expected.old_columns[index] = false;
-        require_legacy_snapshot(&expected, &after)?;
-        trusted = after;
-    }
-    for &(table, name, _) in LEGACY_CHECK_DROPS {
-        if !trusted.observed_checks.contains(&(table, name)) {
-            continue;
-        }
-        let before = preflight_with_retry(probe, version).await?;
-        require_legacy_snapshot(&trusted, &before)?;
-        if !before.observed_checks.contains(&(table, name)) {
-            return Err(legacy_preflight_error("drop precondition"));
-        }
-        let ddl = probe.drop_known_check(table, name).await;
-        let after = preflight_with_retry(probe, version).await;
-        ddl?;
-        let after = after?;
-        let mut expected = before;
-        expected
-            .observed_checks
-            .retain(|check| *check != (table, name));
-        require_legacy_snapshot(&expected, &after)?;
-        trusted = after;
-    }
-    let final_read = preflight_with_retry(probe, version).await?;
-    require_legacy_snapshot(&trusted, &final_read)?;
-    if final_read.old_columns.iter().any(|old| *old) || !final_read.observed_checks.is_empty() {
-        return Err(legacy_preflight_error("target not ready"));
-    }
-    probe.strict_v3_shape_without_meta_update().await?;
-    let affected = probe.cas_version(version, 3).await;
-    if !matches!(affected, Ok(1)) {
-        // Read only for operator diagnosis. A successful read of 3 after a
-        // failed CAS does NOT prove this caller can claim a completed upgrade.
-        let _observed = probe.read_version().await;
-        return Err(ControllerError::Config(
-            "legacy version CAS outcome uncertain".into(),
-        ));
-    }
-    if !matches!(probe.read_version().await, Ok(Some(3))) {
-        // A reported single CAS row is insufficient evidence that the
-        // persisted version is 3. Unknown/old/read failure stays uncertain.
-        return Err(ControllerError::Config(
-            "legacy version CAS outcome uncertain".into(),
-        ));
-    }
-    probe.ready_v3().await
-}
-
-#[allow(dead_code)] // historical reference; active fixture preflight uses full legacy probe
-async fn preflight_values(db: &DbPool, status: &[bool]) -> Result<(), ControllerError> {
-    validate_identity_status(1, status)?;
-    scan_legacy_usernames(db).await?;
-    for ((table, column, negative_query, _), old) in IDENTITY_COLUMNS.iter().zip(status) {
-        if *old && !negative_query.is_empty() {
-            let found = sqlx::query(negative_query)
-                .fetch_optional(&db.0)
-                .await
-                .map_err(|_| legacy_preflight_error("counter.read"))?;
-            if found.is_some() {
-                return Err(ControllerError::Config(format!(
-                    "negative identity column {table}.{column}"
-                )));
-            }
-        }
-    }
-    username_encoding_is_lossless(db).await?;
-    username_target_has_no_collision(db).await
-}
-
-// The complete v3 baseline is only for an authorized, genuinely empty schema.
-// Every identifier comes from the checked-in migration and the fixed TABLES set.
-fn v3_create_statements() -> Result<Vec<(&'static str, &'static str)>, ControllerError> {
-    let mut statements = Vec::new();
-    for statement in V3_MIGRATION
-        .split(';')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        let table = statement
-            .strip_prefix("CREATE TABLE IF NOT EXISTS ")
-            .and_then(|rest| rest.split_once(" ("))
-            .map(|(name, _)| name)
-            .ok_or_else(|| ControllerError::Config("invalid v3 baseline SQL".into()))?;
-        if !TABLES.iter().any(|(known, _, _)| *known == table)
-            || statements.iter().any(|(name, _)| *name == table)
-            || statement.to_ascii_uppercase().contains("FOREIGN KEY")
-            || statement.to_ascii_uppercase().contains(" CHECK ")
-        {
-            return Err(ControllerError::Config("invalid v3 baseline SQL".into()));
-        }
-        statements.push((table, statement));
-    }
-    if statements.len() != TABLES.len() {
-        return Err(ControllerError::Config("incomplete v3 baseline SQL".into()));
-    }
-    Ok(statements)
-}
-
-// Historical 0001 is immutable; only its eleven known CREATE statements may
-// run in a previously confirmed empty schema. Never repair partial creation.
-fn v1_create_statements() -> Result<Vec<(&'static str, &'static str)>, ControllerError> {
-    let mut statements = Vec::new();
-    for statement in MIGRATION
-        .split(';')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        let table = statement
-            .strip_prefix("CREATE TABLE IF NOT EXISTS ")
-            .and_then(|rest| rest.split_once(" ("))
-            .map(|(name, _)| name)
-            .ok_or_else(|| legacy_preflight_error("baseline SQL"))?;
-        if !TABLES.iter().any(|(known, _, _)| *known == table)
-            || statements.iter().any(|(name, _)| *name == table)
-            || statement.to_ascii_uppercase().contains("FOREIGN KEY")
-        {
-            return Err(legacy_preflight_error("baseline SQL"));
-        }
-        statements.push((table, statement));
-    }
-    if statements.len() != TABLES.len() {
-        return Err(legacy_preflight_error("baseline SQL"));
-    }
-    Ok(statements)
-}
-
-trait FreshIdentityMigrationProbe: IdentitySchemaProbe {
+/// v4 fresh 建库探针：在只读门禁探针之上补上唯一的写路径三件事
+/// （按固定 DDL 建一张表、确认 16 表皆空、写入 v4 元数据行）。
+/// 真实实现仅由 `DbPool` 提供；离线测试注入受控 fake 验证顺序与失败即停。
+trait FreshV4Probe: IdentitySchemaProbe {
+    /// 当前库中已存在的全部表名（information_schema 视角）。
     fn schema_tables(
         &self,
     ) -> impl std::future::Future<Output = Result<Vec<String>, ControllerError>> + Send;
+    /// 执行一条白名单内的固定 CREATE 语句（DDL 非事务）。
     fn create_table(
         &self,
         statement: &str,
     ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
-    fn validate_empty_data(
+    /// 16 张表必须全部零行。
+    fn validate_tables_are_empty(
         &self,
     ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
-    fn insert_v3_meta(
+    /// 写入 `schema_meta` 单行：`singleton = 1`、`schema_version = 4`、未初始化。
+    fn insert_v4_meta(
         &self,
     ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
 }
 
-async fn upgrade_fresh_v3(probe: &impl FreshIdentityMigrationProbe) -> Result<(), ControllerError> {
-    match probe.read_version().await? {
-        Some(3) => return check_v3_ready_with_probe(probe).await,
-        Some(1 | 2) => {
-            return Err(ControllerError::Config(
-                "legacy v3 upgrade not ready".into(),
-            ));
-        }
-        Some(_) => {
-            return Err(ControllerError::Config(
-                "unsupported test identity schema version".into(),
-            ));
-        }
-        None => {}
+/// 空库 → 完整 v4 的唯一建库流程（显式入口专用，普通启动路径绝不隐式调用）：
+///
+/// 1. 版本必须"不存在"——已有任何版本行（含 v4）都拒绝，绝不就地升级或续迁；
+/// 2. **第一条 DDL 之前**必须确认库中零张表：部分建表、旧表、未知表一律拒绝，
+///    因此本函数在任何拒绝路径上的写入次数恒为 0；
+/// 3. 逐条执行 `schema/v4.sql` 的 16 条固定 CREATE，每条后复核已见表集合
+///    恰为预期前缀（漂移即停，绝不自动修复）；
+/// 4. 完整形状 + 无 FK + 16 表皆空；
+/// 5. 写入 `schema_meta(schema_version = 4)`；结果不确定时绝不宣称成功；
+/// 6. 复核版本落定为 4，再跑一次与普通启动完全相同的只读闭合门禁。
+async fn create_v4_schema_with_probe(probe: &impl FreshV4Probe) -> Result<(), ControllerError> {
+    if probe.read_version().await?.is_some() {
+        return Err(v4_schema_error("fresh create requires an empty database"));
     }
-    let statements = v3_create_statements()?;
     if !probe.schema_tables().await?.is_empty() {
-        return Err(ControllerError::Config(
-            "nonempty unversioned test schema requires manual handling".into(),
+        return Err(v4_schema_error(
+            "fresh create requires zero existing tables before the first DDL",
         ));
     }
-    let mut expected = Vec::new();
-    for (table, statement) in statements {
-        // CREATE is non-transactional. A failed or unverifiable step leaves the
-        // partial unversioned schema for an operator, never an automatic retry.
-        probe.create_table(statement).await?;
-        expected.push(table);
-        let actual = probe.schema_tables().await?;
-        if actual.len() != expected.len()
-            || actual.iter().any(|name| !expected.contains(&name.as_str()))
-        {
-            return Err(ControllerError::Config(
-                "v3 CREATE result not reflected in schema metadata".into(),
+    let mut created: Vec<&'static str> = Vec::new();
+    for (table, statement) in v4_schema_statements()? {
+        probe.create_table(&statement).await?;
+        created.push(table);
+        let observed = probe.schema_tables().await?;
+        let drift = observed.len() != created.len()
+            || created
+                .iter()
+                .any(|name| !observed.iter().any(|seen| seen == name));
+        if drift {
+            return Err(v4_schema_error(
+                "create result disagrees with schema metadata",
             ));
         }
     }
-    probe.validate_v2_shape().await?;
+    probe.validate_shape().await?;
     probe.validate_fk().await?;
-    probe.validate_empty_data().await?;
-    if probe.insert_v3_meta().await.is_err() {
-        // Even when a subsequent read sees version 3, the outcome of this INSERT
-        // is uncertain; never claim success or reset an operator's partial schema.
-        let _observed = probe.read_version().await;
-        let _shape = probe.validate_v2_shape().await;
-        let _fk = probe.validate_fk().await;
-        return Err(ControllerError::Config(
-            "v3 metadata insert uncertain; inspect schema manually".into(),
+    probe.validate_tables_are_empty().await?;
+    if probe.insert_v4_meta().await.is_err() {
+        // 写入返回错误时结果本身不可信：只有读回**成功**并能证明版本行缺失或不是
+        // 受支持版本，才允许固定为"被拒"；读回自身失败无法证明未提交，与"读回已是
+        // 受支持版本"一样都只能报结果不确定。两种情形都绝不宣称成功、绝不自动重试。
+        let outcome = match probe.read_version().await {
+            Err(_) => "version write outcome uncertain",
+            Ok(Some(crate::integrity::SUPPORTED_SCHEMA_VERSION)) => {
+                "version write outcome uncertain"
+            }
+            Ok(_) => "version write rejected",
+        };
+        return Err(v4_schema_error(outcome));
+    }
+    if probe.read_version().await? != Some(crate::integrity::SUPPORTED_SCHEMA_VERSION) {
+        return Err(v4_schema_error(
+            "version readback is not the supported version",
         ));
     }
-    check_v3_ready_with_probe(probe).await
+    check_identity_schema_with_probe(probe).await
 }
 
-impl FreshIdentityMigrationProbe for DbPool {
+impl FreshV4Probe for DbPool {
     async fn schema_tables(&self) -> Result<Vec<String>, ControllerError> {
-        Ok(sqlx::query_scalar("SELECT CAST(table_name AS CHAR) AS table_name FROM information_schema.tables WHERE table_schema = DATABASE()")
-            .fetch_all(&self.0).await?)
-    }
-    async fn create_table(&self, statement: &str) -> Result<(), ControllerError> {
-        sqlx::query(statement).execute(&self.0).await.map_err(|_| {
-            ControllerError::Config(
-                "v3 CREATE failed; partial schema needs manual inspection".into(),
-            )
-        })?;
-        Ok(())
-    }
-    async fn validate_empty_data(&self) -> Result<(), ControllerError> {
-        crate::integrity::validate_identity_rows(self, false).await?;
-        // The bounded scanner checks values; freshness additionally requires *no*
-        // business rows, including otherwise valid rows inserted by another writer.
-        for &(table, _, _) in TABLES {
-            let statement = format!("SELECT 1 FROM {table} LIMIT 1");
-            if sqlx::query(&statement)
-                .fetch_optional(&self.0)
-                .await?
-                .is_some()
-            {
-                return Err(ControllerError::Config(
-                    "v3 fresh schema contains rows before version insert".into(),
-                ));
-            }
-        }
-        Ok(())
-    }
-    async fn insert_v3_meta(&self) -> Result<(), ControllerError> {
-        let result = sqlx::query("INSERT INTO schema_meta (singleton, schema_version, instance_id, initialized, authz_epoch, admin_guard_revision) VALUES (1, 3, ?, FALSE, 0, 0)")
-            .bind(uuid::Uuid::new_v4().as_bytes().as_slice()).execute(&self.0).await?;
-        if result.rows_affected() != 1 {
-            return Err(ControllerError::Config(
-                "v3 metadata insert affected unexpected rows".into(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-async fn upgrade_authorized_with_probe<P>(probe: &P) -> Result<(), ControllerError>
-where
-    P: FreshIdentityMigrationProbe + LegacyUpgradeProbe,
-{
-    match IdentitySchemaProbe::read_version(probe).await? {
-        Some(version @ (1 | 2)) => upgrade_legacy_with_probe(probe, version).await,
-        _ => upgrade_fresh_v3(probe).await,
-    }
-}
-
-async fn upgrade_identity_schema(
-    db: &DbPool,
-    mode: TestMigrationMode,
-) -> Result<(), ControllerError> {
-    match mode {
-        TestMigrationMode::Upgrade => upgrade_authorized_with_probe(db).await,
-        // Historical fixtures remain explicitly selectable development tools;
-        // neither path is reachable from the production startup or Upgrade.
-        TestMigrationMode::FixtureV2 => create_historical_v2_fixture(db).await,
-        TestMigrationMode::FixtureV1 | TestMigrationMode::FixturePartialV1 => {
-            create_historical_v1_fixture(db, mode).await
-        }
-    }
-}
-
-fn v4_migration_error(code: &'static str) -> ControllerError {
-    ControllerError::Config(format!("v4 migration {code}"))
-}
-
-// 固定字面量的五表存在性探测：表名全部硬编码，绝不接受外部输入拼装。
-const RUNTIME_TABLE_PRESENCE_QUERY: &str = "SELECT CAST(table_name AS CHAR) AS table_name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name IN ('main_tasks','sub_tasks','task_previews','device_operation_locks','recovery_checks')";
-
-/// 把 `TASKS_MIGRATION` 解析为五条固定 CREATE 语句：每条必须形如
-/// `CREATE TABLE IF NOT EXISTS <五表白名单之一> (`，不重复、不含
-/// FOREIGN KEY/REFERENCES/CHECK。任何偏差 fail-closed，绝不执行未知 DDL。
-fn tasks_migration_statements() -> Result<Vec<String>, ControllerError> {
-    let mut statements: Vec<(&str, String)> = Vec::new();
-    let sql = TASKS_MIGRATION
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("--"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    for statement in sql
-        .split(';')
-        .map(str::trim)
-        .filter(|statement| !statement.is_empty())
-    {
-        let table = statement
-            .strip_prefix("CREATE TABLE IF NOT EXISTS ")
-            .and_then(|rest| rest.split_once(" ("))
-            .map(|(name, _)| name)
-            .ok_or_else(|| v4_migration_error("invalid runtime DDL"))?;
-        let upper = statement.to_ascii_uppercase();
-        if !RUNTIME_TABLE_NAMES.contains(&table)
-            || statements.iter().any(|(seen, _)| *seen == table)
-            || upper.contains("FOREIGN KEY")
-            || upper.contains("REFERENCES")
-            || upper.contains("CHECK (")
-        {
-            return Err(v4_migration_error("invalid runtime DDL"));
-        }
-        statements.push((table, statement.to_owned()));
-    }
-    if statements.len() != RUNTIME_TABLE_NAMES.len() {
-        return Err(v4_migration_error("incomplete runtime DDL"));
-    }
-    Ok(statements.into_iter().map(|(_, sql)| sql).collect())
-}
-
-/// v3 → v4 显式迁移的探针抽象：真实实现仅由 `DbPool` 提供；离线测试注入
-/// 受控 fake 验证流程与失败回滚。期望版本与 DDL 均为编译期固定值。
-trait SchemaV4MigrationProbe {
-    fn read_version(
-        &self,
-    ) -> impl std::future::Future<Output = Result<Option<i32>, ControllerError>> + Send;
-    fn v3_integrity_preflight(
-        &self,
-    ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
-    fn runtime_table_presence(
-        &self,
-    ) -> impl std::future::Future<Output = Result<RuntimeTablePresence, ControllerError>> + Send;
-    fn create_runtime_tables(
-        &self,
-    ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
-    fn cas_version_v3_to_v4(
-        &self,
-    ) -> impl std::future::Future<Output = Result<(), ControllerError>> + Send;
-}
-
-/// v3 → v4 显式迁移：只由测试/操作员显式调用，普通启动路径绝不隐式执行。
-/// 流程：版本必须恰为 3 → v3 完整性 preflight → 五张 runtime 表必须尚不存在
-/// → 执行 `TASKS_MIGRATION` 五表 DDL → 复核五表齐备 → 事务内把
-/// `schema_meta.schema_version` 从 3 CAS 更新为 4 → 重读确认落定为 4。
-/// DDL 非事务：中途失败留下已建表交由操作员核查，绝不自动修复或伪造成功。
-async fn run_schema_v4_migration_with_probe(
-    probe: &impl SchemaV4MigrationProbe,
-) -> Result<(), ControllerError> {
-    if probe.read_version().await? != Some(IDENTITY_SCHEMA_VERSION) {
-        return Err(v4_migration_error("requires schema version 3"));
-    }
-    probe.v3_integrity_preflight().await?;
-    let presence = probe.runtime_table_presence().await?;
-    crate::integrity::validate_runtime_tables_for_version(IDENTITY_SCHEMA_VERSION, &presence)
-        .map_err(|_| v4_migration_error("runtime tables must not exist before DDL"))?;
-    probe.create_runtime_tables().await?;
-    let presence = probe.runtime_table_presence().await?;
-    crate::integrity::validate_runtime_tables_for_version(
-        crate::integrity::SUPPORTED_SCHEMA_VERSION,
-        &presence,
-    )
-    .map_err(|_| v4_migration_error("runtime tables incomplete after DDL"))?;
-    probe.cas_version_v3_to_v4().await?;
-    // A reported successful CAS is insufficient evidence that the persisted
-    // version is 4. Unknown/old/read failure stays uncertain.
-    if probe.read_version().await? != Some(crate::integrity::SUPPORTED_SCHEMA_VERSION) {
-        return Err(v4_migration_error("version CAS outcome uncertain"));
-    }
-    Ok(())
-}
-
-/// 显式 v3 → v4 迁移入口（操作员/测试专用）。绝不在 `check_identity_schema`
-/// 或任何启动路径中被隐式调用；迁移前库必须已是完整 v3（preflight 校验），
-/// 迁移成功后 `schema_version = 4` 且五张 runtime 表齐备。
-pub async fn run_schema_v4_migration(db: &DbPool) -> Result<(), ControllerError> {
-    run_schema_v4_migration_with_probe(db).await
-}
-
-impl SchemaV4MigrationProbe for DbPool {
-    async fn read_version(&self) -> Result<Option<i32>, ControllerError> {
-        read_version(self).await
-    }
-    async fn v3_integrity_preflight(&self) -> Result<(), ControllerError> {
-        validate_v3_schema_shape(self).await?;
-        require_no_identity_foreign_keys(self).await?;
-        crate::integrity::validate_identity_rows_at_version(self, IDENTITY_SCHEMA_VERSION).await
-    }
-    async fn runtime_table_presence(&self) -> Result<RuntimeTablePresence, ControllerError> {
-        let names: Vec<String> = sqlx::query_scalar(RUNTIME_TABLE_PRESENCE_QUERY)
+        sqlx::query_scalar("SELECT CAST(table_name AS CHAR) AS table_name FROM information_schema.tables WHERE table_schema = DATABASE()")
             .fetch_all(&self.0)
             .await
-            .map_err(|_| v4_migration_error("runtime table presence read failed"))?;
-        let present = |name: &str| names.iter().any(|seen| seen == name);
-        Ok(RuntimeTablePresence {
-            main_tasks: present("main_tasks"),
-            sub_tasks: present("sub_tasks"),
-            task_previews: present("task_previews"),
-            device_operation_locks: present("device_operation_locks"),
-            recovery_checks: present("recovery_checks"),
-        })
+            .map_err(|_| v4_schema_error("schema table presence read failed"))
     }
-    async fn create_runtime_tables(&self) -> Result<(), ControllerError> {
-        for statement in tasks_migration_statements()? {
-            // CREATE is non-transactional: a failed step leaves the partial
-            // schema for an operator, never an automatic repair.
-            sqlx::query(&statement)
-                .execute(&self.0)
-                .await
-                .map_err(|_| v4_migration_error("runtime table CREATE failed"))?;
-        }
-        Ok(())
-    }
-    async fn cas_version_v3_to_v4(&self) -> Result<(), ControllerError> {
-        let mut tx = self
-            .0
-            .begin()
-            .await
-            .map_err(|_| v4_migration_error("version CAS transaction begin failed"))?;
-        let result = sqlx::query(
-            "UPDATE schema_meta SET schema_version = 4 WHERE singleton = 1 AND schema_version = 3",
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(|_| v4_migration_error("version CAS failed"))?;
-        if result.rows_affected() != 1 {
-            return Err(v4_migration_error("version CAS affected unexpected rows"));
-        }
-        tx.commit()
-            .await
-            .map_err(|_| v4_migration_error("version CAS commit failed"))
-    }
-}
-
-trait FixtureV2Probe: LegacyUpgradeProbe + FreshIdentityMigrationProbe {
-    async fn create_v1_table(&self, statement: &'static str) -> Result<(), ControllerError>;
-    async fn validate_created_v1(&self) -> Result<(), ControllerError>;
-    async fn insert_v1_meta(&self) -> Result<(), ControllerError>;
-    async fn cas_fixture_v2(&self) -> Result<u64, ControllerError>;
-}
-
-async fn fixture_v2_with_probe(probe: &impl FixtureV2Probe) -> Result<(), ControllerError> {
-    // Non-resumable by design: only None + reliably zero tables may run 0001.
-    if IdentitySchemaProbe::read_version(probe).await?.is_some() {
-        return Err(legacy_preflight_error("fixture-v2 requires empty schema"));
-    }
-    let statements = v1_create_statements()?;
-    if !probe.schema_tables().await?.is_empty() {
-        return Err(legacy_preflight_error("fixture-v2 requires zero tables"));
-    }
-    let mut expected = Vec::new();
-    for (table, statement) in statements {
-        probe.create_v1_table(statement).await?;
-        expected.push(table);
-        let actual = probe.schema_tables().await?;
-        if actual.len() != expected.len()
-            || actual.iter().any(|name| !expected.contains(&name.as_str()))
-        {
-            return Err(legacy_preflight_error("fixture-v2 CREATE drift"));
-        }
-    }
-    probe.validate_created_v1().await?;
-    probe.validate_empty_data().await?;
-    probe.insert_v1_meta().await?;
-    if !matches!(IdentitySchemaProbe::read_version(probe).await, Ok(Some(1))) {
-        return Err(legacy_preflight_error("fixture-v2 v1 insert uncertain"));
-    }
-    let mut trusted = probe.preflight(1).await?;
-    if trusted.old_columns.iter().any(|old| !*old) {
-        return Err(legacy_preflight_error("fixture-v2 v1 columns"));
-    }
-    for (index, &(_, _, _, statement)) in IDENTITY_COLUMNS.iter().enumerate() {
-        let before = probe.preflight(1).await?;
-        require_legacy_snapshot(&trusted, &before)?;
-        if !before.old_columns[index] {
-            return Err(legacy_preflight_error("fixture-v2 ALTER precondition"));
-        }
-        let ddl = probe.alter(statement).await;
-        // A failed nontransactional ALTER might still have applied. Re-read,
-        // but never convert an uncertain result into success.
-        let after = probe.preflight(1).await;
-        ddl?;
-        let after = after?;
-        let mut expected = before;
-        expected.old_columns[index] = false;
-        require_legacy_snapshot(&expected, &after)?;
-        trusted = after;
-    }
-    let final_read = probe.preflight(1).await?;
-    require_legacy_snapshot(&trusted, &final_read)?;
-    if final_read.old_columns.iter().any(|old| *old) {
-        return Err(legacy_preflight_error("fixture-v2 target columns"));
-    }
-    let cas = probe.cas_fixture_v2().await;
-    if !matches!(cas, Ok(1)) {
-        let _observed = IdentitySchemaProbe::read_version(probe).await;
-        return Err(legacy_preflight_error("fixture-v2 CAS uncertain"));
-    }
-    if !matches!(IdentitySchemaProbe::read_version(probe).await, Ok(Some(2))) {
-        return Err(legacy_preflight_error("fixture-v2 CAS uncertain"));
-    }
-    let ready = probe.preflight(2).await?;
-    require_legacy_snapshot(&final_read, &ready)
-}
-
-impl FixtureV2Probe for DbPool {
-    async fn create_v1_table(&self, statement: &'static str) -> Result<(), ControllerError> {
-        if !v1_create_statements()?
-            .iter()
-            .any(|&(_, sql)| sql == statement)
-        {
-            return Err(legacy_preflight_error("fixture-v2 CREATE whitelist"));
-        }
+    async fn create_table(&self, statement: &str) -> Result<(), ControllerError> {
         sqlx::query(statement)
             .execute(&self.0)
             .await
-            .map_err(|_| legacy_preflight_error("fixture-v2 CREATE failed"))?;
+            .map_err(|_| v4_schema_error("runtime DDL failed"))?;
         Ok(())
     }
-    async fn validate_created_v1(&self) -> Result<(), ControllerError> {
-        validate_legacy_shape(self, 1).await?;
-        require_no_identity_foreign_keys(self).await?;
-        for &(table, column, _, _) in IDENTITY_COLUMNS {
-            let actual = read_column(self, table, column).await?;
-            if !classify_identity_column(table, column, &actual)? {
-                return Err(legacy_preflight_error("fixture-v2 v1 columns"));
-            }
-        }
-        Ok(())
+    async fn validate_tables_are_empty(&self) -> Result<(), ControllerError> {
+        validate_v4_tables_are_empty(self).await
     }
-    async fn insert_v1_meta(&self) -> Result<(), ControllerError> {
-        let result = sqlx::query("INSERT INTO schema_meta (singleton, schema_version, instance_id, initialized, authz_epoch, admin_guard_revision) VALUES (1, 1, ?, FALSE, 0, 0)")
-            .bind(uuid::Uuid::new_v4().as_bytes().as_slice()).execute(&self.0).await
-            .map_err(|_| legacy_preflight_error("fixture-v2 v1 insert uncertain"))?;
+    async fn insert_v4_meta(&self) -> Result<(), ControllerError> {
+        let result = sqlx::query("INSERT INTO schema_meta (singleton, schema_version, instance_id, initialized, authz_epoch, admin_guard_revision) VALUES (1, ?, ?, FALSE, 0, 0)")
+            .bind(crate::integrity::SUPPORTED_SCHEMA_VERSION)
+            .bind(uuid::Uuid::new_v4().as_bytes().as_slice())
+            .execute(&self.0)
+            .await
+            .map_err(|_| v4_schema_error("version write rejected"))?;
         if result.rows_affected() != 1 {
-            return Err(legacy_preflight_error("fixture-v2 v1 insert uncertain"));
+            return Err(v4_schema_error("version write rejected"));
         }
         Ok(())
     }
-    async fn cas_fixture_v2(&self) -> Result<u64, ControllerError> {
-        let result = sqlx::query(
-            "UPDATE schema_meta SET schema_version = 2 WHERE singleton = 1 AND schema_version = 1",
-        )
-        .execute(&self.0)
-        .await
-        .map_err(|_| legacy_preflight_error("fixture-v2 CAS uncertain"))?;
-        Ok(result.rows_affected())
-    }
 }
 
-async fn create_historical_v2_fixture(db: &DbPool) -> Result<(), ControllerError> {
-    fixture_v2_with_probe(db).await
-}
-
-async fn create_historical_v1_fixture(
-    db: &DbPool,
-    mode: TestMigrationMode,
-) -> Result<(), ControllerError> {
-    if IDENTITY_MIGRATION
-        .split(';')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ne(IDENTITY_COLUMNS.iter().map(|(_, _, _, alter)| *alter))
-    {
-        return Err(ControllerError::Config(
-            "identity migration SQL disagrees with fixed whitelist".into(),
-        ));
-    }
-    // All access reaches this private writer only through the authorized test command.
-    let version = read_version(db).await?;
-    if matches!(mode, TestMigrationMode::FixturePartialV1) && version != Some(1) {
-        return Err(ControllerError::Config(
-            "fixture-partial-v1 requires existing v1 test schema".into(),
-        ));
-    }
-    if matches!(mode, TestMigrationMode::FixtureV1) && version.is_some() {
-        return Err(ControllerError::Config(
-            "fixture-v1 requires empty test database".into(),
-        ));
-    }
-    if version == Some(2) {
-        return Err(ControllerError::Config(
-            "historical fixture requires v1".into(),
-        ));
-    }
-    if version.is_none() {
-        let tables: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE()",
-        )
-        .fetch_one(&db.0)
-        .await?;
-        if tables != 0 {
-            return Err(ControllerError::Config(
-                "nonempty unversioned test schema requires manual handling".into(),
-            ));
-        }
-        // 0001 remains byte-identical. A failed CREATE leaves an unversioned partial schema;
-        // never repair it automatically: the operator must inspect the stopped test fixture.
-        for (_, statement) in v1_create_statements()? {
-            sqlx::query(statement).execute(&db.0).await?;
-        }
-        validate_legacy_shape(db, 1).await?;
-        require_no_identity_foreign_keys(db).await?;
-        for &(table, column, _, _) in IDENTITY_COLUMNS {
-            if !classify_identity_column(table, column, &read_column(db, table, column).await?)? {
-                return Err(legacy_preflight_error("fixture-v1 old column"));
-            }
-        }
-        sqlx::query("INSERT INTO schema_meta (singleton, schema_version, instance_id, initialized, authz_epoch, admin_guard_revision) VALUES (1, 1, ?, FALSE, 0, 0)")
-            .bind(uuid::Uuid::new_v4().as_bytes().as_slice()).execute(&db.0).await?;
-        preflight_legacy_for_v3(db, 1).await?;
-    } else if version != Some(1) {
-        return Err(ControllerError::Config(
-            "unsupported test identity schema version".into(),
-        ));
-    }
-    if matches!(mode, TestMigrationMode::FixtureV1) {
-        return Ok(());
-    }
-    let trusted = preflight_legacy_for_v3(db, 1).await?;
-    if matches!(mode, TestMigrationMode::FixturePartialV1) {
-        if !trusted.old_columns[0] {
-            return Err(ControllerError::Config(
-                "fixture partial column already altered".into(),
-            ));
-        }
-        let ddl = sqlx::query(IDENTITY_COLUMNS[0].3).execute(&db.0).await;
-        let after = preflight_legacy_for_v3(db, 1).await;
-        ddl.map_err(|_| legacy_preflight_error("fixture partial ALTER failed"))?;
-        let mut expected = trusted;
-        expected.old_columns[0] = false;
-        require_legacy_snapshot(&expected, &after?)?;
-        return Ok(());
-    }
-    Err(ControllerError::Config(
-        "historical fixture mode not supported for this state".into(),
-    ))
+/// 显式 v4 建库入口（仅由 `run_production_migration` 在门禁与身份复核之后调用）。
+async fn create_v4_schema(db: &DbPool) -> Result<(), ControllerError> {
+    create_v4_schema_with_probe(db).await
 }
 
 pub trait AdmissionStore {
@@ -3213,2370 +1696,33 @@ fn audit_code(decision: ReviewDecision, previous: AdmissionState) -> &'static st
 mod tests {
     use super::*;
 
-    mod readonly_preflight_diagnostic {
-        use super::*;
-        use std::sync::Mutex;
-
-        // Offline tests below exercise summary mapping, not fabricated driver rows.
-        struct UsernameSample<'a> {
-            // Raw access succeeded: value non-NULL, type non-NULL, str/bytes compatibility.
-            metadata: Option<[bool; 4]>,
-            original_str: Result<&'a str, sqlx::Error>,
-            original_bytes: Result<&'a [u8], sqlx::Error>,
-            cast_bytes: Result<&'a [u8], sqlx::Error>,
-        }
-
-        fn username_sample_summary(sample: Option<UsernameSample<'_>>) -> String {
-            let code = |value: Option<bool>| match value {
-                Some(true) => "true",
-                Some(false) => "false",
-                None => "not_evaluated",
-            };
-            let mut fields = [None; 9];
-            let mut class = "not_evaluated";
-            if let Some(sample) = &sample {
-                if let Some(metadata) = sample.metadata {
-                    for (field, value) in fields.iter_mut().zip(metadata) {
-                        *field = Some(value);
-                    }
-                }
-                fields[4] = Some(sample.original_bytes.is_ok());
-                fields[5] = Some(sample.cast_bytes.is_ok());
-                if let (Ok(original), Ok(cast)) = (&sample.original_bytes, &sample.cast_bytes) {
-                    fields[6] = Some(original == cast);
-                }
-                if let Ok(raw) = sample.cast_bytes {
-                    let utf8 = std::str::from_utf8(raw);
-                    fields[7] = Some(utf8.is_ok());
-                    fields[8] = utf8.ok().map(valid_username);
-                }
-                class = if sample.metadata.is_some_and(|metadata| !metadata[0]) {
-                    "null"
-                } else {
-                    match &sample.original_str {
-                        Ok(_) => "none",
-                        Err(sqlx::Error::ColumnDecode { source, .. })
-                            if source.is::<sqlx::error::UnexpectedNullError>() =>
-                        {
-                            "null"
-                        }
-                        Err(sqlx::Error::ColumnDecode { .. })
-                            if matches!(sample.metadata, Some([true, true, false, _])) =>
-                        {
-                            "type_mismatch"
-                        }
-                        Err(
-                            sqlx::Error::ColumnDecode { source, .. } | sqlx::Error::Decode(source),
-                        ) if source.is::<std::str::Utf8Error>() => "utf8",
-                        Err(sqlx::Error::ColumnDecode { .. } | sqlx::Error::Decode(_)) => {
-                            "other_decode"
-                        }
-                        Err(
-                            sqlx::Error::ColumnNotFound(_)
-                            | sqlx::Error::ColumnIndexOutOfBounds { .. },
-                        ) => "column_access",
-                        Err(_) => "other",
-                    }
-                };
-            }
-            let [
-                original_non_null,
-                type_non_null,
-                str_compatible,
-                bytes_compatible,
-                original_bytes_ok,
-                cast_bytes_ok,
-                bytes_equal,
-                utf8_valid,
-                username_valid,
-            ] = fields.map(code);
-            format!(
-                "sample_present={} original_non_null={original_non_null} type_non_null={type_non_null} str_compatible={str_compatible} bytes_compatible={bytes_compatible} original_bytes_ok={original_bytes_ok} cast_bytes_ok={cast_bytes_ok} bytes_equal={bytes_equal} utf8_valid={utf8_valid} username_valid={username_valid} str_error_class={class} diagnostic_complete=true",
-                sample.is_some()
-            )
-        }
-
-        fn sample_evidence(bytes: &[u8]) -> UsernameSample<'_> {
-            UsernameSample {
-                metadata: Some([true, true, false, true]),
-                original_str: Err(sqlx::Error::ColumnDecode {
-                    index: "private-column-marker".into(),
-                    source: "private-error-marker".into(),
-                }),
-                original_bytes: Ok(bytes),
-                cast_bytes: Ok(bytes),
-            }
-        }
-
-        fn assert_sample_fields(summary: &str, expected: &[(&str, &str)]) {
-            let fields: Vec<_> = summary.split_whitespace().collect();
-            assert_eq!(fields.len(), 12);
-            assert!(fields.contains(&"diagnostic_complete=true"));
-            for (key, value) in expected {
-                assert!(
-                    fields.contains(&format!("{key}={value}").as_str()),
-                    "missing {key}={value}"
-                );
-            }
-            for field in fields {
-                let (_, value) = field.split_once('=').unwrap();
-                assert!(
-                    [
-                        "true",
-                        "false",
-                        "not_evaluated",
-                        "none",
-                        "type_mismatch",
-                        "null",
-                        "utf8",
-                        "other_decode",
-                        "column_access",
-                        "other"
-                    ]
-                    .contains(&value)
-                );
-            }
-            assert!(!summary.contains("private-"));
-        }
-
-        #[test]
-        fn username_sample_no_row_is_not_evaluated() {
-            assert_eq!(
-                username_sample_summary(None),
-                "sample_present=false original_non_null=not_evaluated type_non_null=not_evaluated str_compatible=not_evaluated bytes_compatible=not_evaluated original_bytes_ok=not_evaluated cast_bytes_ok=not_evaluated bytes_equal=not_evaluated utf8_valid=not_evaluated username_valid=not_evaluated str_error_class=not_evaluated diagnostic_complete=true"
-            );
-        }
-
-        #[test]
-        fn username_sample_proves_mismatch_without_error_text() {
-            let summary = username_sample_summary(Some(sample_evidence(b"private-user-marker")));
-            assert_sample_fields(
-                &summary,
-                &[
-                    ("sample_present", "true"),
-                    ("original_non_null", "true"),
-                    ("type_non_null", "true"),
-                    ("str_compatible", "false"),
-                    ("bytes_compatible", "true"),
-                    ("original_bytes_ok", "true"),
-                    ("cast_bytes_ok", "true"),
-                    ("bytes_equal", "true"),
-                    ("utf8_valid", "true"),
-                    ("username_valid", "true"),
-                    ("str_error_class", "type_mismatch"),
-                ],
-            );
-        }
-
-        #[test]
-        fn username_sample_null_and_missing_metadata_do_not_prove_mismatch() {
-            for metadata in [
-                Some([false, true, false, true]),
-                Some([true, false, false, true]),
-                None,
-            ] {
-                let mut sample = sample_evidence(b"private-user-marker");
-                sample.metadata = metadata;
-                sample.original_bytes = Err(sqlx::Error::Decode("private-error-marker".into()));
-                sample.cast_bytes = Err(sqlx::Error::Decode("private-error-marker".into()));
-                let expected_class = if metadata.is_some_and(|m| !m[0]) {
-                    "null"
-                } else {
-                    "other_decode"
-                };
-                let compatibility = if metadata.is_some() {
-                    ("false", "true")
-                } else {
-                    ("not_evaluated", "not_evaluated")
-                };
-                assert_sample_fields(
-                    &username_sample_summary(Some(sample)),
-                    &[
-                        ("str_compatible", compatibility.0),
-                        ("bytes_compatible", compatibility.1),
-                        ("bytes_equal", "not_evaluated"),
-                        ("utf8_valid", "not_evaluated"),
-                        ("username_valid", "not_evaluated"),
-                        ("str_error_class", expected_class),
-                    ],
-                );
-            }
-        }
-
-        #[test]
-        fn username_sample_strict_utf8_and_username_dependencies() {
-            let invalid = [0xff];
-            for (bytes, utf8, valid) in [
-                (invalid.as_slice(), "false", "not_evaluated"),
-                (b"bad name".as_slice(), "true", "false"),
-            ] {
-                assert_sample_fields(
-                    &username_sample_summary(Some(sample_evidence(bytes))),
-                    &[("utf8_valid", utf8), ("username_valid", valid)],
-                );
-            }
-            let mut sample = sample_evidence(b"private-user-marker");
-            sample.original_bytes = Ok(b"different-private-marker");
-            assert_sample_fields(
-                &username_sample_summary(Some(sample)),
-                &[("bytes_equal", "false")],
-            );
-        }
-
-        #[test]
-        fn username_sample_unknown_errors_are_closed_and_success_is_none() {
-            for (result, class) in [
-                (
-                    Err(sqlx::Error::ColumnDecode {
-                        index: "private-column-marker".into(),
-                        source: "private-error-marker".into(),
-                    }),
-                    "other_decode",
-                ),
-                (
-                    Err(sqlx::Error::ColumnNotFound("private-column-marker".into())),
-                    "column_access",
-                ),
-                (
-                    Err(sqlx::Error::Protocol("private-error-marker".into())),
-                    "other",
-                ),
-                (Ok("private-user-marker"), "none"),
-            ] {
-                let mut sample = sample_evidence(b"private-user-marker");
-                sample.metadata = Some([true, true, true, true]);
-                sample.original_str = result;
-                assert_sample_fields(
-                    &username_sample_summary(Some(sample)),
-                    &[("str_error_class", class)],
-                );
-            }
-        }
-
-        fn version_class(version: &Result<Option<i32>, ControllerError>) -> &'static str {
-            match version {
-                Ok(None) => "none",
-                Ok(Some(1)) => "v1",
-                Ok(Some(2)) => "v2",
-                Ok(Some(3)) => "v3",
-                Ok(Some(_)) => "unsupported",
-                Err(_) => "unreadable",
-            }
-        }
-
-        fn error_class(error: &ControllerError) -> &'static str {
-            // Exact matching only; never return a slice of the input error.
-            const DATA_CODES: &[&str] = &[
-                "transaction.begin",
-                "transaction.end",
-                "meta.read",
-                "meta.decode",
-                "meta.singleton",
-                "users.read",
-                "users.decode",
-                "users.username",
-                "boolean.read",
-                "boolean.decode",
-                "schema_meta.initialized",
-                "users.active",
-                "users.is_admin",
-                "users.must_change_password",
-                "sessions.revoked",
-                "roles.builtin",
-                "roles.archived",
-                "device_groups.archived",
-                "devices.archived",
-                "devices.read",
-                "devices.decode",
-                "devices.state",
-                "role_permissions.read",
-                "role_permissions.decode",
-                "role_permissions.permission",
-                "grants.length_read",
-                "grants.json_length",
-                "grants.read",
-                "grants.decode",
-                "grants.role_presence",
-                "grants.group_presence",
-                "grants.device_presence",
-                "grants.json",
-                "grants.fields",
-                "reference.read",
-                "sessions",
-                "role_permissions",
-                "group_members",
-                "grants",
-                "admission_decisions",
-                "audit_events",
-            ];
-            const PREFLIGHT_CODES: &[&str] = &[
-                "version",
-                "meta.read",
-                "meta.decode",
-                "meta.singleton",
-                "shape",
-                "check.whitelist",
-                "foreign_keys",
-                "data",
-                "column.read",
-                "column.count",
-                "column.v2_old",
-                "counter.query",
-                "counter.read",
-                "username.encoding_read",
-                "username.encoding",
-                "username.collision_read",
-                "username.collision",
-            ];
-            if let ControllerError::Config(message) = error {
-                for (prefix, codes) in [
-                    ("identity data ", DATA_CODES),
-                    ("legacy preflight ", PREFLIGHT_CODES),
-                ] {
-                    if let Some(suffix) = message.strip_prefix(prefix) {
-                        return codes
-                            .iter()
-                            .copied()
-                            .find(|code| *code == suffix)
-                            .unwrap_or("unclassified");
-                    }
-                }
-                if message.starts_with("negative identity column ")
-                    && IDENTITY_COLUMNS.iter().any(|(table, column, _, _)| {
-                        message == &format!("negative identity column {table}.{column}")
-                    })
-                {
-                    return "negative_value";
-                }
-            }
-            let shape = legacy_diagnostic_shape_code(error).0;
-            if shape == "shape_read_error" {
-                "unclassified"
-            } else {
-                shape
-            }
-        }
-
-        fn column_bitmap(columns: &[Result<bool, ControllerError>; 11]) -> String {
-            columns
-                .iter()
-                .map(|column| match column {
-                    Ok(true) => 'O',
-                    Ok(false) => 'T',
-                    Err(_) => 'U',
-                })
-                .collect()
-        }
-
-        // Input must be a complete, validated production shape result, never a
-        // best-effort name enumeration. No trusted result means all unknown.
-        fn check_bitmap(checks: Result<&[(&str, &str)], &ControllerError>) -> String {
-            let Ok(checks) = checks else {
-                return "UUUUU".into();
-            };
-            let mut bitmap = ['A'; 5];
-            for &(table, name) in checks {
-                let Some(index) = LEGACY_CHECK_DROPS
-                    .iter()
-                    .position(|&(t, n, _)| (t, n) == (table, name))
-                else {
-                    return "UUUUU".into();
-                };
-                if bitmap[index] == 'P' {
-                    return "UUUUU".into();
-                }
-                bitmap[index] = 'P';
-            }
-            bitmap.iter().collect()
-        }
-
-        #[derive(Default)]
-        struct Observation {
-            stages: Vec<&'static str>,
-            error: Option<&'static str>,
-            checks: Option<Vec<(&'static str, &'static str)>>,
-        }
-
-        struct DiagnosticProbe<P> {
-            inner: P,
-            observation: Mutex<Observation>,
-        }
-
-        impl<P> DiagnosticProbe<P> {
-            fn new(inner: P) -> Self {
-                Self {
-                    inner,
-                    observation: Mutex::new(Observation::default()),
-                }
-            }
-
-            async fn record<T>(
-                &self,
-                stage: &'static str,
-                future: impl std::future::Future<Output = Result<T, ControllerError>>,
-            ) -> Result<T, ControllerError> {
-                // Record before polling the delegated read. Preserve its error
-                // before production preflight replaces it with a broader code.
-                self.observation.lock().unwrap().stages.push(stage);
-                let result = future.await;
-                if let Err(error) = &result {
-                    self.observation.lock().unwrap().error = Some(error_class(error));
-                }
-                result
-            }
-        }
-
-        impl<P: LegacyPreflightProbe + Sync> LegacyPreflightProbe for DiagnosticProbe<P> {
-            async fn read_legacy_meta(&self) -> Result<Vec<(i8, i32)>, ControllerError> {
-                self.record("meta", self.inner.read_legacy_meta()).await
-            }
-            async fn legacy_shape(
-                &self,
-                version: i32,
-            ) -> Result<Vec<(&'static str, &'static str)>, ControllerError> {
-                let result = self.record("shape", self.inner.legacy_shape(version)).await;
-                if let Ok(checks) = &result {
-                    self.observation.lock().unwrap().checks = Some(checks.clone());
-                }
-                result
-            }
-            async fn no_foreign_keys(&self) -> Result<(), ControllerError> {
-                self.record("fk", self.inner.no_foreign_keys()).await
-            }
-            async fn identity_rows(&self, version: i32) -> Result<(), ControllerError> {
-                self.record("data", self.inner.identity_rows(version)).await
-            }
-            async fn column_status(&self, version: i32) -> Result<Vec<bool>, ControllerError> {
-                self.record("columns", self.inner.column_status(version))
-                    .await
-            }
-            async fn negative(&self, query: &'static str) -> Result<bool, ControllerError> {
-                self.record("negative", self.inner.negative(query)).await
-            }
-            async fn username_encoding(&self) -> Result<(), ControllerError> {
-                self.record("encoding", self.inner.username_encoding())
-                    .await
-            }
-            async fn username_collision(&self) -> Result<(), ControllerError> {
-                self.record("collision", self.inner.username_collision())
-                    .await
-            }
-        }
-
-        #[test]
-        fn readonly_diagnostic_version_and_errors_are_closed_classes() {
-            for (input, expected) in [
-                (Ok(None), "none"),
-                (Ok(Some(1)), "v1"),
-                (Ok(Some(2)), "v2"),
-                (Ok(Some(3)), "v3"),
-                (Ok(Some(99)), "unsupported"),
-                (
-                    Err(ControllerError::Config("private-marker".into())),
-                    "unreadable",
-                ),
-            ] {
-                assert_eq!(version_class(&input), expected);
-            }
-            for code in [
-                "users.username",
-                "transaction.begin",
-                "transaction.end",
-                "grants.json",
-                "meta.singleton",
-                "users.active",
-                "audit_events",
-            ] {
-                assert_eq!(
-                    error_class(&ControllerError::Config(format!("identity data {code}"))),
-                    code
-                );
-                assert_eq!(
-                    error_class(&ControllerError::Config(format!(
-                        "identity data {code} private-marker"
-                    ))),
-                    "unclassified"
-                );
-            }
-            assert_eq!(
-                error_class(&ControllerError::Config("private-marker".into())),
-                "unclassified"
-            );
-            assert_eq!(
-                error_class(&ControllerError::InvalidArgument),
-                "unclassified"
-            );
-        }
-
-        #[test]
-        fn readonly_diagnostic_bitmaps_preserve_order_and_fail_closed() {
-            let columns = std::array::from_fn(|index| match index % 3 {
-                0 => Ok(true),
-                1 => Ok(false),
-                _ => Err(ControllerError::Config("private-marker".into())),
-            });
-            assert_eq!(column_bitmap(&columns), "OTUOTUOTUOT");
-            assert_eq!(IDENTITY_COLUMNS.len(), 11);
-            assert_eq!(LEGACY_CHECK_DROPS.len(), 5);
-            for (index, &(table, name, _)) in LEGACY_CHECK_DROPS.iter().enumerate() {
-                let mut expected = ['A'; 5];
-                expected[index] = 'P';
-                assert_eq!(
-                    check_bitmap(Ok(&[(table, name)])),
-                    expected.iter().collect::<String>()
-                );
-                assert_eq!(check_bitmap(Ok(&[(table, name), (table, name)])), "UUUUU");
-            }
-            assert_eq!(check_bitmap(Ok(&[])), "AAAAA");
-            assert_eq!(check_bitmap(Ok(&[("private-marker", "unknown")])), "UUUUU");
-            assert_eq!(
-                check_bitmap(Err(&ControllerError::InvalidArgument)),
-                "UUUUU"
-            );
-            // The production reader rejects NULL, unknown, duplicate and invalid clauses.
-            for rows in [
-                vec![(None, None, None)],
-                vec![(
-                    Some("users".into()),
-                    Some("unknown".into()),
-                    Some("1".into()),
-                )],
-                vec![(
-                    Some("schema_meta".into()),
-                    Some("chk_schema_singleton".into()),
-                    None,
-                )],
-            ] {
-                let result = validate_legacy_check_metadata(&rows);
-                assert_eq!(check_bitmap(result.as_deref()), "UUUUU");
-            }
-        }
-
-        #[test]
-        fn readonly_diagnostic_static_entrypoint_has_only_read_paths() {
-            // Static source evidence only: no physical connection or DB behavior proof.
-            let module = include_str!("db.rs")
-                .split_once("    mod readonly_preflight_diagnostic {").unwrap().1
-                .split_once("    #[derive(Clone, Copy, Debug, PartialEq, Eq)]\n    enum DiagnosticTokenClass").unwrap().0;
-            let entry = module.split_once(
-                "\n        async fn mysql_failed_upgrade_readonly_preflight_diagnostic()",
-            );
-            assert!(entry.is_some(), "missing new ignored diagnostic entrypoint");
-            let entry = entry.unwrap().1;
-            for required in [
-                "read_version(&db)",
-                "read_column(&db, table, column)",
-                "classify_identity_column(table, column, &actual)",
-                "preflight_legacy_with_probe(&probe, version)",
-                "check_identity_schema(&db)",
-                "diagnostic_complete=true",
-            ] {
-                assert!(entry.contains(required), "missing read path: {required}");
-            }
-            assert!(entry.contains("let db = DbPool(readonly_diagnostic_pool().await)"));
-            let helper = module
-                .split_once("\n        async fn readonly_diagnostic_pool() -> sqlx::MySqlPool {")
-                .expect("missing shared guarded pool helper")
-                .1
-                .split_once("\n        #[tokio::test]")
-                .unwrap()
-                .0;
-            let sample = module
-                .split_once("\n        async fn mysql_username_decode_readonly_sample() {")
-                .expect("missing independent ignored username sample")
-                .1
-                .split_once("\n        // Read-only diagnostic entrypoint;")
-                .unwrap()
-                .0;
-            for required in [
-                "readonly_diagnostic_pool().await",
-                "SELECT username AS original, CAST(username AS BINARY) AS raw_bytes FROM users ORDER BY id LIMIT 1",
-                "row.try_get_raw(\"original\")",
-                "!raw.is_null()",
-                "!info.is_null()",
-                "<str as sqlx::Type<sqlx::MySql>>::compatible(&info)",
-                "<[u8] as sqlx::Type<sqlx::MySql>>::compatible(&info)",
-                "row.try_get::<&str, _>(\"original\")",
-                "row.try_get::<&[u8], _>(\"original\")",
-                "row.try_get::<&[u8], _>(\"raw_bytes\")",
-                "username_sample_summary(sample)",
-                "pool.close().await",
-            ] {
-                assert!(
-                    sample.contains(required),
-                    "missing bounded sample path: {required}"
-                );
-            }
-            assert_eq!(sample.matches("sqlx::query(").count(), 1);
-            let hook = helper
-                .split_once(".after_connect(")
-                .unwrap()
-                .1
-                .split_once(".connect(&db_url)")
-                .unwrap()
-                .0;
-            for required in [
-                "SELECT DATABASE()",
-                "SELECT VERSION()",
-                "SHOW GRANTS",
-                "validate_schema_metadata_grants(&grants, &expected)",
-                "8.0.46",
-            ] {
-                assert!(
-                    hook.contains(required),
-                    "missing physical connection guard: {required}"
-                );
-            }
-            assert!(helper.contains(".max_connections(1)"));
-            for required in [
-                "actual.as_deref() != Some(expected.as_str())",
-                "version.as_deref() != Some(\"8.0.46\")",
-                "diagnostic_connection_rejected",
-                "diagnostic_connect_failed",
-            ] {
-                assert!(
-                    helper.contains(required),
-                    "missing fail-closed guard: {required}"
-                );
-            }
-            for forbidden in [
-                "run_identity_test_migration",
-                "upgrade_",
-                "fixture_",
-                ".execute(",
-                ".alter(",
-                ".drop_known_check(",
-                ".cas_version(",
-                "LegacyUpgradeProbe",
-                "println!(\"{error}",
-                "println!(\"{error:?}",
-                "try_get_unchecked",
-                "from_utf8_lossy",
-                "unsafe",
-            ] {
-                for source in [entry, helper, sample] {
-                    assert!(!source.contains(forbidden), "unexpected path: {forbidden}");
-                }
-            }
-        }
-
-        struct ReadonlyFake {
-            version: i32,
-            fault: Option<&'static str>,
-        }
-        impl ReadonlyFake {
-            fn gate(&self, stage: &str) -> Result<(), ControllerError> {
-                if self.fault == Some(stage) {
-                    Err(ControllerError::Config(
-                        "identity data users.username".into(),
-                    ))
-                } else {
-                    Ok(())
-                }
-            }
-        }
-        impl LegacyPreflightProbe for ReadonlyFake {
-            async fn read_legacy_meta(&self) -> Result<Vec<(i8, i32)>, ControllerError> {
-                self.gate("meta")?;
-                Ok(vec![(1, self.version)])
-            }
-            async fn legacy_shape(
-                &self,
-                _: i32,
-            ) -> Result<Vec<(&'static str, &'static str)>, ControllerError> {
-                self.gate("shape")?;
-                Ok(LEGACY_CHECK_ORDER.to_vec())
-            }
-            async fn no_foreign_keys(&self) -> Result<(), ControllerError> {
-                self.gate("fk")
-            }
-            async fn identity_rows(&self, _: i32) -> Result<(), ControllerError> {
-                self.gate("data")
-            }
-            async fn column_status(&self, _: i32) -> Result<Vec<bool>, ControllerError> {
-                self.gate("columns")?;
-                Ok(vec![self.version == 1; 11])
-            }
-            async fn negative(&self, _: &'static str) -> Result<bool, ControllerError> {
-                self.gate("negative")?;
-                Ok(false)
-            }
-            async fn username_encoding(&self) -> Result<(), ControllerError> {
-                self.gate("encoding")
-            }
-            async fn username_collision(&self) -> Result<(), ControllerError> {
-                self.gate("collision")
-            }
-        }
-
-        #[tokio::test]
-        async fn readonly_diagnostic_decorator_tracks_real_preflight_order_and_stops() {
-            for version in [1, 2] {
-                let mut stages = vec!["meta", "shape", "fk", "data", "columns"];
-                if version == 1 {
-                    stages.extend(["negative"; 10]);
-                }
-                stages.extend(["encoding", "collision"]);
-                let good = DiagnosticProbe::new(ReadonlyFake {
-                    version,
-                    fault: None,
-                });
-                let result = preflight_legacy_with_probe(&good, version).await.unwrap();
-                assert_eq!(result.old_columns, [version == 1; 11]);
-                assert_eq!(good.observation.lock().unwrap().stages, stages);
-                for (index, &stage) in stages.iter().enumerate() {
-                    if index > 0 && stages[index - 1] == stage {
-                        continue;
-                    }
-                    let bad = DiagnosticProbe::new(ReadonlyFake {
-                        version,
-                        fault: Some(stage),
-                    });
-                    let error = preflight_legacy_with_probe(&bad, version)
-                        .await
-                        .err()
-                        .unwrap();
-                    let observation = bad.observation.lock().unwrap();
-                    assert_eq!(observation.stages, stages[..=index]);
-                    assert_eq!(observation.error, Some("users.username"));
-                    if stage == "data" {
-                        assert_eq!(
-                            error.to_string(),
-                            legacy_preflight_error("data").to_string()
-                        );
-                    }
-                }
-            }
-        }
-        async fn readonly_diagnostic_pool() -> sqlx::MySqlPool {
-            let db_url = std::env::var("RSETUP_TEST_DATABASE_URL")
-                .unwrap_or_else(|_| panic!("diagnostic_env_url_missing"));
-            let expected = std::env::var("RSETUP_EXPECTED_DATABASE")
-                .unwrap_or_else(|_| panic!("diagnostic_env_database_missing"));
-            assert!(!db_url.is_empty(), "diagnostic_env_url_empty");
-            assert!(!expected.is_empty(), "diagnostic_env_database_empty");
-            sqlx::mysql::MySqlPoolOptions::new()
-                .max_connections(1)
-                .after_connect(move |connection, _meta| {
-                    let expected = expected.clone();
-                    Box::pin(async move {
-                        let rejected =
-                            || sqlx::Error::Protocol("diagnostic_connection_rejected".into());
-                        let actual: Option<String> = sqlx::query_scalar("SELECT DATABASE()")
-                            .fetch_one(&mut *connection)
-                            .await
-                            .map_err(|_| rejected())?;
-                        if actual.as_deref() != Some(expected.as_str()) {
-                            return Err(rejected());
-                        }
-                        let version: Option<String> = sqlx::query_scalar("SELECT VERSION()")
-                            .fetch_one(&mut *connection)
-                            .await
-                            .map_err(|_| rejected())?;
-                        if version.as_deref() != Some("8.0.46") {
-                            return Err(sqlx::Error::Protocol("diagnostic_wrong_engine".into()));
-                        }
-                        let rows = sqlx::query("SHOW GRANTS")
-                            .fetch_all(&mut *connection)
-                            .await
-                            .map_err(|_| rejected())?;
-                        let grants = rows
-                            .iter()
-                            .map(|row| row.try_get::<Option<String>, _>(0).map_err(|_| rejected()))
-                            .collect::<Result<Vec<_>, _>>()?;
-                        validate_schema_metadata_grants(&grants, &expected)
-                            .map_err(|_| rejected())?;
-                        Ok(())
-                    })
-                })
-                .connect(&db_url)
-                .await
-                .unwrap_or_else(|_| panic!("diagnostic_connect_failed"))
-        }
-
-        #[tokio::test]
-        #[ignore = "manual one-row SELECT-only MySQL 8.0.46 sample; parent approval and review required"]
-        async fn mysql_username_decode_readonly_sample() {
-            use sqlx::{TypeInfo, ValueRef};
-
-            let pool = readonly_diagnostic_pool().await;
-            let row = sqlx::query("SELECT username AS original, CAST(username AS BINARY) AS raw_bytes FROM users ORDER BY id LIMIT 1")
-                .fetch_optional(&pool)
-                .await
-                .unwrap_or_else(|_| panic!("diagnostic_sample_query_failed"));
-            let sample = row.as_ref().map(|row| UsernameSample {
-                metadata: row.try_get_raw("original").ok().map(|raw| {
-                    let info = raw.type_info();
-                    [
-                        !raw.is_null(),
-                        !info.is_null(),
-                        <str as sqlx::Type<sqlx::MySql>>::compatible(&info),
-                        <[u8] as sqlx::Type<sqlx::MySql>>::compatible(&info),
-                    ]
-                }),
-                original_str: row.try_get::<&str, _>("original"),
-                original_bytes: row.try_get::<&[u8], _>("original"),
-                cast_bytes: row.try_get::<&[u8], _>("raw_bytes"),
-            });
-            let summary = username_sample_summary(sample);
-            pool.close().await;
-            println!("{summary}");
-        }
-
-        // Read-only diagnostic entrypoint; separate from the old None/meta0 probe.
-        #[tokio::test]
-        #[ignore = "manual SELECT-only MySQL 8.0.46 preflight; parent approval and review required"]
-        async fn mysql_failed_upgrade_readonly_preflight_diagnostic() {
-            let db = DbPool(readonly_diagnostic_pool().await);
-            let version = read_version(&db).await;
-            println!("version_class={}", version_class(&version));
-            // Independent observation, not an atomic snapshot with preflight.
-            let mut columns = std::array::from_fn(|_| Err(ControllerError::InvalidArgument));
-            for (index, &(table, column, _, _)) in IDENTITY_COLUMNS.iter().enumerate() {
-                columns[index] = read_column(&db, table, column)
-                    .await
-                    .and_then(|actual| classify_identity_column(table, column, &actual));
-            }
-            println!("old_columns={}", column_bitmap(&columns));
-            let (stage, status, class, checks) = match version {
-                Ok(Some(version @ (1 | 2))) => {
-                    let probe = DiagnosticProbe::new(db.clone());
-                    let result = preflight_legacy_with_probe(&probe, version).await;
-                    let observation = probe.observation.lock().unwrap();
-                    let checks = check_bitmap(
-                        observation
-                            .checks
-                            .as_deref()
-                            .ok_or(&ControllerError::InvalidArgument),
-                    );
-                    match result {
-                        Ok(_) => ("complete", "passed", "none", checks),
-                        Err(error) => (
-                            observation.stages.last().copied().unwrap_or("meta"),
-                            "failed",
-                            observation.error.unwrap_or_else(|| error_class(&error)),
-                            checks,
-                        ),
-                    }
-                }
-                Ok(Some(3)) => match check_identity_schema(&db).await {
-                    // The production v3 ready gate rejects every CHECK.
-                    Ok(()) => ("complete", "passed", "none", "AAAAA".into()),
-                    Err(error) => ("ready", "failed", error_class(&error), "UUUUU".into()),
-                },
-                Ok(None | Some(_)) => ("meta", "not_applicable", "none", "UUUUU".into()),
-                Err(_) => ("meta", "failed", "version_unreadable", "UUUUU".into()),
-            };
-            println!("known_checks={checks}");
-            println!("preflight_stage={stage} preflight_status={status} error_class={class}");
-            db.0.close().await;
-            println!("diagnostic_complete=true");
-            assert!(status != "failed", "diagnostic_preflight_failed");
-        }
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum DiagnosticTokenClass {
-        ParenOpen,
-        ParenClose,
-        Operator,
-        KnownIdentifier,
-        KnownStringLiteral,
-        Keyword,
-        Other,
-        End,
-    }
-
-    #[derive(Debug, PartialEq, Eq)]
-    struct DiagnosticTokenDiff {
-        observed_tokens_parseable: bool,
-        expected_tokens_parseable: bool,
-        observed_token_count: Option<u8>,
-        expected_token_count: Option<u8>,
-        first_mismatch_token_index: Option<u16>,
-        first_mismatch_token_class: Option<DiagnosticTokenClass>,
-        expected_class: Option<DiagnosticTokenClass>,
-    }
-
-    impl DiagnosticTokenClass {
-        fn code(&self) -> &'static str {
-            match self {
-                Self::ParenOpen => "paren/open",
-                Self::ParenClose => "paren/close",
-                Self::Operator => "operator",
-                Self::KnownIdentifier => "known_identifier",
-                Self::KnownStringLiteral => "known_string_literal",
-                Self::Keyword => "keyword",
-                Self::Other => "other",
-                Self::End => "end",
-            }
-        }
-    }
-
-    fn diagnostic_token_class(token: Option<&str>) -> DiagnosticTokenClass {
-        match token {
-            None => DiagnosticTokenClass::End,
-            Some("(") => DiagnosticTokenClass::ParenOpen,
-            Some(")") => DiagnosticTokenClass::ParenClose,
-            Some("=" | ",") => DiagnosticTokenClass::Operator,
-            Some(
-                "singleton" | "admission_state" | "review_decision" | "source_kind" | "role_id"
-                | "permissions" | "scope_kind" | "scope_group_id" | "scope_device_id",
-            ) => DiagnosticTokenClass::KnownIdentifier,
-            Some("'role'" | "'direct'" | "'all'" | "'group'" | "'device'") => {
-                DiagnosticTokenClass::KnownStringLiteral
-            }
-            Some("and" | "or" | "is" | "not" | "null" | "in") => DiagnosticTokenClass::Keyword,
-            Some(_) => DiagnosticTokenClass::Other,
-        }
-    }
-
-    fn diagnostic_token_diff(observed: &str, expected: &str) -> DiagnosticTokenDiff {
-        let observed_tokens = legacy_check_tokens(observed);
-        let expected_tokens = legacy_check_tokens(expected);
-        let observed_token_count = observed_tokens
-            .as_ref()
-            .map(|tokens| tokens.len().min(255) as u8);
-        let expected_token_count = expected_tokens
-            .as_ref()
-            .map(|tokens| tokens.len().min(255) as u8);
-        let mismatch = observed_tokens
-            .as_ref()
-            .zip(expected_tokens.as_ref())
-            .and_then(|(observed, expected)| {
-                (0..observed.len().max(expected.len()))
-                    .find(|&index| observed.get(index) != expected.get(index))
-                    .and_then(|index| {
-                        let mismatch_index = u16::try_from(index).ok()?;
-                        Some((
-                            mismatch_index,
-                            diagnostic_token_class(observed.get(index).map(String::as_str)),
-                            diagnostic_token_class(expected.get(index).map(String::as_str)),
-                        ))
-                    })
-            });
-        DiagnosticTokenDiff {
-            observed_tokens_parseable: observed_tokens.is_some(),
-            expected_tokens_parseable: expected_tokens.is_some(),
-            observed_token_count,
-            expected_token_count,
-            first_mismatch_token_index: mismatch.as_ref().map(|(index, _, _)| *index),
-            first_mismatch_token_class: mismatch.as_ref().map(|(_, class, _)| *class),
-            expected_class: mismatch.map(|(_, _, class)| class),
-        }
-    }
+    // ===== v4-only 基线：版本决策、DDL 解析、空库直建与表集合契约 =====
 
     #[test]
-    fn grant_token_diff_ignores_outer_parentheses_but_detects_reordered_tokens() {
-        let expected = "(source_kind = 'role')";
+    fn production_migration_plan_accepts_only_empty_database_and_v4() {
+        // 生产共享决策：空库 → 直接创建完整 v4。
         assert_eq!(
-            diagnostic_token_diff("(((source_kind = 'role')))", expected),
-            DiagnosticTokenDiff {
-                observed_tokens_parseable: true,
-                expected_tokens_parseable: true,
-                observed_token_count: Some(3),
-                expected_token_count: Some(3),
-                first_mismatch_token_index: None,
-                first_mismatch_token_class: None,
-                expected_class: None,
-            }
+            production_migration_plan(None).unwrap(),
+            ProductionMigrationPlan::CreateV4,
+            "空库必须直接创建完整 v4"
         );
-        assert_eq!(
-            diagnostic_token_diff("(role_id = source_kind)", "(source_kind = role_id)"),
-            DiagnosticTokenDiff {
-                observed_tokens_parseable: true,
-                expected_tokens_parseable: true,
-                observed_token_count: Some(3),
-                expected_token_count: Some(3),
-                first_mismatch_token_index: Some(0),
-                first_mismatch_token_class: Some(DiagnosticTokenClass::KnownIdentifier),
-                expected_class: Some(DiagnosticTokenClass::KnownIdentifier),
-            }
-        );
-    }
-
-    #[test]
-    fn grant_token_diff_reports_unparseable_without_guessing_mismatch() {
-        assert_eq!(
-            diagnostic_token_diff("(source_kind = 'ro\\'le')", "(source_kind = 'role')"),
-            DiagnosticTokenDiff {
-                observed_tokens_parseable: false,
-                expected_tokens_parseable: true,
-                observed_token_count: None,
-                expected_token_count: Some(3),
-                first_mismatch_token_index: None,
-                first_mismatch_token_class: None,
-                expected_class: None,
-            }
-        );
-    }
-
-    #[test]
-    fn grant_token_diff_classifies_only_fixed_categories_and_end() {
-        assert_eq!(
-            diagnostic_token_diff("('rogue')", "('role')"),
-            DiagnosticTokenDiff {
-                observed_tokens_parseable: true,
-                expected_tokens_parseable: true,
-                observed_token_count: Some(1),
-                expected_token_count: Some(1),
-                first_mismatch_token_index: Some(0),
-                first_mismatch_token_class: Some(DiagnosticTokenClass::Other),
-                expected_class: Some(DiagnosticTokenClass::KnownStringLiteral),
-            }
-        );
-        assert_eq!(
-            diagnostic_token_diff("(source_kind)", "(source_kind = 'role')"),
-            DiagnosticTokenDiff {
-                observed_tokens_parseable: true,
-                expected_tokens_parseable: true,
-                observed_token_count: Some(1),
-                expected_token_count: Some(3),
-                first_mismatch_token_index: Some(1),
-                first_mismatch_token_class: Some(DiagnosticTokenClass::End),
-                expected_class: Some(DiagnosticTokenClass::Operator),
-            }
-        );
-    }
-
-    #[test]
-    fn grant_token_diff_bounds_counts_and_classifies_parentheses_keywords() {
-        let many = "source_kind ".repeat(300);
-        let capped = diagnostic_token_diff(&many, &many);
-        assert_eq!(capped.observed_token_count, Some(255));
-        assert_eq!(capped.expected_token_count, Some(255));
-        assert_eq!(capped.first_mismatch_token_index, None);
-
-        let open = diagnostic_token_diff("source_kind = (role_id)", "source_kind = role_id");
-        assert_eq!(open.first_mismatch_token_index, Some(2));
-        assert_eq!(
-            open.first_mismatch_token_class,
-            Some(DiagnosticTokenClass::ParenOpen)
-        );
-        assert_eq!(
-            open.expected_class,
-            Some(DiagnosticTokenClass::KnownIdentifier)
-        );
-
-        let close = diagnostic_token_diff(
-            "source_kind = (role_id) OR role_id",
-            "source_kind = (role_id OR role_id)",
-        );
-        assert_eq!(close.first_mismatch_token_index, Some(4));
-        assert_eq!(
-            close.first_mismatch_token_class,
-            Some(DiagnosticTokenClass::ParenClose)
-        );
-        assert_eq!(close.expected_class, Some(DiagnosticTokenClass::Keyword));
-    }
-
-    // Test-only: compare restored metadata to the original fixed 0001 declaration.
-    // The returned summary never contains tokens or CHECK text.
-    fn fixed_grant_check_token_diff(index: usize, stored: &str) -> Option<DiagnosticTokenDiff> {
-        if !matches!(index, 3 | 4) {
-            return None;
-        }
-        let (table, name, _) = LEGACY_CHECK_DROPS[index];
-        let declared = ddl_parts_from(MIGRATION, table)
-            .into_iter()
-            .find(|part| part.starts_with(&format!("CONSTRAINT {name} CHECK ")))?;
-        let expression = declared.split_once("CHECK ")?.1;
-        let restored = stored.replace("\\'", "'");
-        Some(diagnostic_token_diff(&restored, expression))
-    }
-
-    #[test]
-    fn grant_token_diff_only_uses_two_fixed_declared_checks() {
-        let stored = "((`source_kind` = _utf8mb4\\'role\\' AND `role_id` IS NOT NULL AND `permissions` IS NULL) OR (`source_kind` = _utf8mb4\\'direct\\' AND `role_id` IS NULL AND `permissions` IS NOT NULL))";
-        let diff = fixed_grant_check_token_diff(3, stored).expect("fixed source CHECK");
-        assert!(diff.observed_tokens_parseable);
-        assert!(diff.expected_tokens_parseable);
-        assert_eq!(diff.first_mismatch_token_index, None);
-        assert_eq!(fixed_grant_check_token_diff(0, stored), None);
-        assert_eq!(fixed_grant_check_token_diff(1, stored), None);
-        assert_eq!(fixed_grant_check_token_diff(2, stored), None);
-        assert_eq!(fixed_grant_check_token_diff(5, stored), None);
-
-        let scope = "((`scope_kind` = _utf8mb4\\'all\\' AND `scope_group_id` IS NULL AND `scope_device_id` IS NULL) OR (`scope_kind` = _utf8mb4\\'group\\' AND `scope_group_id` IS NOT NULL AND `scope_device_id` IS NULL) OR (`scope_kind` = _utf8mb4\\'device\\' AND `scope_group_id` IS NULL AND `scope_device_id` IS NOT NULL))";
-        let scope_diff = fixed_grant_check_token_diff(4, scope).expect("fixed scope CHECK");
-        assert!(scope_diff.observed_tokens_parseable);
-        assert!(scope_diff.expected_tokens_parseable);
-        assert_eq!(scope_diff.first_mismatch_token_index, None);
-    }
-
-    #[test]
-    fn grant_token_diff_output_stays_inside_check_mismatch_gate() {
-        let diagnostic = include_str!("db.rs")
-            .split_once("\n    async fn mysql_preserved_v1_legacy_select_gates_diagnostic()")
-            .unwrap()
-            .1
-            .split_once("\n    #[test]\n    fn decode_snapshot_rejects_invalid_pairs")
-            .unwrap()
-            .0;
-        let check_guard = diagnostic
-            .find("if code == \"check_unavailable_or_incompatible\"")
-            .unwrap();
-        let mismatch_guard = diagnostic.find("Some(index @ (3 | 4))").unwrap();
-        let probe = diagnostic
-            .find("fixed_grant_check_escape_probe(index, stored)")
-            .unwrap();
-        let token_diff = diagnostic
-            .find("fixed_grant_check_token_diff(index, stored)")
-            .expect("missing token diff");
-        let output = diagnostic
-            .find("observed_tokens_parseable={}")
-            .expect("missing fixed output");
-        assert!(
-            check_guard < mismatch_guard
-                && mismatch_guard < probe
-                && probe < token_diff
-                && token_diff < output
-        );
-        assert!(diagnostic.contains("first_mismatch_token_class={:?}"));
-        assert!(diagnostic.contains("expected_class={:?}"));
-        let wrapped_probe = diagnostic
-            .find("fixed_wrapped_grant_probe(index, stored)")
-            .expect("missing fixed wrapped-candidate probe");
-        let wrapped_output = diagnostic
-            .find("wrapped_candidate_exact_bytes={} wrapped_candidate_tokens_equal={}")
-            .expect("missing wrapped-candidate booleans");
-        assert!(mismatch_guard < wrapped_probe && wrapped_probe < wrapped_output);
-    }
-
-    // Diagnostic only: full fixed candidates for the atom-wrapping hypothesis.
-    // They are never accepted by the production CHECK validator.
-    fn fixed_wrapped_grant_candidate(index: usize) -> Option<&'static str> {
-        match index {
-            3 => Some(concat!(
-                "(((`source_kind` = _utf8mb4'role') AND (`role_id` IS NOT NULL) AND (`permissions` IS NULL)) OR ",
-                "((`source_kind` = _utf8mb4'direct') AND (`role_id` IS NULL) AND (`permissions` IS NOT NULL)))",
-            )),
-            4 => Some(concat!(
-                "(((`scope_kind` = _utf8mb4'all') AND (`scope_group_id` IS NULL) AND (`scope_device_id` IS NULL)) OR ",
-                "((`scope_kind` = _utf8mb4'group') AND (`scope_group_id` IS NOT NULL) AND (`scope_device_id` IS NULL)) OR ",
-                "((`scope_kind` = _utf8mb4'device') AND (`scope_group_id` IS NULL) AND (`scope_device_id` IS NOT NULL)))",
-            )),
-            _ => None,
-        }
-    }
-
-    fn fixed_wrapped_grant_probe(index: usize, stored: &str) -> Option<(bool, bool)> {
-        let candidate = fixed_wrapped_grant_candidate(index)?;
-        let restored = stored.replace("\\'", "'");
-        Some((
-            stored == candidate.replace('\'', "\\'"),
-            legacy_check_tokens(&restored)
-                .zip(legacy_check_tokens(candidate))
-                .is_some_and(|(observed, expected)| observed == expected),
-        ))
-    }
-
-    #[test]
-    fn fixed_wrapped_grant_candidates_match_only_declared_atom_layouts() {
-        // Compare against the original 0001 tokens using fixed atom widths and
-        // explicit AND/OR positions, never arbitrary parenthesis removal.
-        for (index, groups, count) in [
-            (3, &[&[3, 4, 3][..], &[3, 3, 4][..]][..], 41),
-            (4, &[&[3, 3, 3][..], &[3, 4, 3][..], &[3, 3, 4][..]][..], 61),
-        ] {
-            let (table, name, _) = LEGACY_CHECK_DROPS[index];
-            let declared = ddl_parts_from(MIGRATION, table)
-                .into_iter()
-                .find(|part| part.starts_with(&format!("CONSTRAINT {name} CHECK ")))
-                .expect("fixed 0001 CHECK");
-            let original =
-                legacy_check_tokens(declared.split_once("CHECK ").unwrap().1).expect("0001 tokens");
-            assert_eq!(original.len(), if index == 3 { 29 } else { 43 });
-            let candidate = fixed_wrapped_grant_candidate(index).expect("fixed candidate");
-            let observed = legacy_check_tokens(candidate).expect("fixed candidate tokens");
-            assert_eq!(observed.len(), count);
-            let mut expected_wrapped = Vec::new();
-            let mut cursor = 0;
-            for (group_index, atoms) in groups.iter().enumerate() {
-                assert_eq!(original[cursor], "(");
-                expected_wrapped.push(original[cursor].clone());
-                cursor += 1;
-                for (atom_index, &width) in atoms.iter().enumerate() {
-                    expected_wrapped.push("(".to_owned());
-                    expected_wrapped.extend(original[cursor..cursor + width].iter().cloned());
-                    cursor += width;
-                    expected_wrapped.push(")".to_owned());
-                    if atom_index + 1 < atoms.len() {
-                        assert_eq!(original[cursor], "and");
-                        expected_wrapped.push(original[cursor].clone());
-                        cursor += 1;
-                    }
-                }
-                assert_eq!(original[cursor], ")");
-                expected_wrapped.push(original[cursor].clone());
-                cursor += 1;
-                if group_index + 1 < groups.len() {
-                    assert_eq!(original[cursor], "or");
-                    expected_wrapped.push(original[cursor].clone());
-                    cursor += 1;
-                }
-            }
-            assert_eq!(cursor, original.len());
-            assert_eq!(observed, expected_wrapped);
-            assert_eq!(
-                fixed_wrapped_grant_probe(index, &candidate.replace('\'', "\\'")),
-                Some((true, true))
-            );
-            assert_eq!(fixed_wrapped_grant_probe(0, candidate), None);
-            assert_eq!(fixed_wrapped_grant_probe(1, candidate), None);
-            assert_eq!(fixed_wrapped_grant_probe(2, candidate), None);
-            assert_eq!(fixed_wrapped_grant_probe(5, candidate), None);
-        }
-    }
-
-    #[test]
-    fn fixed_wrapped_grant_probe_rejects_literal_column_connective_and_paren_mutations() {
-        for index in [3, 4] {
-            let candidate = fixed_wrapped_grant_candidate(index).expect("fixed candidate");
-            let escaped = candidate.replace('\'', "\\'");
-            let (literals, columns): (&[&str], &[&str]) = if index == 3 {
-                (
-                    &["role", "direct"],
-                    &["source_kind", "role_id", "permissions"],
-                )
-            } else {
-                (
-                    &["all", "group", "device"],
-                    &["scope_kind", "scope_group_id", "scope_device_id"],
-                )
-            };
-            for literal in literals {
-                let needle = format!("\\'{literal}\\'");
-                for (offset, _) in escaped.match_indices(&needle) {
-                    let mut changed = escaped.clone();
-                    changed.replace_range(offset..offset + needle.len(), "\\'rogue\\'");
-                    assert_eq!(
-                        fixed_wrapped_grant_probe(index, &changed),
-                        Some((false, false))
-                    );
-                }
-            }
-            for column in columns {
-                let needle = format!("`{column}`");
-                for (offset, _) in escaped.match_indices(&needle) {
-                    let mut changed = escaped.clone();
-                    changed.replace_range(offset..offset + needle.len(), "`rogue`");
-                    assert_eq!(
-                        fixed_wrapped_grant_probe(index, &changed),
-                        Some((false, false))
-                    );
-                }
-            }
-            for (needle, replacement) in [(" AND ", " OR "), (" OR ", " AND ")] {
-                for (offset, _) in escaped.match_indices(needle) {
-                    let mut changed = escaped.clone();
-                    changed.replace_range(offset..offset + needle.len(), replacement);
-                    assert_eq!(
-                        fixed_wrapped_grant_probe(index, &changed),
-                        Some((false, false))
-                    );
-                }
-            }
-            let extra_atom_parens = escaped
-                .replacen("(((", "((((", 1)
-                .replacen(") AND ", ")) AND ", 1);
-            assert_eq!(
-                fixed_wrapped_grant_probe(index, &extra_atom_parens),
-                Some((false, false))
-            );
-            assert_eq!(
-                fixed_wrapped_grant_probe(index, &format!("({escaped})")),
-                Some((false, true))
-            );
-            assert_eq!(
-                fixed_wrapped_grant_probe(index, candidate),
-                Some((false, true))
-            );
-        }
-    }
-
-    // Test-only observation shape; no metadata text is retained in printable fields.
-    #[derive(Debug)]
-    struct GrantFormatObservation {
-        stored_len: usize,
-        candidate_len: usize,
-        leading_parens: usize,
-        trailing_parens: usize,
-        ascii_whitespace: usize,
-        backticks: usize,
-        wrapped_matches: [bool; 5],
-        enforced: &'static str,
-    }
-
-    // Compare the complete synthetic spelling, permitting case changes only in
-    // fixed SQL keywords. All literal/identifier bytes and inner spaces remain exact.
-    fn fixed_keyword_case_match(observed: &str, expected: &str) -> bool {
-        let observed = observed.as_bytes();
-        let expected = expected.as_bytes();
-        if observed.len() != expected.len() {
-            return false;
-        }
-        let mut offset = 0;
-        while offset < expected.len() {
-            if expected[offset].is_ascii_alphabetic() {
-                let end = offset
-                    + expected[offset..]
-                        .iter()
-                        .take_while(|byte| byte.is_ascii_alphabetic())
-                        .count();
-                let word = &expected[offset..end];
-                let keyword = [b"AND".as_slice(), b"OR", b"IS", b"NOT", b"NULL"].contains(&word);
-                if (keyword && !observed[offset..end].eq_ignore_ascii_case(word))
-                    || (!keyword && observed[offset..end] != *word)
-                {
-                    return false;
-                }
-                offset = end;
-            } else {
-                if observed[offset] != expected[offset] {
-                    return false;
-                }
-                offset += 1;
-            }
-        }
-        true
-    }
-
-    fn diagnostic_enforced_code(enforced: Option<&str>) -> &'static str {
-        match enforced {
-            Some("YES") => "yes",
-            Some("NO") => "no",
-            _ => "unknown",
-        }
-    }
-
-    fn grant_format_observation(
-        index: usize,
-        stored: &str,
-        enforced: Option<&str>,
-    ) -> Option<GrantFormatObservation> {
-        let literals: &[&str] = match index {
-            3 => &["role", "direct"],
-            4 => &["all", "group", "device"],
-            _ => return None,
-        };
-        let candidate = fixed_wrapped_grant_candidate(index)?.replace('\'', "\\'");
-        let bytes = stored.as_bytes();
-        let leading_parens = stored
-            .trim_ascii_start()
-            .bytes()
-            .take_while(|&b| b == b'(')
-            .count();
-        let trailing_parens = stored
-            .trim_ascii_end()
-            .bytes()
-            .rev()
-            .take_while(|&b| b == b')')
-            .count();
-        let ascii_whitespace = bytes
-            .iter()
-            .filter(|byte| byte.is_ascii_whitespace())
-            .count();
-        let backticks = bytes.iter().filter(|&&byte| byte == b'`').count();
-        let pair_count = bytes.windows(2).filter(|pair| *pair == b"\\'").count();
-        let slash_count = bytes.iter().filter(|&&byte| byte == b'\\').count();
-        if bytes.len() >= 4096
-            || candidate.len() >= 4096
-            || leading_parens > 8
-            || trailing_parens > 8
-            || ascii_whitespace > 255
-            || pair_count != 2 * literals.len()
-            || slash_count != pair_count
-            || stored.matches("_utf8mb4").count() != literals.len()
-            || literals.iter().any(|literal| {
-                let anchor = format!("_utf8mb4\\'{literal}\\'");
-                stored.matches(&anchor).count() != 1
-            })
-        {
-            return None;
-        }
-        let stored_trimmed = stored.trim_ascii();
-        let wrapped_matches = std::array::from_fn(|layers| {
-            let wrapped = format!("{}{}{}", "(".repeat(layers), candidate, ")".repeat(layers));
-            fixed_keyword_case_match(stored_trimmed, &wrapped)
-        });
-        Some(GrantFormatObservation {
-            stored_len: bytes.len(),
-            candidate_len: candidate.len(),
-            leading_parens,
-            trailing_parens,
-            ascii_whitespace,
-            backticks,
-            wrapped_matches,
-            enforced: diagnostic_enforced_code(enforced),
-        })
-    }
-
-    #[test]
-    fn grant_format_observation_does_not_emit_check_fingerprint() {
-        let source = include_str!("db.rs");
-        let probe = source
-            .split_once("struct GrantFormatObservation {")
-            .unwrap()
-            .1
-            .split_once("    // Compare the complete synthetic spelling")
-            .unwrap()
-            .0;
-        let helper = source
-            .split_once("fn grant_format_observation(")
-            .unwrap()
-            .1
-            .split_once(
-                "    #[test]\n    fn grant_format_observation_does_not_emit_check_fingerprint",
-            )
-            .unwrap()
-            .0;
-        let diagnostic = source
-            .split_once("\n    async fn mysql_preserved_v1_legacy_select_gates_diagnostic()")
-            .unwrap()
-            .1
-            .split_once("    #[test]\n    fn decode_snapshot_rejects_invalid_pairs")
-            .unwrap()
-            .0;
-        assert!(!probe.contains("sha256"));
-        assert!(!helper.contains("Sha256"));
-        assert!(!diagnostic.contains("stored_sha256"));
-        assert!(diagnostic.contains("row.try_get::<Option<String>, _>(\"enforced\")"));
-        assert!(diagnostic.contains(".unwrap_or(None)"));
-    }
-
-    #[test]
-    fn grant_format_observation_accepts_only_fixed_synthetic_anchors() {
-        for (index, literal_count, slash_count) in [(3, 2, 4), (4, 3, 6)] {
-            let candidate = fixed_wrapped_grant_candidate(index).unwrap();
-            let stored = candidate.replace('\'', "\\'");
-            let observed = grant_format_observation(index, &stored, Some("YES"))
-                .expect("synthetic readback must be observable");
-            assert_eq!(observed.stored_len, stored.len());
-            assert_eq!(observed.candidate_len, stored.len());
-            assert_eq!(observed.leading_parens, 3);
-            assert_eq!(observed.trailing_parens, 3);
-            assert_eq!(
-                observed.ascii_whitespace,
-                stored.bytes().filter(u8::is_ascii_whitespace).count()
-            );
-            assert_eq!(
-                observed.backticks,
-                stored.bytes().filter(|&byte| byte == b'`').count()
-            );
-            assert_eq!(observed.wrapped_matches, [true, false, false, false, false]);
-            assert_eq!(observed.enforced, "yes");
-            assert_eq!(stored.matches("_utf8mb4").count(), literal_count);
-            assert_eq!(
-                stored.bytes().filter(|&byte| byte == b'\\').count(),
-                slash_count
-            );
-            assert_eq!(
-                grant_format_observation(index, &stored, Some("NO"))
-                    .unwrap()
-                    .enforced,
-                "no"
-            );
-            assert_eq!(
-                grant_format_observation(index, &stored, None)
-                    .unwrap()
-                    .enforced,
-                "unknown"
-            );
-            assert_eq!(
-                grant_format_observation(index, &stored, Some("YES"))
-                    .unwrap()
-                    .enforced
-                    .to_string(),
-                "yes"
-            );
-            assert_eq!(
-                grant_format_observation(index, &stored, Some("NO"))
-                    .unwrap()
-                    .enforced
-                    .to_string(),
-                "no"
-            );
-            for value in [None, Some("MAYBE"), Some("yes"), Some("")] {
-                assert_eq!(
-                    grant_format_observation(index, &stored, value)
-                        .unwrap()
-                        .enforced,
-                    "unknown"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn grant_format_observation_distinguishes_wrapping_and_keyword_case() {
-        let stored = fixed_wrapped_grant_candidate(3)
-            .unwrap()
-            .replace('\'', "\\'");
-        for layers in 1..=4 {
-            let wrapped = format!(
-                " \t{}{}{}\n",
-                "(".repeat(layers),
-                stored,
-                ")".repeat(layers)
-            );
-            let observed = grant_format_observation(3, &wrapped, Some("YES")).unwrap();
-            assert!(observed.wrapped_matches[layers]);
-            assert_eq!(
-                observed.wrapped_matches.iter().filter(|&&hit| hit).count(),
-                1
-            );
-        }
-        let case_only = stored.replace(" AND ", " and ");
-        assert!(
-            grant_format_observation(3, &case_only, Some("YES"))
-                .unwrap()
-                .wrapped_matches[0]
-        );
-        let literal_changed = stored.replace("\\'role\\'", "\\'ROLE\\'");
-        assert!(grant_format_observation(3, &literal_changed, Some("YES")).is_none());
-        let inner_space = stored.replacen(" AND ", "  AND ", 1);
-        assert_eq!(
-            grant_format_observation(3, &inner_space, Some("YES"))
-                .unwrap()
-                .wrapped_matches,
-            [false; 5]
-        );
-    }
-
-    #[test]
-    fn grant_format_observation_rejects_anchor_and_bound_mutations() {
-        for index in [3, 4] {
-            let stored = fixed_wrapped_grant_candidate(index)
-                .unwrap()
-                .replace('\'', "\\'");
-            for changed in [
-                stored.replacen("_utf8mb4", "_latin1", 1),
-                stored.replacen("_utf8mb4", "", 1),
-                stored.replacen("\\'", "'", 1),
-                stored.replacen("\\'", "\\\\'", 1),
-                format!("{stored}\\x"),
-                format!("{}{}", " ".repeat(256), stored),
-                format!("{}{}{}", "(".repeat(9), stored, ")".repeat(9)),
-                "X".repeat(4096),
-            ] {
-                assert!(grant_format_observation(index, &changed, Some("YES")).is_none());
-            }
-        }
-    }
-
-    #[test]
-    fn diagnostic_session_mode_flags_are_only_fixed_booleans() {
-        assert_eq!(
-            diagnostic_session_mode_flags(Some("STRICT_TRANS_TABLES"), Some("utf8mb4")),
-            (Some(true), Some(true))
-        );
-        assert_eq!(
-            diagnostic_session_mode_flags(
-                Some("NO_BACKSLASH_ESCAPES,STRICT_TRANS_TABLES"),
-                Some("latin1")
-            ),
-            (Some(false), Some(false))
-        );
-        assert_eq!(diagnostic_session_mode_flags(None, None), (None, None));
-    }
-
-    fn diagnostic_session_mode_flags(
-        mode: Option<&str>,
-        charset: Option<&str>,
-    ) -> (Option<bool>, Option<bool>) {
-        (
-            mode.map(|mode| {
-                !mode
-                    .split(',')
-                    .any(|flag| flag.trim_ascii() == "NO_BACKSLASH_ESCAPES")
-            }),
-            charset.map(|charset| charset == "utf8mb4"),
-        )
-    }
-
-    #[test]
-    fn grant_format_observation_read_path_stays_inside_existing_ignored_shape_failure() {
-        let source = include_str!("db.rs");
-        let diagnostic = source
-            .split_once("\n    async fn mysql_preserved_v1_legacy_select_gates_diagnostic()")
-            .unwrap()
-            .1
-            .split_once("\n    #[test]\n    fn decode_snapshot_rejects_invalid_pairs")
-            .unwrap()
-            .0;
-        let gate = diagnostic
-            .find("if code == \"check_unavailable_or_incompatible\"")
-            .unwrap();
-        let clause = diagnostic
-            .find("CAST(cc.check_clause AS CHAR) AS check_clause")
-            .unwrap();
-        let enforced = diagnostic
-            .find("CAST(tc.enforced AS CHAR) AS enforced")
-            .unwrap();
-        let flag_mode = diagnostic.find("SELECT @@SESSION.sql_mode").unwrap();
-        let flag_charset = diagnostic
-            .find("SELECT @@SESSION.character_set_connection")
-            .unwrap();
-        let mismatch = diagnostic.find("Some(index @ (3 | 4))").unwrap();
-        let observation = diagnostic
-            .find("grant_format_observation(index, stored")
-            .unwrap();
-        let panic = diagnostic
-            .find("panic!(\"diagnostic_shape_{code} table_index={table_index:?}\")")
-            .unwrap();
-        let acquire = diagnostic[gate..]
-            .find("db.0.acquire()")
-            .expect("CHECK failure branch must acquire one connection")
-            + gate;
-        let check_read = diagnostic
-            .find("CAST(cc.check_clause AS CHAR) AS check_clause")
-            .unwrap();
-        assert!(gate < acquire && acquire < flag_mode && flag_mode < flag_charset);
-        assert!(flag_charset < check_read && check_read == clause && clause < enforced);
-        let sample =
-            &diagnostic[acquire..check_read + diagnostic[check_read..].find(".await;").unwrap()];
-        assert_eq!(sample.matches("db.0.acquire()").count(), 1);
-        assert_eq!(sample.matches("&mut *connection").count(), 3);
-        assert!(!sample.contains("&db.0"));
-        assert!(diagnostic[check_read..].contains("drop(connection);"));
-        assert!(enforced < mismatch && mismatch < observation && observation < panic);
-        assert!(!diagnostic.contains("println!(\"{stored}"));
-    }
-
-    type DiagnosticCheckRow = Result<(Option<String>, Option<String>, Option<String>), ()>;
-    type DiagnosticEnforcedCheckRow = Result<
-        (
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ),
-        (),
-    >;
-
-    #[derive(Debug, PartialEq, Eq)]
-    struct GrantCheckEscapeProbe {
-        candidate_equal: bool,
-        backslash_quote_pair_count: u8,
-        total_backslash_count: u8,
-        restored_tokens_equal: bool,
-    }
-
-    // Diagnostic only: these are the two full, previously known unescaped
-    // MySQL readbacks, not a new rule for accepting legacy CHECK metadata.
-    fn fixed_grant_check_escape_probe(index: usize, stored: &str) -> Option<GrantCheckEscapeProbe> {
-        let unescaped = match index {
-            3 => {
-                "((`source_kind` = _utf8mb4'role' AND `role_id` IS NOT NULL AND `permissions` IS NULL) OR (`source_kind` = _utf8mb4'direct' AND `role_id` IS NULL AND `permissions` IS NOT NULL))"
-            }
-            4 => {
-                "((`scope_kind` = _utf8mb4'all' AND `scope_group_id` IS NULL AND `scope_device_id` IS NULL) OR (`scope_kind` = _utf8mb4'group' AND `scope_group_id` IS NOT NULL AND `scope_device_id` IS NULL) OR (`scope_kind` = _utf8mb4'device' AND `scope_group_id` IS NULL AND `scope_device_id` IS NOT NULL))"
-            }
-            _ => return None,
-        };
-        let (table, name, _) = LEGACY_CHECK_DROPS[index];
-        let declared = ddl_parts_from(MIGRATION, table)
-            .into_iter()
-            .find(|part| part.starts_with(&format!("CONSTRAINT {name} CHECK ")))
-            .and_then(|part| {
-                part.split_once("CHECK ")
-                    .map(|(_, expression)| expression.to_owned())
-            });
-        let restored = stored.replace("\\'", "'");
-        let restored_tokens_equal = declared
-            .as_deref()
-            .and_then(|expression| {
-                legacy_check_tokens(&restored).zip(legacy_check_tokens(expression))
-            })
-            .is_some_and(|(actual, expected)| actual == expected);
-        let bytes = stored.as_bytes();
-        Some(GrantCheckEscapeProbe {
-            candidate_equal: stored == unescaped.replace('\'', "\\'"),
-            backslash_quote_pair_count: bytes
-                .windows(2)
-                .filter(|pair| *pair == b"\\'")
-                .count()
-                .min(255) as u8,
-            total_backslash_count: bytes.iter().filter(|&&byte| byte == b'\\').count().min(255)
-                as u8,
-            restored_tokens_equal,
-        })
-    }
-
-    #[test]
-    fn grant_check_escape_probe_matches_only_fully_escaped_fixed_readbacks() {
-        for (index, unescaped, quote_pairs) in [
-            (
-                3,
-                "((`source_kind` = _utf8mb4'role' AND `role_id` IS NOT NULL AND `permissions` IS NULL) OR (`source_kind` = _utf8mb4'direct' AND `role_id` IS NULL AND `permissions` IS NOT NULL))",
-                4,
-            ),
-            (
-                4,
-                "((`scope_kind` = _utf8mb4'all' AND `scope_group_id` IS NULL AND `scope_device_id` IS NULL) OR (`scope_kind` = _utf8mb4'group' AND `scope_group_id` IS NOT NULL AND `scope_device_id` IS NULL) OR (`scope_kind` = _utf8mb4'device' AND `scope_group_id` IS NULL AND `scope_device_id` IS NOT NULL))",
-                6,
-            ),
-        ] {
-            let escaped = unescaped.replace('\'', "\\'");
-            assert_eq!(
-                fixed_grant_check_escape_probe(index, &escaped),
-                Some(GrantCheckEscapeProbe {
-                    candidate_equal: true,
-                    backslash_quote_pair_count: quote_pairs,
-                    total_backslash_count: quote_pairs,
-                    restored_tokens_equal: true,
-                })
-            );
-            assert_eq!(fixed_grant_check_escape_probe(1, &escaped), None);
-            assert_eq!(fixed_grant_check_escape_probe(2, &escaped), None);
-        }
-    }
-
-    #[test]
-    fn grant_check_escape_probe_distinguishes_literal_and_escape_mutations() {
-        let unescaped = "((`source_kind` = _utf8mb4'role' AND `role_id` IS NOT NULL AND `permissions` IS NULL) OR (`source_kind` = _utf8mb4'direct' AND `role_id` IS NULL AND `permissions` IS NOT NULL))";
-        assert_eq!(
-            fixed_grant_check_escape_probe(3, unescaped),
-            Some(GrantCheckEscapeProbe {
-                candidate_equal: false,
-                backslash_quote_pair_count: 0,
-                total_backslash_count: 0,
-                restored_tokens_equal: true,
-            })
-        );
-        let escaped = unescaped.replace('\'', "\\'");
-        assert_eq!(
-            fixed_grant_check_escape_probe(3, &escaped.replace("role", "rogue")),
-            Some(GrantCheckEscapeProbe {
-                candidate_equal: false,
-                backslash_quote_pair_count: 4,
-                total_backslash_count: 4,
-                restored_tokens_equal: false,
-            })
-        );
-        assert_eq!(
-            fixed_grant_check_escape_probe(3, &escaped.replacen("\\'role", "'role", 1)),
-            Some(GrantCheckEscapeProbe {
-                candidate_equal: false,
-                backslash_quote_pair_count: 3,
-                total_backslash_count: 3,
-                restored_tokens_equal: true,
-            })
-        );
-        assert_eq!(
-            fixed_grant_check_escape_probe(3, &escaped.replacen("\\'role", "\\\\'role", 1)),
-            Some(GrantCheckEscapeProbe {
-                candidate_equal: false,
-                backslash_quote_pair_count: 4,
-                total_backslash_count: 5,
-                restored_tokens_equal: false,
-            })
-        );
-        let scope = "((`scope_kind` = _utf8mb4'all' AND `scope_group_id` IS NULL AND `scope_device_id` IS NULL) OR (`scope_kind` = _utf8mb4'group' AND `scope_group_id` IS NOT NULL AND `scope_device_id` IS NULL) OR (`scope_kind` = _utf8mb4'device' AND `scope_group_id` IS NULL AND `scope_device_id` IS NOT NULL))";
-        assert_eq!(
-            fixed_grant_check_escape_probe(
-                4,
-                &scope.replace("'group'", "'groups'").replace('\'', "\\'")
-            ),
-            Some(GrantCheckEscapeProbe {
-                candidate_equal: false,
-                backslash_quote_pair_count: 6,
-                total_backslash_count: 6,
-                restored_tokens_equal: false,
-            })
-        );
-    }
-
-    // Only emit compiled-in CHECK indices and fixed classifications, never metadata bytes.
-    fn legacy_diagnostic_check_classifications(
-        rows: &[DiagnosticCheckRow],
-    ) -> Vec<(Option<usize>, &'static str)> {
-        let mut seen = [false; 5];
-        rows.iter()
-            .map(|row| {
-                let Ok((table, name, clause)) = row else {
-                    return (None, "decode_failed");
-                };
-                let Some(index) =
-                    LEGACY_CHECK_DROPS
-                        .iter()
-                        .position(|&(known_table, known_name, _)| {
-                            table.as_deref() == Some(known_table)
-                                && name.as_deref() == Some(known_name)
-                        })
-                else {
-                    return (None, "unknown_or_duplicate");
-                };
-                if seen[index] {
-                    return (Some(index), "unknown_or_duplicate");
-                }
-                seen[index] = true;
-                let (table, name, _) = LEGACY_CHECK_DROPS[index];
-                let Some(stored) = clause.as_deref() else {
-                    return (Some(index), "missing_clause");
-                };
-                let declared = ddl_parts_from(MIGRATION, table)
-                    .into_iter()
-                    .find(|part| part.starts_with(&format!("CONSTRAINT {name} CHECK ")))
-                    .and_then(|part| {
-                        part.split_once("CHECK ")
-                            .map(|(_, expression)| expression.to_owned())
-                    });
-                let Some(declared) = declared else {
-                    return (Some(index), "literal_escape_or_other_mismatch");
-                };
-                let valid = validate_legacy_check_metadata(&[(
-                    Some(table.to_owned()),
-                    Some(name.to_owned()),
-                    Some(stored.to_owned()),
-                )])
-                .is_ok();
-                let token_equal = legacy_check_tokens(stored)
-                    .zip(legacy_check_tokens(&declared))
-                    .is_some_and(|(stored, expected)| stored == expected);
-                let classification = if valid && token_equal {
-                    "token_equal"
-                } else if valid && check_clause_matches(table, name, stored, &declared) {
-                    "known_mysql_spelling"
-                } else {
-                    "literal_escape_or_other_mismatch"
-                };
-                (Some(index), classification)
-            })
-            .collect()
-    }
-
-    #[test]
-    fn legacy_diagnostic_check_mapper_rejects_unknown_and_duplicate() {
-        let known = (
-            Some("schema_meta".to_owned()),
-            Some("chk_schema_singleton".to_owned()),
-            Some("(singleton = 1)".to_owned()),
-        );
-        assert_eq!(
-            legacy_diagnostic_check_classifications(&[
-                Ok((
-                    Some("unknown".into()),
-                    Some("unknown".into()),
-                    known.2.clone()
-                )),
-                Ok(known.clone()),
-                Ok(known),
-            ]),
-            vec![
-                (None, "unknown_or_duplicate"),
-                (Some(0), "token_equal"),
-                (Some(0), "unknown_or_duplicate"),
-            ]
-        );
-    }
-
-    #[test]
-    fn legacy_diagnostic_check_mapper_distinguishes_mismatch_from_token_equality() {
-        assert_eq!(
-            legacy_diagnostic_check_classifications(&[
-                Ok((
-                    Some("schema_meta".into()),
-                    Some("chk_schema_singleton".into()),
-                    Some("(singleton = 2)".into()),
-                )),
-                Ok((
-                    Some("grants".into()),
-                    Some("chk_grants_source".into()),
-                    None
-                )),
-                Err(()),
-            ]),
-            vec![
-                (Some(0), "literal_escape_or_other_mismatch"),
-                (Some(3), "missing_clause"),
-                (None, "decode_failed"),
-            ]
-        );
-    }
-
-    #[test]
-    fn legacy_diagnostic_check_mapper_preserves_exact_known_mysql_spelling_boundary() {
-        let observed = "(`admission_state` in (_utf8mb4\\'PENDING\\',_utf8mb4\\'APPROVED\\',_utf8mb4\\'REVOKED\\'))";
-        let altered = observed.replace("PENDING", "PEND ING");
-        let rows = [
-            Ok((
-                Some("devices".into()),
-                Some("chk_devices_state".into()),
-                Some(observed.into()),
-            )),
-            Ok((
-                Some("grants".into()),
-                Some("chk_grants_source".into()),
-                Some(altered),
-            )),
-        ];
-        assert_eq!(
-            legacy_diagnostic_check_classifications(&rows),
-            vec![
-                (Some(1), "known_mysql_spelling"),
-                (Some(3), "literal_escape_or_other_mismatch"),
-            ]
-        );
-    }
-
-    // Diagnostic output may only contain codes and indices from compiled-in lists.
-    fn legacy_diagnostic_shape_code(error: &ControllerError) -> (&'static str, Option<usize>) {
-        let ControllerError::Config(message) = error else {
-            return ("shape_read_error", None);
-        };
-        if message == "identity schema has missing or unexpected tables; manual inspection required"
-        {
-            return ("table_set", None);
-        }
-        if message == "legacy CHECK metadata unavailable or incompatible" {
-            return ("check_unavailable_or_incompatible", None);
-        }
-        for (prefix, code) in [
-            ("migration incompatible table charset ", "table_charset"),
-            ("migration incompatible column names in ", "column_set"),
-            ("migration missing column ", "column_set"),
-            ("migration incompatible column ", "column_shape"),
-            ("migration incompatible default ", "column_default"),
-            (
-                "migration incompatible character metadata ",
-                "column_charset",
-            ),
-            ("migration incompatible index order ", "index_order"),
-            ("migration incompatible index set in ", "index_set"),
-            ("migration incompatible index ", "index_set"),
-        ] {
-            if let Some(suffix) = message.strip_prefix(prefix) {
-                let index = TABLES.iter().position(|(table, _, _)| {
-                    suffix == *table
-                        || suffix
-                            .strip_prefix(table)
-                            .is_some_and(|rest| rest.starts_with('.'))
-                });
-                return (code, index);
-            }
-        }
-        ("shape_read_error", None)
-    }
-
-    #[test]
-    fn legacy_diagnostic_mapper_redacts_errors_and_uses_static_table_indices() {
-        assert_eq!(
-            legacy_diagnostic_shape_code(&ControllerError::Config(
-                "migration incompatible default grants.revision secret-marker".into()
-            )),
-            ("column_default", Some(8))
-        );
-        assert_eq!(
-            legacy_diagnostic_shape_code(&ControllerError::Config(
-                "legacy CHECK metadata unavailable or incompatible".into()
-            )),
-            ("check_unavailable_or_incompatible", None)
-        );
-        assert_eq!(
-            legacy_diagnostic_shape_code(&ControllerError::Config(
-                "migration incompatible column users.username: got sensitive-marker".into()
-            )),
-            ("column_shape", Some(1))
-        );
-        assert_eq!(
-            legacy_diagnostic_shape_code(&ControllerError::Config(
-                "unknown sensitive-marker".into()
-            )),
-            ("shape_read_error", None)
-        );
-    }
-
-    #[test]
-    fn legacy_diagnostic_rechecks_identity_engine_and_grants_on_every_physical_connection() {
-        // No live DB here: this guards the hook's placement and read-only queries,
-        // not a runtime reconnect or a physical server identity proof.
-        let diagnostic = include_str!("db.rs")
-            .split_once("\n    async fn mysql_preserved_v1_legacy_select_gates_diagnostic()")
-            .unwrap()
-            .1
-            .split_once("\n    #[test]\n    fn decode_snapshot_rejects_invalid_pairs")
-            .unwrap()
-            .0;
-        let hook_start = diagnostic.find(".after_connect(").expect("missing hook");
-        let connect = diagnostic.find(".connect(&db_url)").unwrap();
-        assert!(hook_start < connect);
-        let hook = &diagnostic[hook_start..connect];
-        let database = hook.find("SELECT DATABASE()").unwrap();
-        let version = hook.find("SELECT VERSION()").unwrap();
-        let grants = hook.find("SHOW GRANTS").unwrap();
-        let validate = hook.find("validate_schema_metadata_grants(").unwrap();
-        assert!(database < version && version < grants && grants < validate);
-        assert!(hook.contains("&mut *connection"));
-        assert!(hook.contains("diagnostic_wrong_engine"));
-        assert!(hook.contains("diagnostic_connection_rejected"));
-        assert!(hook.contains("8.0.46"));
-    }
-
-    #[test]
-    fn legacy_diagnostic_counts_five_checks_before_validating_shape() {
-        let diagnostic = include_str!("db.rs")
-            .split_once("\n    async fn mysql_preserved_v1_legacy_select_gates_diagnostic()")
-            .unwrap()
-            .1
-            .split_once("\n    #[test]\n    fn decode_snapshot_rejects_invalid_pairs")
-            .unwrap()
-            .0;
-        let count = diagnostic
-            .find("information_schema.table_constraints WHERE table_schema = DATABASE() AND constraint_type = 'CHECK'")
-            .expect("missing read-only CHECK count");
-        let five = diagnostic.find("check_count == 5").unwrap();
-        let shape = diagnostic.find("validate_legacy_shape(&db, 1)").unwrap();
-        assert!(count < five && five < shape);
-        assert!(diagnostic.contains("diagnostic_check_count_not_five"));
-        assert!(diagnostic.contains("diagnostic_check_count_read_failed"));
-    }
-
-    #[tokio::test]
-    #[ignore = "manual SELECT-only diagnostic; parent must verify isolated preserved MySQL target"]
-    async fn mysql_preserved_v1_legacy_select_gates_diagnostic() {
-        let db_url = std::env::var("RSETUP_TEST_DATABASE_URL")
-            .unwrap_or_else(|_| panic!("diagnostic_env_url_missing"));
-        let expected = std::env::var("RSETUP_EXPECTED_DATABASE")
-            .unwrap_or_else(|_| panic!("diagnostic_env_database_missing"));
-        assert!(!db_url.is_empty(), "diagnostic_env_url_empty");
-        assert!(!expected.is_empty(), "diagnostic_env_database_empty");
-        let hook_expected = expected.clone();
-        let pool = sqlx::mysql::MySqlPoolOptions::new()
-            .max_connections(1)
-            .after_connect(move |connection, _meta| {
-                let expected = hook_expected.clone();
-                Box::pin(async move {
-                    let diagnostic_connection_rejected =
-                        || sqlx::Error::Protocol("diagnostic_connection_rejected".into());
-                    let actual: Option<String> = sqlx::query_scalar("SELECT DATABASE()")
-                        .fetch_one(&mut *connection)
-                        .await
-                        .map_err(|_| diagnostic_connection_rejected())?;
-                    if actual.as_deref() != Some(expected.as_str()) {
-                        return Err(diagnostic_connection_rejected());
-                    }
-                    let version: Option<String> = sqlx::query_scalar("SELECT VERSION()")
-                        .fetch_one(&mut *connection)
-                        .await
-                        .map_err(|_| diagnostic_connection_rejected())?;
-                    if version.as_deref() != Some("8.0.46") {
-                        return Err(sqlx::Error::Protocol("diagnostic_wrong_engine".into()));
-                    }
-                    let rows = sqlx::query("SHOW GRANTS")
-                        .fetch_all(&mut *connection)
-                        .await
-                        .map_err(|_| diagnostic_connection_rejected())?;
-                    let grants = rows
-                        .iter()
-                        .map(|row| {
-                            row.try_get::<Option<String>, _>(0)
-                                .map_err(|_| diagnostic_connection_rejected())
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    validate_schema_metadata_grants(&grants, &expected)
-                        .map_err(|_| diagnostic_connection_rejected())?;
-                    Ok(())
-                })
-            })
-            .connect(&db_url)
-            .await
-            .unwrap_or_else(|_| panic!("diagnostic_connect_failed"));
-        let mut connection = pool
-            .acquire()
-            .await
-            .unwrap_or_else(|_| panic!("diagnostic_identity_connection_failed"));
-        let actual: Option<String> = sqlx::query_scalar("SELECT DATABASE()")
-            .fetch_one(&mut *connection)
-            .await
-            .unwrap_or_else(|_| panic!("diagnostic_identity_read_failed"));
-        assert!(
-            actual.as_deref() == Some(expected.as_str()),
-            "diagnostic_identity_mismatch"
-        );
-        assert!(
-            require_schema_metadata_privilege(&mut connection, &expected)
-                .await
-                .is_ok(),
-            "diagnostic_grants_failed"
-        );
-        drop(connection);
-
-        let db = DbPool(pool);
-        let version = read_version(&db)
-            .await
-            .unwrap_or_else(|_| panic!("diagnostic_version_read_failed"));
-        assert!(version.is_none(), "diagnostic_version_not_none");
-        let table_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE()",
-        )
-        .fetch_one(&db.0)
-        .await
-        .unwrap_or_else(|_| panic!("diagnostic_table_count_read_failed"));
-        assert!(
-            table_count == 11 && TABLES.len() == 11,
-            "diagnostic_table_count_not_eleven"
-        );
-        let schema_meta_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_meta")
-            .fetch_one(&db.0)
-            .await
-            .unwrap_or_else(|_| panic!("diagnostic_schema_meta_read_failed"));
-        assert!(schema_meta_rows == 0, "diagnostic_schema_meta_not_empty");
-        let check_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM information_schema.table_constraints WHERE table_schema = DATABASE() AND constraint_type = 'CHECK'",
-        )
-        .fetch_one(&db.0)
-        .await
-        .unwrap_or_else(|_| panic!("diagnostic_check_count_read_failed"));
-        assert!(check_count == 5, "diagnostic_check_count_not_five");
-
-        if let Err(error) = validate_legacy_shape(&db, 1).await {
-            let (code, table_index) = legacy_diagnostic_shape_code(&error);
-            if code == "check_unavailable_or_incompatible" {
-                // One checked physical session for both variables and CHECK metadata.
-                // A failed read aborts this sample; never reborrow a replacement session.
-                let mut connection =
-                    db.0.acquire()
-                        .await
-                        .unwrap_or_else(|_| panic!("diagnostic_check_connection_failed"));
-                let mode: Option<String> = sqlx::query_scalar("SELECT @@SESSION.sql_mode")
-                    .fetch_one(&mut *connection)
-                    .await
-                    .unwrap_or_else(|_| panic!("diagnostic_session_mode_read_failed"));
-                let charset: Option<String> =
-                    sqlx::query_scalar("SELECT @@SESSION.character_set_connection")
-                        .fetch_one(&mut *connection)
-                        .await
-                        .unwrap_or_else(|_| panic!("diagnostic_session_charset_read_failed"));
-                let rows = sqlx::query("SELECT CAST(tc.table_name AS CHAR) AS table_name, CAST(tc.constraint_name AS CHAR) AS constraint_name, CAST(cc.check_clause AS CHAR) AS check_clause, CAST(tc.enforced AS CHAR) AS enforced FROM information_schema.table_constraints tc LEFT JOIN information_schema.check_constraints cc ON cc.constraint_schema=tc.constraint_schema AND cc.constraint_name=tc.constraint_name WHERE tc.table_schema=DATABASE() AND tc.constraint_type='CHECK'")
-                    .fetch_all(&mut *connection)
-                    .await;
-                drop(connection);
-                match rows {
-                    Ok(rows) => {
-                        let (backslash_mode_safe, charset_utf8mb4) =
-                            diagnostic_session_mode_flags(mode.as_deref(), charset.as_deref());
-                        let fixed_flag = |flag| match flag {
-                            Some(true) => "true",
-                            Some(false) => "false",
-                            None => "unknown",
-                        };
-                        println!(
-                            "diagnostic_not_no_backslash_escapes={} diagnostic_charset_utf8mb4={}",
-                            fixed_flag(backslash_mode_safe),
-                            fixed_flag(charset_utf8mb4)
-                        );
-                        let decoded: Vec<DiagnosticEnforcedCheckRow> = rows
-                            .iter()
-                            .map(|row| {
-                                Ok((
-                                    row.try_get::<Option<String>, _>("table_name")
-                                        .map_err(|_| ())?,
-                                    row.try_get::<Option<String>, _>("constraint_name")
-                                        .map_err(|_| ())?,
-                                    row.try_get::<Option<String>, _>("check_clause")
-                                        .map_err(|_| ())?,
-                                    row.try_get::<Option<String>, _>("enforced").unwrap_or(None),
-                                ))
-                            })
-                            .collect();
-                        println!("diagnostic_check_rows={}", decoded.len());
-                        let classifications: Vec<DiagnosticCheckRow> = decoded
-                            .iter()
-                            .map(|row| match row {
-                                Ok((table, name, clause, _)) => {
-                                    Ok((table.clone(), name.clone(), clause.clone()))
-                                }
-                                Err(_) => Err(()),
-                            })
-                            .collect();
-                        for ((index, classification), row) in
-                            legacy_diagnostic_check_classifications(&classifications)
-                                .into_iter()
-                                .zip(decoded.iter())
-                        {
-                            println!("check_index={index:?} classification={classification}");
-                            if let (
-                                Some(index @ (3 | 4)),
-                                "literal_escape_or_other_mismatch",
-                                Ok((_, _, Some(stored), enforced)),
-                            ) = (index, classification, row)
-                                && let Some(probe) = fixed_grant_check_escape_probe(index, stored)
-                            {
-                                println!(
-                                    "check_index={index} candidate_equal={} backslash_quote_pair_count={} total_backslash_count={} restored_tokens_equal={}",
-                                    probe.candidate_equal,
-                                    probe.backslash_quote_pair_count,
-                                    probe.total_backslash_count,
-                                    probe.restored_tokens_equal,
-                                );
-                                if let Some(diff) = fixed_grant_check_token_diff(index, stored) {
-                                    println!(
-                                        "check_index={index} observed_tokens_parseable={} expected_tokens_parseable={} observed_token_count={:?} expected_token_count={:?} first_mismatch_token_index={:?} first_mismatch_token_class={:?} expected_class={:?}",
-                                        diff.observed_tokens_parseable,
-                                        diff.expected_tokens_parseable,
-                                        diff.observed_token_count,
-                                        diff.expected_token_count,
-                                        diff.first_mismatch_token_index,
-                                        diff.first_mismatch_token_class.map(|class| class.code()),
-                                        diff.expected_class.map(|class| class.code()),
-                                    );
-                                }
-                                if let Some((exact_bytes, tokens_equal)) =
-                                    fixed_wrapped_grant_probe(index, stored)
-                                {
-                                    println!(
-                                        "check_index={index} wrapped_candidate_exact_bytes={} wrapped_candidate_tokens_equal={}",
-                                        exact_bytes, tokens_equal,
-                                    );
-                                }
-                                if let Some(observation) =
-                                    grant_format_observation(index, stored, enforced.as_deref())
-                                {
-                                    println!(
-                                        "check_index={index} enforced={} stored_len={} candidate_len={} leading_parens={} trailing_parens={} ascii_whitespace={} backticks={} wrapped_layers_0_to_4={:?}",
-                                        observation.enforced,
-                                        observation.stored_len,
-                                        observation.candidate_len,
-                                        observation.leading_parens,
-                                        observation.trailing_parens,
-                                        observation.ascii_whitespace,
-                                        observation.backticks,
-                                        observation.wrapped_matches,
-                                    );
-                                } else {
-                                    println!(
-                                        "check_index={index} enforced={} grant_format_observation=unknown",
-                                        diagnostic_enforced_code(enforced.as_deref())
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    Err(_) => println!("diagnostic_check_metadata_read_failed"),
-                }
-            }
-            panic!("diagnostic_shape_{code} table_index={table_index:?}");
-        }
-        assert!(
-            require_no_identity_foreign_keys(&db).await.is_ok(),
-            "diagnostic_fk_unavailable_or_nonempty"
-        );
-        for (index, &(table, column, _, _)) in IDENTITY_COLUMNS.iter().enumerate() {
-            let actual = read_column(&db, table, column).await.unwrap_or_else(|_| {
-                panic!("diagnostic_old_column_read_failed identity_index={index}")
-            });
-            let old = classify_identity_column(table, column, &actual).unwrap_or_else(|_| {
-                panic!("diagnostic_old_column_shape_failed identity_index={index}")
-            });
-            assert!(old, "diagnostic_old_column_target identity_index={index}");
-        }
-        println!("legacy_select_gates_ok");
-    }
-
-    #[test]
-    fn decode_snapshot_rejects_invalid_pairs_even_when_values_are_known() {
-        for (state, decision) in [
-            ("PENDING", "none"),
-            ("PENDING", "denied"),
-            ("APPROVED", "approved"),
-            ("REVOKED", "revoked"),
-        ] {
-            assert_eq!(decode_snapshot(state, decision, 42).unwrap().revision, 42);
-        }
-        for (state, decision) in [
-            ("PENDING", "approved"),
-            ("APPROVED", "none"),
-            ("REVOKED", "denied"),
-            ("pending", "none"),
-            ("PENDING", "NONE"),
-        ] {
-            assert!(
-                decode_snapshot(state, decision, 42).is_err(),
-                "{state}/{decision}"
-            );
-        }
-    }
-
-    #[test]
-    fn schema_metadata_grants_require_exact_direct_schema_all() {
-        let target = "dev_identity";
-        let direct = "GRANT ALL PRIVILEGES ON `dev_identity`.* TO `tester`@`localhost`";
-        let usage = "GRANT USAGE ON *.* TO `tester`@`localhost`";
-        assert!(validate_schema_metadata_grants(&[Some(direct.into())], target).is_ok());
-        assert!(
-            validate_schema_metadata_grants(
-                &[
-                    Some(usage.into()),
-                    Some(format!("{direct} WITH GRANT OPTION"))
-                ],
-                target,
-            )
-            .is_ok()
-        );
-        for invalid in [
-            "GRANT ALL PRIVILEGES ON `dev_identity_backup`.* TO `tester`@`localhost`",
-            "GRANT ALL PRIVILEGES ON `other_dev_identity`.* TO `tester`@`localhost`",
-            "GRANT ALL PRIVILEGES ON *.* TO `tester`@`localhost`",
-            "GRANT USAGE ON *.* TO `tester`@`localhost`",
-            "GRANT `metadata_role`@`localhost` TO `tester`@`localhost`",
-            "not a recognized SHOW GRANTS row",
-            "GRANT ALL PRIVILEGES ON `dev_identity`.* TO `tester`@`localhost` arbitrary",
-        ] {
-            assert!(validate_schema_metadata_grants(&[Some(invalid.into())], target).is_err());
-        }
-        for grants in [
-            vec![],
-            vec![None],
-            vec![Some(direct.into()), None],
-            vec![
-                Some(direct.into()),
-                Some("REVOKE SELECT ON `dev_identity`.`hidden` FROM `tester`@`localhost`".into()),
-            ],
-            vec![
-                Some(direct.into()),
-                Some("GRANT USAGE ON *.* TO `different`@`localhost`".into()),
-            ],
-            vec![
-                Some(direct.into()),
-                Some("GRANT `metadata_role`@`localhost` TO `tester`@`localhost`".into()),
-            ],
-        ] {
-            assert!(validate_schema_metadata_grants(&grants, target).is_err());
-        }
-        assert!(
-            validate_schema_metadata_grants(&[Some(direct.into())], "dev_identity_bad").is_err()
-        );
-        assert!(validate_schema_metadata_grants(&[Some(direct.into())], "dev_identity`").is_err());
-        assert!(
-            !format!(
-                "{}",
-                validate_schema_metadata_grants(&[None], target).unwrap_err()
-            )
-            .contains(target)
-        );
-    }
-
-    /// 生产迁移决策表的穷举（纯函数，无数据库）：v4 只做只读校验；空库与 v1/v2/v3
-    /// 走 `Upgrade` + 显式 v4；其余版本一律 fail-closed，且错误固定去敏。
-    #[test]
-    fn production_migration_plan_is_fixed_per_version() {
+        // 已是 v4 → 只读校验（重复执行幂等）。
         assert_eq!(
             production_migration_plan(Some(crate::integrity::SUPPORTED_SCHEMA_VERSION)).unwrap(),
             ProductionMigrationPlan::VerifyOnly
         );
-        for version in [None, Some(1), Some(2), Some(IDENTITY_SCHEMA_VERSION)] {
-            assert_eq!(
-                production_migration_plan(version).unwrap(),
-                ProductionMigrationPlan::UpgradeThenV4,
-                "版本 {version:?} 必须先 Upgrade 再 v4"
-            );
-        }
-        for version in [Some(0), Some(5), Some(-1), Some(i32::MAX)] {
-            let error = production_migration_plan(version).expect_err("未知版本必须拒绝");
+        // v1/v2/v3 与 0、负数、未来版本一律拒绝：不存在任何续迁路线。
+        for version in [
+            Some(0),
+            Some(1),
+            Some(2),
+            Some(3),
+            Some(5),
+            Some(-1),
+            Some(i32::MAX),
+        ] {
+            let error = production_migration_plan(version).expect_err("非空库且非 v4 必须拒绝");
             let message = error.to_string();
-            // 固定诊断：纯 ASCII、静态码，不含连接标识。
             assert!(message.is_ascii(), "固定诊断必须纯 ASCII，实际：{message}");
             assert!(
                 !message.contains("mysql://") && !message.contains('@'),
@@ -5585,7 +1731,528 @@ mod tests {
         }
     }
 
-    /// 生产门禁的合成环境变量样本：取值全是合成值，唯一用途是断言它们绝不外泄。
+    #[test]
+    fn v4_baseline_sql_is_sixteen_tables_without_checks_or_foreign_keys() {
+        let statements = v4_schema_statements().expect("v4 基线 SQL 必须可解析");
+        assert_eq!(statements.len(), 16, "v4 基线必须恰好 16 条 CREATE");
+        let seen: Vec<&str> = statements.iter().map(|(table, _)| *table).collect();
+        let mut expected: Vec<&str> = TABLES.iter().map(|(table, ..)| *table).collect();
+        expected.extend(RUNTIME_TABLES.iter().map(|(table, ..)| *table));
+        assert_eq!(seen, expected, "v4 基线表集合与顺序必须与契约常量逐项一致");
+        for (table, statement) in &statements {
+            assert!(
+                statement.starts_with(&format!("CREATE TABLE IF NOT EXISTS {table} (")),
+                "{table} 的 DDL 必须以受控 CREATE 前缀开始"
+            );
+            let upper = statement.to_ascii_uppercase();
+            for forbidden in ["FOREIGN KEY", "REFERENCES", "CHECK ("] {
+                assert!(
+                    !upper.contains(forbidden),
+                    "v4 基线不得声明 {forbidden}：{table}"
+                );
+            }
+            assert!(
+                statement
+                    .lines()
+                    .all(|line| !line.trim_start().starts_with("--")),
+                "{table} 的 DDL 不得残留整行注释"
+            );
+        }
+    }
+
+    #[test]
+    fn v4_baseline_parser_rejects_unknown_tables_and_constraints() {
+        let base = v4_schema_body();
+        let users_tail = "UNIQUE KEY uq_users_username (username)\n)";
+        assert!(
+            base.contains(users_tail),
+            "用例前提：users DDL 尾部必须可定位，用于注入被禁止的约束"
+        );
+        let unknown = base.replace(
+            "CREATE TABLE IF NOT EXISTS users (",
+            "CREATE TABLE IF NOT EXISTS users_extra (",
+        );
+        assert_ne!(unknown, base);
+        assert!(parse_v4_statements(&unknown).is_err(), "未知表名必须拒绝");
+        let foreign_key = base.replace(
+            users_tail,
+            "UNIQUE KEY uq_users_username (username),\n  FOREIGN KEY (id) REFERENCES roles (id)\n)",
+        );
+        assert!(
+            parse_v4_statements(&foreign_key).is_err(),
+            "注入外键必须拒绝"
+        );
+        let check = base.replace(
+            users_tail,
+            "UNIQUE KEY uq_users_username (username),\n  CONSTRAINT ck_x CHECK (1 = 1)\n)",
+        );
+        assert!(parse_v4_statements(&check).is_err(), "注入 CHECK 必须拒绝");
+        let duplicated = format!("{base}\n{base}");
+        assert!(
+            parse_v4_statements(&duplicated).is_err(),
+            "重复建表（含多一条语句）必须拒绝"
+        );
+        let missing = base.replace(
+            "CREATE TABLE IF NOT EXISTS recovery_checks (",
+            "CREATE TABLE IF NOT EXISTS recovery_checks_unused (",
+        );
+        assert!(
+            parse_v4_statements(&missing).is_err(),
+            "少一张已知表必须拒绝"
+        );
+    }
+
+    /// 注释形态门禁：v4 基线**只支持整行 `--` 注释**，行内注释、`#` 与 `/* … */` 一律
+    /// fail-closed；字符串字面量里的同名标记不得被误判为注释。
+    ///
+    /// 这条门禁的存在理由来自真实缺陷：`schema/v4.sql` 曾在 `task_previews` 的列尾写行内
+    /// 注释，`ddl_parts_from` 按顶层逗号切分后，下一个片段以注释文本开头，真实 MySQL 8.0
+    /// 只读核验于是报出 `v4 schema DDL missing column task_previews.targets_json`。
+    #[test]
+    fn v4_schema_comments_must_be_whole_line_only() {
+        // 基线自身两侧都必须通过：原始文件与去整行注释后的 DDL。
+        v4_comment_form_check(V4_SCHEMA_SQL).expect("schema/v4.sql 的注释必须全部是整行注释");
+        v4_comment_form_check(&v4_schema_body()).expect("去注释后的 DDL 不得再残留任何注释标记");
+
+        // 行内注释：必须拒绝，且诊断是固定 ASCII 文案。
+        let inline = "CREATE TABLE IF NOT EXISTS users (\n  id BINARY(16) NOT NULL PRIMARY KEY, -- 行内注释\n  display_name VARCHAR(255) NOT NULL\n) CHARACTER SET utf8mb4;";
+        let error = v4_comment_form_check(inline).expect_err("行内注释必须 fail-closed");
+        let message = error.to_string();
+        assert!(message.is_ascii(), "固定诊断必须纯 ASCII，实际：{message}");
+        assert!(
+            message.contains("unsupported inline comment"),
+            "行内注释必须有专属固定码，实际：{message}"
+        );
+
+        // 整行注释（含缩进）：必须放行。
+        v4_comment_form_check(
+            "-- 顶部注释\n  -- 缩进注释\nCREATE TABLE IF NOT EXISTS users (\n  id BINARY(16) NOT NULL PRIMARY KEY\n) CHARACTER SET utf8mb4;",
+        )
+        .expect("整行注释是 v4 基线唯一支持的注释形态");
+        // 注释体里出现未配对引号也不能影响判定（整行注释整段跳过）。
+        v4_comment_form_check(
+            "-- 注释里有单引号 ' 与 -- 继续\nCREATE TABLE IF NOT EXISTS users (\n  id BINARY(16) NOT NULL PRIMARY KEY\n) CHARACTER SET utf8mb4;",
+        )
+        .expect("整行注释的注释体不参与扫描");
+
+        // `#` 与块注释同样不受支持。
+        for unsupported in [
+            "CREATE TABLE IF NOT EXISTS users (\n  id BINARY(16) NOT NULL PRIMARY KEY\n) CHARACTER SET utf8mb4; # 尾注",
+            "CREATE TABLE IF NOT EXISTS users (\n  id BINARY(16) /* 块注释 */ NOT NULL PRIMARY KEY\n) CHARACTER SET utf8mb4;",
+        ] {
+            let error = v4_comment_form_check(unsupported).expect_err("# 与块注释必须 fail-closed");
+            assert!(
+                error.to_string().contains("unsupported comment form"),
+                "不受支持的注释形态必须有固定码，实际：{error}"
+            );
+        }
+
+        // 字符串字面量里的 `--` 不是注释：不得把合法 SQL 文本误判。
+        v4_comment_form_check(
+            "CREATE TABLE IF NOT EXISTS users (\n  marker VARCHAR(8) NOT NULL DEFAULT '--'\n) CHARACTER SET utf8mb4;",
+        )
+        .expect("字符串字面量里的 -- 不是注释");
+        // 字面量里的 `--` 之后仍要能识别真正的行内注释。
+        let literal_then_comment = "CREATE TABLE IF NOT EXISTS users (\n  marker VARCHAR(8) NOT NULL DEFAULT '--', -- 真注释\n  id BINARY(16) NOT NULL PRIMARY KEY\n) CHARACTER SET utf8mb4;";
+        assert!(v4_comment_form_check(literal_then_comment).is_err());
+        // 未闭合字面量说明文本本身已损坏，同样拒绝。
+        assert!(
+            v4_comment_form_check(
+                "CREATE TABLE IF NOT EXISTS users (\n  marker VARCHAR(8) NOT NULL DEFAULT 'oops\n) CHARACTER SET utf8mb4;"
+            )
+            .is_err(),
+            "未闭合字符串字面量必须拒绝"
+        );
+
+        // 端到端：把行内注释注回基线，门禁必须在解析语句之前就拒绝（而不是解析出 16 条语句
+        // 后在形状校验里伪装成"库里缺列"）。
+        let polluted = v4_schema_body().replace(
+            "  targets_json JSON NOT NULL,",
+            "  targets_json JSON NOT NULL, -- x",
+        );
+        assert_ne!(polluted, v4_schema_body(), "用例前提：注入必须命中");
+        assert!(
+            v4_comment_form_check(&polluted).is_err(),
+            "注入的行内注释必须被门禁拒绝"
+        );
+    }
+
+    #[test]
+    fn table_set_requires_exactly_the_sixteen_v4_tables() {
+        let sixteen: Vec<String> = TABLES
+            .iter()
+            .chain(RUNTIME_TABLES)
+            .map(|(table, ..)| (*table).to_owned())
+            .collect();
+        assert!(validate_table_set(&sixteen).is_ok());
+        // 旧 identity-only 形状（11 表）不再可接受。
+        let identity_only: Vec<String> = sixteen[..TABLES.len()].to_vec();
+        assert!(
+            validate_table_set(&identity_only).is_err(),
+            "缺 runtime 五表的旧形状必须拒绝"
+        );
+        let mut missing_runtime = sixteen.clone();
+        missing_runtime.retain(|name| name != "recovery_checks");
+        assert!(
+            validate_table_set(&missing_runtime).is_err(),
+            "缺任意一张 runtime 表必须拒绝"
+        );
+        let mut unknown = sixteen.clone();
+        unknown.push("legacy_users".into());
+        assert!(validate_table_set(&unknown).is_err(), "未知表必须拒绝");
+        let mut duplicated = sixteen.clone();
+        duplicated.push("users".into());
+        assert!(validate_table_set(&duplicated).is_err(), "重复表必须拒绝");
+    }
+
+    /// v4 fresh 建库流程的受控 fake：把「已存在的表」「建表次数」「元数据写入次数」
+    /// 「只读门禁次数」显式暴露成断言目标，用于验证顺序与失败即停。
+    #[derive(Default)]
+    struct FreshState {
+        created: Vec<String>,
+        creates: usize,
+        meta_writes: usize,
+        readonly_checks: usize,
+        version: Option<i32>,
+    }
+
+    #[derive(Default)]
+    struct FakeFresh {
+        version: Option<i32>,
+        existing: Vec<String>,
+        create_error_at: Option<usize>,
+        create_drift: bool,
+        shape_error: bool,
+        fk_error: bool,
+        empty_error: bool,
+        meta_error: bool,
+        meta_lands_anyway: bool,
+        /// true 时写入返回成功，但读回版本恒为 3（版本落定失败）。
+        stuck_readback: bool,
+        /// true 时写入之后的版本读回**自身失败**（连"没落定"都无法证明）。
+        readback_error: bool,
+        state: std::sync::Mutex<FreshState>,
+    }
+
+    impl IdentitySchemaProbe for FakeFresh {
+        async fn read_version(&self) -> Result<Option<i32>, ControllerError> {
+            let state = self.state.lock().unwrap();
+            if state.meta_writes > 0 {
+                if self.readback_error {
+                    // 读回自身失败：既不能证明落定，也不能证明未落定。
+                    return Err(v4_schema_error("injected readback failure"));
+                }
+                return Ok(if self.stuck_readback {
+                    Some(3)
+                } else {
+                    state.version
+                });
+            }
+            Ok(self.version)
+        }
+        async fn validate_shape(&self) -> Result<(), ControllerError> {
+            if self.shape_error {
+                return Err(v4_schema_error("injected shape drift"));
+            }
+            Ok(())
+        }
+        async fn validate_data(&self) -> Result<(), ControllerError> {
+            self.state.lock().unwrap().readonly_checks += 1;
+            Ok(())
+        }
+        async fn runtime_table_presence(&self) -> Result<RuntimeTablePresence, ControllerError> {
+            Ok(full_presence())
+        }
+        async fn validate_runtime_data(&self) -> Result<(), ControllerError> {
+            Ok(())
+        }
+        async fn validate_fk(&self) -> Result<(), ControllerError> {
+            if self.fk_error {
+                return Err(v4_schema_error("injected foreign key"));
+            }
+            Ok(())
+        }
+    }
+
+    impl FreshV4Probe for FakeFresh {
+        async fn schema_tables(&self) -> Result<Vec<String>, ControllerError> {
+            let state = self.state.lock().unwrap();
+            Ok(self
+                .existing
+                .iter()
+                .cloned()
+                .chain(state.created.iter().cloned())
+                .collect())
+        }
+        async fn create_table(&self, statement: &str) -> Result<(), ControllerError> {
+            let mut state = self.state.lock().unwrap();
+            state.creates += 1;
+            if self.create_error_at == Some(state.creates) {
+                return Err(v4_schema_error("injected DDL failure"));
+            }
+            let table = statement
+                .strip_prefix("CREATE TABLE IF NOT EXISTS ")
+                .and_then(|rest| rest.split_once('('))
+                .map(|(name, _)| name.trim())
+                .ok_or_else(|| v4_schema_error("injected unparsable DDL"))?;
+            if !self.create_drift {
+                state.created.push(table.to_owned());
+            }
+            Ok(())
+        }
+        async fn validate_tables_are_empty(&self) -> Result<(), ControllerError> {
+            if self.empty_error {
+                return Err(v4_schema_error("injected nonempty table"));
+            }
+            Ok(())
+        }
+        async fn insert_v4_meta(&self) -> Result<(), ControllerError> {
+            let mut state = self.state.lock().unwrap();
+            state.meta_writes += 1;
+            if self.meta_error {
+                if self.meta_lands_anyway {
+                    // 驱动报错但写入实际落定：结果不确定，绝不宣称成功。
+                    state.version = Some(crate::integrity::SUPPORTED_SCHEMA_VERSION);
+                }
+                return Err(v4_schema_error("injected write failure"));
+            }
+            state.version = Some(crate::integrity::SUPPORTED_SCHEMA_VERSION);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_create_rejects_any_existing_version_before_touching_ddl() {
+        for version in [
+            Some(1),
+            Some(2),
+            Some(3),
+            Some(4),
+            Some(5),
+            Some(0),
+            Some(-1),
+        ] {
+            let fake = FakeFresh {
+                version,
+                ..FakeFresh::default()
+            };
+            assert!(
+                create_v4_schema_with_probe(&fake).await.is_err(),
+                "已存在版本 {version:?} 必须拒绝建库"
+            );
+            let state = fake.state.lock().unwrap();
+            assert_eq!(state.creates, 0, "拒绝路径必须零 DDL");
+            assert_eq!(state.meta_writes, 0, "拒绝路径必须零元数据写入");
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_create_rejects_partial_schema_before_first_ddl() {
+        // 部分建表 / 旧表残留 / 未知表：即便没有版本行也不允许"顺手补齐"。
+        for existing in [
+            vec!["users".to_owned()],
+            vec!["schema_meta".to_owned()],
+            vec!["main_tasks".to_owned(), "sub_tasks".to_owned()],
+            vec!["legacy_users".to_owned()],
+        ] {
+            let fake = FakeFresh {
+                existing,
+                ..FakeFresh::default()
+            };
+            assert!(
+                create_v4_schema_with_probe(&fake).await.is_err(),
+                "非真正空库必须拒绝建库"
+            );
+            let state = fake.state.lock().unwrap();
+            assert_eq!(state.creates, 0, "空库判定在首条 DDL 之前，拒绝必须零写入");
+            assert_eq!(state.meta_writes, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_create_writes_meta_only_after_full_shape_and_empty_data_pass() {
+        let fake = FakeFresh::default();
+        create_v4_schema_with_probe(&fake)
+            .await
+            .expect("真正空库必须一次建满 v4");
+        let state = fake.state.lock().unwrap();
+        assert_eq!(state.creates, 16, "必须恰好执行 16 条 CREATE");
+        assert_eq!(state.created.len(), 16, "16 张表都必须可见");
+        assert_eq!(state.meta_writes, 1, "元数据只写一次");
+        assert_eq!(
+            state.version,
+            Some(crate::integrity::SUPPORTED_SCHEMA_VERSION)
+        );
+        assert_eq!(state.readonly_checks, 1, "版本落定后必须跑一次只读闭合门禁");
+    }
+
+    #[tokio::test]
+    async fn fresh_create_stops_at_first_failure_and_never_writes_meta() {
+        // DDL 失败：立即返回，绝不自动修复或续跑。
+        let fake = FakeFresh {
+            create_error_at: Some(3),
+            ..FakeFresh::default()
+        };
+        assert!(create_v4_schema_with_probe(&fake).await.is_err());
+        assert_eq!(
+            fake.state.lock().unwrap().meta_writes,
+            0,
+            "建表失败绝不写版本"
+        );
+
+        // 建表成功但元数据不承认（漂移）：同样停。
+        let fake = FakeFresh {
+            create_drift: true,
+            ..FakeFresh::default()
+        };
+        assert!(create_v4_schema_with_probe(&fake).await.is_err());
+        assert_eq!(
+            fake.state.lock().unwrap().meta_writes,
+            0,
+            "建表结果与元数据不一致绝不写版本"
+        );
+
+        // 形状漂移 / 外键漂移 / 数据非空：都不写版本。
+        for (shape, fk, empty) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let fake = FakeFresh {
+                shape_error: shape,
+                fk_error: fk,
+                empty_error: empty,
+                ..FakeFresh::default()
+            };
+            assert!(create_v4_schema_with_probe(&fake).await.is_err());
+            assert_eq!(
+                fake.state.lock().unwrap().meta_writes,
+                0,
+                "shape={shape} fk={fk} empty={empty} 时绝不写版本"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_create_never_claims_success_when_meta_write_is_untrusted() {
+        // 写入被拒：报未就绪，且不跑成功门禁。
+        let fake = FakeFresh {
+            meta_error: true,
+            ..FakeFresh::default()
+        };
+        let error = create_v4_schema_with_probe(&fake)
+            .await
+            .expect_err("元数据写入被拒必须报错");
+        assert!(
+            error.to_string().contains("version write rejected"),
+            "写入被拒必须显式报未就绪，实际：{error}"
+        );
+        assert_eq!(
+            fake.state.lock().unwrap().readonly_checks,
+            0,
+            "写入失败绝不跑成功门禁"
+        );
+
+        // 写入结果不确定（报错但实际落定）：同样绝不宣称成功。
+        let fake = FakeFresh {
+            meta_error: true,
+            meta_lands_anyway: true,
+            ..FakeFresh::default()
+        };
+        let error = create_v4_schema_with_probe(&fake)
+            .await
+            .expect_err("写入结果不确定必须报错");
+        assert!(
+            error
+                .to_string()
+                .contains("version write outcome uncertain"),
+            "不确定结果必须显式报不确定，实际：{error}"
+        );
+        assert_eq!(
+            fake.state.lock().unwrap().readonly_checks,
+            0,
+            "不确定结果绝不跑成功门禁"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_create_reports_uncertain_when_failed_write_cannot_be_read_back() {
+        // 写入报错之后版本读回也失败：连"确实没落定"都证明不了，只能报结果不确定。
+        let fake = FakeFresh {
+            meta_error: true,
+            readback_error: true,
+            ..FakeFresh::default()
+        };
+        let error = create_v4_schema_with_probe(&fake)
+            .await
+            .expect_err("写入失败且读回失败必须报错");
+        assert!(
+            error
+                .to_string()
+                .contains("version write outcome uncertain"),
+            "读回自身失败不能证明未提交，必须报不确定，实际：{error}"
+        );
+        let (meta_writes, readonly_checks) = {
+            let state = fake.state.lock().unwrap();
+            (state.meta_writes, state.readonly_checks)
+        };
+        assert_eq!(meta_writes, 1, "不确定结果绝不自动重试");
+        assert_eq!(readonly_checks, 0, "不确定结果绝不跑成功门禁");
+
+        // 对照：读回成功且能证明版本行不是受支持版本，才允许固定为"被拒"。
+        let fake = FakeFresh {
+            meta_error: true,
+            stuck_readback: true,
+            ..FakeFresh::default()
+        };
+        let error = create_v4_schema_with_probe(&fake)
+            .await
+            .expect_err("读回确证非受支持版本必须报错");
+        assert!(
+            error.to_string().contains("version write rejected"),
+            "读回确证非受支持版本才可报被拒，实际：{error}"
+        );
+        assert_eq!(
+            fake.state.lock().unwrap().meta_writes,
+            1,
+            "被拒同样绝不自动重试"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_create_requires_supported_version_readback_before_closure_check() {
+        let fake = FakeFresh {
+            stuck_readback: true,
+            ..FakeFresh::default()
+        };
+        let error = create_v4_schema_with_probe(&fake)
+            .await
+            .expect_err("读回版本不是受支持版本必须报错");
+        assert!(
+            error
+                .to_string()
+                .contains("version readback is not the supported version"),
+            "读回漂移必须显式报错，实际：{error}"
+        );
+        assert_eq!(
+            fake.state.lock().unwrap().readonly_checks,
+            0,
+            "读回漂移绝不跑闭合门禁"
+        );
+    }
+
+    #[test]
+    fn v4_schema_error_messages_are_fixed_ascii_without_identifiers() {
+        let message = v4_schema_error("injected shape drift").to_string();
+        assert!(message.is_ascii(), "诊断必须纯 ASCII：{message}");
+        assert!(message.starts_with("configuration: v4 schema baseline rejected: "));
+        for secret in ["mysql://", "@", "password", "BEGIN", "COMMIT", "ROLLBACK"] {
+            assert!(!message.contains(secret), "诊断去敏失败：{message}");
+        }
+    }
+
+    // ===== 与 v4-only 契约仍然一致的通用门禁 / 授权 / 去敏测试（原样保留） =====
+
     fn production_gate_env(overrides: &[(&str, Option<&str>)]) -> Vec<(String, Option<String>)> {
         let mut vars: Vec<(String, Option<String>)> = vec![
             (
@@ -5629,8 +2296,6 @@ mod tests {
         })
     }
 
-    /// 所有门禁失败分支都塌缩到同一条固定去敏消息：既不含 DSN 任何片段，也不含库名或
-    /// 备份引用。
     fn production_gate_error_is_fixed(message: &str) {
         assert_eq!(
             message, "configuration: production migration authorization required",
@@ -5725,306 +2390,62 @@ mod tests {
     }
 
     #[test]
-    fn explicit_migration_checks_session_grants_before_any_upgrade_branch() {
-        let source = include_str!("db.rs");
-        let entry = source
-            .split_once("pub async fn run_identity_test_migration(")
-            .unwrap()
-            .1
-            .split_once("\nasync fn preflight_values(")
-            .unwrap()
-            .0;
-        let name = entry.find("SELECT DATABASE()").unwrap();
-        let grants = entry
-            .find("require_schema_metadata_privilege(&mut connection, &actual).await?")
-            .unwrap();
-        let upgrade = entry
-            .find("upgrade_identity_schema(&db, mode).await")
-            .unwrap();
-        let gate = source
-            .split_once("async fn run_authorized_migration_with<")
-            .unwrap()
-            .1
-            .split_once("\nfn validate_v3_table_collation(")
-            .unwrap()
-            .0;
-        let authorized = gate
-            .find("authorize_test_migration(config, &actual)?")
-            .unwrap();
-        let verify = gate.find("verify_grants(db, actual).await?").unwrap();
-        let dispatch = gate.find("upgrade(db).await").unwrap();
-        assert!(name < grants && grants < upgrade);
-        assert!(authorized < verify && verify < dispatch);
-    }
-
-    #[test]
-    fn fresh_upgrades_to_check_free_v3_not_historical_v2() {
-        // This deliberately guards the executable dispatch, not just the already
-        // present v3 SQL file: a v3 file alone did not make Upgrade use it.
-        let source = include_str!("db.rs");
-        let dispatch = source
-            .split_once("async fn upgrade_identity_schema(")
-            .unwrap()
-            .1
-            .split_once("\npub trait AdmissionStore")
-            .unwrap()
-            .0;
-        assert!(dispatch.contains("TestMigrationMode::Upgrade => upgrade_authorized_with_probe"));
-        assert!(source.contains("_ => upgrade_fresh_v3(probe).await"));
+    fn schema_metadata_grants_require_exact_direct_schema_all() {
+        let target = "dev_identity";
+        let direct = "GRANT ALL PRIVILEGES ON `dev_identity`.* TO `tester`@`localhost`";
+        let usage = "GRANT USAGE ON *.* TO `tester`@`localhost`";
+        assert!(validate_schema_metadata_grants(&[Some(direct.into())], target).is_ok());
         assert!(
-            dispatch.contains("TestMigrationMode::FixtureV1 | TestMigrationMode::FixturePartialV1")
-        );
-    }
-
-    #[test]
-    fn fresh_v3_fixed_baseline_has_exactly_eleven_create_only_statements() {
-        let statements = v3_create_statements().unwrap();
-        assert_eq!(statements.len(), 11);
-        assert_eq!(statements[0].0, "schema_meta");
-        assert_eq!(
-            statements
-                .iter()
-                .filter(|(name, _)| *name == "users")
-                .count(),
-            1
-        );
-        assert!(statements.iter().all(|(name, sql)| {
-            TABLES.iter().any(|(known, _, _)| known == name)
-                && sql.starts_with(&format!("CREATE TABLE IF NOT EXISTS {name} ("))
-                && !sql.contains("CHECK (")
-                && !sql.contains("FOREIGN KEY")
-        }));
-    }
-
-    #[tokio::test]
-    async fn upgrade_fresh_v3_fake_records_closed_checks_and_no_legacy_writes() {
-        use std::sync::Mutex;
-
-        #[derive(Default)]
-        struct State {
-            version: Option<i32>,
-            tables: Vec<String>,
-            calls: Vec<&'static str>,
-            creates: usize,
-            inserts: usize,
-            fail_version: bool,
-            fail_tables: bool,
-            fail_at_create: Option<usize>,
-            stale_metadata: bool,
-            fail_empty: bool,
-            fail_shape: bool,
-            fail_fk: bool,
-            fail_insert: bool,
-        }
-        #[derive(Default)]
-        struct Fake(Mutex<State>);
-        impl IdentitySchemaProbe for Fake {
-            async fn read_version(&self) -> Result<Option<i32>, ControllerError> {
-                let mut state = self.0.lock().unwrap();
-                state.calls.push("version");
-                if state.fail_version {
-                    return Err(ControllerError::Config(
-                        "version metadata unavailable".into(),
-                    ));
-                }
-                Ok(state.version)
-            }
-            async fn validate_v2_shape(&self) -> Result<(), ControllerError> {
-                let mut state = self.0.lock().unwrap();
-                state.calls.push("shape");
-                if state.fail_shape {
-                    Err(ControllerError::Config("shape".into()))
-                } else {
-                    Ok(())
-                }
-            }
-            #[cfg(test)]
-            async fn validate_legacy_v2_shape(&self) -> Result<(), ControllerError> {
-                panic!("historical shape is not part of Upgrade")
-            }
-            async fn validate_data(&self) -> Result<(), ControllerError> {
-                self.0.lock().unwrap().calls.push("data");
-                Ok(())
-            }
-            async fn validate_data_at_v3(&self) -> Result<(), ControllerError> {
-                self.0.lock().unwrap().calls.push("data");
-                Ok(())
-            }
-            async fn runtime_table_presence(
-                &self,
-            ) -> Result<RuntimeTablePresence, ControllerError> {
-                panic!("v3 terminal gate must not probe runtime tables")
-            }
-            async fn validate_runtime_data(&self) -> Result<(), ControllerError> {
-                panic!("v3 terminal gate must not scan runtime data")
-            }
-            async fn validate_fk(&self) -> Result<(), ControllerError> {
-                let mut state = self.0.lock().unwrap();
-                state.calls.push("fk");
-                if state.fail_fk {
-                    Err(ControllerError::Config("fk".into()))
-                } else {
-                    Ok(())
-                }
-            }
-        }
-        impl FreshIdentityMigrationProbe for Fake {
-            async fn schema_tables(&self) -> Result<Vec<String>, ControllerError> {
-                let mut state = self.0.lock().unwrap();
-                state.calls.push("tables");
-                if state.fail_tables {
-                    return Err(ControllerError::Config("table metadata unavailable".into()));
-                }
-                let mut actual = state.tables.clone();
-                if state.stale_metadata && state.creates != 0 {
-                    actual.pop();
-                }
-                Ok(actual)
-            }
-            async fn create_table(&self, statement: &str) -> Result<(), ControllerError> {
-                let (name, _) = v3_create_statements()?
-                    .into_iter()
-                    .find(|(_, sql)| *sql == statement)
-                    .ok_or_else(|| ControllerError::Config("unwhitelisted CREATE".into()))?;
-                let mut state = self.0.lock().unwrap();
-                state.calls.push("create");
-                state.creates += 1;
-                if state.fail_at_create == Some(state.creates) {
-                    return Err(ControllerError::Config("CREATE failed".into()));
-                }
-                state.tables.push(name.to_owned());
-                Ok(())
-            }
-            async fn validate_empty_data(&self) -> Result<(), ControllerError> {
-                let mut state = self.0.lock().unwrap();
-                state.calls.push("empty");
-                if state.fail_empty {
-                    Err(ControllerError::Config("nonempty".into()))
-                } else {
-                    Ok(())
-                }
-            }
-            async fn insert_v3_meta(&self) -> Result<(), ControllerError> {
-                let mut state = self.0.lock().unwrap();
-                state.calls.push("insert");
-                state.inserts += 1;
-                if state.fail_insert {
-                    Err(ControllerError::Config("insert uncertain".into()))
-                } else {
-                    state.version = Some(3);
-                    Ok(())
-                }
-            }
-        }
-        let fresh = Fake::default();
-        upgrade_fresh_v3(&fresh).await.unwrap();
-        {
-            let state = fresh.0.lock().unwrap();
-            assert_eq!(
-                (state.version, state.creates, state.inserts),
-                (Some(3), 11, 1)
-            );
-            assert_eq!(&state.calls[..2], &["version", "tables"]);
-            assert_eq!(
-                &state.calls[24..],
+            validate_schema_metadata_grants(
                 &[
-                    "shape", "fk", "empty", "insert", "version", "shape", "data", "fk"
-                ]
-            );
-        }
-        let before = fresh.0.lock().unwrap().calls.len();
-        upgrade_fresh_v3(&fresh).await.unwrap();
-        {
-            let state = fresh.0.lock().unwrap();
-            assert_eq!((state.creates, state.inserts), (11, 1));
-            assert_eq!(
-                &state.calls[before..],
-                &["version", "version", "shape", "data", "fk"]
-            );
-        }
-
-        for version in [Some(1), Some(2), Some(4)] {
-            let fake = Fake(Mutex::new(State {
-                version,
-                ..State::default()
-            }));
-            let error = upgrade_fresh_v3(&fake).await.unwrap_err();
-            assert!(matches!(error, ControllerError::Config(_)));
-            let state = fake.0.lock().unwrap();
-            assert_eq!((state.creates, state.inserts), (0, 0));
-            assert_eq!(state.calls, ["version"]);
-        }
-        for state in [
-            State {
-                fail_version: true,
-                ..State::default()
-            },
-            State {
-                fail_tables: true,
-                ..State::default()
-            },
-            State {
-                tables: vec!["schema_meta".into()],
-                ..State::default()
-            },
-            State {
-                fail_at_create: Some(3),
-                ..State::default()
-            },
-            State {
-                stale_metadata: true,
-                ..State::default()
-            },
-            State {
-                fail_shape: true,
-                ..State::default()
-            },
-            State {
-                fail_fk: true,
-                ..State::default()
-            },
-            State {
-                fail_empty: true,
-                ..State::default()
-            },
-            State {
-                fail_insert: true,
-                ..State::default()
-            },
+                    Some(usage.into()),
+                    Some(format!("{direct} WITH GRANT OPTION"))
+                ],
+                target,
+            )
+            .is_ok()
+        );
+        for invalid in [
+            "GRANT ALL PRIVILEGES ON `dev_identity_backup`.* TO `tester`@`localhost`",
+            "GRANT ALL PRIVILEGES ON `other_dev_identity`.* TO `tester`@`localhost`",
+            "GRANT ALL PRIVILEGES ON *.* TO `tester`@`localhost`",
+            "GRANT USAGE ON *.* TO `tester`@`localhost`",
+            "GRANT `metadata_role`@`localhost` TO `tester`@`localhost`",
+            "not a recognized SHOW GRANTS row",
+            "GRANT ALL PRIVILEGES ON `dev_identity`.* TO `tester`@`localhost` arbitrary",
         ] {
-            let fake = Fake(Mutex::new(state));
-            let error = upgrade_fresh_v3(&fake).await.unwrap_err();
-            let state = fake.0.lock().unwrap();
-            assert_eq!(state.inserts, if state.fail_insert { 1 } else { 0 });
-            if state.fail_at_create.is_some() {
-                assert_eq!(
-                    state.tables.len(),
-                    2,
-                    "failed nontransactional CREATE is not rolled back"
-                );
-            }
-            if state.fail_insert {
-                assert!(format!("{error}").contains("uncertain"));
-                assert_ne!(
-                    state.calls.last(),
-                    Some(&"insert"),
-                    "uncertain insert must re-read"
-                );
-            }
+            assert!(validate_schema_metadata_grants(&[Some(invalid.into())], target).is_err());
         }
-    }
-
-    #[test]
-    fn historical_fixtures_never_write_v2_version() {
-        let body = include_str!("db.rs")
-            .split_once("async fn create_historical_v1_fixture(")
-            .unwrap()
-            .1
-            .split_once("\npub trait AdmissionStore")
-            .unwrap()
-            .0;
-        assert!(!body.contains("SET schema_version = 2"));
-        assert!(!body.contains("check_legacy_v2_ready(db).await"));
+        for grants in [
+            vec![],
+            vec![None],
+            vec![Some(direct.into()), None],
+            vec![
+                Some(direct.into()),
+                Some("REVOKE SELECT ON `dev_identity`.`hidden` FROM `tester`@`localhost`".into()),
+            ],
+            vec![
+                Some(direct.into()),
+                Some("GRANT USAGE ON *.* TO `different`@`localhost`".into()),
+            ],
+            vec![
+                Some(direct.into()),
+                Some("GRANT `metadata_role`@`localhost` TO `tester`@`localhost`".into()),
+            ],
+        ] {
+            assert!(validate_schema_metadata_grants(&grants, target).is_err());
+        }
+        assert!(
+            validate_schema_metadata_grants(&[Some(direct.into())], "dev_identity_bad").is_err()
+        );
+        assert!(validate_schema_metadata_grants(&[Some(direct.into())], "dev_identity`").is_err());
+        assert!(
+            !format!(
+                "{}",
+                validate_schema_metadata_grants(&[None], target).unwrap_err()
+            )
+            .contains(target)
+        );
     }
 
     #[test]
@@ -6078,296 +2499,11 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn readonly_probe_requires_version_shape_data_and_trusted_empty_fk_metadata() {
-        use std::sync::Mutex;
-        struct Fake {
-            version: Option<i32>,
-            broken_shape: bool,
-            bad_data: bool,
-            missing_runtime_table: Option<&'static str>,
-            bad_runtime_data: bool,
-            fk: &'static str,
-            calls: Mutex<Vec<&'static str>>,
-        }
-        impl IdentitySchemaProbe for Fake {
-            async fn read_version(&self) -> Result<Option<i32>, ControllerError> {
-                self.calls.lock().unwrap().push("version");
-                Ok(self.version)
-            }
-            async fn validate_v2_shape(&self) -> Result<(), ControllerError> {
-                self.calls.lock().unwrap().push("shape");
-                if self.broken_shape {
-                    Err(ControllerError::Config("broken shape".into()))
-                } else {
-                    Ok(())
-                }
-            }
-            #[cfg(test)]
-            async fn validate_legacy_v2_shape(&self) -> Result<(), ControllerError> {
-                panic!("startup must never use historical v2 shape")
-            }
-            async fn validate_data(&self) -> Result<(), ControllerError> {
-                self.calls.lock().unwrap().push("data");
-                if self.bad_data {
-                    Err(ControllerError::Config("polluted identity data".into()))
-                } else {
-                    Ok(())
-                }
-            }
-            async fn validate_data_at_v3(&self) -> Result<(), ControllerError> {
-                panic!("v4 startup gate must not use the v3-scoped data scan")
-            }
-            async fn runtime_table_presence(
-                &self,
-            ) -> Result<RuntimeTablePresence, ControllerError> {
-                self.calls.lock().unwrap().push("presence");
-                let mut presence = full_presence();
-                match self.missing_runtime_table {
-                    None => {}
-                    Some("main_tasks") => presence.main_tasks = false,
-                    Some("sub_tasks") => presence.sub_tasks = false,
-                    Some("task_previews") => presence.task_previews = false,
-                    Some("device_operation_locks") => presence.device_operation_locks = false,
-                    Some("recovery_checks") => presence.recovery_checks = false,
-                    Some(other) => panic!("unknown runtime table {other}"),
-                }
-                Ok(presence)
-            }
-            async fn validate_runtime_data(&self) -> Result<(), ControllerError> {
-                self.calls.lock().unwrap().push("runtime_data");
-                if self.bad_runtime_data {
-                    Err(ControllerError::Config("polluted runtime data".into()))
-                } else {
-                    Ok(())
-                }
-            }
-            async fn validate_fk(&self) -> Result<(), ControllerError> {
-                self.calls.lock().unwrap().push("fk");
-                match self.fk {
-                    "empty" => Ok(()),
-                    "present" => Err(ControllerError::Config(
-                        "identity foreign keys present".into(),
-                    )),
-                    "unknown" => Err(ControllerError::Config(
-                        "identity FK metadata unavailable".into(),
-                    )),
-                    _ => unreachable!(),
-                }
-            }
-        }
-        #[derive(Clone, Copy)]
-        struct Case {
-            name: &'static str,
-            version: Option<i32>,
-            broken_shape: bool,
-            bad_data: bool,
-            missing_runtime_table: Option<&'static str>,
-            bad_runtime_data: bool,
-            fk: &'static str,
-            expected_calls: &'static [&'static str],
-            expected_error: &'static str,
-        }
-        // 完整合法的 v4 基线：五张 runtime 表齐备、runtime 数据干净。
-        const VALID_V4: Case = Case {
-            name: "v4-ready",
-            version: Some(4),
-            broken_shape: false,
-            bad_data: false,
-            missing_runtime_table: None,
-            bad_runtime_data: false,
-            fk: "empty",
-            expected_calls: &["shape", "presence", "data", "runtime_data", "fk"],
-            expected_error: "ready",
-        };
-        let mut cases: Vec<Case> = vec![
-            // 非 v4（含缺失行、v1..=3、v5+）在版本决策处即被拒绝，绝不触达
-            // identity 结构、runtime 五表与数据门禁。
-            Case {
-                name: "missing-version",
-                version: None,
-                expected_calls: &[],
-                expected_error: "not-ready",
-                ..VALID_V4
-            },
-            Case {
-                name: "v1",
-                version: Some(1),
-                expected_calls: &[],
-                expected_error: "not-ready",
-                ..VALID_V4
-            },
-            Case {
-                name: "v2",
-                version: Some(2),
-                expected_calls: &[],
-                expected_error: "not-ready",
-                ..VALID_V4
-            },
-            // v3 只能经显式迁移 preflight 放行，普通启动（期望 v4）必须拒绝。
-            Case {
-                name: "v3",
-                version: Some(3),
-                expected_calls: &[],
-                expected_error: "not-ready",
-                ..VALID_V4
-            },
-            Case {
-                name: "v5",
-                version: Some(5),
-                expected_calls: &[],
-                expected_error: "not-ready",
-                ..VALID_V4
-            },
-            Case {
-                name: "broken-shape",
-                broken_shape: true,
-                expected_calls: &["shape"],
-                expected_error: "broken shape",
-                ..VALID_V4
-            },
-            Case {
-                name: "bad-identity-data",
-                bad_data: true,
-                expected_calls: &["shape", "presence", "data"],
-                expected_error: "polluted identity data",
-                ..VALID_V4
-            },
-            Case {
-                name: "bad-runtime-data",
-                bad_runtime_data: true,
-                expected_calls: &["shape", "presence", "data", "runtime_data"],
-                expected_error: "polluted runtime data",
-                ..VALID_V4
-            },
-            Case {
-                name: "fk-unknown",
-                fk: "unknown",
-                expected_error: "identity FK metadata unavailable",
-                ..VALID_V4
-            },
-            Case {
-                name: "fk-present",
-                fk: "present",
-                expected_error: "identity foreign keys present",
-                ..VALID_V4
-            },
-            VALID_V4,
-        ];
-        // v4 库缺任一张 runtime 表都必须 fail-closed，且不再继续数据扫描。
-        for table in RUNTIME_TABLE_NAMES {
-            cases.insert(
-                cases.len() - 1,
-                Case {
-                    name: table,
-                    missing_runtime_table: Some(table),
-                    expected_calls: &["shape", "presence"],
-                    expected_error: "runtime schema table missing",
-                    ..VALID_V4
-                },
-            );
-        }
-        for case in cases {
-            let fake = Fake {
-                version: case.version,
-                broken_shape: case.broken_shape,
-                bad_data: case.bad_data,
-                missing_runtime_table: case.missing_runtime_table,
-                bad_runtime_data: case.bad_runtime_data,
-                fk: case.fk,
-                calls: Mutex::new(Vec::new()),
-            };
-            let result = check_identity_schema_with_probe(&fake).await;
-            match case.expected_error {
-                "not-ready" => assert!(
-                    matches!(result, Err(ControllerError::SchemaNotReady { found, required: 4 }) if found == case.version),
-                    "{}: {result:?}",
-                    case.name
-                ),
-                "ready" => assert!(
-                    result.is_ok(),
-                    "{}: 六道门禁全过才允许启动: {result:?}",
-                    case.name
-                ),
-                message => assert!(
-                    matches!(result, Err(ControllerError::Config(ref found)) if found == message
-                        || found.starts_with(&format!("{message}:"))),
-                    "{}: {result:?}",
-                    case.name
-                ),
-            }
-            let calls = fake.calls.lock().unwrap();
-            assert_eq!(calls.first(), Some(&"version"), "{}", case.name);
-            assert_eq!(&calls[1..], case.expected_calls, "{}", case.name);
-        }
-    }
-
-    #[tokio::test]
-    async fn legacy_v2_probe_accepts_only_version_two_with_complete_historical_shape() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        struct Fake {
-            version: Option<i32>,
-            shape_valid: bool,
-            shape_calls: AtomicUsize,
-        }
-        impl IdentitySchemaProbe for Fake {
-            async fn read_version(&self) -> Result<Option<i32>, ControllerError> {
-                Ok(self.version)
-            }
-            async fn validate_v2_shape(&self) -> Result<(), ControllerError> {
-                panic!("startup v3 shape must not be used by legacy runner")
-            }
-            #[cfg(test)]
-            async fn validate_legacy_v2_shape(&self) -> Result<(), ControllerError> {
-                self.shape_calls.fetch_add(1, Ordering::SeqCst);
-                if self.shape_valid {
-                    Ok(())
-                } else {
-                    Err(ControllerError::Config(
-                        "incomplete historical v2 shape".into(),
-                    ))
-                }
-            }
-            async fn validate_data(&self) -> Result<(), ControllerError> {
-                panic!("legacy runner must not scan v3 data")
-            }
-            async fn validate_data_at_v3(&self) -> Result<(), ControllerError> {
-                panic!("legacy v2 runner must not use the v3 terminal data scan")
-            }
-            async fn runtime_table_presence(
-                &self,
-            ) -> Result<RuntimeTablePresence, ControllerError> {
-                panic!("legacy v2 runner must not probe v4 runtime tables")
-            }
-            async fn validate_runtime_data(&self) -> Result<(), ControllerError> {
-                panic!("legacy v2 runner must not scan v4 runtime data")
-            }
-            async fn validate_fk(&self) -> Result<(), ControllerError> {
-                panic!("legacy v2 terminal check must not use the startup FK gate")
-            }
-        }
-        for (version, shape_valid, expected_calls, accepted) in [
-            (None, true, 0, false),
-            (Some(1), true, 0, false),
-            (Some(3), true, 0, false),
-            (Some(2), false, 1, false),
-            (Some(2), true, 1, true),
-        ] {
-            let fake = Fake {
-                version,
-                shape_valid,
-                shape_calls: AtomicUsize::new(0),
-            };
-            assert_eq!(check_legacy_v2_ready(&fake).await.is_ok(), accepted);
-            assert_eq!(fake.shape_calls.load(Ordering::SeqCst), expected_calls);
-        }
-    }
-
     #[test]
     fn normal_startup_accepts_only_v4_and_rejects_old_or_unknown_versions() {
         // 普通启动期望版本来自编译期配置 = 4（`startup_guard_decision`）。
         assert!(identity_schema_decision(Some(4)).is_ok());
-        // 缺失行与旧版（v1..=3）仅能经显式迁移 preflight 放行，普通启动拒绝。
+        // 缺失版本行或旧版一律拒绝普通启动；空库仅可显式初始化 v4，旧版无升级路线。
         for version in [None, Some(1), Some(2), Some(3)] {
             assert!(
                 matches!(identity_schema_decision(version), Err(ControllerError::SchemaNotReady { found, required: 4 }) if found == version)
@@ -6466,1045 +2602,6 @@ mod tests {
         ] {
             assert!(!output.contains(sensitive));
         }
-    }
-
-    const LEGACY_CHECK_ORDER: [(&str, &str); 5] = [
-        ("schema_meta", "chk_schema_singleton"),
-        ("devices", "chk_devices_state"),
-        ("devices", "chk_devices_decision"),
-        ("grants", "chk_grants_source"),
-        ("grants", "chk_grants_scope"),
-    ];
-
-    struct LegacyUpgradeFake(std::sync::Mutex<LegacyUpgradeFakeState>);
-    struct LegacyUpgradeFakeState {
-        version: i32,
-        columns: [bool; 11],
-        checks: Vec<(&'static str, &'static str)>,
-        check_sample: Option<(String, Option<String>, String)>,
-        events: Vec<String>,
-        fault_gate: Option<&'static str>,
-        fail_ddl_at: Option<(usize, bool)>,
-        noop_drop: bool,
-        drift_on_read: Option<usize>,
-        cas_rows: u64,
-        cas_updates_version: bool,
-        cas_corrupt_shape: bool,
-        cas_error: bool,
-        read_version_reply: Option<Option<i32>>,
-        fixture_tables: Option<Vec<String>>,
-    }
-    impl LegacyUpgradeFake {
-        fn new(version: i32) -> Self {
-            Self(std::sync::Mutex::new(LegacyUpgradeFakeState {
-                version,
-                columns: [version == 1; 11],
-                checks: LEGACY_CHECK_ORDER.to_vec(),
-                check_sample: None,
-                events: Vec::new(),
-                fault_gate: None,
-                fail_ddl_at: None,
-                noop_drop: false,
-                drift_on_read: None,
-                cas_rows: 1,
-                cas_updates_version: true,
-                cas_corrupt_shape: false,
-                cas_error: false,
-                read_version_reply: None,
-                fixture_tables: None,
-            }))
-        }
-        fn gate(&self, name: &'static str) -> Result<(), ControllerError> {
-            let mut state = self.0.lock().unwrap();
-            state.events.push(name.into());
-            if state.fault_gate == Some(name) {
-                return Err(ControllerError::Config("simulated gate failure".into()));
-            }
-            Ok(())
-        }
-        fn events(&self) -> Vec<String> {
-            self.0.lock().unwrap().events.clone()
-        }
-        fn writes(&self) -> Vec<String> {
-            self.events()
-                .into_iter()
-                .filter(|event| {
-                    event.starts_with("ALTER ") || event.starts_with("DROP ") || event == "cas"
-                })
-                .collect()
-        }
-    }
-    impl LegacyPreflightProbe for LegacyUpgradeFake {
-        async fn read_legacy_meta(&self) -> Result<Vec<(i8, i32)>, ControllerError> {
-            self.gate("meta")?;
-            let mut state = self.0.lock().unwrap();
-            let count = state.events.iter().filter(|event| *event == "meta").count();
-            if state.drift_on_read == Some(count) {
-                state.checks.clear();
-            }
-            Ok(vec![(1, state.version)])
-        }
-        async fn legacy_shape(
-            &self,
-            _: i32,
-        ) -> Result<Vec<(&'static str, &'static str)>, ControllerError> {
-            self.gate("shape")?;
-            let state = self.0.lock().unwrap();
-            if let Some((version, enforced, clause)) = &state.check_sample {
-                validate_legacy_check_metadata_with_version(
-                    &[(
-                        Some("grants".into()),
-                        Some("chk_grants_source".into()),
-                        Some(clause.clone()),
-                        enforced.clone(),
-                    )],
-                    Ok(Some(version)),
-                )?;
-            }
-            Ok(state.checks.clone())
-        }
-        async fn no_foreign_keys(&self) -> Result<(), ControllerError> {
-            self.gate("fk")
-        }
-        async fn identity_rows(&self, _: i32) -> Result<(), ControllerError> {
-            self.gate("data")
-        }
-        async fn column_status(&self, _: i32) -> Result<Vec<bool>, ControllerError> {
-            self.gate("status")?;
-            Ok(self.0.lock().unwrap().columns.to_vec())
-        }
-        async fn negative(&self, _: &'static str) -> Result<bool, ControllerError> {
-            self.gate("negative")?;
-            Ok(false)
-        }
-        async fn username_encoding(&self) -> Result<(), ControllerError> {
-            self.gate("encoding")
-        }
-        async fn username_collision(&self) -> Result<(), ControllerError> {
-            self.gate("collision")
-        }
-    }
-    impl LegacyUpgradeProbe for LegacyUpgradeFake {
-        async fn alter(&self, statement: &'static str) -> Result<(), ControllerError> {
-            let mut state = self.0.lock().unwrap();
-            state.events.push(format!("ALTER {statement}"));
-            let ordinal = state
-                .events
-                .iter()
-                .filter(|s| s.starts_with("ALTER ") || s.starts_with("DROP "))
-                .count();
-            if state.fail_ddl_at == Some((ordinal, false)) {
-                return Err(ControllerError::Config("simulated before ALTER".into()));
-            }
-            let index = IDENTITY_COLUMNS
-                .iter()
-                .position(|entry| entry.3 == statement)
-                .unwrap();
-            state.columns[index] = false;
-            if state.fail_ddl_at == Some((ordinal, true)) {
-                return Err(ControllerError::Config("simulated after ALTER".into()));
-            }
-            Ok(())
-        }
-        async fn drop_known_check(
-            &self,
-            table: &'static str,
-            name: &'static str,
-        ) -> Result<(), ControllerError> {
-            let mut state = self.0.lock().unwrap();
-            state.events.push(format!("DROP {table}.{name}"));
-            let ordinal = state
-                .events
-                .iter()
-                .filter(|s| s.starts_with("ALTER ") || s.starts_with("DROP "))
-                .count();
-            if state.fail_ddl_at == Some((ordinal, false)) {
-                return Err(ControllerError::Config("simulated before DROP".into()));
-            }
-            if !state.noop_drop {
-                state.checks.retain(|entry| *entry != (table, name));
-            }
-            if state.fail_ddl_at == Some((ordinal, true)) {
-                return Err(ControllerError::Config("simulated after DROP".into()));
-            }
-            Ok(())
-        }
-        async fn strict_v3_shape_without_meta_update(&self) -> Result<(), ControllerError> {
-            self.gate("strict")
-        }
-        async fn cas_version(&self, from: i32, to: i32) -> Result<u64, ControllerError> {
-            let mut state = self.0.lock().unwrap();
-            state.events.push("cas".into());
-            assert_eq!((from, to), (state.version, 3));
-            if state.cas_error {
-                state.version = 3; // Unknown result: even an applied CAS is not success.
-                return Err(ControllerError::Config("simulated uncertain CAS".into()));
-            }
-            if state.cas_rows == 1 && state.cas_updates_version {
-                state.version = to;
-            }
-            if state.cas_rows == 1 && state.cas_corrupt_shape {
-                state.columns[0] = true;
-            }
-            Ok(state.cas_rows)
-        }
-        async fn read_version(&self) -> Result<Option<i32>, ControllerError> {
-            self.gate("read_version")?;
-            let state = self.0.lock().unwrap();
-            Ok(state.read_version_reply.unwrap_or(Some(state.version)))
-        }
-        async fn ready_v3(&self) -> Result<(), ControllerError> {
-            self.gate("ready")?;
-            self.gate("ready_version")?;
-            if self.0.lock().unwrap().version != 3 {
-                return Err(legacy_preflight_error("ready.version"));
-            }
-            self.gate("ready_shape")?;
-            {
-                let state = self.0.lock().unwrap();
-                if state.columns.iter().any(|old| *old) || !state.checks.is_empty() {
-                    return Err(legacy_preflight_error("ready.shape"));
-                }
-            }
-            self.gate("ready_data")?;
-            self.gate("ready_fk")
-        }
-    }
-
-    impl IdentitySchemaProbe for LegacyUpgradeFake {
-        async fn read_version(&self) -> Result<Option<i32>, ControllerError> {
-            LegacyUpgradeProbe::read_version(self).await
-        }
-        async fn validate_v2_shape(&self) -> Result<(), ControllerError> {
-            assert_eq!(self.0.lock().unwrap().version, 3);
-            self.gate("fresh_shape")
-        }
-        async fn validate_legacy_v2_shape(&self) -> Result<(), ControllerError> {
-            panic!("legacy route must not use historical version-2 startup")
-        }
-        async fn validate_data(&self) -> Result<(), ControllerError> {
-            assert_eq!(self.0.lock().unwrap().version, 3);
-            self.gate("fresh_data")
-        }
-        async fn validate_data_at_v3(&self) -> Result<(), ControllerError> {
-            assert_eq!(self.0.lock().unwrap().version, 3);
-            self.gate("fresh_data")
-        }
-        async fn runtime_table_presence(&self) -> Result<RuntimeTablePresence, ControllerError> {
-            panic!("legacy v3 route must not probe v4 runtime tables")
-        }
-        async fn validate_runtime_data(&self) -> Result<(), ControllerError> {
-            panic!("legacy v3 route must not scan v4 runtime data")
-        }
-        async fn validate_fk(&self) -> Result<(), ControllerError> {
-            assert_eq!(self.0.lock().unwrap().version, 3);
-            self.gate("fresh_fk")
-        }
-    }
-    impl FreshIdentityMigrationProbe for LegacyUpgradeFake {
-        async fn schema_tables(&self) -> Result<Vec<String>, ControllerError> {
-            self.gate("fresh_tables")?;
-            let state = self.0.lock().unwrap();
-            Ok(state
-                .fixture_tables
-                .clone()
-                .unwrap_or_else(|| vec!["unversioned".to_owned()]))
-        }
-        async fn create_table(&self, _: &str) -> Result<(), ControllerError> {
-            panic!("legacy route must not create fresh tables")
-        }
-        async fn validate_empty_data(&self) -> Result<(), ControllerError> {
-            if self.0.lock().unwrap().fixture_tables.is_some() {
-                self.gate("fixture_empty_data")
-            } else {
-                panic!("legacy route must not use fresh row scan")
-            }
-        }
-        async fn insert_v3_meta(&self) -> Result<(), ControllerError> {
-            panic!("legacy route must not insert fresh metadata")
-        }
-    }
-
-    impl FixtureV2Probe for LegacyUpgradeFake {
-        async fn create_v1_table(&self, statement: &'static str) -> Result<(), ControllerError> {
-            let (table, _) = v1_create_statements()?
-                .into_iter()
-                .find(|&(_, sql)| sql == statement)
-                .unwrap();
-            let mut state = self.0.lock().unwrap();
-            state.events.push(format!("CREATE {table}"));
-            state.fixture_tables.as_mut().unwrap().push(table.into());
-            Ok(())
-        }
-        async fn validate_created_v1(&self) -> Result<(), ControllerError> {
-            self.gate("fixture_v1_shape")?;
-            self.gate("fixture_v1_fk")?;
-            self.gate("fixture_v1_columns")
-        }
-        async fn insert_v1_meta(&self) -> Result<(), ControllerError> {
-            let mut state = self.0.lock().unwrap();
-            state.events.push("fixture_insert".into());
-            state.version = 1;
-            state.read_version_reply = None;
-            Ok(())
-        }
-        async fn cas_fixture_v2(&self) -> Result<u64, ControllerError> {
-            let mut state = self.0.lock().unwrap();
-            state.events.push("fixture_cas".into());
-            assert_eq!(state.version, 1);
-            if state.cas_error {
-                state.version = 2;
-                return Err(legacy_preflight_error("fixture CAS uncertain"));
-            }
-            if state.cas_rows == 1 && state.cas_updates_version {
-                state.version = 2;
-            }
-            Ok(state.cas_rows)
-        }
-    }
-
-    fn empty_v2_fixture_fake() -> LegacyUpgradeFake {
-        let fake = LegacyUpgradeFake::new(1);
-        let mut state = fake.0.lock().unwrap();
-        state.read_version_reply = Some(None);
-        state.fixture_tables = Some(Vec::new());
-        drop(state);
-        fake
-    }
-
-    #[tokio::test]
-    async fn fixture_v2_fake_builds_old_schema_then_eleven_alters_and_cas_to_two() {
-        for count in [0, 5] {
-            let fake = empty_v2_fixture_fake();
-            if count == 0 {
-                fake.0.lock().unwrap().checks.clear();
-            }
-            fixture_v2_with_probe(&fake).await.unwrap();
-            let events = fake.events();
-            assert_eq!(
-                events.iter().filter(|e| e.starts_with("CREATE ")).count(),
-                11
-            );
-            assert_eq!(
-                events.iter().filter(|e| e.starts_with("ALTER ")).count(),
-                11
-            );
-            assert!(
-                !events
-                    .iter()
-                    .any(|e| e.starts_with("DROP ") || e == "ready")
-            );
-            assert!(
-                events.iter().position(|e| e == "fixture_v1_fk").unwrap()
-                    < events.iter().position(|e| e == "fixture_insert").unwrap()
-            );
-            assert!(
-                events.iter().position(|e| e == "data").unwrap()
-                    < events.iter().position(|e| e.starts_with("ALTER ")).unwrap()
-            );
-            assert_eq!(events.last().unwrap(), "collision");
-            let state = fake.0.lock().unwrap();
-            assert_eq!(state.version, 2);
-            assert_eq!(state.checks.len(), count);
-            assert_eq!(state.columns, [false; 11]);
-        }
-    }
-
-    #[tokio::test]
-    async fn fixture_v2_fake_refuses_nonempty_or_versioned_schema_without_ddl() {
-        for version in [Some(1), Some(2), Some(3), None] {
-            let fake = empty_v2_fixture_fake();
-            {
-                let mut state = fake.0.lock().unwrap();
-                state.read_version_reply = Some(version);
-                if version.is_none() {
-                    state.fixture_tables = Some(vec!["users".into()]);
-                }
-            }
-            assert!(fixture_v2_with_probe(&fake).await.is_err());
-            assert!(!fake.events().iter().any(|e| e.starts_with("CREATE ")
-                || e.starts_with("ALTER ")
-                || e == "fixture_cas"));
-        }
-    }
-
-    #[tokio::test]
-    async fn fixture_v2_fake_refuses_bad_preflight_before_first_alter_and_uncertain_cas() {
-        let fake = empty_v2_fixture_fake();
-        fake.0.lock().unwrap().fault_gate = Some("data");
-        assert!(fixture_v2_with_probe(&fake).await.is_err());
-        assert!(
-            !fake
-                .events()
-                .iter()
-                .any(|e| e.starts_with("ALTER ") || e == "fixture_cas")
-        );
-        for (rows, advances) in [(0, true), (1, false)] {
-            let fake = empty_v2_fixture_fake();
-            {
-                let mut state = fake.0.lock().unwrap();
-                state.cas_rows = rows;
-                state.cas_updates_version = advances;
-            }
-            assert!(fixture_v2_with_probe(&fake).await.is_err());
-            assert!(fake.events().contains(&"fixture_cas".into()));
-        }
-    }
-
-    #[test]
-    fn fixture_v2_dispatch_requires_separate_historical_route() {
-        let source = include_str!("db.rs");
-        let dispatch = source
-            .split_once("async fn upgrade_identity_schema(")
-            .unwrap()
-            .1
-            .split_once("async fn create_historical_v1_fixture(")
-            .unwrap()
-            .0;
-        assert!(dispatch.contains("TestMigrationMode::FixtureV2"));
-        assert!(dispatch.contains("create_historical_v2_fixture(db).await"));
-        assert!(!dispatch.contains("check_identity_schema(db).await"));
-    }
-
-    #[test]
-    fn historical_fixtures_require_proven_check_subset_not_exact_five() {
-        let source = include_str!("db.rs");
-        let fixture = source
-            .split_once("async fn create_historical_v1_fixture(")
-            .unwrap()
-            .1
-            .split_once("\npub trait AdmissionStore")
-            .unwrap()
-            .0;
-        assert!(fixture.contains("validate_legacy_shape(db, 1).await?"));
-        assert!(!fixture.contains("validate_schema_shape(db, Some(false)).await?"));
-        assert!(!fixture.contains("validate_schema_shape(db, None).await?"));
-    }
-
-    #[tokio::test]
-    async fn authorized_upgrade_routes_legacy_versions_to_resumable_probe() {
-        for version in [1, 2] {
-            let fake = LegacyUpgradeFake::new(version);
-            {
-                let mut state = fake.0.lock().unwrap();
-                state.columns = [false; 11];
-                state.checks.clear();
-            }
-            upgrade_authorized_with_probe(&fake).await.unwrap();
-            assert_eq!(fake.writes(), vec!["cas"]);
-            assert_eq!(fake.0.lock().unwrap().version, 3);
-            assert_eq!(fake.events()[0], "read_version");
-        }
-    }
-
-    #[tokio::test]
-    async fn authorized_upgrade_v3_is_readonly_and_unknown_version_is_rejected() {
-        let ready = LegacyUpgradeFake::new(3);
-        {
-            let mut state = ready.0.lock().unwrap();
-            state.columns = [false; 11];
-            state.checks.clear();
-        }
-        upgrade_authorized_with_probe(&ready).await.unwrap();
-        assert!(ready.writes().is_empty());
-        assert_eq!(
-            ready.events(),
-            vec![
-                "read_version",
-                "read_version",
-                "read_version",
-                "fresh_shape",
-                "fresh_data",
-                "fresh_fk"
-            ]
-        );
-        let unknown = LegacyUpgradeFake::new(4);
-        assert!(upgrade_authorized_with_probe(&unknown).await.is_err());
-        assert_eq!(unknown.events(), vec!["read_version", "read_version"]);
-        assert!(unknown.writes().is_empty());
-        let unversioned = LegacyUpgradeFake::new(1);
-        unversioned.0.lock().unwrap().read_version_reply = Some(None);
-        assert!(upgrade_authorized_with_probe(&unversioned).await.is_err());
-        assert_eq!(
-            unversioned.events(),
-            vec!["read_version", "read_version", "fresh_tables"]
-        );
-        assert!(unversioned.writes().is_empty());
-    }
-
-    #[test]
-    fn sqlx_legacy_adapter_has_fixed_ddl_and_narrow_version_cas() {
-        let source = include_str!("db.rs");
-        let adapter = source
-            .split_once("impl LegacyUpgradeProbe for DbPool {")
-            .map_or("", |(_, rest)| {
-                rest.split_once("\ntrait LegacyUpgradeProbe").unwrap().0
-            });
-        assert!(adapter.contains("IDENTITY_COLUMNS.iter().any(|entry| entry.3 == statement)"));
-        assert!(adapter.contains("legacy_check_drop_sql(table, name)?"));
-        assert!(adapter.contains(
-            "UPDATE schema_meta SET schema_version = 3 WHERE singleton = 1 AND schema_version = ?"
-        ));
-        assert!(adapter.contains(".bind(from)"));
-        assert!(adapter.contains("result.rows_affected()"));
-        assert!(adapter.contains("validate_v3_schema_shape(self).await?"));
-        assert!(adapter.contains("require_no_identity_foreign_keys(self).await?"));
-        assert!(adapter.contains("preflight_legacy_for_v3(self, version).await?"));
-        assert!(adapter.contains("check_v3_ready_with_probe(self).await"));
-        assert!(!adapter.contains("format!(\"ALTER"));
-        assert!(!adapter.contains("DROP DATABASE"));
-        assert!(!adapter.contains("tidb_enable_check_constraint"));
-    }
-
-    #[test]
-    fn legacy_drop_templates_are_fixed_whitelisted_sql() {
-        assert_eq!(LEGACY_CHECK_DROPS.len(), LEGACY_CHECK_ORDER.len());
-        for (index, &(table, name, statement)) in LEGACY_CHECK_DROPS.iter().enumerate() {
-            assert_eq!((table, name), LEGACY_CHECK_ORDER[index]);
-            assert_eq!(statement, format!("ALTER TABLE {table} DROP CHECK {name}"));
-            assert_eq!(legacy_check_drop_sql(table, name).unwrap(), statement);
-            assert!(!statement.contains("DROP DATABASE"));
-            assert!(!statement.contains("GLOBAL"));
-        }
-        assert!(legacy_check_drop_sql("devices", "unknown").is_err());
-        assert!(legacy_check_drop_sql("other", "chk_devices_state").is_err());
-    }
-
-    #[tokio::test]
-    async fn legacy_upgrade_only_writes_fixed_remaining_steps_and_reads_every_boundary() {
-        for version in [1, 2] {
-            let fake = LegacyUpgradeFake::new(version);
-            {
-                let mut state = fake.0.lock().unwrap();
-                state.columns = [false; 11];
-                if version == 1 {
-                    state.columns[1] = true;
-                    state.columns[10] = true;
-                }
-                state.checks = vec![
-                    LEGACY_CHECK_ORDER[4],
-                    LEGACY_CHECK_ORDER[1],
-                    LEGACY_CHECK_ORDER[0],
-                ];
-            }
-            upgrade_legacy_with_probe(&fake, version).await.unwrap();
-            let mut expected = Vec::new();
-            if version == 1 {
-                expected.push(format!("ALTER {}", IDENTITY_COLUMNS[1].3));
-                expected.push(format!("ALTER {}", IDENTITY_COLUMNS[10].3));
-            }
-            for (table, name) in [
-                LEGACY_CHECK_ORDER[0],
-                LEGACY_CHECK_ORDER[1],
-                LEGACY_CHECK_ORDER[4],
-            ] {
-                expected.push(format!("DROP {table}.{name}"));
-            }
-            expected.push("cas".into());
-            assert_eq!(fake.writes(), expected);
-            let events = fake.events();
-            let preflight_reads = events.iter().filter(|event| *event == "meta").count();
-            assert_eq!(preflight_reads, 2 + 2 * (expected.len() - 1));
-            for index in 0..events.len() {
-                if events[index].starts_with("ALTER ") || events[index].starts_with("DROP ") {
-                    assert_eq!(events[index - 1], "collision");
-                    assert_eq!(events[index + 1], "meta");
-                }
-            }
-            assert!(events.ends_with(&[
-                "strict".into(),
-                "cas".into(),
-                "read_version".into(),
-                "ready".into(),
-                "ready_version".into(),
-                "ready_shape".into(),
-                "ready_data".into(),
-                "ready_fk".into(),
-            ]));
-            assert_eq!(fake.0.lock().unwrap().version, 3);
-        }
-        let full = LegacyUpgradeFake::new(1);
-        full.0.lock().unwrap().checks.clear();
-        upgrade_legacy_with_probe(&full, 1).await.unwrap();
-        assert_eq!(full.writes().len(), IDENTITY_COLUMNS.len() + 1);
-        assert_eq!(
-            full.events()
-                .iter()
-                .filter(|event| *event == "meta")
-                .count(),
-            2 + 2 * IDENTITY_COLUMNS.len()
-        );
-        for (index, &(_, _, _, statement)) in IDENTITY_COLUMNS.iter().enumerate() {
-            assert_eq!(full.writes()[index], format!("ALTER {statement}"));
-        }
-        let empty = LegacyUpgradeFake::new(2);
-        empty.0.lock().unwrap().checks.clear();
-        upgrade_legacy_with_probe(&empty, 2).await.unwrap();
-        assert_eq!(empty.writes(), vec!["cas"]);
-    }
-
-    #[tokio::test]
-    async fn legacy_upgrade_fails_closed_before_writes_on_bad_gates_and_drift() {
-        for gate in [
-            "meta",
-            "shape",
-            "fk",
-            "data",
-            "status",
-            "negative",
-            "encoding",
-            "collision",
-        ] {
-            let fake = LegacyUpgradeFake::new(1);
-            fake.0.lock().unwrap().fault_gate = Some(gate);
-            assert!(upgrade_legacy_with_probe(&fake, 1).await.is_err(), "{gate}");
-            assert!(fake.writes().is_empty(), "{gate}");
-        }
-        for version in [0, 3] {
-            let fake = LegacyUpgradeFake::new(version);
-            assert!(upgrade_legacy_with_probe(&fake, version).await.is_err());
-            assert!(fake.events().is_empty());
-        }
-        let v2_old = LegacyUpgradeFake::new(2);
-        v2_old.0.lock().unwrap().columns[0] = true;
-        assert!(upgrade_legacy_with_probe(&v2_old, 2).await.is_err());
-        assert!(v2_old.writes().is_empty());
-        for checks in [
-            vec![("outsider", "unknown")],
-            vec![LEGACY_CHECK_ORDER[0]; 2],
-        ] {
-            let fake = LegacyUpgradeFake::new(2);
-            fake.0.lock().unwrap().checks = checks;
-            assert!(upgrade_legacy_with_probe(&fake, 2).await.is_err());
-            assert!(fake.writes().is_empty());
-        }
-        let drift = LegacyUpgradeFake::new(1);
-        drift.0.lock().unwrap().drift_on_read = Some(2);
-        assert!(upgrade_legacy_with_probe(&drift, 1).await.is_err());
-        assert!(drift.writes().is_empty());
-        for (version, read_at, expected_writes) in [(1, 3, 1), (2, 2, 0), (2, 3, 1)] {
-            let drift = LegacyUpgradeFake::new(version);
-            drift.0.lock().unwrap().drift_on_read = Some(read_at);
-            assert!(upgrade_legacy_with_probe(&drift, version).await.is_err());
-            assert_eq!(drift.writes().len(), expected_writes);
-            assert_eq!(drift.0.lock().unwrap().version, version);
-        }
-    }
-
-    #[tokio::test]
-    async fn legacy_upgrade_nontransactional_errors_are_retryable_but_not_success() {
-        for (version, first_drop) in [(1, false), (2, true)] {
-            for ordinal in [1, 2] {
-                for applied in [false, true] {
-                    let fake = LegacyUpgradeFake::new(version);
-                    if !first_drop {
-                        let mut state = fake.0.lock().unwrap();
-                        state.columns = [false; 11];
-                        state.columns[0] = true;
-                        state.columns[1] = true;
-                    }
-                    fake.0.lock().unwrap().fail_ddl_at = Some((ordinal, applied));
-                    assert!(upgrade_legacy_with_probe(&fake, version).await.is_err());
-                    assert_eq!(fake.0.lock().unwrap().version, version);
-                    assert_eq!(fake.writes().len(), ordinal);
-                    assert_eq!(
-                        fake.events()
-                            .iter()
-                            .filter(|event| *event == "meta")
-                            .count(),
-                        1 + 2 * ordinal
-                    );
-                    fake.0.lock().unwrap().fail_ddl_at = None;
-                    upgrade_legacy_with_probe(&fake, version).await.unwrap();
-                    let total_ddl = if first_drop { 5 } else { 7 };
-                    let already_applied = ordinal - 1 + usize::from(applied);
-                    assert_eq!(
-                        fake.writes().len() - ordinal,
-                        total_ddl - already_applied + 1
-                    );
-                    assert_eq!(fake.0.lock().unwrap().version, 3);
-                }
-            }
-        }
-        let noop = LegacyUpgradeFake::new(2);
-        noop.0.lock().unwrap().noop_drop = true;
-        assert!(upgrade_legacy_with_probe(&noop, 2).await.is_err());
-        assert_eq!(noop.writes(), vec!["DROP schema_meta.chk_schema_singleton"]);
-        assert_eq!(
-            noop.events()
-                .iter()
-                .filter(|event| *event == "meta")
-                .count(),
-            3
-        );
-        assert_eq!(noop.0.lock().unwrap().version, 2);
-    }
-
-    #[tokio::test]
-    async fn legacy_upgrade_cas_and_post_cas_failures_never_claim_success() {
-        for rows in [0, 2] {
-            let fake = LegacyUpgradeFake::new(2);
-            {
-                let mut state = fake.0.lock().unwrap();
-                state.checks.clear();
-                state.cas_rows = rows;
-            }
-            assert!(upgrade_legacy_with_probe(&fake, 2).await.is_err());
-            assert_eq!(fake.0.lock().unwrap().version, 2);
-            assert!(fake.events().contains(&"read_version".into()));
-        }
-        let uncertain = LegacyUpgradeFake::new(2);
-        uncertain.0.lock().unwrap().checks.clear();
-        uncertain.0.lock().unwrap().cas_error = true;
-        assert!(upgrade_legacy_with_probe(&uncertain, 2).await.is_err());
-        assert_eq!(uncertain.0.lock().unwrap().version, 3);
-        assert!(uncertain.events().contains(&"read_version".into()));
-        let ready = LegacyUpgradeFake::new(2);
-        ready.0.lock().unwrap().checks.clear();
-        ready.0.lock().unwrap().fault_gate = Some("ready");
-        assert!(upgrade_legacy_with_probe(&ready, 2).await.is_err());
-        assert_eq!(ready.0.lock().unwrap().version, 3);
-        let strict = LegacyUpgradeFake::new(2);
-        strict.0.lock().unwrap().checks.clear();
-        strict.0.lock().unwrap().fault_gate = Some("strict");
-        assert!(upgrade_legacy_with_probe(&strict, 2).await.is_err());
-        assert!(strict.writes().is_empty());
-    }
-
-    #[tokio::test]
-    async fn legacy_upgrade_rejects_cas_ok_one_when_version_remains_legacy() {
-        for version in [1, 2] {
-            let fake = LegacyUpgradeFake::new(version);
-            {
-                let mut state = fake.0.lock().unwrap();
-                state.columns = [false; 11];
-                state.checks.clear();
-                state.cas_rows = 1;
-                state.cas_updates_version = false;
-            }
-            // The original permissive ready_v3 let this pass during RED;
-            // the state machine must not infer version 3 from rowcount alone.
-            let result = upgrade_legacy_with_probe(&fake, version).await;
-            assert!(
-                matches!(result, Err(ControllerError::Config(ref message)) if message == "legacy version CAS outcome uncertain"),
-                "version {version}: {result:?}"
-            );
-            assert_eq!(fake.0.lock().unwrap().version, version);
-            assert!(fake.events().contains(&"read_version".into()));
-            assert!(!fake.events().contains(&"ready".into()));
-        }
-    }
-
-    #[tokio::test]
-    async fn legacy_upgrade_rejects_unknown_post_cas_version_without_ready() {
-        for reply in [Some(1), Some(2), None] {
-            let fake = LegacyUpgradeFake::new(2);
-            {
-                let mut state = fake.0.lock().unwrap();
-                state.checks.clear();
-                state.read_version_reply = Some(reply);
-            }
-            let result = upgrade_legacy_with_probe(&fake, 2).await;
-            assert!(
-                matches!(result, Err(ControllerError::Config(ref message)) if message == "legacy version CAS outcome uncertain"),
-                "reply {reply:?}: {result:?}"
-            );
-            assert_eq!(fake.0.lock().unwrap().version, 3);
-            assert!(!fake.events().contains(&"ready".into()));
-        }
-        let read_failure = LegacyUpgradeFake::new(2);
-        {
-            let mut state = read_failure.0.lock().unwrap();
-            state.checks.clear();
-            state.fault_gate = Some("read_version");
-        }
-        let result = upgrade_legacy_with_probe(&read_failure, 2).await;
-        assert!(
-            matches!(result, Err(ControllerError::Config(ref message)) if message == "legacy version CAS outcome uncertain")
-        );
-        assert!(!read_failure.events().contains(&"ready".into()));
-    }
-
-    #[tokio::test]
-    async fn legacy_upgrade_rejects_post_cas_shape_data_and_fk_failures() {
-        for gate in ["ready_shape", "ready_data", "ready_fk"] {
-            let fake = LegacyUpgradeFake::new(2);
-            {
-                let mut state = fake.0.lock().unwrap();
-                state.checks.clear();
-                state.fault_gate = Some(gate);
-            }
-            assert!(upgrade_legacy_with_probe(&fake, 2).await.is_err(), "{gate}");
-            assert_eq!(fake.0.lock().unwrap().version, 3);
-            assert!(fake.events().contains(&gate.into()));
-        }
-        let shape_drift = LegacyUpgradeFake::new(2);
-        {
-            let mut state = shape_drift.0.lock().unwrap();
-            state.checks.clear();
-            state.cas_corrupt_shape = true;
-        }
-        assert!(upgrade_legacy_with_probe(&shape_drift, 2).await.is_err());
-        assert_eq!(shape_drift.0.lock().unwrap().version, 3);
-        assert!(shape_drift.events().contains(&"ready_shape".into()));
-    }
-
-    #[tokio::test]
-    async fn legacy_preflight_orders_all_select_gates_and_never_calls_a_writer() {
-        use std::sync::Mutex;
-        struct Fake {
-            meta: Vec<(i8, i32)>,
-            status: Vec<bool>,
-            fault: Option<&'static str>,
-            negative_at: Option<usize>,
-            checks: Vec<(&'static str, &'static str)>,
-            calls: Mutex<Vec<&'static str>>,
-            writes: Mutex<usize>,
-        }
-        impl Fake {
-            fn clean(version: i32) -> Self {
-                Self {
-                    meta: vec![(1, version)],
-                    status: vec![version == 1; IDENTITY_COLUMNS.len()],
-                    fault: None,
-                    negative_at: None,
-                    checks: vec![("devices", "chk_devices_state")],
-                    calls: Mutex::new(Vec::new()),
-                    writes: Mutex::new(0),
-                }
-            }
-            fn step(&self, name: &'static str) -> Result<(), ControllerError> {
-                self.calls.lock().unwrap().push(name);
-                if self.fault == Some(name) {
-                    Err(ControllerError::Config("simulated metadata failure".into()))
-                } else {
-                    Ok(())
-                }
-            }
-            fn write(&self) {
-                *self.writes.lock().unwrap() += 1;
-            }
-        }
-        impl LegacyPreflightProbe for Fake {
-            async fn read_legacy_meta(&self) -> Result<Vec<(i8, i32)>, ControllerError> {
-                self.step("meta")?;
-                Ok(self.meta.clone())
-            }
-            async fn legacy_shape(
-                &self,
-                _: i32,
-            ) -> Result<Vec<(&'static str, &'static str)>, ControllerError> {
-                self.step("shape")?;
-                Ok(self.checks.clone())
-            }
-            async fn no_foreign_keys(&self) -> Result<(), ControllerError> {
-                self.step("fk")
-            }
-            async fn identity_rows(&self, _: i32) -> Result<(), ControllerError> {
-                self.step("data")
-            }
-            async fn column_status(&self, _: i32) -> Result<Vec<bool>, ControllerError> {
-                self.step("status")?;
-                Ok(self.status.clone())
-            }
-            async fn negative(&self, query: &'static str) -> Result<bool, ControllerError> {
-                self.step("negative")?;
-                Ok(self
-                    .negative_at
-                    .is_some_and(|i| IDENTITY_COLUMNS[i].2 == query))
-            }
-            async fn username_encoding(&self) -> Result<(), ControllerError> {
-                self.step("encoding")
-            }
-            async fn username_collision(&self) -> Result<(), ControllerError> {
-                self.step("collision")
-            }
-        }
-        for version in [1, 2] {
-            let good = Fake::clean(version);
-            let status = preflight_legacy_with_probe(&good, version).await.unwrap();
-            assert_eq!(status.old_columns.len(), 11);
-            assert_eq!(status.old_columns, [version == 1; 11]);
-            assert_eq!(
-                status.observed_checks,
-                vec![("devices", "chk_devices_state")]
-            );
-            let calls = good.calls.lock().unwrap().clone();
-            assert_eq!(&calls[..5], &["meta", "shape", "fk", "data", "status"]);
-            assert_eq!(&calls[calls.len() - 2..], &["encoding", "collision"]);
-            assert_eq!(
-                calls.iter().filter(|&&name| name == "negative").count(),
-                if version == 1 { 10 } else { 0 }
-            );
-            assert_eq!(*good.writes.lock().unwrap(), 0);
-
-            let empty_checks = Fake {
-                checks: vec![],
-                ..Fake::clean(version)
-            };
-            assert!(
-                preflight_legacy_with_probe(&empty_checks, version)
-                    .await
-                    .unwrap()
-                    .observed_checks
-                    .is_empty()
-            );
-            for checks in [
-                vec![("unknown_table", "chk_looks_known")],
-                vec![("devices", "chk_devices_state"); 2],
-            ] {
-                let untrusted = Fake {
-                    checks,
-                    ..Fake::clean(version)
-                };
-                assert!(
-                    preflight_legacy_with_probe(&untrusted, version)
-                        .await
-                        .is_err()
-                );
-                assert_eq!(&*untrusted.calls.lock().unwrap(), &["meta", "shape"]);
-                assert_eq!(*untrusted.writes.lock().unwrap(), 0);
-            }
-            for meta in [
-                vec![],
-                vec![(0, version)],
-                vec![(1, version + 1)],
-                vec![(1, version), (1, version)],
-            ] {
-                let bad = Fake {
-                    meta,
-                    ..Fake::clean(version)
-                };
-                assert!(preflight_legacy_with_probe(&bad, version).await.is_err());
-                assert_eq!(&*bad.calls.lock().unwrap(), &["meta"]);
-                assert_eq!(*bad.writes.lock().unwrap(), 0);
-            }
-            for fault in [
-                "meta",
-                "shape",
-                "fk",
-                "data",
-                "status",
-                "encoding",
-                "collision",
-            ] {
-                let bad = Fake {
-                    fault: Some(fault),
-                    ..Fake::clean(version)
-                };
-                assert!(
-                    preflight_legacy_with_probe(&bad, version).await.is_err(),
-                    "{fault}"
-                );
-                assert_eq!(bad.calls.lock().unwrap().last(), Some(&fault));
-                assert_eq!(*bad.writes.lock().unwrap(), 0);
-            }
-            for length in [0, 10, 12] {
-                let bad = Fake {
-                    status: vec![false; length],
-                    ..Fake::clean(version)
-                };
-                assert!(preflight_legacy_with_probe(&bad, version).await.is_err());
-                assert_eq!(
-                    &*bad.calls.lock().unwrap(),
-                    &["meta", "shape", "fk", "data", "status"]
-                );
-            }
-            if version == 2 {
-                let bad = Fake {
-                    status: vec![true; 11],
-                    ..Fake::clean(version)
-                };
-                assert!(preflight_legacy_with_probe(&bad, version).await.is_err());
-                assert_eq!(
-                    &*bad.calls.lock().unwrap(),
-                    &["meta", "shape", "fk", "data", "status"]
-                );
-            } else {
-                for i in 0..10 {
-                    let bad = Fake {
-                        negative_at: Some(i),
-                        ..Fake::clean(version)
-                    };
-                    assert!(
-                        preflight_legacy_with_probe(&bad, version).await.is_err(),
-                        "negative {i}"
-                    );
-                    assert_eq!(bad.calls.lock().unwrap().last(), Some(&"negative"));
-                    assert_eq!(*bad.writes.lock().unwrap(), 0);
-                }
-                let bad = Fake {
-                    fault: Some("negative"),
-                    ..Fake::clean(version)
-                };
-                assert!(preflight_legacy_with_probe(&bad, version).await.is_err());
-                let mut mixed = Fake::clean(version);
-                mixed.status = vec![false; 11];
-                mixed.status[0] = true;
-                assert!(preflight_legacy_with_probe(&mixed, version).await.is_ok());
-                assert_eq!(
-                    mixed
-                        .calls
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .filter(|&&name| name == "negative")
-                        .count(),
-                    1
-                );
-            }
-        }
-        for version in [0, 3, -1] {
-            let bad = Fake::clean(version);
-            assert!(preflight_legacy_with_probe(&bad, version).await.is_err());
-            assert!(bad.calls.lock().unwrap().is_empty());
-        }
-        // A separate writer witness is deliberately never invoked by this read-only entry.
-        let fake = Fake::clean(1);
-        let _writer: fn(&Fake) = Fake::write;
-        assert_eq!(*fake.writes.lock().unwrap(), 0);
-    }
-
-    #[test]
-    fn preflight_refuses_invalid_and_target_collision() {
-        let long = "a".repeat(65);
-        for names in [
-            &["alice", "Éric"][..],
-            &["alice", long.as_str()],
-            &["alice", "Alice"],
-            &["alice", "alice"],
-        ] {
-            assert!(
-                preflight_usernames(names.iter().copied()).is_err(),
-                "{names:?}"
-            );
-        }
-        assert!(preflight_usernames(["alice", "bob_1"]).is_ok());
-    }
-
-    #[test]
-    fn mixed_identity_columns_are_resumable() {
-        let old = ColumnMeta {
-            name: "revision".into(),
-            data_type: "bigint".into(),
-            column_type: "bigint".into(),
-            nullable: false,
-            character_set_name: None,
-            collation_name: None,
-            default: None,
-        };
-        assert!(classify_identity_column("devices", "revision", &old).unwrap());
-        let new = ColumnMeta {
-            column_type: "bigint unsigned".into(),
-            ..old.clone()
-        };
-        assert!(!classify_identity_column("devices", "revision", &new).unwrap());
-        let drift = ColumnMeta {
-            data_type: "varchar".into(),
-            column_type: "varchar(20)".into(),
-            ..old
-        };
-        assert!(classify_identity_column("devices", "revision", &drift).is_err());
     }
 
     #[tokio::test]
@@ -7607,1553 +2704,28 @@ mod tests {
         assert_eq!(upgraded.get(), 1);
     }
 
-    #[tokio::test]
-    async fn failed_grants_read_blocks_upgrade_after_actual_database_authorization() {
-        use std::cell::RefCell;
-        let calls = RefCell::new(Vec::new());
-        let config = TestMigrationConfig {
-            test_url: "mysql://fixture/test_identity".into(),
-            allow_destructive: true,
-            expected_database: "test_identity".into(),
-            backup_ref: "snapshot-placeholder".into(),
-            migration_ack: "isolated-exclusive-backed-up-disposable".into(),
-        };
-        let result = run_authorized_migration_with(
-            &config,
-            || async {
-                calls.borrow_mut().push("connect_and_database");
-                Ok(((), "test_identity".into()))
-            },
-            |_, actual| {
-                calls.borrow_mut().push("read_grants");
-                assert_eq!(actual, "test_identity");
-                async { Err::<(), _>(schema_metadata_privilege_error()) }
-            },
-            |_| async {
-                calls.borrow_mut().push("upgrade_or_fixture_ddl");
-                Ok(())
-            },
-        )
-        .await;
-        assert!(matches!(result, Err(ControllerError::Config(_))));
-        assert_eq!(*calls.borrow(), ["connect_and_database", "read_grants"]);
-    }
-
     #[test]
-    fn closed_identity_metadata_rejects_extra_or_missing_objects() {
-        for kind in ["column", "check"] {
-            let expected = vec!["known".to_owned()];
-            assert!(validate_object_names("users", kind, &expected, &expected).is_ok());
-            assert!(
-                validate_object_names(
-                    "users",
-                    kind,
-                    &expected,
-                    &["known".into(), "unknown".into()]
-                )
-                .is_err(),
-                "{kind}"
-            );
-            assert!(
-                validate_object_names("users", kind, &expected, &[]).is_err(),
-                "{kind}"
-            );
-        }
-        let expected =
-            expected_indexes(&ddl_parts("users"), &["PRIMARY", "uq_users_username"]).unwrap();
-        let mut extra = expected.clone();
-        extra.push(IndexMeta {
-            name: "ix_extra".into(),
-            columns: vec!["username".into()],
-            unique: false,
-            sub_parts: vec![None],
-        });
-        assert!(validate_indexes("users", &expected, &extra).is_err());
-        assert!(validate_indexes("users", &expected, &expected[..1]).is_err());
-        let mut prefix = expected.clone();
-        prefix[1].sub_parts = vec![Some(3)];
-        assert!(validate_indexes("users", &expected, &prefix).is_err());
-    }
-
-    #[test]
-    fn information_schema_string_projections_are_cast_for_sqlx() {
-        // These SQL literals are kept on single source lines; catch new uncast
-        // information_schema string projections without connecting to a database.
-        let source = include_str!("db.rs");
-        let production = source.split_once("\n#[cfg(test)]\nmod tests {").unwrap().0;
-        let mut queries = 0;
-        let mut string_columns = 0;
-        for line in production
-            .lines()
-            .filter(|line| line.contains("SELECT ") && line.contains("information_schema."))
-        {
-            queries += 1;
-            let projections = line
-                .split_once("SELECT ")
-                .unwrap()
-                .1
-                .split_once(" FROM ")
-                .unwrap()
-                .0;
-            for projection in projections.split(", ") {
-                if matches!(
-                    projection,
-                    "COUNT(*)"
-                        | "CAST(COUNT(*) AS SIGNED) AS fk_count"
-                        | "CAST(non_unique AS SIGNED) AS non_unique"
-                        | "CAST(seq_in_index AS SIGNED) AS seq_in_index"
-                        | "CAST(sub_part AS SIGNED) AS sub_part"
-                ) {
-                    continue;
-                }
-                let column = projection
-                    .strip_prefix("CAST(")
-                    .and_then(|value| value.split_once(" AS CHAR) AS "))
-                    .unwrap_or_else(|| {
-                        panic!("uncast information_schema projection: {projection}")
-                    });
-                assert_eq!(column.0.rsplit('.').next().unwrap(), column.1);
-                assert!(matches!(
-                    column.1,
-                    "table_name"
-                        | "table_collation"
-                        | "column_name"
-                        | "index_name"
-                        | "constraint_name"
-                        | "check_clause"
-                        | "enforced"
-                        | "data_type"
-                        | "column_type"
-                        | "is_nullable"
-                        | "character_set_name"
-                        | "collation_name"
-                        | "column_default"
-                ));
-                string_columns += 1;
-            }
-        }
-        assert_eq!(queries, 16);
-        assert_eq!(string_columns, 24);
-    }
-
-    #[test]
-    fn statistics_numeric_projections_keep_lowercase_result_names() {
-        let projections = STATISTICS_QUERY
-            .split_once("SELECT ")
-            .unwrap()
-            .1
-            .split_once(" FROM information_schema.statistics ")
-            .unwrap()
-            .0;
-        assert_eq!(
-            projections.split(", ").collect::<Vec<_>>(),
-            [
-                "CAST(index_name AS CHAR) AS index_name",
-                "CAST(column_name AS CHAR) AS column_name",
-                "CAST(non_unique AS SIGNED) AS non_unique",
-                "CAST(seq_in_index AS SIGNED) AS seq_in_index",
-                "CAST(sub_part AS SIGNED) AS sub_part",
-            ]
-        );
-    }
-
-    #[test]
-    fn fixed_identity_ddl_exactly_matches_0002() {
-        let declared: Vec<_> = IDENTITY_MIGRATION
-            .split(';')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect();
-        let allowed: Vec<_> = IDENTITY_COLUMNS.iter().map(|entry| entry.3).collect();
-        assert_eq!(declared, allowed);
-    }
-
-    #[test]
-    fn migration_declares_all_identity_and_admission_tables() {
-        for &(table, ..) in TABLES {
-            assert!(
-                MIGRATION.contains(&format!("CREATE TABLE IF NOT EXISTS {table}")),
-                "missing {table}"
-            );
-        }
-    }
-
-    #[test]
-    fn tasks_migration_declares_exactly_five_runtime_tables_without_constraints() {
-        const RUNTIME_TABLES: [&str; 5] = [
-            "task_previews",
-            "main_tasks",
-            "sub_tasks",
-            "device_operation_locks",
-            "recovery_checks",
-        ];
-        let sql = TASKS_MIGRATION
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("--"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let statements: Vec<&str> = sql
-            .split(';')
-            .map(str::trim)
-            .filter(|statement| !statement.is_empty())
-            .collect();
-        assert_eq!(statements.len(), RUNTIME_TABLES.len(), "one DDL per table");
-        let mut declared = Vec::with_capacity(statements.len());
-        for statement in &statements {
-            let words: Vec<&str> = statement.split_whitespace().collect();
-            assert_eq!(
-                words[..5],
-                ["CREATE", "TABLE", "IF", "NOT", "EXISTS"],
-                "runtime tables must be idempotent CREATE TABLE"
-            );
-            declared.push(words[5]);
-        }
-        for table in RUNTIME_TABLES {
-            assert!(declared.contains(&table), "missing runtime table {table}");
-        }
-        let upper = TASKS_MIGRATION.to_ascii_uppercase();
-        assert!(!upper.contains("FOREIGN KEY"));
-        assert!(!upper.contains("REFERENCES"));
-        assert!(!upper.contains("CHECK ("));
-    }
-
-    #[test]
-    fn v3_baseline_matches_v2_columns_and_indexes_without_checks_or_foreign_keys() {
-        let baseline = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/migrations/0003_identity_application_integrity.sql"
-        ))
-        // A missing file must still fail on the actual v1-vs-v3 contract, not a compile error.
-        .unwrap_or_else(|_| MIGRATION.to_owned());
-        let mut expected = MIGRATION.to_owned();
-        for &(table, column, _, alter) in IDENTITY_COLUMNS {
-            let old = if (table, column) == ("users", "username") {
-                "VARCHAR(128) NOT NULL"
-            } else {
-                identity_column_declarations(table, column).unwrap().0
-            };
-            let new = alter.split_once(" MODIFY COLUMN ").unwrap().1;
-            let old_definition = format!("{column} {old}");
-            assert!(
-                expected.contains(&old_definition),
-                "v1 missing {table}.{column}"
-            );
-            expected = expected.replacen(&old_definition, new, 1);
-        }
-        expected = expected.replace(
-            ", CONSTRAINT chk_schema_singleton CHECK (singleton = 1)",
-            "",
-        );
-        expected = expected
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("CONSTRAINT "))
-            .collect::<Vec<_>>()
-            .join("\n");
-        expected = expected.replace(
-            "(admission_state, review_decision),\n",
-            "(admission_state, review_decision)\n",
-        );
-        expected = expected.replace("(user_id),\n) CHARACTER SET", "(user_id)\n) CHARACTER SET");
-        assert!(!baseline.to_ascii_uppercase().contains("FOREIGN KEY"));
-        assert!(!baseline.to_ascii_uppercase().contains("CHECK "));
-        let statements = |sql: &str| {
-            sql.split(';')
-                .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(statements(&baseline), statements(&expected));
-        assert_eq!(statements(&baseline).len(), TABLES.len());
-    }
-
-    #[test]
-    fn v3_shape_contract_uses_check_free_unsigned_declarations() {
-        let parts = ddl_parts("schema_meta");
-        assert!(parts.contains(&"authz_epoch BIGINT UNSIGNED NOT NULL DEFAULT 0".to_owned()));
-        assert!(!parts.iter().any(|part| part.starts_with("CONSTRAINT ")));
-        let users = ddl_parts("users");
-        assert!(users.contains(
-            &"username VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL".to_owned()
-        ));
-        assert_eq!(
-            expected_indexes(&users, &["PRIMARY", "uq_users_username"])
-                .unwrap()
-                .len(),
-            2
-        );
-    }
-
-    #[test]
-    fn v3_shape_policy_is_check_free_and_keeps_legacy_checks() {
-        assert_eq!(
-            ddl_parts_from(V3_MIGRATION, "devices"),
-            ddl_parts("devices")
-        );
-        assert!(
-            ddl_parts_from(MIGRATION, "devices")
-                .iter()
-                .any(|part| part.starts_with("CONSTRAINT "))
-        );
-        for &(table, _, _) in TABLES {
-            let parts = ddl_parts(table);
-            assert!(!parts.iter().any(|p| p.starts_with("CONSTRAINT ")));
-        }
-        assert!(
-            validate_object_names("devices", "check", &[], &["chk_devices_state".into()]).is_err()
-        );
-    }
-
-    #[test]
-    fn v3_shape_policy_routes_to_v3_baseline_without_legacy_checks() {
-        let source = include_str!("db.rs");
-        let body = source
-            .split_once("async fn validate_schema_shape_with_contract(")
-            .unwrap()
-            .1
-            .split_once("\nasync fn read_column(")
-            .unwrap()
-            .0;
-        assert!(body.contains("ddl_parts(table)"));
-        assert!(body.contains("validate_column_shape(table, declaration, &actual)"));
-        assert!(body.contains("validate_indexes(table, &expected, &actual)"));
-        assert!(
-            body.contains(
-                "validate_object_names(table, \"check\", &expected_checks, &actual_checks)"
-            )
-        );
-        assert!(
-            source.contains(
-                "validate_schema_shape_with_contract(db, Some(true), V3_MIGRATION).await"
-            )
-        );
-    }
-
-    #[test]
-    fn v3_table_charset_rejects_non_utf8mb4_collation() {
-        assert!(validate_v3_table_collation("users", "utf8mb4_0900_ai_ci").is_ok());
-        assert!(validate_v3_table_collation("users", "utf8mb4_bin").is_ok());
-        assert!(validate_v3_table_collation("users", "latin1_swedish_ci").is_err());
-        assert!(validate_v3_table_collation("users", "utf8mb4fake_ci").is_err());
-    }
-
-    #[test]
-    fn v3_checks_implicit_character_columns_against_table_default() {
-        let source = include_str!("db.rs");
-        let body = source
-            .split_once("async fn validate_schema_shape_with_contract(")
-            .unwrap()
-            .1
-            .split_once("\nasync fn read_column(")
-            .unwrap()
-            .0;
-        assert!(body.contains("validate_v3_column_charset("));
-    }
-
-    #[test]
-    fn v3_implicit_character_metadata_rejects_column_overrides() {
-        let good = ColumnMeta {
-            name: "display_name".into(),
-            data_type: "varchar".into(),
-            column_type: "varchar(128)".into(),
-            nullable: false,
-            character_set_name: Some("utf8mb4".into()),
-            collation_name: Some("utf8mb4_bin".into()),
-            default: None,
-        };
-        for (table, declaration) in [
-            ("users", "VARCHAR(128) NOT NULL"),
-            ("roles", "VARCHAR(128) NOT NULL"),
-            ("devices", "VARCHAR(128) NOT NULL"),
+    fn decode_snapshot_rejects_invalid_pairs_even_when_values_are_known() {
+        for (state, decision) in [
+            ("PENDING", "none"),
+            ("PENDING", "denied"),
+            ("APPROVED", "approved"),
+            ("REVOKED", "revoked"),
         ] {
-            assert!(validate_v3_column_charset(table, declaration, &good, "utf8mb4_bin").is_ok());
-            for bad in [
-                ColumnMeta {
-                    character_set_name: Some("latin1".into()),
-                    ..good.clone()
-                },
-                ColumnMeta {
-                    character_set_name: Some("ascii".into()),
-                    ..good.clone()
-                },
-                ColumnMeta {
-                    collation_name: Some("utf8mb4_general_ci".into()),
-                    ..good.clone()
-                },
-                ColumnMeta {
-                    collation_name: None,
-                    ..good.clone()
-                },
-            ] {
-                assert!(
-                    validate_v3_column_charset(table, declaration, &bad, "utf8mb4_bin").is_err()
-                );
-            }
+            assert_eq!(decode_snapshot(state, decision, 42).unwrap().revision, 42);
         }
-        assert!(
-            validate_v3_column_charset(
-                "users",
-                "VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL",
-                &ColumnMeta {
-                    character_set_name: Some("ascii".into()),
-                    collation_name: Some("ascii_bin".into()),
-                    ..good
-                },
-                "utf8mb4_bin"
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn legacy_username_utf8mb4_collation_matches_table_default() {
-        let old = ColumnMeta {
-            name: "username".into(),
-            data_type: "varchar".into(),
-            column_type: "varchar(128)".into(),
-            nullable: false,
-            character_set_name: Some("utf8mb4".into()),
-            collation_name: Some("utf8mb4_bin".into()),
-            default: None,
-        };
-        let old_declaration = identity_column_declarations("users", "username").unwrap().0;
-        assert!(validate_v3_table_collation("users", "utf8mb4_bin").is_ok());
-        assert!(validate_column_shape("users", old_declaration, &old).is_ok());
-        assert!(validate_v3_column_charset("users", old_declaration, &old, "utf8mb4_bin").is_ok());
-        let changed = ColumnMeta {
-            collation_name: Some("utf8mb4_general_ci".into()),
-            ..old.clone()
-        };
-        assert!(
-            validate_v3_column_charset("users", old_declaration, &changed, "utf8mb4_bin").is_err()
-        );
-        // Original 0001 has no explicit charset and already rejects this drift.
-        assert!(
-            validate_v3_column_charset("users", "VARCHAR(128) NOT NULL", &changed, "utf8mb4_bin")
-                .is_err()
-        );
-        let target = ColumnMeta {
-            column_type: "varchar(64)".into(),
-            character_set_name: Some("ascii".into()),
-            collation_name: Some("ascii_bin".into()),
-            ..old
-        };
-        assert!(
-            validate_v3_column_charset(
-                "users",
-                identity_column_declarations("users", "username").unwrap().1,
-                &target,
-                "utf8mb4_bin"
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn v3_false_defaults_are_part_of_the_readonly_shape_gate() {
-        let source = include_str!("db.rs");
-        let body = source
-            .split_once("async fn validate_schema_shape_with_contract(")
-            .unwrap()
-            .1
-            .split_once("\nasync fn read_column(")
-            .unwrap()
-            .0;
-        assert!(body.contains("validate_column_shape(table, declaration, &actual)"));
-        assert!(source.contains("CAST(column_default AS CHAR) AS column_default"));
-    }
-
-    #[test]
-    fn every_legacy_and_v3_column_rejects_unexpected_defaults() {
-        let validate_with_default =
-            |table: &str, declaration: &str, actual: &ColumnMeta, default: Option<&str>| {
-                validate_column_shape(
-                    table,
-                    declaration,
-                    &ColumnMeta {
-                        default: default.map(str::to_owned),
-                        ..actual.clone()
-                    },
-                )
-            };
-        let active = ColumnMeta {
-            name: "active".into(),
-            data_type: "tinyint".into(),
-            column_type: "tinyint(1)".into(),
-            nullable: false,
-            character_set_name: None,
-            collation_name: None,
-            default: None,
-        };
-        for migration in [MIGRATION, V3_MIGRATION] {
-            let declaration = ddl_parts_from(migration, "users")
-                .into_iter()
-                .find_map(|part| part.strip_prefix("active ").map(str::to_owned))
-                .unwrap();
-            assert!(validate_with_default("users", &declaration, &active, None).is_ok());
-            assert!(validate_with_default("users", &declaration, &active, Some("1")).is_err());
-        }
-    }
-
-    #[test]
-    fn every_ddl_column_default_is_closed_in_legacy_and_v3() {
-        for migration in [MIGRATION, V3_MIGRATION] {
-            let mut columns = 0;
-            let mut explicit_zero = 0;
-            for &(table, names, _) in TABLES {
-                let parts = ddl_parts_from(migration, table);
-                for &name in names {
-                    let declaration = parts
-                        .iter()
-                        .find_map(|part| part.strip_prefix(&format!("{name} ")))
-                        .unwrap();
-                    let token = declaration
-                        .split_whitespace()
-                        .next()
-                        .unwrap()
-                        .to_ascii_lowercase();
-                    let data_type = token.split('(').next().unwrap();
-                    let actual_type = if data_type == "boolean" {
-                        "tinyint(1)".to_owned()
-                    } else if declaration.contains("UNSIGNED") {
-                        format!("{token} unsigned")
-                    } else {
-                        token.clone()
-                    };
-                    let default = declaration.contains("DEFAULT ").then(|| "0".to_owned());
-                    let actual = ColumnMeta {
-                        name: name.into(),
-                        data_type: if data_type == "boolean" {
-                            "tinyint"
-                        } else {
-                            data_type
-                        }
-                        .into(),
-                        column_type: actual_type,
-                        nullable: !declaration.contains("NOT NULL"),
-                        character_set_name: declaration
-                            .contains("CHARACTER SET ascii")
-                            .then(|| "ascii".into()),
-                        collation_name: declaration
-                            .contains("COLLATE ascii_bin")
-                            .then(|| "ascii_bin".into()),
-                        default: default.clone(),
-                    };
-                    assert!(
-                        validate_column_shape(table, declaration, &actual).is_ok(),
-                        "{table}.{name}"
-                    );
-                    let drift = ColumnMeta {
-                        default: Some("1".into()),
-                        ..actual.clone()
-                    };
-                    let error = validate_column_shape(table, declaration, &drift).unwrap_err();
-                    assert!(!format!("{error}").contains("1"));
-                    if default.is_some() {
-                        explicit_zero += 1;
-                        assert!(
-                            validate_column_shape(
-                                table,
-                                declaration,
-                                &ColumnMeta {
-                                    default: None,
-                                    ..actual.clone()
-                                }
-                            )
-                            .is_err()
-                        );
-                    } else {
-                        assert!(
-                            validate_column_shape(
-                                table,
-                                declaration,
-                                &ColumnMeta {
-                                    default: Some("CURRENT_TIMESTAMP".into()),
-                                    ..actual.clone()
-                                }
-                            )
-                            .is_err()
-                        );
-                    }
-                    columns += 1;
-                }
-            }
-            assert_eq!(columns, 70);
-            assert_eq!(explicit_zero, 5);
-        }
-    }
-
-    #[test]
-    fn v3_false_defaults_reject_true_null_and_unverified_readbacks_without_value_leaks() {
-        for (table, column) in [
-            ("schema_meta", "initialized"),
-            ("sessions", "revoked"),
-            ("devices", "archived"),
-        ] {
-            assert!(validate_false_default_metadata(table, column, Some("0")).is_ok());
-            for bad in [
-                None,
-                Some("1"),
-                Some("TRUE"),
-                Some("FALSE"),
-                Some("unexpected sensitive value"),
-            ] {
-                let error = validate_false_default_metadata(table, column, bad).unwrap_err();
-                assert!(!format!("{error}").contains("unexpected sensitive value"));
-            }
-        }
-    }
-
-    #[test]
-    fn fallback_evidence_has_stable_reference_and_unknown_fields() {
-        let a: serde_json::Value = serde_json::from_str(&system_fallback_time_evidence()).unwrap();
-        let b: serde_json::Value = serde_json::from_str(&system_fallback_time_evidence()).unwrap();
-        assert_eq!(a["quality"], "system_fallback");
-        let wall = a["system_wall_utc"].as_str().unwrap();
-        chrono::DateTime::parse_from_rfc3339(wall).unwrap();
-        assert_eq!(a["reference_utc"], wall);
-        let epoch = uuid::Uuid::parse_str(a["clock_epoch"].as_str().unwrap()).unwrap();
-        assert_eq!(epoch.get_version_num(), 4);
-        assert_eq!(a["clock_epoch"], b["clock_epoch"]);
-        for key in ["source", "sample_age_ms", "offset_ms", "uncertainty_ms"] {
-            assert!(a.get(key).unwrap().is_null(), "{key} must be unknown");
-        }
-    }
-
-    #[test]
-    fn migration_checks_all_columns_including_audit_evidence() {
-        for (table, required) in [
-            ("sessions", "created_time"),
-            ("roles", "revision"),
-            ("devices", "first_seen"),
-            ("grants", "revision"),
-            ("admission_decisions", "time_evidence"),
-            ("audit_events", "event_type"),
-            ("audit_events", "time_evidence"),
+        for (state, decision) in [
+            ("PENDING", "approved"),
+            ("APPROVED", "none"),
+            ("REVOKED", "denied"),
+            ("pending", "none"),
+            ("PENDING", "NONE"),
         ] {
             assert!(
-                TABLES
-                    .iter()
-                    .find(|entry| entry.0 == table)
-                    .unwrap()
-                    .1
-                    .contains(&required),
-                "unchecked {table}.{required}"
+                decode_snapshot(state, decision, 42).is_err(),
+                "{state}/{decision}"
             );
         }
-    }
-
-    #[test]
-    fn same_width_signed_counter_is_incompatible() {
-        let signed = ColumnMeta {
-            name: "event_seq".into(),
-            data_type: "bigint".into(),
-            column_type: "bigint".into(),
-            nullable: false,
-            character_set_name: None,
-            collation_name: None,
-            default: None,
-        };
-        let unsigned = ColumnMeta {
-            column_type: "bigint unsigned".into(),
-            ..signed.clone()
-        };
-        assert!(
-            validate_column_shape("audit_events", "BIGINT UNSIGNED NOT NULL", &unsigned).is_ok()
-        );
-        assert!(
-            validate_column_shape("audit_events", "BIGINT UNSIGNED NOT NULL", &signed).is_err()
-        );
-    }
-
-    #[test]
-    fn username_requires_ascii_bin_not_matching_width_only() {
-        let good = ColumnMeta {
-            name: "username".into(),
-            data_type: "varchar".into(),
-            column_type: "varchar(64)".into(),
-            nullable: false,
-            character_set_name: Some("ascii".into()),
-            collation_name: Some("ascii_bin".into()),
-            default: None,
-        };
-        assert!(
-            validate_column_shape(
-                "users",
-                "VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL",
-                &good
-            )
-            .is_ok()
-        );
-        for bad in [
-            ColumnMeta {
-                character_set_name: Some("utf8mb4".into()),
-                ..good.clone()
-            },
-            ColumnMeta {
-                collation_name: Some("ascii_general_ci".into()),
-                ..good.clone()
-            },
-        ] {
-            assert!(
-                validate_column_shape(
-                    "users",
-                    "VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL",
-                    &bad
-                )
-                .is_err()
-            );
-        }
-    }
-
-    #[test]
-    fn username_rules_reject_noncanonical_input() {
-        let long_ok = "a".repeat(64);
-        let long_bad = "a".repeat(65);
-        for good in ["abc", "a.b_c-1", long_ok.as_str()] {
-            assert!(valid_username(good));
-        }
-        for bad in [
-            "ab",
-            long_bad.as_str(),
-            "Éric",
-            "Alice",
-            "alice!",
-            "-alice",
-            "a b",
-        ] {
-            assert!(!valid_username(bad), "{bad:?}");
-        }
-    }
-
-    #[test]
-    fn all_identity_counters_require_unsigned_but_schema_version_stays_int() {
-        for (table, column) in [
-            ("schema_meta", "authz_epoch"),
-            ("schema_meta", "admin_guard_revision"),
-            ("users", "revision"),
-            ("roles", "revision"),
-            ("device_groups", "revision"),
-            ("devices", "revision"),
-            ("grants", "revision"),
-            ("admission_decisions", "previous_revision"),
-            ("admission_decisions", "new_revision"),
-            ("audit_events", "event_seq"),
-        ] {
-            let signed = ColumnMeta {
-                name: column.into(),
-                data_type: "bigint".into(),
-                column_type: "bigint".into(),
-                nullable: false,
-                character_set_name: None,
-                collation_name: None,
-                default: None,
-            };
-            let unsigned = ColumnMeta {
-                column_type: "bigint unsigned".into(),
-                ..signed.clone()
-            };
-            assert!(
-                validate_column_shape(table, "BIGINT UNSIGNED NOT NULL", &unsigned).is_ok(),
-                "{table}.{column}"
-            );
-            assert!(
-                validate_column_shape(table, "BIGINT UNSIGNED NOT NULL", &signed).is_err(),
-                "{table}.{column}"
-            );
-        }
-        let version = ColumnMeta {
-            name: "schema_version".into(),
-            data_type: "int".into(),
-            column_type: "int".into(),
-            nullable: false,
-            character_set_name: None,
-            collation_name: None,
-            default: None,
-        };
-        assert!(validate_column_shape("schema_meta", "INT NOT NULL", &version).is_ok());
-    }
-
-    #[test]
-    fn incompatible_binary_length_type_and_nullability_are_rejected() {
-        let base = ColumnMeta {
-            name: "public_key".into(),
-            data_type: "binary".into(),
-            column_type: "binary(32)".into(),
-            nullable: false,
-            character_set_name: None,
-            collation_name: None,
-            default: None,
-        };
-        assert!(validate_column_shape("devices", "BINARY(32) NOT NULL", &base).is_ok());
-        for altered in [
-            ColumnMeta {
-                column_type: "binary(16)".into(),
-                ..base.clone()
-            },
-            ColumnMeta {
-                data_type: "varbinary".into(),
-                column_type: "varbinary(32)".into(),
-                ..base.clone()
-            },
-            ColumnMeta {
-                nullable: true,
-                ..base.clone()
-            },
-        ] {
-            assert!(validate_column_shape("devices", "BINARY(32) NOT NULL", &altered).is_err());
-        }
-    }
-
-    #[test]
-    fn wrong_unique_index_or_column_order_is_rejected() {
-        let expected = [IndexMeta {
-            name: "uq_audit_epoch_seq".into(),
-            columns: vec!["process_epoch".into(), "event_seq".into()],
-            unique: true,
-            sub_parts: vec![None, None],
-        }];
-        for broken in [
-            IndexMeta {
-                unique: false,
-                ..expected[0].clone()
-            },
-            IndexMeta {
-                columns: vec!["event_seq".into(), "process_epoch".into()],
-                ..expected[0].clone()
-            },
-        ] {
-            assert!(validate_indexes("audit_events", &expected, &[broken]).is_err());
-        }
-    }
-
-    #[test]
-    fn ddl_parser_covers_all_declared_columns_and_constraints() {
-        for &(table, columns, indexes) in TABLES {
-            let parts = ddl_parts(table);
-            for column in columns {
-                assert!(
-                    parts
-                        .iter()
-                        .any(|part| part.starts_with(&format!("{column} "))),
-                    "missing DDL shape {table}.{column}"
-                );
-            }
-            for index in indexes {
-                assert!(
-                    parts.iter().any(|part| if *index == "PRIMARY" {
-                        part.contains("PRIMARY KEY")
-                    } else {
-                        part.contains(index)
-                    }),
-                    "missing DDL index {table}.{index}"
-                );
-            }
-            for part in parts.iter().filter(|part| {
-                !part.starts_with("PRIMARY KEY (")
-                    && !part.starts_with("UNIQUE KEY ")
-                    && !part.starts_with("KEY ")
-                    && !part.starts_with("CONSTRAINT ")
-            }) {
-                let name = part.split_whitespace().next().unwrap();
-                assert!(
-                    columns.contains(&name),
-                    "unchecked DDL column {table}.{name}"
-                );
-            }
-            assert_eq!(
-                expected_indexes(&parts, indexes).unwrap().len(),
-                indexes.len()
-            );
-        }
-        assert!(
-            ddl_parts_from(MIGRATION, "devices")
-                .iter()
-                .any(|part| part.contains("chk_devices_state"))
-        );
-    }
-
-    #[test]
-    fn mysql_8046_grant_readbacks_require_fixed_original_and_enforcement() {
-        for (index, name) in [(3, "chk_grants_source"), (4, "chk_grants_scope")] {
-            let expected = ddl_parts_from(MIGRATION, "grants")
-                .into_iter()
-                .find(|part| part.starts_with(&format!("CONSTRAINT {name} CHECK ")))
-                .unwrap();
-            assert!(expected.contains("CHECK (("));
-            let stored = fixed_wrapped_grant_candidate(index)
-                .unwrap()
-                .replace('\'', "\\'");
-            assert!(mysql_8046_grant_clause(
-                "grants",
-                name,
-                &stored,
-                expected.split_once("CHECK ").unwrap().1
-            ));
-            assert!(!mysql_8046_grant_clause(
-                "grants",
-                name,
-                &stored,
-                &expected
-                    .split_once("CHECK ")
-                    .unwrap()
-                    .1
-                    .replacen("AND", "OR", 1)
-            ));
-            assert!(
-                validate_legacy_check_metadata(&[(
-                    Some("grants".into()),
-                    Some(name.into()),
-                    Some(stored.clone())
-                )])
-                .is_err(),
-                "old permission must stay closed for {name}"
-            );
-            assert_eq!(
-                validate_legacy_check_metadata_with_version(
-                    &[(
-                        Some("grants".into()),
-                        Some(name.into()),
-                        Some(stored),
-                        Some("YES".into())
-                    )],
-                    Ok(Some("8.0.46"))
-                )
-                .unwrap(),
-                vec![("grants", name)]
-            );
-        }
-    }
-
-    #[test]
-    fn mysql_8046_grants_compatibility_has_no_token_whitespace_or_metadata_fallback() {
-        let accepts = |clause: String,
-                       version: Result<Option<&str>, ()>,
-                       enforced: Option<&str>,
-                       table: &str,
-                       name: &str| {
-            validate_legacy_check_metadata_with_version(
-                &[(
-                    Some(table.into()),
-                    Some(name.into()),
-                    Some(clause),
-                    enforced.map(str::to_owned),
-                )],
-                version,
-            )
-            .is_ok()
-        };
-        for (index, name) in [(3, "chk_grants_source"), (4, "chk_grants_scope")] {
-            let stored = fixed_wrapped_grant_candidate(index)
-                .unwrap()
-                .replace('\'', "\\'");
-            assert!(accepts(
-                stored
-                    .replace(" AND ", " aNd ")
-                    .replace(" OR ", " Or ")
-                    .replace(" IS ", " is ")
-                    .replace(" NOT ", " nOt ")
-                    .replace(" NULL", " nUlL"),
-                Ok(Some("8.0.46")),
-                Some("YES"),
-                "grants",
-                name
-            ));
-            for version in [
-                Ok(None),
-                Ok(Some("8.0.45")),
-                Ok(Some("8.0.47")),
-                Ok(Some("8.0.11-TiDB-v8.0.46")),
-                Err(()),
-            ] {
-                assert!(!accepts(
-                    stored.clone(),
-                    version,
-                    Some("YES"),
-                    "grants",
-                    name
-                ));
-            }
-            for enforced in [None, Some("NO"), Some("yes"), Some("UNKNOWN"), Some("")] {
-                assert!(!accepts(
-                    stored.clone(),
-                    Ok(Some("8.0.46")),
-                    enforced,
-                    "grants",
-                    name
-                ));
-            }
-            assert!(!accepts(
-                stored.clone(),
-                Ok(Some("8.0.46")),
-                Some("YES"),
-                "devices",
-                name
-            ));
-            assert!(!accepts(
-                stored.clone(),
-                Ok(Some("8.0.46")),
-                Some("YES"),
-                "grants",
-                "chk_devices_state"
-            ));
-            let literals = if index == 3 {
-                &["role", "direct"][..]
-            } else {
-                &["all", "group", "device"][..]
-            };
-            for literal in literals {
-                let needle = format!("\\'{literal}\\'");
-                for (offset, _) in stored.match_indices(&needle) {
-                    let mut changed = stored.clone();
-                    changed.replace_range(
-                        offset + 2..offset + 2 + literal.len(),
-                        &literal.to_ascii_uppercase(),
-                    );
-                    assert!(!accepts(
-                        changed,
-                        Ok(Some("8.0.46")),
-                        Some("YES"),
-                        "grants",
-                        name
-                    ));
-                }
-            }
-            let columns = if index == 3 {
-                &["source_kind", "role_id", "permissions"][..]
-            } else {
-                &["scope_kind", "scope_group_id", "scope_device_id"][..]
-            };
-            for column in columns {
-                let needle = format!("`{column}`");
-                for (offset, _) in stored.match_indices(&needle) {
-                    let mut changed = stored.clone();
-                    changed.replace_range(
-                        offset + 1..offset + 1 + column.len(),
-                        &column.to_ascii_uppercase(),
-                    );
-                    assert!(!accepts(
-                        changed,
-                        Ok(Some("8.0.46")),
-                        Some("YES"),
-                        "grants",
-                        name
-                    ));
-                }
-            }
-            for (needle, replacement) in [
-                (" AND ", " OR "),
-                (" OR ", " AND "),
-                (" IS NOT NULL", " IS NULL"),
-                (" IS NULL", " IS NOT NULL"),
-                ("_utf8mb4", "_latin1"),
-                ("_utf8mb4", ""),
-                ("\\'", "'"),
-                ("\\'", "\\\\'"),
-                ("`", ""),
-                (" = ", " != "),
-            ] {
-                if stored.contains(needle) {
-                    assert!(
-                        !accepts(
-                            stored.replacen(needle, replacement, 1),
-                            Ok(Some("8.0.46")),
-                            Some("YES"),
-                            "grants",
-                            name
-                        ),
-                        "{name}: {needle}"
-                    );
-                }
-            }
-            for changed in [
-                format!(" {stored}"),
-                format!("{stored} "),
-                stored.replacen(" AND ", "  AND ", 1),
-                stored.replacen(" AND ", " AND  ", 1),
-                format!("({stored})"),
-                stored.replacen("(((", "((((", 1),
-                format!("{stored} OR 1=1"),
-                stored.replacen("`", "`X", 1),
-                stored.replacen("\\'", "\\'x", 1),
-            ] {
-                assert!(!accepts(
-                    changed,
-                    Ok(Some("8.0.46")),
-                    Some("YES"),
-                    "grants",
-                    name
-                ));
-            }
-            let row = (
-                Some("grants".into()),
-                Some(name.into()),
-                Some(stored),
-                Some("YES".into()),
-            );
-            for invalid in [
-                (None, row.1.clone(), row.2.clone(), row.3.clone()),
-                (row.0.clone(), None, row.2.clone(), row.3.clone()),
-                (row.0.clone(), row.1.clone(), None, row.3.clone()),
-                (row.0.clone(), row.1.clone(), row.2.clone(), None),
-            ] {
-                assert!(
-                    validate_legacy_check_metadata_with_version(&[invalid], Ok(Some("8.0.46")))
-                        .is_err()
-                );
-            }
-            assert!(
-                validate_legacy_check_metadata_with_version(
-                    &[row.clone(), row],
-                    Ok(Some("8.0.46"))
-                )
-                .is_err()
-            );
-        }
-    }
-
-    #[test]
-    fn grant_metadata_reader_keeps_version_enforcement_and_clauses_on_one_connection() {
-        let source = include_str!("db.rs")
-            .split_once("\nasync fn read_column(")
-            .unwrap()
-            .0;
-        assert!(
-            source.contains("async fn read_legacy_checks_for_table("),
-            "expected a held-connection legacy CHECK reader"
-        );
-        let reader = source
-            .split_once("async fn read_legacy_checks_for_table(")
-            .unwrap()
-            .1;
-        assert_eq!(reader.matches("db.0.acquire()").count(), 1);
-        assert!(reader.contains("CAST(VERSION() AS CHAR)"));
-        assert!(reader.contains("CAST(tc.enforced AS CHAR) AS enforced"));
-        assert!(reader.contains(".bind(table).fetch_all(&mut *connection)"));
-        assert!(reader.contains(".fetch_one(&mut *connection)"));
-        assert!(reader.contains("validate_legacy_check_metadata_with_version"));
-        assert!(reader.contains("if version == \"8.0.46\""));
-    }
-
-    #[tokio::test]
-    async fn injected_grant_metadata_proof_blocks_upgrade_before_first_ddl() {
-        for (version, enforced, tamper) in [
-            ("8.0.46", Some("YES"), true),
-            ("8.0.45", Some("YES"), false),
-            ("8.0.46", Some("NO"), false),
-        ] {
-            let fake = LegacyUpgradeFake::new(1);
-            let stored = fixed_wrapped_grant_candidate(3)
-                .unwrap()
-                .replace('\'', "\\'");
-            fake.0.lock().unwrap().check_sample = Some((
-                version.into(),
-                enforced.map(str::to_owned),
-                if tamper {
-                    stored.replacen("`role_id`", "`rogue_id`", 1)
-                } else {
-                    stored
-                },
-            ));
-            assert!(upgrade_legacy_with_probe(&fake, 1).await.is_err());
-            assert!(
-                fake.writes().is_empty(),
-                "invalid CHECK must block before DDL"
-            );
-        }
-    }
-
-    #[test]
-    fn legacy_check_subsets_require_semantic_proof_even_when_empty() {
-        let mut originals = Vec::new();
-        for (table, name) in [
-            ("schema_meta", "chk_schema_singleton"),
-            ("devices", "chk_devices_state"),
-            ("devices", "chk_devices_decision"),
-            ("grants", "chk_grants_source"),
-            ("grants", "chk_grants_scope"),
-        ] {
-            let part = ddl_parts_from(MIGRATION, table)
-                .into_iter()
-                .find(|p| p.starts_with(&format!("CONSTRAINT {name} ")))
-                .unwrap();
-            originals.push((
-                Some(table.to_owned()),
-                Some(name.to_owned()),
-                Some(part.split_once("CHECK ").unwrap().1.to_owned()),
-            ));
-        }
-        for mask in 0u32..32 {
-            let rows: Vec<_> = originals
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| mask & (1 << i) != 0)
-                .map(|(_, row)| row.clone())
-                .collect();
-            let confirmed = validate_legacy_check_metadata(&rows).unwrap();
-            assert_eq!(confirmed.len(), mask.count_ones() as usize, "subset {mask}");
-        }
-        let mut bad = originals[1].clone();
-        for changed in [
-            "(admission_state IN ('PEND ING','APPROVED','REVOKED'))",
-            "(admission_state IN ('pending','APPROVED','REVOKED'))",
-            "(admission_state IN (_latin1'PENDING','APPROVED','REVOKED'))",
-            "(admission_state IN ('PENDING','APPROVED','REVOKED') OR 1=1)",
-            "(admission _state IN ('PENDING','APPROVED','REVOKED'))",
-        ] {
-            bad.2 = Some(changed.to_owned());
-            assert!(validate_legacy_check_metadata(&[bad.clone()]).is_err());
-        }
-        let observed = "(`admission_state` in (_utf8mb4\\'PENDING\\',_utf8mb4\\'APPROVED\\',_utf8mb4\\'REVOKED\\'))";
-        bad.2 = Some(observed.to_owned());
-        assert!(validate_legacy_check_metadata(&[bad.clone()]).is_ok());
-        bad.2 = Some(observed.replace("PENDING", "PEND ING"));
-        assert!(validate_legacy_check_metadata(&[bad]).is_err());
-        for row in [
-            (
-                Some("grants".into()),
-                originals[1].1.clone(),
-                originals[1].2.clone(),
-            ),
-            (
-                Some("devices".into()),
-                Some("unknown".into()),
-                originals[1].2.clone(),
-            ),
-            (None, originals[1].1.clone(), originals[1].2.clone()),
-            (originals[1].0.clone(), None, originals[1].2.clone()),
-            (originals[1].0.clone(), originals[1].1.clone(), None),
-        ] {
-            assert!(validate_legacy_check_metadata(&[row]).is_err());
-        }
-        assert!(
-            validate_legacy_check_metadata(&[originals[1].clone(), originals[1].clone()]).is_err()
-        );
-        assert!(legacy_check_tokens("('PENDING' /* metadata */)").is_none());
-        let readbacks = [
-            ("schema_meta", "chk_schema_singleton", "(`singleton` = 1)"),
-            (
-                "devices",
-                "chk_devices_state",
-                "(`admission_state` in (_utf8mb4'PENDING',_utf8mb4'APPROVED',_utf8mb4'REVOKED'))",
-            ),
-            (
-                "devices",
-                "chk_devices_decision",
-                "(`review_decision` in (_utf8mb4'none',_utf8mb4'approved',_utf8mb4'denied',_utf8mb4'revoked'))",
-            ),
-            (
-                "grants",
-                "chk_grants_source",
-                "((`source_kind` = _utf8mb4'role' AND `role_id` IS NOT NULL AND `permissions` IS NULL) OR (`source_kind` = _utf8mb4'direct' AND `role_id` IS NULL AND `permissions` IS NOT NULL))",
-            ),
-            (
-                "grants",
-                "chk_grants_scope",
-                "((`scope_kind` = _utf8mb4'all' AND `scope_group_id` IS NULL AND `scope_device_id` IS NULL) OR (`scope_kind` = _utf8mb4'group' AND `scope_group_id` IS NOT NULL AND `scope_device_id` IS NULL) OR (`scope_kind` = _utf8mb4'device' AND `scope_group_id` IS NULL AND `scope_device_id` IS NOT NULL))",
-            ),
-        ];
-        for (table, name, clause) in readbacks {
-            assert!(
-                validate_legacy_check_metadata(&[(
-                    Some(table.into()),
-                    Some(name.into()),
-                    Some(clause.into())
-                )])
-                .is_ok(),
-                "{table}.{name}"
-            );
-        }
-        let grants_unobserved_backslashes = readbacks[3].2.replace("'role'", "\\'role\\'");
-        assert!(
-            validate_legacy_check_metadata(&[(
-                Some("grants".into()),
-                Some("chk_grants_source".into()),
-                Some(grants_unobserved_backslashes)
-            )])
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn v1_mixed_and_v2_target_columns_are_version_specific() {
-        for (table, column, _, _) in IDENTITY_COLUMNS {
-            let (old, target) = identity_column_declarations(table, column).unwrap();
-            let meta = |decl: &str| {
-                let type_token = decl.split_whitespace().next().unwrap().to_ascii_lowercase();
-                let data_type = type_token.split('(').next().unwrap().to_owned();
-                ColumnMeta {
-                    name: (*column).into(),
-                    data_type,
-                    column_type: if decl.contains("UNSIGNED") {
-                        format!("{type_token} unsigned")
-                    } else {
-                        type_token
-                    },
-                    nullable: false,
-                    character_set_name: if *column == "username" {
-                        Some(
-                            if decl.contains("ascii") {
-                                "ascii"
-                            } else {
-                                "utf8mb4"
-                            }
-                            .into(),
-                        )
-                    } else {
-                        None
-                    },
-                    collation_name: if decl.contains("ascii_bin") {
-                        Some("ascii_bin".into())
-                    } else {
-                        None
-                    },
-                    default: decl.contains("DEFAULT 0").then(|| "0".into()),
-                }
-            };
-            let old = meta(old);
-            let target = meta(target);
-            assert!(validate_legacy_column(1, table, column, &old).unwrap());
-            assert!(!validate_legacy_column(1, table, column, &target).unwrap());
-            assert!(validate_legacy_column(2, table, column, &old).is_err());
-            assert!(!validate_legacy_column(2, table, column, &target).unwrap());
-        }
-        let old = ColumnMeta {
-            name: "revision".into(),
-            data_type: "bigint".into(),
-            column_type: "bigint".into(),
-            nullable: false,
-            character_set_name: None,
-            collation_name: None,
-            default: None,
-        };
-        assert!(validate_legacy_column(3, "users", "revision", &old).is_err());
-    }
-
-    #[test]
-    fn check_literals_are_byte_sensitive_while_external_format_is_not() {
-        let declared = "admission_state IN ('PENDING','it''s')";
-        for changed in [
-            "admission_state IN ('PEND ING','it''s')",
-            "admission_state IN ('PEND`ING','it''s')",
-            "admission_state IN ('pending','it''s')",
-            "admission_state IN ('PENDING','its')",
-            "admission_state IN ('PENDING','it''''s')",
-            "admission_state IN (_latin1'PENDING','it''s')",
-        ] {
-            assert_ne!(
-                normalize_check(declared),
-                normalize_check(changed),
-                "{changed}"
-            );
-        }
-        assert_eq!(
-            normalize_check(declared),
-            normalize_check("((`admission_state` in (_utf8mb4'PENDING', _utf8mb4'it''s')))"),
-        );
-        assert_eq!(
-            normalize_check("source_kind = 'it''_utf8mb4role'"),
-            normalize_check("(`source_kind` = _utf8mb4'it''_utf8mb4role')"),
-        );
-        assert_eq!(
-            normalize_check("source_kind = \"Ro\"\"le\""),
-            normalize_check("(`source_kind` = \"Ro\"\"le\")"),
-        );
-        assert_ne!(
-            normalize_check("source_kind = \"Ro\"\"le\""),
-            normalize_check("source_kind = \"Ro\"\" le\""),
-        );
-    }
-
-    #[test]
-    fn check_normalization_ignores_sql_comments_outside_literals_only() {
-        let declared = "source_kind = 'role'";
-        assert_eq!(
-            normalize_check(declared),
-            normalize_check("(`source_kind` /* metadata */ = _utf8mb4'role')")
-        );
-        assert_eq!(
-            normalize_check(declared),
-            normalize_check("source_kind -- metadata\n = _utf8mb4'role'")
-        );
-        assert_ne!(
-            normalize_check(declared),
-            normalize_check("source_kind = 'ro/* metadata */le'")
-        );
-    }
-
-    #[test]
-    fn mysql_8046_escaped_check_readback_accepts_only_observed_forms() {
-        for (name, observed) in [
-            (
-                "chk_devices_state",
-                "(`admission_state` in (_utf8mb4\\'PENDING\\',_utf8mb4\\'APPROVED\\',_utf8mb4\\'REVOKED\\'))",
-            ),
-            (
-                "chk_devices_decision",
-                "(`review_decision` in (_utf8mb4\\'none\\',_utf8mb4\\'approved\\',_utf8mb4\\'denied\\',_utf8mb4\\'revoked\\'))",
-            ),
-        ] {
-            let part = ddl_parts_from(MIGRATION, "devices")
-                .into_iter()
-                .find(|part| part.starts_with(&format!("CONSTRAINT {name} ")))
-                .unwrap();
-            let declared = part.split_once("CHECK ").unwrap().1;
-            assert!(
-                check_clause_matches("devices", name, observed, declared),
-                "{name}"
-            );
-            for changed in [
-                observed.replace("PENDING", "PEND ING"),
-                observed.replace("PENDING", "pending"),
-                observed.replace("none", "None"),
-                observed.replace("_utf8mb4", "_latin1"),
-                observed.replace("\\'approved", "\\'app''roved"),
-                observed.replace("\\'PENDING", "'PENDING"),
-                observed.replace("\\'", "\\\\'"),
-                format!("{observed} OR 1=1"),
-            ] {
-                if changed != observed {
-                    assert!(
-                        !check_clause_matches("devices", name, &changed, declared),
-                        "{changed}"
-                    );
-                }
-            }
-            assert!(!check_clause_matches("grants", name, observed, declared));
-            assert!(!check_clause_matches(
-                "devices",
-                "chk_grants_source",
-                observed,
-                declared
-            ));
-            assert!(!check_clause_matches("devices", name, observed, "(1 = 1)"));
-        }
-        assert!(check_clause_matches(
-            "schema_meta",
-            "chk_schema_singleton",
-            "(`singleton` = 1)",
-            "(singleton = 1)"
-        ));
-    }
-
-    #[test]
-    fn check_clause_normalization_accepts_utf8mb4_rewritten_ddl_literals() {
-        for (table, name, stored) in [
-            (
-                "devices",
-                "chk_devices_state",
-                "(`admission_state` in (_utf8mb4'PENDING',_utf8mb4'APPROVED',_utf8mb4'REVOKED'))",
-            ),
-            (
-                "devices",
-                "chk_devices_decision",
-                "(`review_decision` in (_utf8mb4'none',_utf8mb4'approved',_utf8mb4'denied',_utf8mb4'revoked'))",
-            ),
-            (
-                "grants",
-                "chk_grants_source",
-                "((`source_kind` = _utf8mb4'role' AND `role_id` IS NOT NULL AND `permissions` IS NULL) OR (`source_kind` = _utf8mb4'direct' AND `role_id` IS NULL AND `permissions` IS NOT NULL))",
-            ),
-            (
-                "grants",
-                "chk_grants_scope",
-                "((`scope_kind` = _utf8mb4'all' AND `scope_group_id` IS NULL AND `scope_device_id` IS NULL) OR (`scope_kind` = _utf8mb4'group' AND `scope_group_id` IS NOT NULL AND `scope_device_id` IS NULL) OR (`scope_kind` = _utf8mb4'device' AND `scope_group_id` IS NULL AND `scope_device_id` IS NOT NULL))",
-            ),
-        ] {
-            let part = ddl_parts_from(MIGRATION, table)
-                .into_iter()
-                .find(|part| part.starts_with(&format!("CONSTRAINT {name} ")))
-                .unwrap();
-            let declared = part.split_once("CHECK ").unwrap().1;
-            assert_eq!(
-                normalize_check(stored),
-                normalize_check(declared),
-                "{table}.{name}"
-            );
-        }
-    }
-
-    #[test]
-    fn check_clause_normalization_preserves_other_literals_and_expressions() {
-        let declared = "source_kind = 'role'";
-        for changed in [
-            "source_kind = _latin1'role'",
-            "source_kind = '_utf8mb4role'",
-            "source_kind = 'direct'",
-            "source_kind = _utf8mb4'role' AND role_id IS NULL",
-            "source_kind = x_utf8mb4'role'",
-            "source_kind = `_utf8mb4`'role'",
-            "source_kind = 'it\\'_utf8mb4role'",
-        ] {
-            assert_ne!(
-                normalize_check(changed),
-                normalize_check(declared),
-                "{changed}"
-            );
-        }
-        assert_ne!(
-            normalize_check("source_kind = 'it''_utf8mb4role'"),
-            normalize_check("source_kind = 'it''role'")
-        );
-    }
-
-    #[test]
-    fn check_clause_normalization_accepts_outer_wrappers_but_not_changed_values() {
-        assert_eq!(normalize_check("CHECK"), "check");
-        assert_eq!(
-            normalize_check("(singleton = 1)"),
-            normalize_check("singleton = 1")
-        );
-        assert_ne!(
-            normalize_check("singleton = 2"),
-            normalize_check("singleton = 1")
-        );
-    }
-
-    #[test]
-    fn nullable_readback_accepts_only_yes_or_no() {
-        let parse = |value: Option<&str>| parse_nullable_metadata("users", "active", value);
-        assert!(parse(Some("YES")).unwrap());
-        assert!(!parse(Some("NO")).unwrap());
-        for unknown in [None, Some("UNKNOWN"), Some("FALSE"), Some("no"), Some("")] {
-            let error = parse(unknown).unwrap_err();
-            assert!(!format!("{error}").contains("UNKNOWN"));
-        }
-    }
-
-    #[test]
-    fn nullable_json_and_boolean_alias_match_migration() {
-        let json = ColumnMeta {
-            name: "descriptor_json".into(),
-            data_type: "json".into(),
-            column_type: "json".into(),
-            nullable: true,
-            character_set_name: None,
-            collation_name: None,
-            default: None,
-        };
-        let bool_col = ColumnMeta {
-            name: "initialized".into(),
-            data_type: "tinyint".into(),
-            column_type: "tinyint(1)".into(),
-            nullable: false,
-            character_set_name: None,
-            collation_name: None,
-            default: Some("0".into()),
-        };
-        assert!(validate_column_shape("devices", "JSON NULL", &json).is_ok());
-        assert!(
-            validate_column_shape("schema_meta", "BOOLEAN NOT NULL DEFAULT FALSE", &bool_col)
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn inline_primary_key_uses_column_name_not_type_width() {
-        let parts = ddl_parts("devices");
-        let primary = expected_indexes(&parts, &["PRIMARY"]).unwrap();
-        assert_eq!(primary[0].columns, vec!["public_key"]);
-        assert!(primary[0].unique);
     }
 
     #[test]
@@ -9242,6 +2814,418 @@ mod tests {
         );
     }
 
+    #[test]
+    fn closed_identity_metadata_rejects_extra_or_missing_objects() {
+        for kind in ["column", "check"] {
+            let expected = vec!["known".to_owned()];
+            assert!(validate_object_names("users", kind, &expected, &expected).is_ok());
+            assert!(
+                validate_object_names(
+                    "users",
+                    kind,
+                    &expected,
+                    &["known".into(), "unknown".into()]
+                )
+                .is_err(),
+                "{kind}"
+            );
+            assert!(
+                validate_object_names("users", kind, &expected, &[]).is_err(),
+                "{kind}"
+            );
+        }
+        let expected =
+            expected_indexes(&ddl_parts("users"), &["PRIMARY", "uq_users_username"]).unwrap();
+        let mut extra = expected.clone();
+        extra.push(IndexMeta {
+            name: "ix_extra".into(),
+            columns: vec!["username".into()],
+            unique: false,
+            sub_parts: vec![None],
+        });
+        assert!(validate_indexes("users", &expected, &extra).is_err());
+        assert!(validate_indexes("users", &expected, &expected[..1]).is_err());
+        let mut prefix = expected.clone();
+        prefix[1].sub_parts = vec![Some(3)];
+        assert!(validate_indexes("users", &expected, &prefix).is_err());
+    }
+
+    #[test]
+    fn username_rules_reject_noncanonical_input() {
+        let long_ok = "a".repeat(64);
+        let long_bad = "a".repeat(65);
+        for good in ["abc", "a.b_c-1", long_ok.as_str()] {
+            assert!(valid_username(good));
+        }
+        for bad in [
+            "ab",
+            long_bad.as_str(),
+            "Éric",
+            "Alice",
+            "alice!",
+            "-alice",
+            "a b",
+        ] {
+            assert!(!valid_username(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn inline_primary_key_uses_column_name_not_type_width() {
+        let parts = ddl_parts("devices");
+        let primary = expected_indexes(&parts, &["PRIMARY"]).unwrap();
+        assert_eq!(primary[0].columns, vec!["public_key"]);
+        assert!(primary[0].unique);
+    }
+
+    #[test]
+    fn same_width_signed_counter_is_incompatible() {
+        let signed = ColumnMeta {
+            name: "event_seq".into(),
+            data_type: "bigint".into(),
+            column_type: "bigint".into(),
+            nullable: false,
+            character_set_name: None,
+            collation_name: None,
+            default: None,
+        };
+        let unsigned = ColumnMeta {
+            column_type: "bigint unsigned".into(),
+            ..signed.clone()
+        };
+        assert!(
+            validate_column_shape("audit_events", "BIGINT UNSIGNED NOT NULL", &unsigned).is_ok()
+        );
+        assert!(
+            validate_column_shape("audit_events", "BIGINT UNSIGNED NOT NULL", &signed).is_err()
+        );
+    }
+
+    #[test]
+    fn migration_checks_all_columns_including_audit_evidence() {
+        for (table, required) in [
+            ("sessions", "created_time"),
+            ("roles", "revision"),
+            ("devices", "first_seen"),
+            ("grants", "revision"),
+            ("admission_decisions", "time_evidence"),
+            ("audit_events", "event_type"),
+            ("audit_events", "time_evidence"),
+        ] {
+            assert!(
+                TABLES
+                    .iter()
+                    .find(|entry| entry.0 == table)
+                    .unwrap()
+                    .1
+                    .contains(&required),
+                "unchecked {table}.{required}"
+            );
+        }
+    }
+
+    #[test]
+    fn v4_baseline_sql_declares_every_contracted_table() {
+        let statements = v4_schema_statements().expect("v4 基线 SQL 必须可解析");
+        let seen: Vec<&str> = statements.iter().map(|(table, _)| *table).collect();
+        for &(table, ..) in TABLES.iter().chain(RUNTIME_TABLES) {
+            assert!(seen.contains(&table), "v4 基线缺少表 {table}");
+        }
+        assert_eq!(seen.len(), 16, "v4 基线必须恰好 16 条 CREATE");
+    }
+
+    /// 从 v4 DDL 的列声明片段推导"该列在 `information_schema` 里应当读回的元数据"。
+    ///
+    /// 只按 v4 契约受控的写法推导（类型/长度/`UNSIGNED`/`NOT NULL`/
+    /// `CHARACTER SET … COLLATE …`/`DEFAULT FALSE|0`），任何推导不出来或推导后仍被生产
+    /// 校验器拒绝的形状，都说明基线 SQL 与自身的严格解析契约不兼容。本函数**不放宽**任何
+    /// 一项：非受控的 `DEFAULT` 值原样交给 [`validate_column_default`] 判定。
+    fn ideal_metadata_from_declaration(
+        table: &str,
+        column: &str,
+        declaration: &str,
+        table_collation: &str,
+    ) -> ColumnMeta {
+        let tokens: Vec<&str> = declaration.split_whitespace().collect();
+        let head = tokens
+            .first()
+            .unwrap_or_else(|| panic!("{table}.{column} 的列声明片段为空：{declaration:?}"))
+            .to_ascii_lowercase();
+        let (base, length) = match head.split_once('(') {
+            Some((base, rest)) => (
+                base.to_owned(),
+                rest.strip_suffix(')')
+                    .unwrap_or_else(|| panic!("{table}.{column} 的类型长度写法非法：{head}"))
+                    .to_owned(),
+            ),
+            None => (head.clone(), String::new()),
+        };
+        let unsigned = tokens
+            .iter()
+            .any(|token| token.eq_ignore_ascii_case("UNSIGNED"));
+        // MySQL 读回时 BOOLEAN 是 TINYINT 别名，data_type 与 column_type 都是 tinyint。
+        let (data_type, bare_type) = if base == "boolean" {
+            ("tinyint".to_owned(), "tinyint".to_owned())
+        } else if length.is_empty() {
+            (base.clone(), base.clone())
+        } else {
+            (base.clone(), format!("{base}({length})"))
+        };
+        let column_type = if unsigned {
+            format!("{bare_type} unsigned")
+        } else {
+            bare_type
+        };
+        let nullable = !tokens.windows(2).any(|pair| pair == ["NOT", "NULL"]);
+        let declared_charset = tokens
+            .windows(3)
+            .find(|pair| {
+                pair[0].eq_ignore_ascii_case("CHARACTER") && pair[1].eq_ignore_ascii_case("SET")
+            })
+            .map(|pair| pair[2].to_owned());
+        let declared_collation = tokens
+            .windows(2)
+            .find(|pair| pair[0].eq_ignore_ascii_case("COLLATE"))
+            .map(|pair| pair[1].to_owned());
+        let character_column = matches!(
+            base.as_str(),
+            "varchar" | "char" | "text" | "tinytext" | "mediumtext" | "longtext"
+        );
+        let (character_set_name, collation_name) = match declared_charset {
+            Some(set) => (Some(set), declared_collation),
+            None if character_column => {
+                (Some("utf8mb4".to_owned()), Some(table_collation.to_owned()))
+            }
+            None => (None, None),
+        };
+        let default = match tokens
+            .windows(2)
+            .find(|pair| pair[0].eq_ignore_ascii_case("DEFAULT"))
+            .map(|pair| pair[1])
+        {
+            Some(value) if value.eq_ignore_ascii_case("FALSE") || value == "0" => {
+                Some("0".to_owned())
+            }
+            // 非受控默认值原样保留，由生产校验器给出"unsupported default"级别的拒绝。
+            Some(value) => Some(value.to_owned()),
+            None => None,
+        };
+        ColumnMeta {
+            name: column.to_owned(),
+            data_type,
+            column_type,
+            nullable,
+            character_set_name,
+            collation_name,
+            default,
+        }
+    }
+
+    /// v4 基线的**契约自闭合**回归（离线、不连库）：把生产形状校验
+    /// [`validate_v4_shape`] 实际消费的同一套 helper——[`ddl_parts`]、
+    /// [`expected_indexes`]、[`validate_column_shape`]、[`validate_column_charset`]
+    /// （以及其内部调用的 [`validate_column_default`]）——套到 16 张表的**每一个契约列名与
+    /// 每一个契约索引名**上，逐列逐索引起真实作用，而不是只数 `CREATE` 条数或源码出现次数。
+    ///
+    /// 断言内容：
+    /// 1. 每张契约表都在白名单解析结果里；
+    /// 2. 每个契约列都能按**与生产逐字相同的规则**（片段以 `列名 + 空格` 开头）在 DDL 里
+    ///    找到恰好一个声明；
+    /// 3. 该声明喂给生产校验器后，类型/长度/UNSIGNED/NULL/字符集/collation/默认值全部通过，
+    ///    并且**四类反向变异**（可空性取反、长度 ±1、默认值改成 `1`、字符集/collation 改成
+    ///    latin1）都必须被拒绝——证明这个 `Ok` 不是空判定，校验确实逐条在跑；
+    /// 4. 每个契约索引都能从 DDL 解析出列集合、唯一性与无前缀长度，并与命名前缀吻合；篡改
+    ///    其中任一索引的列集合后 [`validate_indexes`] 必须拒绝；
+    /// 5. 顶层片段数恰好等于 契约列数 + 独立索引定义数（内联 `PRIMARY KEY` 不额外产生片段），
+    ///    且没有任何片段以 `--` 开头（行内注释被并入下一片段的指纹）。
+    ///
+    /// 覆盖规模（16 表 / 122 列 / 40 索引）也硬编码断言，防止有人靠缩小契约常量蒙过本用例。
+    #[test]
+    fn v4_schema_contract_is_self_consistent_for_all_sixteen_tables() {
+        const TABLE_COLLATION: &str = "utf8mb4_0900_ai_ci";
+        const EXPECTED_COLUMNS: usize = 122;
+        const EXPECTED_INDEXES: usize = 40;
+        let statements = v4_schema_statements().expect("v4 基线 SQL 必须可解析");
+        let mut tables = 0usize;
+        let mut columns_covered = 0usize;
+        let mut indexes_covered = 0usize;
+        for &(table, columns, indexes) in TABLES.iter().chain(RUNTIME_TABLES) {
+            assert!(
+                statements.iter().any(|(seen, _)| *seen == table),
+                "白名单解析结果缺少契约表 {table}"
+            );
+            let parts = ddl_parts(table);
+            for &column in columns {
+                // 与 validate_v4_shape 完全同一条查找规则；固定文案也与生产逐字一致，
+                // 因此这条离线回归失败时给出的正是真实库上会出现的那句话。
+                let found: Vec<&String> = parts
+                    .iter()
+                    .filter(|part| part.starts_with(&format!("{column} ")))
+                    .collect();
+                assert_eq!(
+                    found.len(),
+                    1,
+                    "v4 schema DDL missing column {table}.{column}（片段匹配数 {}）",
+                    found.len()
+                );
+                let declaration = found[0]
+                    .strip_prefix(&format!("{column} "))
+                    .expect("已按 `列名 + 空格` 前缀匹配");
+                let actual =
+                    ideal_metadata_from_declaration(table, column, declaration, TABLE_COLLATION);
+                validate_column_shape(table, declaration, &actual).unwrap_or_else(|error| {
+                    panic!("{table}.{column} 的声明无法通过生产形状校验：{error}")
+                });
+                validate_column_charset(table, declaration, &actual, TABLE_COLLATION)
+                    .unwrap_or_else(|error| {
+                        panic!("{table}.{column} 的字符集元数据无法通过生产校验：{error}")
+                    });
+                let mut flipped = actual.clone();
+                flipped.nullable = !flipped.nullable;
+                assert!(
+                    validate_column_shape(table, declaration, &flipped).is_err(),
+                    "{table}.{column} 的形状校验对可空性不敏感，说明校验没有真正运行"
+                );
+                // 其余三类元数据也必须**真的**参与判定（防止"声明被解析器读懂但校验被跳过"）：
+                // 长度、默认值、字符集/collation 各做一次变异，必须被拒绝。
+                let head = declaration
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                let declared_charset_in_sql =
+                    declaration.to_ascii_uppercase().contains("CHARACTER SET");
+                let character_column = matches!(
+                    head.split('(').next().unwrap_or_default(),
+                    "varchar" | "char" | "text" | "tinytext" | "mediumtext" | "longtext"
+                );
+                let width = actual.column_type.find('(').and_then(|open| {
+                    actual.column_type[open + 1..].find(')').and_then(|digits| {
+                        actual.column_type[open + 1..open + 1 + digits]
+                            .parse::<i64>()
+                            .ok()
+                            .map(|value| (open, digits, value))
+                    })
+                });
+                if let Some((open, digits, value)) = width {
+                    let mut mutated = actual.clone();
+                    let end = open + 1 + digits;
+                    mutated.column_type = format!(
+                        "{}{}{}",
+                        &actual.column_type[..open + 1],
+                        value + 1,
+                        &actual.column_type[end..]
+                    );
+                    assert!(
+                        validate_column_shape(table, declaration, &mutated).is_err(),
+                        "{table}.{column} 的长度判定没有真正运行"
+                    );
+                }
+                if declaration.to_ascii_uppercase().contains("DEFAULT") {
+                    let mut mutated = actual.clone();
+                    mutated.default = Some("1".to_owned());
+                    assert!(
+                        validate_column_shape(table, declaration, &mutated).is_err(),
+                        "{table}.{column} 的默认值判定没有真正运行"
+                    );
+                }
+                if character_column || declared_charset_in_sql {
+                    let mut mutated = actual.clone();
+                    mutated.character_set_name = Some("latin1".to_owned());
+                    mutated.collation_name = Some("latin1_bin".to_owned());
+                    assert!(
+                        validate_column_shape(table, declaration, &mutated)
+                            .and(validate_column_charset(
+                                table,
+                                declaration,
+                                &mutated,
+                                TABLE_COLLATION,
+                            ))
+                            .is_err(),
+                        "{table}.{column} 的字符集/collation 判定没有真正运行"
+                    );
+                }
+                columns_covered += 1;
+            }
+            let parsed = expected_indexes(&parts, indexes)
+                .unwrap_or_else(|error| panic!("{table} 的索引契约无法从 DDL 解析：{error}"));
+            assert_eq!(parsed.len(), indexes.len(), "{table} 索引数量不吻合");
+            for (name, meta) in indexes.iter().zip(parsed.iter()) {
+                assert_eq!(meta.name, *name, "{table} 索引顺序不吻合");
+                assert!(!meta.columns.is_empty(), "{table}.{name} 未解析出任何列");
+                assert!(
+                    meta.columns
+                        .iter()
+                        .all(|column| columns.contains(&column.as_str())),
+                    "{table}.{name} 引用了契约外列 {:?}",
+                    meta.columns
+                );
+                assert!(
+                    meta.sub_parts.iter().all(|part| part.is_none()),
+                    "{table}.{name} 不应存在前缀长度"
+                );
+                let unique = *name == "PRIMARY" || name.starts_with("uq_");
+                assert_eq!(
+                    meta.unique, unique,
+                    "{table}.{name} 的唯一性与命名前缀不吻合"
+                );
+                indexes_covered += 1;
+            }
+            // 索引校验器同样要证明"真的在比对"：改掉解析出的一个列集合必须被拒绝。
+            let mut tampered = parsed.clone();
+            tampered[0].columns = vec!["not_a_contract_column".to_owned()];
+            tampered[0].sub_parts = vec![None];
+            assert!(
+                validate_indexes(table, &parsed, &tampered).is_err(),
+                "{table} 的索引校验对列集合不敏感，说明校验没有真正运行"
+            );
+            for part in &parts {
+                assert!(
+                    !part.starts_with("--"),
+                    "{table} 的 DDL 片段以注释开头，说明 schema/v4.sql 存在行内注释：{part:?}"
+                );
+            }
+            let inline_primary = parts.iter().any(|part| {
+                columns
+                    .iter()
+                    .any(|column| part.starts_with(&format!("{column} ")))
+                    && part.contains("PRIMARY KEY")
+            });
+            assert_eq!(
+                parts.len(),
+                columns.len() + indexes.len()
+                    - usize::from(inline_primary && indexes.contains(&"PRIMARY")),
+                "{table} 的 DDL 顶层片段数与契约列/索引数不吻合"
+            );
+            tables += 1;
+        }
+        assert_eq!(tables, 16, "必须覆盖 11 identity + 5 runtime 共 16 张表");
+        assert_eq!(
+            columns_covered, EXPECTED_COLUMNS,
+            "契约列覆盖规模必须恰好 122 列"
+        );
+        assert_eq!(
+            indexes_covered, EXPECTED_INDEXES,
+            "契约索引覆盖规模必须恰好 40 个"
+        );
+    }
+
+    #[test]
+    fn fallback_evidence_has_stable_reference_and_unknown_fields() {
+        let a: serde_json::Value = serde_json::from_str(&system_fallback_time_evidence()).unwrap();
+        let b: serde_json::Value = serde_json::from_str(&system_fallback_time_evidence()).unwrap();
+        assert_eq!(a["quality"], "system_fallback");
+        let wall = a["system_wall_utc"].as_str().unwrap();
+        chrono::DateTime::parse_from_rfc3339(wall).unwrap();
+        assert_eq!(a["reference_utc"], wall);
+        let epoch = uuid::Uuid::parse_str(a["clock_epoch"].as_str().unwrap()).unwrap();
+        assert_eq!(epoch.get_version_num(), 4);
+        assert_eq!(a["clock_epoch"], b["clock_epoch"]);
+        for key in ["source", "sample_age_ms", "offset_ms", "uncertainty_ms"] {
+            assert!(a.get(key).unwrap().is_null(), "{key} must be unknown");
+        }
+    }
+
     fn full_presence() -> RuntimeTablePresence {
         RuntimeTablePresence {
             main_tasks: true,
@@ -9250,431 +3234,5 @@ mod tests {
             device_operation_locks: true,
             recovery_checks: true,
         }
-    }
-
-    fn empty_presence() -> RuntimeTablePresence {
-        RuntimeTablePresence {
-            main_tasks: false,
-            sub_tasks: false,
-            task_previews: false,
-            device_operation_locks: false,
-            recovery_checks: false,
-        }
-    }
-
-    #[test]
-    fn table_set_policy_allows_runtime_tables_only_for_v3_contract() {
-        let identity: Vec<String> = TABLES
-            .iter()
-            .map(|(table, _, _)| table.to_string())
-            .collect();
-        assert!(validate_table_set(&identity, false).is_ok());
-        assert!(validate_table_set(&identity, true).is_ok());
-        // v3 契约（v4 启动共用）放行五张固定 runtime 表；其余契约拒绝。
-        let mut with_runtime = identity.clone();
-        with_runtime.extend(RUNTIME_TABLE_NAMES.iter().map(|table| table.to_string()));
-        assert!(validate_table_set(&with_runtime, true).is_ok());
-        assert!(validate_table_set(&with_runtime, false).is_err());
-        // 部分 runtime 表在集合判定层放行，由迁移 preflight 负责拒绝半成品。
-        let mut partial = identity.clone();
-        partial.push("main_tasks".into());
-        assert!(validate_table_set(&partial, true).is_ok());
-        // 未知表、缺失 identity 表、重复行一律 fail-closed。
-        let mut unknown = identity.clone();
-        unknown.push("evil_table".into());
-        assert!(validate_table_set(&unknown, true).is_err());
-        assert!(validate_table_set(&unknown, false).is_err());
-        assert!(validate_table_set(&identity[1..], true).is_err());
-        let mut duplicate = identity.clone();
-        duplicate.push("users".into());
-        assert!(validate_table_set(&duplicate, true).is_err());
-    }
-
-    #[test]
-    fn tasks_migration_statements_are_five_whitelisted_creates() {
-        let statements = tasks_migration_statements().unwrap();
-        assert_eq!(statements.len(), RUNTIME_TABLE_NAMES.len());
-        for table in RUNTIME_TABLE_NAMES {
-            assert_eq!(
-                statements
-                    .iter()
-                    .filter(|sql| {
-                        sql.starts_with(&format!("CREATE TABLE IF NOT EXISTS {table} ("))
-                    })
-                    .count(),
-                1,
-                "exactly one whitelisted CREATE for {table}"
-            );
-        }
-        let upper = statements.join("\n").to_ascii_uppercase();
-        assert!(!upper.contains("FOREIGN KEY"));
-        assert!(!upper.contains("REFERENCES"));
-        assert!(!upper.contains("CHECK ("));
-    }
-
-    /// 可观察的版本 CAS 事务状态：只有 `commit` 成功才允许将持久版本落定为 4；
-    /// UPDATE 或 COMMIT 任一失败都必须表现为「未提交 + 已回滚 + 版本仍为 3」。
-    #[derive(Debug, PartialEq, Eq)]
-    struct V4TxReport {
-        tx_open: bool,
-        committed: bool,
-        rolled_back: bool,
-        persisted_version: Option<i32>,
-    }
-
-    #[derive(Default)]
-    struct V4MigrationState {
-        version: Option<i32>,
-        /// 模拟 `schema_meta.schema_version` 的持久值，仅随成功提交变化。
-        persisted_version: Option<i32>,
-        events: Vec<&'static str>,
-        preflight_ok: bool,
-        presence_before: RuntimeTablePresence,
-        presence_after: RuntimeTablePresence,
-        create_ok: bool,
-        /// 模拟 `UPDATE ... WHERE singleton = 1 AND schema_version = 3` 是否恰好影响 1 行。
-        cas_update_ok: bool,
-        /// 模拟 `COMMIT` 是否成功：提交前失败同样必须回滚。
-        commit_ok: bool,
-        tx_open: bool,
-        committed: bool,
-        rolled_back: bool,
-        /// `Some(Some(v))` / `Some(None)`：CAS 之后重读 `schema_meta` 的异常读数；
-        /// `None`：不覆盖，重读返回真实持久版本。
-        read_after_cas: Option<Option<i32>>,
-    }
-    struct V4MigrationFake(std::sync::Mutex<V4MigrationState>);
-    impl V4MigrationFake {
-        fn events(&self) -> Vec<&'static str> {
-            self.0.lock().unwrap().events.clone()
-        }
-        fn tx(&self) -> V4TxReport {
-            let state = self.0.lock().unwrap();
-            V4TxReport {
-                tx_open: state.tx_open,
-                committed: state.committed,
-                rolled_back: state.rolled_back,
-                persisted_version: state.persisted_version,
-            }
-        }
-    }
-    fn v4_migration_fake() -> V4MigrationFake {
-        V4MigrationFake(std::sync::Mutex::new(V4MigrationState {
-            version: Some(3),
-            persisted_version: Some(3),
-            preflight_ok: true,
-            presence_before: empty_presence(),
-            presence_after: full_presence(),
-            create_ok: true,
-            cas_update_ok: true,
-            commit_ok: true,
-            events: Vec::new(),
-            ..V4MigrationState::default()
-        }))
-    }
-
-    impl SchemaV4MigrationProbe for V4MigrationFake {
-        async fn read_version(&self) -> Result<Option<i32>, ControllerError> {
-            let mut state = self.0.lock().unwrap();
-            let reply = if state.events.contains(&"cas") {
-                state.read_after_cas.unwrap_or(state.persisted_version)
-            } else {
-                state.version
-            };
-            state.events.push("read_version");
-            Ok(reply)
-        }
-        async fn v3_integrity_preflight(&self) -> Result<(), ControllerError> {
-            let mut state = self.0.lock().unwrap();
-            state.events.push("preflight");
-            if state.preflight_ok {
-                Ok(())
-            } else {
-                Err(ControllerError::Config("simulated preflight".into()))
-            }
-        }
-        async fn runtime_table_presence(&self) -> Result<RuntimeTablePresence, ControllerError> {
-            let mut state = self.0.lock().unwrap();
-            state.events.push("presence");
-            Ok(if state.events.contains(&"create") {
-                state.presence_after
-            } else {
-                state.presence_before
-            })
-        }
-        async fn create_runtime_tables(&self) -> Result<(), ControllerError> {
-            let mut state = self.0.lock().unwrap();
-            state.events.push("create");
-            if state.create_ok {
-                Ok(())
-            } else {
-                Err(ControllerError::Config("simulated CREATE".into()))
-            }
-        }
-        async fn cas_version_v3_to_v4(&self) -> Result<(), ControllerError> {
-            let mut state = self.0.lock().unwrap();
-            state.events.push("cas");
-            // 镜像真实实现：BEGIN → UPDATE（CAS）→ COMMIT。任一步失败，
-            // `Transaction` 在析构时回滚，持久版本绝不变化。
-            state.tx_open = true;
-            if !state.cas_update_ok {
-                state.tx_open = false;
-                state.rolled_back = true;
-                return Err(ControllerError::Config("simulated CAS UPDATE".into()));
-            }
-            if !state.commit_ok {
-                state.tx_open = false;
-                state.rolled_back = true;
-                return Err(ControllerError::Config("simulated CAS COMMIT".into()));
-            }
-            state.tx_open = false;
-            state.committed = true;
-            state.persisted_version = Some(crate::integrity::SUPPORTED_SCHEMA_VERSION);
-            Ok(())
-        }
-    }
-
-    /// 尚未发生任何版本写入的可观察状态：CAS 事务从未开启、未提交、未回滚，
-    /// 持久版本仍为 3。
-    const NO_TX_AT_V3: V4TxReport = V4TxReport {
-        tx_open: false,
-        committed: false,
-        rolled_back: false,
-        persisted_version: Some(3),
-    };
-    /// CAS 失败后的可观察状态：事务未提交且已回滚，持久版本仍为 3。
-    const ROLLED_BACK_AT_V3: V4TxReport = V4TxReport {
-        tx_open: false,
-        committed: false,
-        rolled_back: true,
-        persisted_version: Some(3),
-    };
-
-    #[tokio::test]
-    async fn v4_migration_happy_path_orders_gates_before_cas_and_confirms_v4() {
-        let fake = v4_migration_fake();
-        run_schema_v4_migration_with_probe(&fake).await.unwrap();
-        assert_eq!(
-            fake.events(),
-            [
-                "read_version",
-                "preflight",
-                "presence",
-                "create",
-                "presence",
-                "cas",
-                "read_version"
-            ]
-        );
-        // 唯一成功路径：事务已提交，持久版本落定为 4。
-        assert_eq!(
-            fake.tx(),
-            V4TxReport {
-                tx_open: false,
-                committed: true,
-                rolled_back: false,
-                persisted_version: Some(4),
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn v4_migration_requires_exact_version_three_without_writes() {
-        for version in [None, Some(1), Some(2), Some(4), Some(5)] {
-            let fake = v4_migration_fake();
-            fake.0.lock().unwrap().version = version;
-            let error = run_schema_v4_migration_with_probe(&fake).await.unwrap_err();
-            assert!(format!("{error}").contains("requires schema version 3"));
-            assert_eq!(fake.events(), ["read_version"], "version={version:?}");
-            assert_eq!(fake.tx(), NO_TX_AT_V3, "version={version:?}");
-        }
-    }
-
-    #[tokio::test]
-    async fn v4_migration_stops_before_ddl_on_preflight_or_presence_failure() {
-        let fake = v4_migration_fake();
-        fake.0.lock().unwrap().preflight_ok = false;
-        assert!(run_schema_v4_migration_with_probe(&fake).await.is_err());
-        assert_eq!(fake.events(), ["read_version", "preflight"]);
-
-        let fake = v4_migration_fake();
-        fake.0.lock().unwrap().presence_before = full_presence();
-        assert!(run_schema_v4_migration_with_probe(&fake).await.is_err());
-        assert_eq!(fake.events(), ["read_version", "preflight", "presence"]);
-
-        // 任一残留 runtime 表都视为半成品库，DDL 前拒绝。
-        let fake = v4_migration_fake();
-        fake.0.lock().unwrap().presence_before.main_tasks = true;
-        let error = run_schema_v4_migration_with_probe(&fake).await.unwrap_err();
-        assert!(format!("{error}").contains("must not exist before DDL"));
-        assert_eq!(fake.events(), ["read_version", "preflight", "presence"]);
-        assert_eq!(fake.tx(), NO_TX_AT_V3);
-    }
-
-    #[tokio::test]
-    async fn v4_migration_ddl_or_incomplete_tables_prevent_cas() {
-        let fake = v4_migration_fake();
-        fake.0.lock().unwrap().create_ok = false;
-        assert!(run_schema_v4_migration_with_probe(&fake).await.is_err());
-        assert_eq!(
-            fake.events(),
-            ["read_version", "preflight", "presence", "create"]
-        );
-        assert_eq!(fake.tx(), NO_TX_AT_V3, "DDL 失败不得开启版本事务");
-
-        let fake = v4_migration_fake();
-        fake.0.lock().unwrap().presence_after.recovery_checks = false;
-        let error = run_schema_v4_migration_with_probe(&fake).await.unwrap_err();
-        assert!(format!("{error}").contains("incomplete after DDL"));
-        assert_eq!(
-            fake.events(),
-            [
-                "read_version",
-                "preflight",
-                "presence",
-                "create",
-                "presence"
-            ]
-        );
-        assert_eq!(fake.tx(), NO_TX_AT_V3, "五表不齐备不得 CAS 版本");
-    }
-
-    #[tokio::test]
-    async fn v4_migration_cas_failure_and_uncertain_version_never_claim_success() {
-        // UPDATE（CAS）本身失败：事务未提交且已回滚，持久版本保持 3。
-        let fake = v4_migration_fake();
-        fake.0.lock().unwrap().cas_update_ok = false;
-        let error = run_schema_v4_migration_with_probe(&fake).await.unwrap_err();
-        assert!(
-            format!("{error}").contains("simulated CAS UPDATE"),
-            "{error}"
-        );
-        assert_eq!(
-            fake.events(),
-            [
-                "read_version",
-                "preflight",
-                "presence",
-                "create",
-                "presence",
-                "cas"
-            ]
-        );
-        assert_eq!(fake.tx(), ROLLED_BACK_AT_V3, "CAS UPDATE 失败不得提交");
-
-        // 提交前失败（COMMIT 失败）：UPDATE 的影响随事务回滚，版本仍为 3。
-        let fake = v4_migration_fake();
-        fake.0.lock().unwrap().commit_ok = false;
-        let error = run_schema_v4_migration_with_probe(&fake).await.unwrap_err();
-        assert!(
-            format!("{error}").contains("simulated CAS COMMIT"),
-            "{error}"
-        );
-        assert_eq!(
-            fake.events(),
-            [
-                "read_version",
-                "preflight",
-                "presence",
-                "create",
-                "presence",
-                "cas"
-            ]
-        );
-        assert_eq!(fake.tx(), ROLLED_BACK_AT_V3, "COMMIT 失败不得落定版本");
-
-        // CAS 已提交但重读读数不确定：迁移绝不声称成功（此时持久版本确已 4）。
-        for observed in [Some(3), Some(5), None] {
-            let fake = v4_migration_fake();
-            fake.0.lock().unwrap().read_after_cas = Some(observed);
-            let error = run_schema_v4_migration_with_probe(&fake).await.unwrap_err();
-            assert!(format!("{error}").contains("uncertain"), "{error}");
-            assert_eq!(
-                fake.events(),
-                [
-                    "read_version",
-                    "preflight",
-                    "presence",
-                    "create",
-                    "presence",
-                    "cas",
-                    "read_version"
-                ]
-            );
-            assert_eq!(
-                fake.tx(),
-                V4TxReport {
-                    tx_open: false,
-                    committed: true,
-                    rolled_back: false,
-                    persisted_version: Some(4),
-                },
-                "observed={observed:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn v4_migration_entry_is_explicit_never_implicit_on_startup() {
-        let source = include_str!("db.rs");
-        let startup = source
-            .split_once("pub async fn check_identity_schema(")
-            .unwrap()
-            .1
-            .split_once("\n#[derive(Clone, Copy, Debug)]")
-            .unwrap()
-            .0;
-        assert!(!startup.contains("run_schema_v4_migration"));
-        let adapter = source
-            .split_once("impl SchemaV4MigrationProbe for DbPool {")
-            .unwrap()
-            .1
-            .split_once("\ntrait FixtureV2Probe")
-            .unwrap()
-            .0;
-        assert!(adapter.contains(
-            "UPDATE schema_meta SET schema_version = 4 WHERE singleton = 1 AND schema_version = 3"
-        ));
-        assert!(adapter.contains("tasks_migration_statements()?"));
-        assert!(adapter.contains("result.rows_affected() != 1"));
-        assert!(adapter.contains("tx.commit()"));
-        assert!(
-            adapter.contains("validate_identity_rows_at_version(self, IDENTITY_SCHEMA_VERSION)")
-        );
-        assert!(!adapter.contains("DROP DATABASE"));
-        assert!(!adapter.contains("format!(\"CREATE"));
-    }
-
-    #[test]
-    fn normal_startup_wires_runtime_table_and_data_gates() {
-        let source = include_str!("db.rs");
-        // 普通启动门禁必须依次触达：版本决策 → identity 结构 → runtime 五表
-        // → identity 数据 → runtime 数据 → FK。
-        let startup = source
-            .split_once("async fn check_identity_schema_with_probe(")
-            .unwrap()
-            .1
-            .split_once("\n/// v3 终态门禁")
-            .unwrap()
-            .0;
-        assert!(startup.contains("identity_schema_decision(probe.read_version().await?)?"));
-        assert!(startup.contains("probe.runtime_table_presence().await?"));
-        assert!(startup.contains("validate_runtime_tables_for_version("));
-        assert!(startup.contains("crate::integrity::SUPPORTED_SCHEMA_VERSION"));
-        assert!(startup.contains("probe.validate_runtime_data().await?"));
-        // 真实适配：五表存在性复用固定字面量探测，runtime 数据扫描的期望版本
-        // 钉死为编译期配置，绝不从数据库行推断。
-        let adapter = source
-            .split_once("impl IdentitySchemaProbe for DbPool {")
-            .unwrap()
-            .1
-            .split_once("\npub async fn check_identity_schema(")
-            .unwrap()
-            .0;
-        assert!(adapter.contains("SchemaV4MigrationProbe::runtime_table_presence(self)"));
-        assert!(
-            adapter
-                .contains("check_runtime_data(self, crate::integrity::SUPPORTED_SCHEMA_VERSION)")
-        );
     }
 }

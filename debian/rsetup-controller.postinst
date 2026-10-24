@@ -2,10 +2,11 @@
 # postinst for rsetup-controller: create the static system account only.
 #
 # This script deliberately does NOT start, stop, restart or enable any service.
-# The unit ships disabled (dh_installsystemd --no-enable) and is additionally
-# gated by ConditionPathExists=/etc/default/rsetup-controller, because starting
-# it means connecting to a real database — an operator action, see
-# /usr/share/doc/rsetup-controller/README.Debian.
+# The unit ships disabled and is never started, restarted nor stopped by the
+# packager (dh_installsystemd --no-enable --no-start --no-stop-on-upgrade), and
+# is additionally gated by ConditionPathExists=/etc/default/rsetup-controller,
+# because starting it means connecting to a real database — an operator action,
+# see /usr/share/doc/rsetup-controller/README.Debian.
 set -e
 
 SERVICE_USER=rsetup-controller

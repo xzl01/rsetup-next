@@ -38,6 +38,16 @@
 //!   两类都只并入 `execute_unverified` 转只读核验、不重发；
 //! - 全部正向 fixture 为合法规范 UUIDv4 且构造即 `validate_dto` 通过。
 //!
+//! 失败与超时的**持久**收敛（04 §5.1/§5.2）追加证明：
+//! - 排队期限已到期的候选被持久置 `expired` + `QUEUE_EXPIRED`，同点释放归属本代际的
+//!   设备锁并回写主任务汇总，下一轮不再作为 `queued` 候选被读出（不再反复判定）；
+//! - `prepare` **明确**失败被持久置 `failed` + 对应稳定原因码（板端可解析的稳定码原样
+//!   采用、词表外按 `EXECUTION_REJECTED` 兜底），同样释放锁并回写汇总；
+//! - 结果**未知**的失败（超时/传输）与**可重试**拒绝（设备忙/资源不足）**绝不**写终态，
+//!   候选保持 `queued`、锁与主行汇总都不动；
+//! - 终结写入 CAS 未命中或结果未知时，`expired_persisted`/`prepare_failed_persisted`
+//!   均不增长，且**不**重复释放锁、**不**重复递增主任务汇总（内存计数绝不冒充已收敛）。
+//!
 //! 诚实边界：fake `SchedulerStore` 只在**同一进程内**用 `std::sync::Mutex` + 内存
 //! 字段比对模拟提交互斥（内存 CAS），它证明的是**编排控制流**不双发**且该内存 CAS
 //! 本身跨线程原子**，**不冒充**也**不能证明**跨进程持久 CAS 这一 exactly-once 强约束
@@ -59,12 +69,15 @@ use uuid::Uuid;
 
 use rsetup_controller::ControllerError;
 use rsetup_controller::tasks::board_client::{BoardClient, BoardClientError, BoardFuture};
-use rsetup_controller::tasks::model::{SubTaskState, TaskIntent};
-use rsetup_controller::tasks::scheduler::{
-    CommitVerdict, DispatchCandidate, DispatchIntentWrite, MonoClock, OBSERVE_WINDOW_MS,
-    RevalidateFailure, ScheduleSummary, SchedulerError, SchedulerPolicy, SchedulerStore,
-    SystemMonoClock, TaskScheduler,
+use rsetup_controller::tasks::model::{
+    MainTaskOutcome, MainTaskState, ReasonCode, SubTaskState, TaskIntent,
 };
+use rsetup_controller::tasks::scheduler::{
+    CommitVerdict, DispatchCandidate, DispatchIntentWrite, FinalizeVerdict, FinalizeWrite,
+    MonoClock, OBSERVE_WINDOW_MS, RevalidateFailure, ScheduleSummary, SchedulerError,
+    SchedulerPolicy, SchedulerStore, SystemMonoClock, TaskScheduler,
+};
+use rsetup_controller::tasks::service::{counts_json_of, main_task_convergence};
 
 // ---- 合法规范 UUIDv4 fixture 基元（可复现，不依赖随机数）--------------------
 
@@ -179,7 +192,12 @@ impl Trace {
 #[derive(Clone)]
 struct StoredRow {
     candidate: DispatchCandidate,
+    /// 该子任务所属主任务：主任务汇总（`main_tasks` 的 state/outcome/counts_json）
+    /// 回写的分组键，与生产同事务口径一致。
+    main_task_id: Uuid,
     cur_state: SubTaskState,
+    /// 终结写入落库的稳定原因码（`sub_tasks.reason_code`）。
+    cur_reason: Option<ReasonCode>,
     cur_actor_active: bool,
     cur_has_reboot: bool,
     cur_admission_approved: bool,
@@ -188,7 +206,83 @@ struct StoredRow {
     cur_authz_epoch: u64,
     /// 若 Some，则 `commit_dispatch_intent` 该子任务直接返回 CommitUnknown（不改状态）。
     inject_commit_unknown: bool,
+    /// 令本行的终结写入返回 Unknown（模拟提交结果未知，不改状态）。
+    inject_finalize_unknown: bool,
     committed_intent: Option<TaskIntent>,
+}
+
+/// `main_tasks` 的持久汇总投影：状态收敛、outcome、十态计数与 revision。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MainSummary {
+    revision: u64,
+    state: MainTaskState,
+    outcome: Option<MainTaskOutcome>,
+    counts_json: String,
+    /// 汇总被回写的次数：子任务每变更一次应恰好 +1。
+    syncs: usize,
+}
+
+/// 子任务 → 主任务的稳定派生（每个子任务独占一个主任务，便于逐例断言汇总回写）。
+fn main_of(sub_task_id: Uuid) -> Uuid {
+    let mut bytes = *sub_task_id.as_bytes();
+    bytes[0] ^= 0x3c;
+    let id = Uuid::from_bytes(bytes);
+    debug_assert!(is_canonical_uuid_v4(&id.to_string()));
+    id
+}
+
+/// 十态频数（与生产 `tally`/`counts_json_of` 同口径）。
+fn tally(states: &[SubTaskState]) -> Vec<(SubTaskState, u64)> {
+    const ALL: [SubTaskState; 10] = [
+        SubTaskState::Queued,
+        SubTaskState::Held,
+        SubTaskState::Dispatching,
+        SubTaskState::Accepted,
+        SubTaskState::Verifying,
+        SubTaskState::Succeeded,
+        SubTaskState::Failed,
+        SubTaskState::Unknown,
+        SubTaskState::Cancelled,
+        SubTaskState::Expired,
+    ];
+    ALL.iter()
+        .map(|state| {
+            (
+                *state,
+                states.iter().filter(|s| **s == *state).count() as u64,
+            )
+        })
+        .collect()
+}
+
+/// 与生产 `finalize_subtask` 第 6 步同口径：子任务变更**之后**、同一把锁之内重算主任务
+/// 收敛态与十态计数，并递增 revision（模拟「同事务回写、同提交、同回滚」）。
+///
+/// 绝不留下「只动子任务、主行陈旧」的中间态：本函数是 fake 里唯一的主任务汇总写入口。
+fn sync_main_locked(
+    rows: &[StoredRow],
+    mains: &mut HashMap<Uuid, MainSummary>,
+    main_task_id: Uuid,
+) {
+    let states: Vec<SubTaskState> = rows
+        .iter()
+        .filter(|row| row.main_task_id == main_task_id)
+        .map(|row| row.cur_state)
+        .collect();
+    let (state, outcome) = main_task_convergence(&states);
+    let counts_json = counts_json_of(&tally(&states));
+    let entry = mains.entry(main_task_id).or_insert_with(|| MainSummary {
+        revision: 0,
+        state,
+        outcome,
+        counts_json: counts_json.clone(),
+        syncs: 0,
+    });
+    entry.revision += 1;
+    entry.syncs += 1;
+    entry.state = state;
+    entry.outcome = outcome;
+    entry.counts_json = counts_json;
 }
 
 #[derive(Default)]
@@ -196,6 +290,13 @@ struct FakeStore {
     rows: Mutex<Vec<StoredRow>>,
     list_calls: Mutex<usize>,
     commit_calls: Mutex<Vec<Uuid>>,
+    /// 终结写入的调用顺序与裁决（含 CAS 未命中/未知），与状态写入同一 guard 内落定。
+    finalize_calls: Mutex<Vec<Uuid>>,
+    finalize_verdicts: Mutex<Vec<(Uuid, FinalizeVerdict)>>,
+    /// `main_tasks` 的持久汇总（终结路径同事务回写的结果）。
+    mains: Mutex<HashMap<Uuid, MainSummary>>,
+    /// 设备锁释放事件：`(子任务, 被释放的锁代际)`。代际必须来自被终结的那一行。
+    lock_releases: Mutex<Vec<(Uuid, u64)>>,
     /// 提交裁决计数：与状态写入同处一个 guard 内自增，跨线程不丢、不重复。
     verdicts: Mutex<Vec<CommitVerdict>>,
     /// 短事务期间的时钟注入（模拟提交 await 消耗票据剩余寿命）。
@@ -274,6 +375,74 @@ impl FakeStore {
             })
     }
 
+    /// 某个子任务的**当前原因码**（`sub_tasks.reason_code`）。
+    fn reason_of(&self, subtask_id: Uuid) -> Option<ReasonCode> {
+        self.rows
+            .lock()
+            .expect("未中毒")
+            .iter()
+            .find(|r| r.candidate.subtask_id == subtask_id)
+            .and_then(|r| r.cur_reason)
+    }
+
+    /// 某个子任务所属的主任务 id。
+    fn main_task_of(&self, subtask_id: Uuid) -> Option<Uuid> {
+        self.rows
+            .lock()
+            .expect("未中毒")
+            .iter()
+            .find(|r| r.candidate.subtask_id == subtask_id)
+            .map(|r| r.main_task_id)
+    }
+
+    /// 主任务汇总的当前投影（从未回写过则 `None`）。
+    fn main_summary(&self, main_task_id: Uuid) -> Option<MainSummary> {
+        self.mains
+            .lock()
+            .expect("未中毒")
+            .get(&main_task_id)
+            .cloned()
+    }
+
+    /// 该子任务被释放的设备锁代际（未释放则 `None`）。
+    fn lock_released_generation(&self, subtask_id: Uuid) -> Option<u64> {
+        self.lock_releases
+            .lock()
+            .expect("未中毒")
+            .iter()
+            .rev()
+            .find(|(id, _)| *id == subtask_id)
+            .map(|(_, generation)| *generation)
+    }
+
+    fn finalize_calls(&self) -> Vec<Uuid> {
+        self.finalize_calls.lock().expect("未中毒").clone()
+    }
+
+    /// 该子任务最近一次终结写入的裁决。
+    fn finalize_verdict_of(&self, subtask_id: Uuid) -> Option<FinalizeVerdict> {
+        self.finalize_verdicts
+            .lock()
+            .expect("未中毒")
+            .iter()
+            .rev()
+            .find(|(id, _)| *id == subtask_id)
+            .map(|(_, verdict)| *verdict)
+    }
+
+    /// 注入：该子任务的终结写入返回「结果未知」，且不改任何状态。
+    fn inject_finalize_unknown(&self, subtask_id: Uuid) {
+        if let Some(row) = self
+            .rows
+            .lock()
+            .expect("未中毒")
+            .iter_mut()
+            .find(|r| r.candidate.subtask_id == subtask_id)
+        {
+            row.inject_finalize_unknown = true;
+        }
+    }
+
     /// 让短事务在返回前推进时钟 `ms`（模拟提交 await 期间票据寿命流逝）。
     fn advance_clock_in_commit(&self, ms: i64) {
         *self.commit_advance_ms.lock().expect("未中毒") = ms;
@@ -298,6 +467,55 @@ impl FakeStore {
         if *self.commit_untrust_clock.lock().expect("未中毒") {
             clock.set_trusted(false);
         }
+    }
+
+    /// **原子终结写入**：读当前行 → 重验（state CAS + 锁代际 CAS）→ 通过则原地写终态
+    /// 与原因码、按归属与代际释放设备锁，并**在同一把锁内**回写主任务汇总。
+    ///
+    /// 与 [`FakeStore::cas_commit`] 同一纪律：检查与写入之间绝不释放锁，否则两个并发
+    /// 周期都会看到 `queued`、各自「终结一次 + 释放一次锁 + 汇总回写一次」，主任务计数
+    /// 被重复递增。CAS 未命中（并发已派发/取消/换锁代际）一律 `Skipped` 且**零副作用**
+    /// ——包括不回写汇总；注入的 `Unknown` 同样零副作用。
+    fn apply_finalize(&self, write: &FinalizeWrite) -> FinalizeVerdict {
+        let subtask_id = write.subtask_id;
+        let mut rows = self.rows.lock().expect("未中毒");
+        self.finalize_calls.lock().expect("未中毒").push(subtask_id);
+        let mut verdict = FinalizeVerdict::Skipped;
+        let mut applied_main: Option<Uuid> = None;
+        if let Some(row) = rows
+            .iter_mut()
+            .find(|r| r.candidate.subtask_id == subtask_id)
+        {
+            if row.inject_finalize_unknown {
+                verdict = FinalizeVerdict::Unknown;
+            } else if row.cur_state != write.expected_from_state
+                || row.cur_lock_generation != write.expected_lock_generation
+            {
+                verdict = FinalizeVerdict::Skipped;
+            } else {
+                row.cur_state = write.target_state;
+                row.cur_reason = Some(write.reason_code);
+                // 与生产 DELETE 的 WHERE 同条件：只释放**归属本子任务本代际**的锁。
+                if row.cur_lock_owned {
+                    row.cur_lock_owned = false;
+                    self.lock_releases
+                        .lock()
+                        .expect("未中毒")
+                        .push((subtask_id, row.cur_lock_generation));
+                }
+                applied_main = Some(row.main_task_id);
+                verdict = FinalizeVerdict::Applied;
+            }
+        }
+        if let Some(main_task_id) = applied_main {
+            let mut mains = self.mains.lock().expect("未中毒");
+            sync_main_locked(&rows, &mut mains, main_task_id);
+        }
+        self.finalize_verdicts
+            .lock()
+            .expect("未中毒")
+            .push((subtask_id, verdict));
+        verdict
     }
 
     /// **真正的原子 CAS**：读当前行 → 重验（state/锁归属/authz_epoch/lock_generation）
@@ -393,6 +611,19 @@ impl SchedulerStore for FakeStore {
             Ok(verdict)
         })
     }
+
+    /// 终结写入同样在**同步段**完成（返回 future 之前），future 只带出结果：
+    /// 「判—写—释放锁—回写汇总」的原子性不依赖 poll 时机。
+    fn finalize_subtask(
+        &self,
+        write: &FinalizeWrite,
+    ) -> Pin<Box<dyn Future<Output = Result<FinalizeVerdict, ControllerError>> + Send + '_>> {
+        let subtask_id = write.subtask_id;
+        let verdict = self.apply_finalize(write);
+        self.trace
+            .push(format!("finalize:{subtask_id}:{verdict:?}"));
+        Box::pin(async move { Ok(verdict) })
+    }
 }
 
 // ---- 板端 fake（6 方法，记账 prepare/execute 次序）-------------------------
@@ -472,7 +703,16 @@ impl TicketSpec {
 #[derive(Clone)]
 enum PrepareOutcome {
     Ok(TicketSpec),
+    /// 板端**明确**失败（能力/持久 journal 不可用）：可持久收敛为 failed。
     Err,
+    /// 结果**未知**的失败（超时）：绝不据此判 failed，候选必须保持 queued。
+    ErrTimeout,
+    /// 可重试的瞬时拒绝（设备忙）：同样不得写终态。
+    ErrDeviceBusy,
+    /// 板端明确拒绝，携带稳定原因码 `TIME_UNCERTAIN`（可解析成稳定词表）。
+    ErrRejectedStable,
+    /// 板端明确拒绝，携带**词表外**原因码：按执行前拒收兜底归因。
+    ErrRejectedUnknownCode,
 }
 
 #[derive(Default)]
@@ -532,10 +772,14 @@ impl FakeBoard {
             .map(|(_, req)| req.clone())
     }
     fn set_prepare_err(&self, id: Uuid) {
+        self.set_prepare_outcome(id, PrepareOutcome::Err);
+    }
+    /// 注入任意 `prepare` 失败形态（明确失败 / 结果未知 / 可重试拒绝）。
+    fn set_prepare_outcome(&self, id: Uuid, outcome: PrepareOutcome) {
         self.prepare_outcomes
             .lock()
             .expect("未中毒")
-            .insert(id, PrepareOutcome::Err);
+            .insert(id, outcome);
     }
     fn set_ticket_valid(&self, ms: u32) {
         *self.default_ticket_valid_ms.lock().expect("未中毒") = ms;
@@ -612,6 +856,16 @@ impl BoardClient for FakeBoard {
             self.apply_prepare_clock_hook();
             match outcome {
                 PrepareOutcome::Err => Err(BoardClientError::CapabilityUnavailable),
+                PrepareOutcome::ErrTimeout => Err(BoardClientError::Timeout),
+                PrepareOutcome::ErrDeviceBusy => Err(BoardClientError::DeviceBusy),
+                PrepareOutcome::ErrRejectedStable => Err(BoardClientError::Rejected {
+                    status: 409,
+                    reason_code: Some("TIME_UNCERTAIN".into()),
+                }),
+                PrepareOutcome::ErrRejectedUnknownCode => Err(BoardClientError::Rejected {
+                    status: 400,
+                    reason_code: Some("BOARD_INTERNAL_FIZZLE".into()),
+                }),
                 PrepareOutcome::Ok(spec) => Ok(spec.build(sub_task_id)),
             }
         })
@@ -755,7 +1009,9 @@ fn admissible_candidate(subtask_id: Uuid, device: [u8; 32], deadline: i64) -> St
         stream_epoch: v4(0x570),
     };
     StoredRow {
+        main_task_id: main_of(subtask_id),
         cur_state: SubTaskState::Queued,
+        cur_reason: None,
         cur_actor_active: true,
         cur_has_reboot: true,
         cur_admission_approved: true,
@@ -763,6 +1019,7 @@ fn admissible_candidate(subtask_id: Uuid, device: [u8; 32], deadline: i64) -> St
         cur_lock_generation: 1,
         cur_authz_epoch: 42,
         inject_commit_unknown: false,
+        inject_finalize_unknown: false,
         committed_intent: None,
         candidate,
     }
@@ -1152,6 +1409,13 @@ async fn candidate_read_failure_fails_closed() {
         ) -> Pin<Box<dyn Future<Output = Result<CommitVerdict, ControllerError>> + Send + '_>>
         {
             Box::pin(async { Ok(CommitVerdict::CommitUnknown) })
+        }
+        fn finalize_subtask(
+            &self,
+            _w: &FinalizeWrite,
+        ) -> Pin<Box<dyn Future<Output = Result<FinalizeVerdict, ControllerError>> + Send + '_>>
+        {
+            Box::pin(async { Ok(FinalizeVerdict::Applied) })
         }
     }
     let trace = Trace::default();
@@ -2047,5 +2311,292 @@ async fn exhausted_ticket_lifetime_after_commit_never_executes_when_min_validity
         store.commit_calls().iter().filter(|x| **x == id).count(),
         1,
         "绝不重发提交"
+    );
+}
+
+// ===========================================================================
+// 失败与超时的**持久**收敛（04 §5.1/§5.2：终态不止于内存计数）
+//
+// 上面各例只断言「本轮不发」；本节的断言下推到**库里**：排队期限到期的候选必须落
+// `expired` + `QUEUE_EXPIRED`，`prepare` 明确失败必须落 `failed` + 对应稳定原因码，
+// 两者都要释放归属本代际的设备锁并同点回写主任务汇总。反过来，结果未知的失败
+// （超时/传输）与可重试拒绝**绝不**写终态，终结写入 CAS 未命中或结果未知时也**绝不**
+// 把内存计数当成"已收敛"。
+// ===========================================================================
+
+#[tokio::test]
+async fn expired_queue_deadline_persists_expired_and_releases_lock() {
+    let trace = Trace::default();
+    let store = FakeStore::new(trace.clone());
+    let board = FakeBoard::new(trace.clone());
+    // 当前单调时刻已超过 queue_deadline：期限只会被单调时钟跨过，不会倒流回来。
+    let clock = FakeClock::new(20_000, true);
+    let row = admissible_candidate(v4(702), [0x67; 32], 10_000);
+    let id = row.candidate.subtask_id;
+    store.push_row(row);
+    let main_id = store.main_task_of(id).expect("候选属于某个主任务");
+
+    let sched = build_scheduler(store.clone(), board.clone(), clock);
+    let summary = sched.run_once(0).await.expect("run_once 成功");
+
+    assert_eq!(summary.admitted, 0, "过期候选不准入");
+    assert_eq!(summary.prepared, 0, "过期候选绝不 prepare");
+    assert_eq!(summary.executed, 0);
+    // 关键：不只是本轮跳过，而是**持久**收敛。
+    assert_eq!(summary.expired_persisted, 1, "expired 已落库");
+    assert_eq!(store.state_of(id), Some(SubTaskState::Expired));
+    assert_eq!(
+        store.reason_of(id),
+        Some(ReasonCode::QueueExpired),
+        "原因码必须是 QUEUE_EXPIRED"
+    );
+    assert_eq!(
+        store.lock_released_generation(id),
+        Some(1),
+        "释放的必须是被终结那一代的设备锁"
+    );
+    assert!(
+        store.candidate(id).expect("候选快照仍在").lock_owned,
+        "只改库中当前状态，绝不改写候选快照"
+    );
+    assert!(
+        store.commit_calls().is_empty(),
+        "终结不经过 commit_dispatch_intent"
+    );
+
+    // 主任务汇总与子任务变更同点收敛（RT-R8-3）：仅 expired 的批次收敛为 completed/failed。
+    let main = store.main_summary(main_id).expect("主任务汇总已回写");
+    assert_eq!(main.state, MainTaskState::Completed);
+    assert_eq!(main.outcome, Some(MainTaskOutcome::Failed));
+    assert_eq!(main.syncs, 1, "一次子任务变更对应一次汇总回写");
+}
+
+/// 持久收敛的实际效果：下一轮不再把它当 queued 候选读出，也不重复终结/重复释放锁。
+#[tokio::test]
+async fn persisted_expired_candidate_is_not_offered_again() {
+    let trace = Trace::default();
+    let store = FakeStore::new(trace.clone());
+    let board = FakeBoard::new(trace.clone());
+    let clock = FakeClock::new(20_000, true);
+    let row = admissible_candidate(v4(703), [0x68; 32], 10_000);
+    let id = row.candidate.subtask_id;
+    store.push_row(row);
+    let main_id = store.main_task_of(id).expect("主任务");
+
+    let sched = build_scheduler(store.clone(), board.clone(), clock);
+    let first = sched.run_once(0).await.expect("第一轮成功");
+    let second = sched.run_once(0).await.expect("第二轮成功");
+
+    assert_eq!(first.candidates, 1);
+    assert_eq!(first.expired_persisted, 1);
+    assert_eq!(
+        second.candidates, 0,
+        "库里已 expired，不再作为 queued 候选读出"
+    );
+    assert_eq!(second.expired_persisted, 0);
+    assert_eq!(store.finalize_calls().len(), 1, "不重复终结、不重复释放锁");
+    assert_eq!(
+        store.main_summary(main_id).expect("汇总").syncs,
+        1,
+        "主任务汇总不被重复递增"
+    );
+}
+
+/// `prepare` 明确失败：终态 `failed` + `CAPABILITY_UNAVAILABLE` 落库、释放设备锁、
+/// 回写主任务汇总。另配 2 槽 3 候选，钉死失败路径归还预留槽。
+#[tokio::test]
+async fn prepare_rejection_persists_failed_releases_lock_and_syncs_main() {
+    let trace = Trace::default();
+    let store = FakeStore::new(trace.clone());
+    let board = FakeBoard::new(trace.clone());
+    let clock = FakeClock::new(1_000, true);
+    let ids: Vec<Uuid> = (0..3u128).map(|i| v4(960 + i)).collect();
+    for (i, id) in ids.iter().enumerate() {
+        store.push_row(admissible_candidate(*id, [0xd0 + i as u8; 32], 10_000_000));
+        board.set_prepare_err(*id);
+    }
+
+    let policy = SchedulerPolicy {
+        global_slots: 2,
+        min_ticket_validity_ms: 1,
+    };
+    let sched = TaskScheduler::new(store.clone(), board.clone(), clock, policy, v4(0xfeed));
+    let summary = sched.run_once(0).await.expect("run_once 成功");
+
+    assert_eq!(summary.admitted, 3);
+    assert_eq!(summary.prepared, 3, "prepare 失败必须归还预留槽");
+    assert_eq!(summary.slot_limit_skips, 0, "槽位从未泄漏");
+    assert_eq!(summary.prepare_failed, 3);
+    assert_eq!(summary.prepare_failed_persisted, 3, "三笔失败全部落库");
+    assert_eq!(summary.executed, 0);
+    assert!(board.execute_calls().is_empty(), "板端零 execute");
+    assert!(store.commit_calls().is_empty(), "无 dispatching 意图落库");
+
+    for id in &ids {
+        assert_eq!(store.state_of(*id), Some(SubTaskState::Failed));
+        assert_eq!(
+            store.reason_of(*id),
+            Some(ReasonCode::CapabilityUnavailable),
+            "prepare 能力拒绝归因 CAPABILITY_UNAVAILABLE"
+        );
+        assert_eq!(store.lock_released_generation(*id), Some(1), "设备锁已释放");
+        let main_id = store.main_task_of(*id).expect("主任务");
+        let main = store.main_summary(main_id).expect("汇总已回写");
+        assert_eq!(main.state, MainTaskState::Completed);
+        assert_eq!(main.outcome, Some(MainTaskOutcome::Failed));
+        assert_eq!(main.syncs, 1);
+    }
+}
+
+/// 结果**未知**（超时）与**可重试**（设备忙）的 prepare 失败绝不写终态：票据可能已
+/// 签发、锁仍可能被下一轮用到，据它们判 failed 会把可恢复的任务误判成失败。
+#[tokio::test]
+async fn prepare_result_unknown_never_persists_failure() {
+    for outcome in [PrepareOutcome::ErrTimeout, PrepareOutcome::ErrDeviceBusy] {
+        let trace = Trace::default();
+        let store = FakeStore::new(trace.clone());
+        let board = FakeBoard::new(trace.clone());
+        let clock = FakeClock::new(1_000, true);
+        let row = admissible_candidate(v4(970), [0xe1; 32], 10_000_000);
+        let id = row.candidate.subtask_id;
+        store.push_row(row);
+        let main_id = store.main_task_of(id).expect("主任务");
+        board.set_prepare_outcome(id, outcome.clone());
+
+        let sched = build_scheduler(store.clone(), board.clone(), clock);
+        let summary = sched.run_once(0).await.expect("run_once 成功");
+
+        assert_eq!(summary.prepare_failed, 1, "内存计数仍记录本次失败");
+        assert_eq!(summary.prepare_failed_persisted, 0, "结果未知绝不写终态");
+        assert!(store.finalize_calls().is_empty(), "零持久终结调用");
+        assert_eq!(
+            store.state_of(id),
+            Some(SubTaskState::Queued),
+            "保持 queued 留待下轮"
+        );
+        assert_eq!(store.reason_of(id), None);
+        assert_eq!(
+            store.lock_released_generation(id),
+            None,
+            "绝不释放仍可能被用到的锁"
+        );
+        assert!(store.main_summary(main_id).is_none(), "主行汇总保持原样");
+    }
+}
+
+/// 板端明确拒绝时的原因码归因：能解析成 04 §3 稳定词表的用板端归因，词表外按执行前
+/// 拒收（`EXECUTION_REJECTED`）兜底——绝不写一个库里不存在的稳定码。
+#[tokio::test]
+async fn prepare_rejection_maps_stable_and_unknown_reason_codes() {
+    let cases = [
+        (PrepareOutcome::ErrRejectedStable, ReasonCode::TimeUncertain),
+        (
+            PrepareOutcome::ErrRejectedUnknownCode,
+            ReasonCode::ExecutionRejected,
+        ),
+    ];
+    for (index, (outcome, expected)) in cases.into_iter().enumerate() {
+        let trace = Trace::default();
+        let store = FakeStore::new(trace.clone());
+        let board = FakeBoard::new(trace.clone());
+        let clock = FakeClock::new(1_000, true);
+        let row = admissible_candidate(v4(980 + index as u128), [0xe5; 32], 10_000_000);
+        let id = row.candidate.subtask_id;
+        store.push_row(row);
+        board.set_prepare_outcome(id, outcome.clone());
+
+        let sched = build_scheduler(store.clone(), board.clone(), clock);
+        let summary = sched.run_once(0).await.expect("run_once 成功");
+
+        assert_eq!(summary.prepare_failed_persisted, 1, "第 {index} 例应落库");
+        assert_eq!(store.state_of(id), Some(SubTaskState::Failed));
+        assert_eq!(store.reason_of(id), Some(expected));
+    }
+}
+
+/// 终结写入结果未知时**绝不**冒充"已收敛"：`expired_persisted` 不增、库里仍 queued、
+/// 锁与主行汇总都不动，且下一轮仍会重新读出再试一次。
+#[tokio::test]
+async fn finalize_unknown_is_counted_and_leaves_row_untouched() {
+    let trace = Trace::default();
+    let store = FakeStore::new(trace.clone());
+    let board = FakeBoard::new(trace.clone());
+    let clock = FakeClock::new(20_000, true);
+    let row = admissible_candidate(v4(985), [0xe7; 32], 10_000);
+    let id = row.candidate.subtask_id;
+    store.push_row(row);
+    let main_id = store.main_task_of(id).expect("主任务");
+    store.inject_finalize_unknown(id);
+
+    let sched = build_scheduler(store.clone(), board.clone(), clock);
+    let summary = sched.run_once(0).await.expect("run_once 成功");
+
+    assert_eq!(summary.finalize_unknown, 1, "未知单独计数");
+    assert_eq!(summary.expired_persisted, 0, "结果未知绝不当成已落库");
+    assert_eq!(store.state_of(id), Some(SubTaskState::Queued));
+    assert_eq!(store.reason_of(id), None);
+    assert_eq!(store.lock_released_generation(id), None);
+    assert!(store.main_summary(main_id).is_none());
+
+    let again = sched.run_once(0).await.expect("第二轮成功");
+    assert_eq!(again.candidates, 1, "未落库的候选不丢失，下轮继续收敛");
+    assert_eq!(again.finalize_unknown, 1);
+}
+
+/// 终结写入的 CAS 契约（fake 与生产同一要求）：状态 CAS 与锁代际 CAS 任一不成立即
+/// `Skipped` 且**零副作用**——不重复释放锁、不重复回写主任务汇总。
+#[tokio::test]
+async fn finalize_write_is_cas_guarded() {
+    let trace = Trace::default();
+    let store = FakeStore::new(trace);
+    let row = admissible_candidate(v4(990), [0xe9; 32], 10_000_000);
+    let id = row.candidate.subtask_id;
+    store.push_row(row);
+    let main_id = store.main_task_of(id).expect("主任务");
+
+    let write = FinalizeWrite {
+        subtask_id: id,
+        target_state: SubTaskState::Expired,
+        reason_code: ReasonCode::QueueExpired,
+        expected_from_state: SubTaskState::Queued,
+        expected_lock_generation: 1,
+    };
+    assert_eq!(
+        store.finalize_subtask(&write).await.expect("存储未报错"),
+        FinalizeVerdict::Applied
+    );
+    // 并发第二个周期：状态已非 queued → 确定跳过。
+    assert_eq!(
+        store.finalize_subtask(&write).await.expect("存储未报错"),
+        FinalizeVerdict::Skipped
+    );
+    assert_eq!(store.lock_released_generation(id), Some(1), "锁只释放一次");
+    let main = store.main_summary(main_id).expect("汇总已回写");
+    assert_eq!(main.syncs, 1, "汇总只回写一次");
+    assert_eq!(main.revision, 1, "主行 revision 只递增一次");
+    assert_eq!(
+        store.finalize_verdict_of(id),
+        Some(FinalizeVerdict::Skipped),
+        "第二次终结的最近裁决必须是跳过"
+    );
+
+    // 锁代际 CAS：代际不符即跳过，零副作用。
+    let other = admissible_candidate(v4(991), [0xea; 32], 10_000_000);
+    let other_id = other.candidate.subtask_id;
+    store.push_row(other);
+    let stale = FinalizeWrite {
+        subtask_id: other_id,
+        expected_lock_generation: 7,
+        ..write.clone()
+    };
+    assert_eq!(
+        store.finalize_subtask(&stale).await.expect("存储未报错"),
+        FinalizeVerdict::Skipped
+    );
+    assert_eq!(store.state_of(other_id), Some(SubTaskState::Queued));
+    assert!(
+        store
+            .main_summary(store.main_task_of(other_id).expect("主任务"))
+            .is_none()
     );
 }

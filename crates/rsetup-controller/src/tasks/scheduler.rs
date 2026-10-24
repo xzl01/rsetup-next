@@ -435,6 +435,40 @@ pub struct DispatchIntentWrite {
     pub expected_from_state: SubTaskState,
 }
 
+/// 终结一个子任务（`expired`/`failed`）所需的持久写入描述（04 §5.1 的失败收敛）。
+///
+/// 调度器只在**尚未发出 execute** 的路径上使用它：排队期限已到期 → `Expired` +
+/// `QUEUE_EXPIRED`；`prepare` 明确失败 → `Failed` + 对应稳定原因码。两个分支都必须
+/// 同时释放归属本代际的设备锁并回写主任务汇总，绝不留下"内存已放弃、库里仍 queued"
+/// 的僵尸候选。
+///
+/// 归属（主任务/设备）由存储侧从**库里的**子任务行读取，不作入参：调用方自报的设备
+/// 不能替代真相源。本结构不含私有摘要，因此可安全 `Debug`。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FinalizeWrite {
+    pub subtask_id: Uuid,
+    /// 目标终态：只允许 `Expired` 或 `Failed`（其余状态由核验/恢复路径负责）。
+    pub target_state: SubTaskState,
+    /// 04 §3 稳定原因码，与 `target_state` 一起构成可审计的收敛结论。
+    pub reason_code: ReasonCode,
+    /// CAS 期望：仅当子任务仍为该状态才终结（调度路径恒为 `Queued`）。
+    pub expected_from_state: SubTaskState,
+    /// CAS 期望：`sub_tasks.lock_generation` 未变才终结并释放锁。
+    pub expected_lock_generation: u64,
+}
+
+/// [`SchedulerStore::finalize_subtask`] 的**显式**结果：与 [`CommitVerdict`] 同样
+/// 刻意区分"确定未提交"与"结果未知"，不得折叠成 `bool`。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FinalizeVerdict {
+    /// 状态 + 原因码 + 设备锁释放 + 主任务汇总已在同一短事务内提交。
+    Applied,
+    /// CAS 未命中（并发已改写 state/锁代际）：**确定未**做任何持久副作用。
+    Skipped,
+    /// 结果未知（连接/超时）：不改判、不重发，子任务按库中原状态继续。
+    Unknown,
+}
+
 /// 调度存储边界（**本地 trait**，不复用 `TaskRepository`——后者的 `begin` 返回真实
 /// sqlx `Transaction`，无法在无数据库环境模拟提交未知分支）。
 ///
@@ -452,6 +486,19 @@ pub trait SchedulerStore: Send + Sync {
     /// 只是替身，不构成该强约束已成立的证明。
     fn commit_dispatch_intent(&self, write: &DispatchIntentWrite)
     -> SchedFuture<'_, CommitVerdict>;
+
+    /// 短事务：把一个**尚未发出 execute** 的候选持久收敛到终态（04 §5.1 的失败收敛）：
+    ///
+    /// 1. 条件更新 `sub_tasks`：仅当仍为 [`FinalizeWrite::expected_from_state`] 且
+    ///    `lock_generation` 未变，才写 `target_state` + `reason_code`；否则确定跳过；
+    /// 2. 释放**归属本子任务本代际**的设备锁（`device_operation_locks`）；
+    /// 3. 同事务回写 `main_tasks` 的 `state`/`outcome`/`counts_json`（RT-R8-3：子任务
+    ///    变更与主任务汇总同提交、同回滚，不留「只动子任务、主行陈旧」的中间态）；
+    /// 4. 提交结果无法确定时才返回 [`FinalizeVerdict::Unknown`]。
+    ///
+    /// 事务内**永不**发生任何网络调用；本次终结失败**绝不**影响本周期其余候选，也
+    /// **绝不**让调度器据此重发 `prepare`/`execute`。
+    fn finalize_subtask(&self, write: &FinalizeWrite) -> SchedFuture<'_, FinalizeVerdict>;
 }
 
 /// 单调时钟边界（可注入、可模拟）。返回相对原点的单调毫秒；不可信时返回 `None`。
@@ -543,6 +590,19 @@ pub struct ScheduleSummary {
     pub slot_limit_skips: usize,
     /// 因本轮该设备已取槽而放弃的候选数（同设备互斥）。
     pub device_mutex_skips: usize,
+    /// 排队期限**已到期**、经 [`SchedulerStore::finalize_subtask`] 持久置 `expired`
+    /// （原因码 `QUEUE_EXPIRED`）、释放设备锁并回写主任务汇总的候选数（04 §5.1）。
+    /// 只统计落库成功（`Applied`）的候选：内存计数与库里状态在此同源。
+    pub expired_persisted: usize,
+    /// `prepare` **明确**失败、经 [`SchedulerStore::finalize_subtask`] 持久置 `failed`
+    /// （对应稳定原因码）、释放设备锁并回写主任务汇总的候选数（04 §5.1）。
+    /// `Timeout`/`Transport` 这类结果未知的失败**不**计入（也不终结状态）。
+    pub prepare_failed_persisted: usize,
+    /// 终结写入 CAS 未命中（并发已改写 `state`/锁代际）的候选数：本次**零**持久副作用，
+    /// 子任务按库中当前状态继续，留待下轮或核验路径。
+    pub finalize_skipped: usize,
+    /// 终结写入结果未知（连接/超时）的候选数：不改判、不重发，转核验路径收敛。
+    pub finalize_unknown: usize,
     /// 本轮是否出现**单调时钟不可信**而中止派发：周期起点守卫置位时零候选读取、
     /// 零 prepare、零 execute；在候选之间某个门禁置位时立即中止本轮剩余候选
     /// （fail-closed），此前已完成的派发不回退。
@@ -627,6 +687,85 @@ where
             queue_deadline_valid,
             candidate.lock_owned,
         )
+    }
+
+    /// 把候选**持久收敛**到终态并释放设备锁、回写主任务汇总（04 §5.1 的失败收敛）。
+    ///
+    /// 返回 `true` 当且仅当存储侧确认**已落库**（[`FinalizeVerdict::Applied`]）。
+    /// `Skipped`（CAS 未命中）与 `Unknown`（结果未知）都**不改判、不重发**：候选按库中
+    /// 当前状态继续，由下一轮或核验路径收敛——把一次写失败当成「已终结」会让内存计数
+    /// 与库里状态分叉，把 `Unknown` 当成「确定未提交」则会重复释放锁。
+    /// 计数分流是本方法的**唯一**出口，两个调用点（队列期限到期 / prepare 明确失败）
+    /// 因此共用同一套口径。
+    async fn finalize_candidate(
+        &self,
+        candidate: &DispatchCandidate,
+        target_state: SubTaskState,
+        reason_code: ReasonCode,
+        summary: &mut ScheduleSummary,
+    ) -> bool {
+        let write = FinalizeWrite {
+            subtask_id: candidate.subtask_id,
+            target_state,
+            reason_code,
+            expected_from_state: SubTaskState::Queued,
+            expected_lock_generation: candidate.lock_generation,
+        };
+        // 存储错误一律折叠为「结果未知」：绝不因一次写失败改判，也不据此重发。
+        let verdict = match self.store.finalize_subtask(&write).await {
+            Ok(verdict) => verdict,
+            Err(_) => FinalizeVerdict::Unknown,
+        };
+        match verdict {
+            FinalizeVerdict::Applied => true,
+            FinalizeVerdict::Skipped => {
+                summary.finalize_skipped += 1;
+                false
+            }
+            FinalizeVerdict::Unknown => {
+                summary.finalize_unknown += 1;
+                false
+            }
+        }
+    }
+
+    /// `prepare` 失败 → 04 §3 稳定原因码；**返回 `None` 表示结果未知或本轮可跳过，
+    /// 禁止终结**。
+    ///
+    /// `prepare` 只换一张短期票据，尚未 execute，因此**明确**失败可以安全收敛为
+    /// `failed`（04 §5.1「prepare 失败可结束为 failed，因为尚未 execute」）。映射口径：
+    ///
+    /// - `DeviceOffline` → `DEVICE_OFFLINE`；
+    /// - `CapabilityUnavailable` 与 `ResourceExhausted` → 均为 `CAPABILITY_UNAVAILABLE`
+    ///   （板端返回 1007 的资源耗尽是对新任务的**明确拒绝**，调度不排队等待资源释放，
+    ///   中控无从重试，因此同样终结为 `failed`；04 §3 十二码内没有独立的资源码）；
+    /// - `ProtocolMismatch` → `PROTOCOL_MISMATCH`；
+    /// - 板端返回的明确拒绝码（`Rejected`）→ 能解析成稳定词表的用板端归因，否则按
+    ///   执行前拒收处理（`EXECUTION_REJECTED`）。
+    ///
+    /// 只有 `Timeout`/`Transport`（不证明板端从未签发票据，结果未知）与 `DeviceBusy`
+    /// （设备忙，属本轮跳过）返回 `None`，据它们写终态会把可恢复的任务误判成失败——
+    /// 候选保持 `queued` 留待下轮。
+    fn prepare_failure_reason(error: &BoardClientError) -> Option<ReasonCode> {
+        match error {
+            BoardClientError::DeviceOffline => Some(ReasonCode::DeviceOffline),
+            // 能力不支持与资源不足都属「本应能受理却没有受理」，统一归
+            // CAPABILITY_UNAVAILABLE（04 §3 十二码内没有独立的资源码）。
+            BoardClientError::CapabilityUnavailable | BoardClientError::ResourceExhausted => {
+                Some(ReasonCode::CapabilityUnavailable)
+            }
+            BoardClientError::ProtocolMismatch => Some(ReasonCode::ProtocolMismatch),
+            // 板端明确拒绝：能解析成稳定词表的用板端归因，否则按执行前拒收处理。
+            BoardClientError::Rejected { reason_code, .. } => Some(
+                reason_code
+                    .as_deref()
+                    .and_then(ReasonCode::from_str_exact)
+                    .unwrap_or(ReasonCode::ExecutionRejected),
+            ),
+            BoardClientError::Timeout
+            | BoardClientError::Transport
+            | BoardClientError::DeviceBusy => None,
+        }
     }
 
     /// 候选自身的 `expected_boot_id` 解析为 UUID；非「规范 36 字符小写 UUIDv4」一律 `None`。
@@ -738,6 +877,27 @@ where
     /// 四道票据门禁共用 [`ticket_expired`] 的口径：**剩余寿命必须严格为正**，寿命
     /// 耗尽（`remaining == 0`）在任何 `policy.min_ticket_validity_ms` 取值（含 `0`）
     /// 下都视为过期，绝不为已被板端倒计时耗尽的票据发送 `execute`。
+    ///
+    /// ## 失败收敛（不止于内存计数）
+    ///
+    /// 两条**尚未发出 execute** 的路径不再只加 `summary` 计数，而是经
+    /// [`SchedulerStore::finalize_subtask`] 持久收敛（同事务写终态 + 原因码 + 释放设备锁
+    /// + 回写主任务汇总）：
+    ///
+    /// - **排队期限已到期** → `expired` + `QUEUE_EXPIRED`（[`ScheduleSummary::expired_persisted`]）：
+    ///   走到准入时单调时钟必然可信（不可信已在门禁 2.5 中止本轮），故 `TimeUncertain`
+    ///   在这里只可能是"期限确实已被跨过"，而期限不会倒流，继续留 `queued` 只会让它
+    ///   每轮被重新读出、反复判定；
+    /// - **`prepare` 明确失败** → `failed` + 对应稳定原因码（[`ScheduleSummary::prepare_failed_persisted`]）：
+    ///   `prepare` 只换票据、尚未 execute。`DeviceOffline`→`DEVICE_OFFLINE`、
+    ///   `CapabilityUnavailable`/`ResourceExhausted`→`CAPABILITY_UNAVAILABLE`、
+    ///   `ProtocolMismatch`→`PROTOCOL_MISMATCH`、板端明确拒绝码→对应稳定原因码，均终结为
+    ///   `failed`；`Timeout`/`Transport`（结果未知）与 `DeviceBusy`（设备忙本轮跳过）**不**
+    ///   终结，候选保持 `queued`。
+    ///
+    /// 终结写入 CAS 未命中记 `finalize_skipped`、结果未知记 `finalize_unknown`，两者都
+    /// **不改判、不重发**；`commit_dispatch_intent` 之后的路径（含票据过期）**绝不**回退
+    /// 已持久化的 `dispatching`，其收敛属核验/恢复切片的职责，不在本方法内。
     pub async fn run_once(&self, active_slots: usize) -> Result<ScheduleSummary, SchedulerError> {
         let mut summary = ScheduleSummary::default();
 
@@ -785,7 +945,26 @@ where
             // 3. 候选准入预筛（复用 admit_for_dispatch 严格顺序，TTL 用刚重取的时刻）。
             //    未准入不占设备、不占槽。
             match Self::admit_candidate(&cand, now_mono_ms) {
-                AdmissionVerdict::Deny { .. } => continue,
+                AdmissionVerdict::Deny { reason_code } => {
+                    // 队列期限**已到期**（此刻时钟可信，故归因是确定的而非"不可信"）：
+                    // 排队期限只会被单调时钟跨过、不会回来，继续留 queued 只会让它每轮
+                    // 被重新读出。据 04 §5.1 持久收敛为 expired + QUEUE_EXPIRED，同事务
+                    // 释放设备锁并回写主任务汇总；不占槽、不 prepare、不 execute。
+                    if reason_code == ReasonCode::TimeUncertain
+                        && now_mono_ms >= cand.queue_deadline_mono_ms
+                    {
+                        let persisted = self
+                            .finalize_candidate(
+                                &cand,
+                                SubTaskState::Expired,
+                                ReasonCode::QueueExpired,
+                                &mut summary,
+                            )
+                            .await;
+                        summary.expired_persisted += usize::from(persisted);
+                    }
+                    continue;
+                }
                 AdmissionVerdict::Admit => summary.admitted += 1,
             }
 
@@ -825,9 +1004,23 @@ where
             summary.prepared += 1;
             let ticket = match prepared {
                 Ok(ticket) => ticket,
-                Err(_) => {
+                Err(error) => {
                     summary.prepare_failed += 1;
                     free_slots += 1; // 未提交任何意图，释放预留槽
+                    // **明确**失败（非超时/传输未知）才可在 execute 之前收敛为 failed：
+                    // 此时库里仍 queued、未发出任何重启请求，04 §5.1 允许结束为 failed。
+                    // 同事务释放设备锁并回写主任务汇总，不留"已放弃但仍占锁"的僵尸候选。
+                    if let Some(reason_code) = Self::prepare_failure_reason(&error) {
+                        let persisted = self
+                            .finalize_candidate(
+                                &cand,
+                                SubTaskState::Failed,
+                                reason_code,
+                                &mut summary,
+                            )
+                            .await;
+                        summary.prepare_failed_persisted += usize::from(persisted);
+                    }
                     continue;
                 }
             };

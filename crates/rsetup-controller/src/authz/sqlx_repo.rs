@@ -825,7 +825,11 @@ pub(crate) const GROUPS_FOR_DEVICES_SQL_TEMPLATE: &str = "SELECT gm.device_id, g
      LEFT JOIN devices d ON d.public_key = gm.device_id \
      WHERE gm.device_id IN ({placeholders}) ORDER BY gm.device_id, gm.group_id";
 
-pub(crate) const DEVICES_BY_IDS_SQL_TEMPLATE: &str = "SELECT public_key, display_name, descriptor_json, admission_state, \
+/// 授权快照的设备批量读（设备详情、审批与改名的授权前置都经 `load_device_snapshot_in_tx`
+/// 走它）：`descriptor_json` 必须 `CAST(... AS CHAR)` 文本投影，与 `devices::repository`
+/// 的两条设备读同口径——v4 `JSON` 列（wire 245）在未启用 sqlx `json` feature 的解码器上
+/// 只能按文本取列，裸列名会失败关闭为去敏 503。
+pub(crate) const DEVICES_BY_IDS_SQL_TEMPLATE: &str = "SELECT public_key, display_name, CAST(descriptor_json AS CHAR) AS descriptor_json, admission_state, \
      review_decision, revision, CAST(archived AS SIGNED) AS archived \
      FROM devices WHERE public_key IN ({placeholders}) ORDER BY public_key";
 
@@ -2985,6 +2989,150 @@ impl AuthzRepository for SqlxAuthzRepository {
     }
 }
 
+/// 测试专用 fixture：生产 SQL 常量的文本形状门禁。只解析字符串，不连引擎、不伪造
+/// `MySqlRow`，因此不声称任何真实引擎行为（真库端到端由受控 executor 复跑）。
+#[cfg(test)]
+pub(crate) mod sql_shape {
+    /// 空白归一：SQL 常量里的换行续行与缩进不参与形状比较。
+    pub(crate) fn normalize_sql(sql: &str) -> String {
+        sql.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// 生产源码文本（`#[cfg(test)]` 之前），供"执行位必须消费被钉常量"的门禁使用。
+    pub(crate) fn production_source(src: &str) -> &str {
+        src.split("#[cfg(test)]").next().unwrap_or(src)
+    }
+
+    /// 把一条 `SELECT ... FROM ...` 语句二分为（顶层 select 列表逐项，`FROM` 起整段尾部）。
+    /// 括号与单引号内的逗号不算顶层分隔；本仓被门禁的生产 SQL 都是 ASCII 单表投影，
+    /// 解析失败直接 panic —— 形状门禁的解析失败本身就是必须暴露的缺陷。
+    pub(crate) fn split_select(sql: &str) -> (Vec<String>, String) {
+        let sql = normalize_sql(sql);
+        assert!(sql.is_ascii(), "SQL 形状门禁只支持 ASCII 常量：{sql}");
+        assert!(sql.starts_with("SELECT "), "不是 SELECT 语句：{sql}");
+        let bytes = sql.as_bytes();
+        let mut depth = 0i32;
+        let mut in_quote = false;
+        let mut splits: Vec<usize> = Vec::new();
+        let mut from_at: Option<usize> = None;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if in_quote {
+                if bytes[i] == b'\'' {
+                    in_quote = false;
+                }
+                i += 1;
+                continue;
+            }
+            match bytes[i] {
+                b'\'' => in_quote = true,
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                b',' if depth == 0 => splits.push(i),
+                _ => {}
+            }
+            if depth == 0 && sql[i..].starts_with(" FROM ") {
+                from_at = Some(i);
+                break;
+            }
+            i += 1;
+        }
+        let from_at =
+            from_at.unwrap_or_else(|| panic!("SQL 常量必须带顶层 FROM 才能做形状门禁：{sql}"));
+        let mut items = Vec::new();
+        let mut start = "SELECT ".len();
+        for split in splits {
+            items.push(sql[start..split].trim().to_string());
+            start = split + 1;
+        }
+        items.push(sql[start..from_at].trim().to_string());
+        (items, sql[from_at + 1..].trim().to_string())
+    }
+
+    /// 取出源码里的 `SELECT` 字符串字面量（`\` 续行拼接、空白归一；本仓生产 SQL 常量
+    /// 不含 `\\n` 之类转义与 raw string，故只做最小扫描）。
+    pub(crate) fn select_string_literals(src: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let chars: Vec<char> = src.chars().collect();
+        let mut i = 0usize;
+        while i < chars.len() {
+            if chars[i] != '"' {
+                i += 1;
+                continue;
+            }
+            let mut raw = String::new();
+            let mut j = i + 1;
+            let mut closed = false;
+            while j < chars.len() {
+                match chars[j] {
+                    '\\' if j + 1 < chars.len() => {
+                        raw.push(chars[j + 1]);
+                        j += 2;
+                    }
+                    '"' => {
+                        closed = true;
+                        break;
+                    }
+                    c => {
+                        raw.push(c);
+                        j += 1;
+                    }
+                }
+            }
+            let normalized = normalize_sql(&raw);
+            if closed && normalized.starts_with("SELECT ") {
+                out.push(normalized);
+            }
+            i = j + 1;
+        }
+        out
+    }
+
+    /// `devices.descriptor_json` 读 SQL 的统一形状门禁：该列在 v4 schema 是 `JSON`
+    /// （MySQL/TiDB wire 245），而 workspace 未启用 sqlx `json` feature，`?` 绑定按文本
+    /// 写入可以、按文本读出会被 sqlx 以类型不匹配拒绝并固定去敏为 503
+    /// `STORAGE_UNAVAILABLE`，所以投影必须是 `CAST(descriptor_json AS CHAR) AS
+    /// descriptor_json`。除投影形态外，本函数把整条 statement 全部纳入断言：select
+    /// 列表逐项（列顺序 + 其余 CAST 口径）、`FROM` 之后尾部（表名/WHERE/ORDER BY/
+    /// LIMIT/行锁）逐字一致、绑定参数数量不漂移。
+    pub(crate) fn assert_device_descriptor_text_projection(
+        label: &str,
+        sql: &str,
+        expected_items: &[&str],
+        expected_tail: &str,
+        expected_binds: usize,
+    ) {
+        const CHAR_PROJECTION: &str = "CAST(descriptor_json AS CHAR) AS descriptor_json";
+        let (items, tail) = split_select(sql);
+        let got: Vec<&str> = items.iter().map(String::as_str).collect();
+        assert_eq!(
+            got,
+            expected_items.to_vec(),
+            "{label} 的 select 列表必须逐项一致（列顺序、descriptor_json 投影形态、archived 布尔 CAST 口径）：{got:?}"
+        );
+        assert_eq!(
+            tail, expected_tail,
+            "{label} 的 FROM 尾部（表名/WHERE/ORDER BY/LIMIT/行锁）必须逐字一致：{tail}"
+        );
+        assert_eq!(
+            normalize_sql(sql).matches('?').count(),
+            expected_binds,
+            "{label} 的绑定参数数量不得漂移"
+        );
+        let descriptor_items: Vec<&str> = got
+            .iter()
+            .copied()
+            .filter(|item| item.contains("descriptor_json"))
+            .collect();
+        assert_eq!(
+            descriptor_items,
+            vec![CHAR_PROJECTION],
+            "{label} 的 descriptor_json 必须是唯一一项 CAST(... AS CHAR) 文本投影，否则 decode_device_admin_view 的 \
+             Option<String> 取列在真实引擎上被 sqlx 拒绝（RC1 真库根因）：{descriptor_items:?}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3125,6 +3273,145 @@ mod tests {
         // 来源页 keyset：cursor 2 + limit 1 = 3。
         assert_eq!(ADMIN_TARGET_DEVICE_KEYS_SQL.matches('?').count(), 3);
         assert!(ADMIN_TARGET_DEVICE_KEYS_SQL.contains("archived=FALSE"));
+    }
+
+    /// RC1 真库根因回归 3/3：授权快照的设备批量读（`load_device_snapshot_in_tx`，
+    /// 设备详情 + approve/rename 的授权前置都走它）必须把 `descriptor_json` 以 CHAR
+    /// 文本投影。这是 GET /devices/{id}、审批与改名的后续入口，首 run 未触达但同根因。
+    #[test]
+    fn devices_by_ids_sql_template_projects_descriptor_json_as_char_text() {
+        sql_shape::assert_device_descriptor_text_projection(
+            "DEVICES_BY_IDS_SQL_TEMPLATE",
+            DEVICES_BY_IDS_SQL_TEMPLATE,
+            &[
+                "public_key",
+                "display_name",
+                "CAST(descriptor_json AS CHAR) AS descriptor_json",
+                "admission_state",
+                "review_decision",
+                "revision",
+                "CAST(archived AS SIGNED) AS archived",
+            ],
+            "FROM devices WHERE public_key IN ({placeholders}) ORDER BY public_key",
+            0,
+        );
+        // 模板占位符由调用侧按去重 id 数 1:1 展开，绑定顺序与数量随 `{placeholders}` 变化，
+        // 但模板自身不得出现 `?`；展开后每个 id 恰好一个绑定。
+        assert!(DEVICES_BY_IDS_SQL_TEMPLATE.contains("IN ({placeholders})"));
+        let expanded = DEVICES_BY_IDS_SQL_TEMPLATE.replace("{placeholders}", "?, ?, ?");
+        assert_eq!(expanded.matches('?').count(), 3);
+    }
+
+    /// 执行位门禁：设备批量读必须消费被上面回归钉住的模板常量，且本文件生产段内不得
+    /// 出现第二条未被钉的 `descriptor_json` 读 SQL 字面量（内联副本会绕过形状回归）。
+    #[test]
+    fn device_snapshot_read_consumes_pinned_template_without_inline_copy() {
+        let src = sql_shape::production_source(include_str!("sqlx_repo.rs"));
+        assert!(
+            src.contains("DEVICES_BY_IDS_SQL_TEMPLATE.replace(\"{placeholders}\", &ph)"),
+            "load_device_snapshot_in_tx 必须消费 DEVICES_BY_IDS_SQL_TEMPLATE 常量"
+        );
+        assert!(
+            src.contains("r.try_get(\"descriptor_json\")"),
+            "设备快照必须以 descriptor_json 列名取列，别名改名会静默改变解码输入"
+        );
+        let pinned = sql_shape::normalize_sql(DEVICES_BY_IDS_SQL_TEMPLATE);
+        for literal in sql_shape::select_string_literals(src) {
+            if literal.contains("descriptor_json") {
+                assert_eq!(
+                    literal, pinned,
+                    "本文件生产段内的 descriptor_json 读 SQL 必须是 DEVICES_BY_IDS_SQL_TEMPLATE 本体"
+                );
+            }
+        }
+    }
+
+    /// 解码器契约回归：`descriptor_json` 的入参类型是 `Option<String>`，即 SQL 侧必须
+    /// 交付 CHAR 文本；NULL 仍 `None`，非法 JSON/非法 descriptor 仍固定去敏 `Config`。
+    #[test]
+    // 显式 fn 指针类型是断言内容本身：第三参必须保持 `Option<String>`，即 SQL 侧必须
+    // 交付 CHAR 文本投影，签名漂移必须在此暴露。
+    #[allow(clippy::type_complexity)]
+    fn descriptor_json_decoder_takes_char_text_and_fails_closed_on_malformed() {
+        let decode: fn(
+            Vec<u8>,
+            String,
+            Option<String>,
+            &str,
+            &str,
+            u64,
+            i64,
+        ) -> Result<DeviceAdminView, ControllerError> = decode_device_admin_view;
+        let mut cases: Vec<(&str, Option<&str>, Option<serde_json::Value>)> = Vec::new();
+        // 非 NULL 合法 JSON 文本 → Some(value)，内容逐字保留（CAST 只换 wire 类型）。
+        cases.push((
+            "object",
+            Some(r#"{"model":"qemu-x86_64","arch":"x86_64"}"#),
+            Some(serde_json::json!({"model":"qemu-x86_64","arch":"x86_64"})),
+        ));
+        // CAST 文本带空白/嵌套/Unicode 也必须原样解析（TiDB/MySQL CAST 输出含空白）。
+        cases.push((
+            "padded_unicode",
+            Some("{ \"型号\": \"板卡 A\" , \"tags\": [ 1 , 2 ] }"),
+            Some(serde_json::json!({"型号": "板卡 A", "tags": [1, 2]})),
+        ));
+        // 边界：SQL NULL（None）与 JSON `null` 文本（Some(Value::Null)）语义不同，都合法。
+        cases.push(("sql_null", None, None));
+        cases.push((
+            "json_null_literal",
+            Some("null"),
+            Some(serde_json::Value::Null),
+        ));
+        // 边界：空对象与 JSON 数组同样是合法 descriptor 文本。
+        cases.push(("empty_object", Some("{}"), Some(serde_json::json!({}))));
+        cases.push(("array", Some("[1,2,3]"), Some(serde_json::json!([1, 2, 3]))));
+        // 边界：本层 descriptor 门禁是"必须是合法 JSON 值"（预算/形状门禁在写入侧
+        // `transport::admission::descriptor_json`），合法标量按原样保留，不静默丢弃。
+        cases.push((
+            "scalar_text",
+            Some("\"just text\""),
+            Some(serde_json::json!("just text")),
+        ));
+        for (label, input, expected) in cases {
+            let view = decode(
+                vec![5u8; 32],
+                "dev-1".into(),
+                input.map(str::to_string),
+                "PENDING",
+                "none",
+                1,
+                0,
+            )
+            .unwrap_or_else(|e| panic!("{label} 合法 descriptor 文本必须解码成功：{e:?}"));
+            assert_eq!(view.descriptor, expected, "{label} 解码结果不符");
+        }
+        // 非法 descriptor 一律失败关闭为固定去敏 Config（503 形状），不得返回空投影。
+        for (label, malformed) in [
+            ("empty_text", ""),
+            ("truncated", r#"{"model":"a""#),
+            ("not_json", "{not json"),
+        ] {
+            let error = match decode(
+                vec![5u8; 32],
+                "dev-1".into(),
+                Some(malformed.to_string()),
+                "PENDING",
+                "none",
+                1,
+                0,
+            ) {
+                Ok(view) => panic!(
+                    "{label} 非法 descriptor 必须失败关闭，实际解码 {:?}",
+                    view.descriptor
+                ),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(&error, ControllerError::Config(message)
+                    if message == "identity admin read devices.descriptor"),
+                "{label} 必须是固定去敏 Config，实际：{error:?}"
+            );
+        }
     }
 
     #[test]

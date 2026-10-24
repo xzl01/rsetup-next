@@ -132,4 +132,3 @@
 - [04-dual-stream-and-gates.md](2026-10-16-transport/04-dual-stream-and-gates.md)：Task 5: 内存双流绑定、Control-first 与审批门（~763 行）
 
 ---
-

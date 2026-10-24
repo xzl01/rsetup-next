@@ -23,14 +23,12 @@ pub mod polling;
 pub mod production;
 pub mod tasks;
 pub mod time;
+pub mod transport;
 pub mod web;
 
 pub use bootstrap::{BootstrapSecretSink, bootstrap_admin};
 pub use config::ControllerConfig;
-pub use db::{
-    AdmissionStore, DbPool, TestMigrationConfig, TestMigrationMode, check_identity_schema,
-    check_v3_ready, run_identity_test_migration,
-};
+pub use db::{AdmissionStore, DbPool, TestMigrationConfig, check_identity_schema};
 pub use error::ControllerError;
 pub use http_auth::{AppState, HttpAuthState, build_http_router};
 pub use integrity::{validate_device_fields, validate_grant_fields, validate_singleton_ids};

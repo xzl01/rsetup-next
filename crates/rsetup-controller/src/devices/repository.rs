@@ -22,7 +22,14 @@ pub struct AuditCursor {
     pub id: Uuid,
 }
 
-pub(crate) const AUDIT_PAGE_SQL: &str = "SELECT id, actor_kind, actor_user_id, event_type, target_kind, target_id, params_redacted, outcome, process_epoch, event_seq, time_evidence AS created_evidence FROM audit_events WHERE (? IS NULL OR actor_user_id = ?) AND (? IS NULL OR (target_kind = 'device' AND target_id = ?)) AND (? IS NULL OR process_epoch > ? OR (process_epoch = ? AND (event_seq > ? OR (event_seq = ? AND id > ?)))) ORDER BY process_epoch, event_seq, id LIMIT ?";
+/// 审计页 SQL（`GET /api/v1/audit` 的唯一读语句）：11 个绑定 = filter 4 + 游标 6 +
+/// `LIMIT` 1，keyset 排序 `(process_epoch, event_seq, id)` 与出口签名游标一一对应。
+/// `audit_events.params_redacted` 与 `audit_events.time_evidence` 在 v4 schema 都是
+/// `JSON NOT NULL`（wire 245），workspace sqlx 未启用 `json` feature，`String` /
+/// `Option<String>` 取列只接受 `CAST(... AS CHAR)` 文本投影（RC1 同根因、同口径）；
+/// `time_evidence` 的别名 `created_evidence` 是 `AuditEventRow.created_evidence` 的
+/// 唯一取列名，改名会静默改变解码输入。
+pub(crate) const AUDIT_PAGE_SQL: &str = "SELECT id, actor_kind, actor_user_id, event_type, target_kind, target_id, CAST(params_redacted AS CHAR) AS params_redacted, outcome, process_epoch, event_seq, CAST(time_evidence AS CHAR) AS created_evidence FROM audit_events WHERE (? IS NULL OR actor_user_id = ?) AND (? IS NULL OR (target_kind = 'device' AND target_id = ?)) AND (? IS NULL OR process_epoch > ? OR (process_epoch = ? AND (event_seq > ? OR (event_seq = ? AND id > ?)))) ORDER BY process_epoch, event_seq, id LIMIT ?";
 
 /// 统一设备候选公钥扫描 SQL（Task 13a）：游标、`search` 文字子串（`LOCATE` 避免 LIKE
 /// 通配扩展）与 `group_id` 成员关系（`EXISTS` + 父 group 行 `archived=FALSE`）三条件单一
@@ -31,8 +38,18 @@ pub(crate) const AUDIT_PAGE_SQL: &str = "SELECT id, actor_kind, actor_user_id, e
 pub(crate) const DEVICE_FILTER_KEYS_SQL: &str = "SELECT d.public_key FROM devices d WHERE (? IS NULL OR d.public_key > ?) AND (? IS NULL OR LOCATE(?, d.display_name) > 0) AND (? IS NULL OR EXISTS (SELECT 1 FROM group_members gm JOIN device_groups dg ON dg.id=gm.group_id WHERE gm.device_id=d.public_key AND gm.group_id=? AND dg.archived=FALSE)) ORDER BY d.public_key LIMIT ?";
 
 /// 审批持久真相页 SQL（Task 13a）：keyset + 可选 `review_decision` 筛选，5 个绑定；
-/// `archived` 走 `CAST(... AS SIGNED)` 与既有解码器同形。连接状态不在本投影内。
-pub(crate) const APPROVAL_PAGE_SQL: &str = "SELECT public_key,display_name,descriptor_json,admission_state,review_decision,revision,CAST(archived AS SIGNED) AS archived FROM devices WHERE (? IS NULL OR public_key > ?) AND (? IS NULL OR review_decision = ?) ORDER BY public_key LIMIT ?";
+/// `archived` 走 `CAST(... AS SIGNED)`、`descriptor_json` 走 `CAST(... AS CHAR)`，与
+/// `authz::sqlx_repo` 的设备读解码同形（v4 `JSON` 列在 wire 上是 245，未启用 sqlx
+/// `json` feature 时只能按 CHAR 文本取列）。连接状态不在本投影内。
+pub(crate) const APPROVAL_PAGE_SQL: &str = "SELECT public_key,display_name,CAST(descriptor_json AS CHAR) AS descriptor_json,admission_state,review_decision,revision,CAST(archived AS SIGNED) AS archived FROM devices WHERE (? IS NULL OR public_key > ?) AND (? IS NULL OR review_decision = ?) ORDER BY public_key LIMIT ?";
+
+/// 设备管理写路径（`patch_device_display_name`）锁定单行的投影 SQL：与
+/// `APPROVAL_PAGE_SQL` 同 7 列投影与同 `CAST(archived AS SIGNED)` 口径，1 个绑定
+/// （`public_key`）+ 行锁 `FOR UPDATE`；前置 guard/actor 校验与 CAS 归调用侧，本常量
+/// 只固定锁 SQL 本身。提取为常量的目的是让 `descriptor_json` 的投影口径与
+/// `authz::sqlx_repo` 的批量读共用同一份离线回归（RC1 真库根因：v4 `JSON` 列必须以
+/// `CAST(... AS CHAR)` 文本投影才能被 `decode_device_admin_view` 的 `Option<String>` 取列）。
+pub(crate) const DEVICE_ROW_FOR_UPDATE_SQL: &str = "SELECT public_key, display_name, CAST(descriptor_json AS CHAR) AS descriptor_json, admission_state, review_decision, revision, CAST(archived AS SIGNED) AS archived FROM devices WHERE public_key = ? FOR UPDATE";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceAdminView {
@@ -58,6 +75,16 @@ pub struct AuditEventRow {
     pub process_epoch: Uuid,
     pub event_seq: u64,
     pub created_evidence: serde_json::Value,
+}
+
+/// `audit_events.time_evidence`（`CAST(... AS CHAR) AS created_evidence` 文本投影）→
+/// `AuditEventRow.created_evidence` 的唯一解码点：SQL `NULL` 与不可解析文本一律同一条
+/// 去敏 `Config` → 503，绝不回退成 `Value::Null`、空串或"跳过该行"。提取为纯函数的目的
+/// 只是让这条 fail-closed 边界可离线断言；语义与提取前逐字一致。
+fn decode_created_evidence(raw: Option<String>) -> Result<serde_json::Value, ControllerError> {
+    let decode_error = || ControllerError::Config("identity admin read audit.decode".into());
+    let text = raw.ok_or_else(decode_error)?;
+    serde_json::from_str(&text).map_err(|_| decode_error())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -542,16 +569,7 @@ impl DeviceRepository for SqlxDeviceRepository {
                     r.try_get("created_evidence").map_err(|_| {
                         ControllerError::Config("identity admin read audit.decode".into())
                     })?;
-                let created_evidence = match time_evidence {
-                    Some(s) => serde_json::from_str(&s).map_err(|_| {
-                        ControllerError::Config("identity admin read audit.decode".into())
-                    })?,
-                    None => {
-                        return Err(ControllerError::Config(
-                            "identity admin read audit.decode".into(),
-                        ));
-                    }
-                };
+                let created_evidence = decode_created_evidence(time_evidence)?;
 
                 items.push(AuditEventRow {
                     id,
@@ -661,13 +679,11 @@ impl DeviceRepository for SqlxDeviceRepository {
             crate::integrity::lock_integrity_guard(&mut tx).await?;
             crate::integrity::require_active_admin(&mut tx, actor.user.id).await?;
             // 1. 锁 devices 行（锁序止于 devices 行，guard → actor 行 → devices 行 FOR UPDATE）。
-            let row = sqlx::query(
-                "SELECT public_key, display_name, descriptor_json, admission_state, review_decision, revision, CAST(archived AS SIGNED) AS archived FROM devices WHERE public_key = ? FOR UPDATE",
-            )
-            .bind(device_id.as_slice())
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(ControllerError::NotFound)?;
+            let row = sqlx::query(DEVICE_ROW_FOR_UPDATE_SQL)
+                .bind(device_id.as_slice())
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(ControllerError::NotFound)?;
             // 2. 严格 decode：复用同 crate 既有去敏解码，不复制第二份解码器。
             let locked = crate::authz::sqlx_repo::decode_device_admin_view(
                 row.try_get("public_key")?,
@@ -896,6 +912,190 @@ mod tests {
         assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(keys.len(), 3);
         assert_eq!(AUDIT_PAGE_SQL.matches('?').count(), 11);
+    }
+
+    /// RC1 真库根因回归 1/3：审批页（`GET /approvals`，即 `approval_page` 的执行 SQL）
+    /// 的 `descriptor_json` 必须是 `CAST(... AS CHAR)` 文本投影。v4 schema 该列是
+    /// `JSON`（wire 245），workspace 未启用 sqlx `json` feature，裸列名喂给
+    /// `decode_device_admin_view` 的 `Option<String>` 会被 sqlx 以类型不匹配拒绝 →
+    /// 固定去敏 503 `STORAGE_UNAVAILABLE`；表内没有非 NULL descriptor 行时不触发，
+    /// 这解释了首 run"设备出现前 200 空页、出现后固定 503"的时间线。
+    #[test]
+    fn approval_page_sql_projects_descriptor_json_as_char_text() {
+        crate::authz::sqlx_repo::sql_shape::assert_device_descriptor_text_projection(
+            "APPROVAL_PAGE_SQL",
+            APPROVAL_PAGE_SQL,
+            &[
+                "public_key",
+                "display_name",
+                "CAST(descriptor_json AS CHAR) AS descriptor_json",
+                "admission_state",
+                "review_decision",
+                "revision",
+                "CAST(archived AS SIGNED) AS archived",
+            ],
+            "FROM devices WHERE (? IS NULL OR public_key > ?) AND (? IS NULL OR review_decision = ?) ORDER BY public_key LIMIT ?",
+            5,
+        );
+    }
+
+    /// RC1 真库根因回归 2/3：改名/审批授权读的行锁 SQL 同根因（首 run 未触达的后续
+    /// 入口）。锁语义与绑定顺序必须与提取常量前一致：1 个 `public_key` 绑定 + 末尾
+    /// `FOR UPDATE`，guard/actor 前置与 revision CAS 归调用侧不变。
+    #[test]
+    fn device_row_for_update_sql_keeps_lock_and_projects_descriptor_as_char_text() {
+        crate::authz::sqlx_repo::sql_shape::assert_device_descriptor_text_projection(
+            "DEVICE_ROW_FOR_UPDATE_SQL",
+            DEVICE_ROW_FOR_UPDATE_SQL,
+            &[
+                "public_key",
+                "display_name",
+                "CAST(descriptor_json AS CHAR) AS descriptor_json",
+                "admission_state",
+                "review_decision",
+                "revision",
+                "CAST(archived AS SIGNED) AS archived",
+            ],
+            "FROM devices WHERE public_key = ? FOR UPDATE",
+            1,
+        );
+        assert_eq!(
+            DEVICE_ROW_FOR_UPDATE_SQL.matches("FOR UPDATE").count(),
+            1,
+            "行锁只能出现一次，且必须是语句末尾的 devices 行锁"
+        );
+    }
+
+    /// 执行位门禁：`approval_page` 与 `patch_device_display_name` 必须消费被上面两条
+    /// 回归钉住的常量，且本文件生产段内不得出现第二条未被钉的 `descriptor_json` 读
+    /// SQL 字面量（内联副本会绕过形状回归）。
+    #[test]
+    fn device_descriptor_reads_consume_pinned_consts_without_inline_duplicates() {
+        use crate::authz::sqlx_repo::sql_shape;
+
+        let src = sql_shape::production_source(include_str!("repository.rs"));
+        assert!(
+            src.contains("sqlx::query(APPROVAL_PAGE_SQL)"),
+            "approval_page 必须消费 APPROVAL_PAGE_SQL 常量"
+        );
+        assert!(
+            src.contains("sqlx::query(DEVICE_ROW_FOR_UPDATE_SQL)"),
+            "patch_device_display_name 必须消费 DEVICE_ROW_FOR_UPDATE_SQL 常量"
+        );
+        for literal in sql_shape::select_string_literals(src) {
+            if literal.contains("descriptor_json") {
+                assert!(
+                    literal == sql_shape::normalize_sql(APPROVAL_PAGE_SQL)
+                        || literal == sql_shape::normalize_sql(DEVICE_ROW_FOR_UPDATE_SQL),
+                    "本文件生产段内的 descriptor_json 读 SQL 必须是本模块被回归钉住的常量之一：{literal}"
+                );
+            }
+        }
+    }
+
+    /// RC2 读侧收口回归（必修 1/2）：审计页 `GET /api/v1/audit` 一次读两列 v4 `JSON`
+    /// —— `audit_events.params_redacted`（`NOT NULL`）与 `audit_events.time_evidence`
+    /// （`NOT NULL`，别名 `created_evidence`）。workspace 的 sqlx 0.8.6 是
+    /// `default-features = false` 且未启用 `json` feature，`str/String` 的
+    /// `Type<MySql>::compatible` 白名单只有 `VarChar|Blob|TinyBlob|MediumBlob|LongBlob|
+    /// String|VarString|Enum` 且非 `BINARY`，不含 wire 245 的 `Json`；裸列名喂给
+    /// `audit_page` 解码闭包的 `String` / `Option<String>` 取列会被 sqlx 以类型不匹配
+    /// 拒绝，固定去敏 503 `STORAGE_UNAVAILABLE`（表内无非空 audit 行时不触发）。
+    /// 投影必须是 `CAST(<col> AS CHAR) AS <旧别名>`，其余一切（11 个绑定、keyset
+    /// `WHERE`、`ORDER BY process_epoch, event_seq, id`、`LIMIT`）逐字不变。
+    #[test]
+    fn audit_page_sql_projects_both_json_columns_as_char_text() {
+        use crate::authz::sqlx_repo::sql_shape;
+
+        const PARAMS_PROJECTION: &str = "CAST(params_redacted AS CHAR) AS params_redacted";
+        const EVIDENCE_PROJECTION: &str = "CAST(time_evidence AS CHAR) AS created_evidence";
+        let (items, tail) = sql_shape::split_select(AUDIT_PAGE_SQL);
+        let got: Vec<&str> = items.iter().map(String::as_str).collect();
+        assert_eq!(
+            got,
+            vec![
+                "id",
+                "actor_kind",
+                "actor_user_id",
+                "event_type",
+                "target_kind",
+                "target_id",
+                PARAMS_PROJECTION,
+                "outcome",
+                "process_epoch",
+                "event_seq",
+                EVIDENCE_PROJECTION,
+            ],
+            "审计页 select 列表必须逐项一致（列顺序与两列 JSON 的 CHAR 文本投影口径）：{got:?}"
+        );
+        assert_eq!(
+            tail,
+            "FROM audit_events WHERE (? IS NULL OR actor_user_id = ?) AND (? IS NULL OR \
+             (target_kind = 'device' AND target_id = ?)) AND (? IS NULL OR process_epoch > ? OR \
+             (process_epoch = ? AND (event_seq > ? OR (event_seq = ? AND id > ?)))) ORDER BY \
+             process_epoch, event_seq, id LIMIT ?",
+            "审计页 FROM 尾部（表名/游标 keyset/排序/LIMIT）必须逐字一致：{tail}"
+        );
+        assert_eq!(
+            sql_shape::normalize_sql(AUDIT_PAGE_SQL)
+                .matches('?')
+                .count(),
+            11,
+            "审计页 11 个绑定（filter 4 + cursor 6 + limit 1）不得漂移"
+        );
+    }
+
+    /// 执行位门禁：`audit_page` 必须消费被上面回归钉住的 `AUDIT_PAGE_SQL` 常量，本文件
+    /// 生产段内不得出现第二条读 `params_redacted`/`time_evidence` 的内联 SELECT 字面量。
+    #[test]
+    fn audit_json_reads_consume_pinned_const_without_inline_duplicates() {
+        use crate::authz::sqlx_repo::sql_shape;
+
+        let src = sql_shape::production_source(include_str!("repository.rs"));
+        assert!(
+            src.contains("sqlx::query(AUDIT_PAGE_SQL)"),
+            "audit_page 必须消费 AUDIT_PAGE_SQL 常量"
+        );
+        for literal in sql_shape::select_string_literals(src) {
+            if literal.contains("params_redacted") || literal.contains("time_evidence") {
+                assert_eq!(
+                    literal,
+                    sql_shape::normalize_sql(AUDIT_PAGE_SQL),
+                    "本文件生产段内读 audit_events JSON 列的 SQL 必须是 AUDIT_PAGE_SQL 本体：{literal}"
+                );
+            }
+        }
+    }
+
+    /// 下游纯解码回归：`time_evidence`（CAST 文本投影后）→ `created_evidence` 的唯一解码点
+    /// 必须保持 fail-closed —— SQL `NULL`、空文本与坏 JSON 一律同一条去敏
+    /// `identity admin read audit.decode` → 503，不得退化成 `Value::Null`、空串或空页；
+    /// 合法对象文本原样解析并逐字保留字段（质量位归写入侧，本 RC 不加严也不放宽）。
+    /// 另一列 `params_redacted` 的下游是**逐字文本透传**（`AuditEventRow.params_redacted:
+    /// String` → wire JSON string），其出口形状由 `api::audit::tests` 既有断言钉住。
+    #[test]
+    fn audit_created_evidence_decode_rejects_null_empty_and_malformed_texts() {
+        let ok = decode_created_evidence(Some(
+            r#"{"source":"system_fallback","clock_epoch":"e1","valid":false}"#.into(),
+        ))
+        .expect("合法对象文本必须解码");
+        assert_eq!(ok["source"], serde_json::json!("system_fallback"));
+        assert_eq!(ok["clock_epoch"], serde_json::json!("e1"));
+        assert_eq!(ok["valid"], serde_json::json!(false));
+        for raw in [
+            None,
+            Some(String::new()),
+            Some("broken".into()),
+            Some("{".into()),
+        ] {
+            let error = decode_created_evidence(raw.clone())
+                .expect_err("NULL/空文本/坏 JSON 必须失败关闭，不得回退成 Null 或空页");
+            assert!(
+                matches!(error, ControllerError::Config(ref code)
+                    if code == "identity admin read audit.decode"),
+                "必须保持既有去敏码：{error:?}"
+            );
+        }
     }
 
     /// 只用于离线门禁用例的 lazy 池：构造不连接，任何真实取连接都会失败成 503 Config，

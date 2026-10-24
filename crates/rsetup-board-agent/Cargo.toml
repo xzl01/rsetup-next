@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 hex.workspace = true
 rsetup-protocol = { path = "../rsetup-protocol" }
+rsetup-tunnel = { path = "../rsetup-tunnel" }
 rsetup-core = { path = "../rsetup-core" }
 thiserror.workspace = true
 tokio.workspace = true

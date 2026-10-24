@@ -9,8 +9,8 @@ license.workspace = true
 repository.workspace = true
 
 # 两个运维 CLI 的 cargo bin 名与 Debian 打包名保持一致：主进程仍由 src/main.rs
-# 自动发现为 `rsetup-controller`，测试专用的 `migrate-identity-test` 亦自动发现，
-# 这里只显式命名需要随包交付的二进制，避免交付名与构建产物名不一致。
+# 自动发现为 `rsetup-controller`，这里只显式命名需要随包交付的二进制，避免交付名与
+# 构建产物名不一致。v4-only 基线不再提供测试专用迁移 CLI（原 migrate-identity-test）。
 [[bin]]
 name = "rsetup-controller-migrate"
 path = "src/bin/migrate-controller.rs"
@@ -30,6 +30,7 @@ hex.workspace = true
 libc.workspace = true
 rand.workspace = true
 rsetup-protocol = { path = "../rsetup-protocol" }
+rsetup-tunnel = { path = "../rsetup-tunnel" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
