@@ -174,7 +174,7 @@ jobs:
         run: >-
           apt-get update &&
           apt-get install -y --no-install-recommends
-          build-essential ca-certificates cargo debhelper devscripts dpkg-dev
+          build-essential ca-certificates cargo curl debhelper devscripts dpkg-dev
           git lintian nodejs npm rustc
       - uses: actions/checkout@v7
         with:
@@ -188,7 +188,13 @@ jobs:
       # 而不是换基础镜像、跳过打包/测试，或把 stable 降级到不兼容版本。apt 的 cargo/rustc
       # 仍留在上面的安装清单里，只用于满足 Build-Depends 的存在性检查，不再充当实际构建
       # 编译器。本步骤排在离线缓存预热与 dpkg-buildpackage 之前，保证 cargo fetch 与打包
-      # 编译共用同一支 stable。本仓统一以 stable 管理 Rust 版本、不在构建配置里钉死具体
+      # 编译共用同一支 stable。同一清单还必须带 curl：CI run 40119249655 里 trixie-slim
+      # 容器没有 curl 命令（只有 apt 自用的 libcurl4 共享库），rust-toolchain 的
+      # 「Install rustup if needed」子步骤用 curl 拉 sh.rustup.rs 直接 exit 127；TLS 信任
+      # 库 ca-certificates 同理是 rustup/cargo/npm https 下载的引导前置。curl 与
+      # ca-certificates 都只属 CI 容器引导，不是业务依赖，不进 debian/control。上述清单
+      # 与「安装早于 @stable」的口径由 scripts/tests/controller-ci-contract.test.mjs 钉住。
+      # 本仓统一以 stable 管理 Rust 版本、不在构建配置里钉死具体
       # 版本号，这里也只装 stable：let-chains 与 slice_as_chunks 自 1.88.0 起就是 stable
       # 的固定能力，stable 恒满足，无需在本仓写死某个具体版本。
       - uses: dtolnay/rust-toolchain@stable

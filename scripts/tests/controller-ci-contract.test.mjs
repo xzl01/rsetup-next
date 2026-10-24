@@ -604,9 +604,11 @@ test('debian package builds the frontend before cargo', () => {
     buildAt < dpkgAt,
     '前端构建必须早于 dpkg-buildpackage：显式步骤是 rules 里同一条链路的双保险',
   );
-  assert.match(
-    debian.text,
-    /apt-get install[\s\S]*?\bnodejs\b[\s\S]*?\bnpm\b/,
+  // 作用域收紧到 Install packaging tools 步骤的那一条 apt 命令（review：全作业跨步骤
+  // 正则过宽，后面步骤里的 npm 字样就能把它喂饱）：nodejs 与 npm 必须同时出现在清单里。
+  assertAptInstallPackages(
+    extractStepBlock(debian.text, 'Install packaging tools'),
+    ['nodejs', 'npm'],
     'debian-package 作业的 apt 安装清单必须同时带上 nodejs 与 npm（容器里没有预装）',
   );
 });
@@ -835,6 +837,59 @@ const extractStepBlock = (jobText, needle) => {
     block.push(line);
   }
   return block.join('\n');
+};
+
+// 解析步骤内**唯一**一条 apt-get install 命令的包名 token 集合。run: >- 折叠标量按空白
+// 并成单条 shell 命令，所以把命令标记之后的空白切分视作清单即可，但**包名只采集到首个
+// shell 分隔符或重定向（&&、||、|、;、>、<）为止**（review P2：只在 token 层面过滤
+// 控制符、不在分隔符处截断，同步骤追加的 `&& curl --version` 里的 curl 会混进包集合误绿）：
+//   * 该步骤必须恰好出现一条 `apt-get install`，包清单归属才没有歧义——断言因此钉在同一条
+//     apt 命令块上，而不是全作业跨步骤的 `[\s\S]*?`（review 口径：cargo/rustc 的旧正则就是
+//     过宽，后面的 `cargo fetch`、dpkg-buildpackage 里的 cargo 字样都能把它喂饱）；
+//   * 识别口径刻意简单、不造通用 shell parser：分隔符**前面有空白**才算命令边界，
+//     `;curl --version`（后续命令常不带前导空格）照样在 `;` 处截断；分隔符粘在前一个
+//     token 上的模糊形状（`pkg;curl`、`curl&&`、`2>&1`）不猜语义，直接报「不支持」；
+//   * 只认精确包名 token：库包（libcurl4-openssl-dev）不等于 curl 命令；flag（- 开头）
+//     不算包名。
+const aptInstallPackages = (stepText) => {
+  const marker = 'apt-get install';
+  assert.equal(
+    stepText.split(marker).length - 1,
+    1,
+    '步骤里应恰好有一条 apt-get install 命令，包清单的作用域才没有歧义',
+  );
+  const rest = stepText.slice(stepText.indexOf(marker) + marker.length);
+  const boundary = rest.search(/[|;<>&]/);
+  let args = rest;
+  if (boundary >= 0) {
+    assert.ok(
+      boundary > 0 && /\s/.test(rest[boundary - 1]),
+      'apt 命令里出现粘连到前一个 token 的分隔符/重定向形状，属不支持的形状，测试拒绝猜测：' +
+        `识别包清单只认「空白 + &&、||、|、;、>、<」这种命令边界（粘连处上下文：${JSON.stringify(
+          rest.slice(Math.max(0, boundary - 12), boundary + 8),
+        )}）`,
+    );
+    args = rest.slice(0, boundary);
+  }
+  const tokens = args
+    .split(/\s+/)
+    .filter(Boolean)
+    .filter((token) => !token.startsWith('-'));
+  return new Set(tokens);
+};
+
+// 同一条 apt 命令块内的包名断言（curl/ca-certificates、cargo/rustc、nodejs/npm 三处清单
+// 断言共用）：pkg 必须以**精确包名 token** 写在 Install packaging tools 步骤的那条
+// apt-get install 里，别处的字样或库包都不算。
+const assertAptInstallPackages = (stepText, expected, reason) => {
+  const pkgs = aptInstallPackages(stepText);
+  for (const pkg of expected) {
+    assert.ok(
+      pkgs.has(pkg),
+      `${reason}（要求包名 token：${pkg}——必须写在 Install packaging tools 步骤的同一条 apt 命令里；库包不等于命令，其它步骤的字样也不算）`,
+    );
+  }
+  return pkgs;
 };
 
 // 构建工具下限：debhelper (>= 13.11.6~) 与 debhelper-compat (= 13) 并存。
@@ -1351,9 +1406,12 @@ test('Debian trixie 作业显式装兼容的 stable Rust 工具链，不把 apt 
 
   // apt 清单仍带上 cargo 与 rustc：Build-Depends 声明了它们，dpkg-checkbuilddeps
   // 在任何构建规则前只核对存在性；这里只是不再让它充当实际构建编译器。
-  assert.match(
-    debian.text,
-    /apt-get install[\s\S]*?\bcargo\b[\s\S]*?\brustc\b/,
+  // 作用域钉在 Install packaging tools 步骤的同一条 apt 命令块（review：旧
+  // `apt-get install[\s\S]*?\bcargo\b` 跨全作业，后面的 cargo fetch、
+  // dpkg-buildpackage 与 debian/rules 文案里的 cargo 字样都能把它喂饱，不算清单证据）。
+  assertAptInstallPackages(
+    extractStepBlock(debian.text, 'Install packaging tools'),
+    ['cargo', 'rustc'],
     'apt 安装清单必须继续带上 cargo 与 rustc（满足 Build-Depends 存在性检查）',
   );
 
@@ -1370,4 +1428,223 @@ test('Debian trixie 作业显式装兼容的 stable Rust 工具链，不把 apt 
   assert.ok(fetchAt >= 0, 'debian-package 必须继续用 cargo fetch --locked 预热离线缓存');
   assert.ok(toolchainAt < fetchAt, 'stable 工具链安装必须早于 cargo fetch：两者用同一支编译器');
   assert.ok(toolchainAt < dpkgAt, 'stable 工具链安装必须早于 dpkg-buildpackage：打包编译用兼容工具链');
+});
+
+// ---------------------------------------------------------------------------
+// debian-package 容器引导：curl 与 ca-certificates（CI run 40119249655 根因回归）
+// ---------------------------------------------------------------------------
+//
+// 根因（本地留存日志 .superpowers/ci-40119249655-debian-bootstrap.log 第 4045-4056 行）：
+// debian-package 跑在 debian:trixie-slim 容器里，「Install packaging tools」步骤的
+// `apt-get install -y --no-install-recommends` 清单没有 curl。Trixie slim 只带 libcurl4
+// 共享库（apt 自己的依赖），**没有 curl 命令**；随后 dtolnay/rust-toolchain@stable 的
+// 「Install rustup if needed」子步骤检测到容器里没有 rustup，执行
+// `curl --proto '=https' --tlsv1.2 … https://sh.rustup.rs | sh`——
+// `curl: command not found`，进程 exit 127，作业在装工具链这一步直接失败。
+//
+// 修复口径：curl 加进**同一条 apt 命令**的清单（TLS 信任库 ca-certificates 本就在清单里，
+// rustup/cargo/npm 的 https 下载依赖它，这里一并钉住），并且该步骤必须排在
+// dtolnay/rust-toolchain@stable 之前——curl 晚到等于没到。
+//
+// 作用域收紧到该步骤内的单条 apt-get install（见 aptInstallPackages）：全作业跨步骤的
+// `apt-get install[\s\S]*?\bcurl\b` 会被任何后续步骤里的 curl 字样喂饱，等于空断言；
+// 下面的负例逐个演示这一点。curl/ca-certificates 是 **CI 容器引导的前置命令**，不是业务
+// 依赖，不进 debian/control 的 Build-Depends。
+const DEBIAN_BOOTSTRAP_STEP = 'Install packaging tools';
+
+// 变异前提断言（review P3，防变异空跑）：变异前当前清单里必须真有被删的包，变异后那条
+// apt 命令的 token 集合里必须真的没有它。replace 模板一旦与 CI 现文脱节（清单文案变化
+// 导致不命中），负例会静默空跑成假负——上面 curl 修复后清单变成 `cargo curl debhelper`，
+// 旧模板 `ca-certificates cargo debhelper` 就是这样落空的。返回变异后的包集合供追加断言。
+const assertMutationRemoves = (basePkgs, mutatedText, removed, reason) => {
+  const pkgs = aptInstallPackages(extractStepBlock(mutatedText, DEBIAN_BOOTSTRAP_STEP));
+  for (const pkg of removed) {
+    assert.ok(basePkgs.has(pkg), `前提：当前 apt 清单里应有 ${pkg}（${reason}）`);
+    assert.ok(!pkgs.has(pkg), `变异后 apt 清单必须已不含 ${pkg}（防变异空跑：${reason}）`);
+  }
+  return pkgs;
+};
+
+// 合同主体（负例演示复用同一函数）：apt 清单里必须有 curl 与 ca-certificates（精确包名、
+// 同一条命令），且整个步骤排在 @stable 安装之前。
+const assertDebianBootstrapAptContract = (jobText) => {
+  const step = extractStepBlock(jobText, DEBIAN_BOOTSTRAP_STEP);
+  const pkgs = aptInstallPackages(step);
+  for (const pkg of ['curl', 'ca-certificates']) {
+    assert.ok(
+      pkgs.has(pkg),
+      `CI run 40119249655 根因：dtolnay/rust-toolchain@stable 在 trixie-slim 容器里用 curl 拉 rustup，` +
+        `清单缺 ${pkg} 会让该步骤 exit 127（或 https 证书校验失败）`,
+    );
+  }
+  const stepAt = jobText.indexOf(step);
+  const stableAt = jobText.search(/(?:^|\n)[ \t]*- uses:[ \t]*dtolnay\/rust-toolchain@stable\b/);
+  assert.ok(
+    stepAt >= 0 && stableAt >= 0 && stepAt < stableAt,
+    'Install packaging tools 必须排在 dtolnay/rust-toolchain@stable 步骤之前：curl 要早于 rust-toolchain 执行才用得上',
+  );
+};
+
+test('Debian 打包作业的 apt 命令显式安装 curl 与 ca-certificates，且早于 @stable（CI run 40119249655 回归）', () => {
+  const debian = jobCalled('debian-package');
+  assert.ok(debian, 'ci.yml 里找不到 debian-package 作业');
+  assertDebianBootstrapAptContract(debian.text);
+  // 变异前的当前包集合：以下各负例的变异前后前提断言共用（防变异空跑）。
+  const basePkgs = aptInstallPackages(extractStepBlock(debian.text, DEBIAN_BOOTSTRAP_STEP));
+
+  // 负例 1（非真空演示，review 点名）：从安装清单删掉 curl，但在作业更后面补一个仍提到
+  // curl 的步骤。跨全作业的正则会把这个字样当成「清单里有 curl」而空过（先 assert.match
+  // 证明它确实空过），作用域合同必须拒绝——这证明断言钉的是 apt 命令，不是全作业文本。
+  const curlMovedToLaterStep =
+    debian.text
+      .replace('ca-certificates cargo curl debhelper', 'ca-certificates cargo debhelper') +
+    '\n      - name: Probe rustup installer\n        run: curl --proto \'=https\' --tlsv1.2 -sSf https://sh.rustup.rs\n';
+  assert.ok(
+    !extractStepBlock(curlMovedToLaterStep, DEBIAN_BOOTSTRAP_STEP).includes('curl'),
+    'mutation 模板必须命中当前 CI 文本：删除后 Install packaging tools 步骤内不得再出现 curl 字样',
+  );
+  assertMutationRemoves(basePkgs, curlMovedToLaterStep, ['curl'], 'curl 挪到后续步骤');
+  assert.match(
+    curlMovedToLaterStep,
+    /apt-get install[\s\S]*?\bcurl\b/,
+    '负例样本必须证明跨全作业的正则会被后续步骤的 curl 字样喂饱（空过）',
+  );
+  assert.throws(
+    () => assertDebianBootstrapAptContract(curlMovedToLaterStep),
+    undefined,
+    'curl 从安装清单删除、仅出现在后续步骤里，必须被拒绝',
+  );
+
+  // 负例 2（review P2，同一条 shell 命令行的后续命令）：apt 清单里删掉 curl，并在同一
+  // 步骤末尾追加 `&& curl --version`——run: >- 折叠后这仍是同一条 shell 命令行。包名
+  // 解析必须在 &&（以及 ||、|、;、重定向）处截断：只在 token 层面过滤控制符的话，
+  // 后续命令的 curl 字样会原样混进包集合，删了清单里的 curl 也误绿。
+  const curlSameStepSuffix = debian.text
+    .replace('ca-certificates cargo curl debhelper', 'ca-certificates cargo debhelper')
+    .replace('git lintian nodejs npm rustc', 'git lintian nodejs npm rustc && curl --version');
+  assert.notEqual(
+    curlSameStepSuffix,
+    debian.text,
+    'mutation 模板必须命中当前 CI 文本：清单删 curl、同步骤追加 && curl --version',
+  );
+  const suffixStep = extractStepBlock(curlSameStepSuffix, DEBIAN_BOOTSTRAP_STEP);
+  assert.ok(suffixStep.includes('&& curl --version'), '后续命令必须仍留在 Install packaging tools 步骤内');
+  assert.ok(
+    !aptInstallPackages(suffixStep).has('curl'),
+    '包名集合必须在 && 处截断：同步骤后续命令的 curl 不是包名（review P2 的误绿形状）',
+  );
+  assertMutationRemoves(basePkgs, curlSameStepSuffix, ['curl'], '清单删 curl、同步骤追加 && curl --version');
+  assert.throws(
+    () => assertDebianBootstrapAptContract(curlSameStepSuffix),
+    undefined,
+    '同步骤 && 之后的 curl --version 不能顶替 apt 清单里的 curl，必须被拒绝',
+  );
+
+  // 负例 3（不把「安装空库/伪 curl」当通过）：换成库包 libcurl4-openssl-dev——装得上、
+  // 但仍然没有 curl 命令，精确包名断言必须拒绝。
+  const curlReplacedByLibrary = debian.text.replace(
+    'ca-certificates cargo curl debhelper',
+    'ca-certificates cargo libcurl4-openssl-dev debhelper',
+  );
+  assert.notEqual(curlReplacedByLibrary, debian.text, 'mutation 模板必须命中当前 CI 文本：curl 换成库包');
+  const libraryPkgs = assertMutationRemoves(basePkgs, curlReplacedByLibrary, ['curl'], 'curl 换成库包');
+  assert.ok(libraryPkgs.has('libcurl4-openssl-dev'), '变异必须命中清单：libcurl4-openssl-dev 应已写入同一条 apt 命令');
+  assert.throws(
+    () => assertDebianBootstrapAptContract(curlReplacedByLibrary),
+    undefined,
+    'libcurl 系列库包不等于 curl 命令，必须被拒绝',
+  );
+
+  // 负例 4：删掉 ca-certificates（rustup/cargo/npm 的 https 下载失去信任库）必须被拒绝。
+  const withoutCaCertificates = debian.text.replace(
+    'build-essential ca-certificates cargo',
+    'build-essential cargo',
+  );
+  assert.notEqual(withoutCaCertificates, debian.text, 'mutation 模板必须命中当前 CI 文本：删除 ca-certificates');
+  assertMutationRemoves(basePkgs, withoutCaCertificates, ['ca-certificates'], '删除 ca-certificates');
+  assert.throws(
+    () => assertDebianBootstrapAptContract(withoutCaCertificates),
+    undefined,
+    'ca-certificates 从 apt 清单删除必须被拒绝',
+  );
+
+  // 负例 5（顺序）：把整个安装步骤挪到作业末尾（@stable 与 cargo fetch 都跑完之后）——
+  // 清单内容一字不差，但 curl 到场太晚，顺序合同必须拒绝。
+  const stepText = extractStepBlock(debian.text, DEBIAN_BOOTSTRAP_STEP);
+  const stepMovedAfterToolchain = `${debian.text.replace(stepText, '')}\n${stepText}\n`;
+  assert.notEqual(stepMovedAfterToolchain, debian.text, 'mutation 模板必须命中当前 CI 文本：步骤整体后移');
+  assert.throws(
+    () => assertDebianBootstrapAptContract(stepMovedAfterToolchain),
+    undefined,
+    'Install packaging tools 整体挪到 @stable 之后必须被拒绝：curl 要早于 rust-toolchain 就位',
+  );
+
+  // 负例 6（顺带把 cargo/rustc 的旧宽正则钉死）：两个包都退出 apt 清单，但补一个提到
+  // `rustc --version && cargo --version` 的后续步骤，而作业里本来就有 cargo fetch——旧的
+  // 跨全作业正则 `apt-get install[\s\S]*?\bcargo\b[\s\S]*?\brustc\b` 会拿 cargo fetch 与
+  // 后续步骤的 rustc 字样凑成一对而空过（先证明），收紧到 apt 命令块的断言必须拒绝
+  // （与「Debian trixie 作业…」那条生产合同共用同一实现）。变异模板必须与含 curl 的
+  // 现清单逐字匹配（review P3：旧模板 `ca-certificates cargo debhelper` 在 curl 修复后
+  // 已不命中，cargo 实际没被删、负例空跑），并有变异前后 token 前提断言兜底。
+  const aptListWithoutRustc = debian.text
+    .replace('ca-certificates cargo curl debhelper', 'ca-certificates debhelper')
+    .replace('nodejs npm rustc', 'nodejs npm');
+  assert.notEqual(aptListWithoutRustc, debian.text, 'mutation 模板必须命中当前 CI 文本：cargo/rustc 退出 apt 清单');
+  assertMutationRemoves(basePkgs, aptListWithoutRustc, ['cargo', 'rustc'], 'cargo/rustc 退出 apt 清单');
+  const cargoRustcMentionedLater =
+    aptListWithoutRustc +
+    '\n      - name: Show toolchain versions\n        run: rustc --version && cargo --version\n';
+  assert.match(
+    cargoRustcMentionedLater,
+    /apt-get install[\s\S]*?\bcargo\b[\s\S]*?\brustc\b/,
+    '负例样本必须证明旧的跨全作业正则会被 cargo fetch + 后续步骤的 rustc 字样喂饱（空过）',
+  );
+  assert.throws(
+    () =>
+      assertAptInstallPackages(
+        extractStepBlock(cargoRustcMentionedLater, DEBIAN_BOOTSTRAP_STEP),
+        ['cargo', 'rustc'],
+        'cargoRustcMentionedLater 负例',
+      ),
+    undefined,
+    'cargo/rustc 退出 apt 清单、仅靠后续步骤字样，必须被收紧后的断言拒绝',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// aptInstallPackages 的形状合同（review P2）：包名只采集到**首个 shell 分隔符或
+// 重定向**（&&、||、|、;、>、<）为止。识别口径刻意简单，不造通用 shell parser：
+//   * 分隔符前面有空白才算命令边界——`;curl --version` 这种后续命令不带前导空格
+//     是常见形状，照样在 `;` 处截断；
+//   * 分隔符粘在前一个 token 上（`pkg;curl`、`curl&&`、`2>&1`）语义模糊，明确
+//     报「不支持」而不是猜。
+// ---------------------------------------------------------------------------
+test('aptInstallPackages 在 shell 分隔符处截断包名，粘连形状明确拒绝', () => {
+  const aptStep = (tail) => `- name: S\n  run: >-\n    apt-get install -y --no-install-recommends ${tail}\n`;
+  const expected = ['ca-certificates', 'curl'];
+  for (const tail of [
+    'curl ca-certificates && rustc --version',
+    'curl ca-certificates || echo nope',
+    'curl ca-certificates | tee apt.log',
+    'curl ca-certificates ;curl --version',
+    'curl ca-certificates > /dev/null',
+    'curl ca-certificates </dev/null',
+  ]) {
+    assert.deepStrictEqual(
+      [...aptInstallPackages(aptStep(tail))].sort(),
+      expected,
+      `包名只应采集到首个分隔符/重定向之前：${tail}`,
+    );
+  }
+  for (const tail of [
+    'curl pkg;curl --version',
+    'curl ca-certificates&& curl --version',
+    'curl ca-certificates 2>&1',
+  ]) {
+    assert.throws(
+      () => aptInstallPackages(aptStep(tail)),
+      /不支持/,
+      `分隔符粘连到前一个 token 的模糊形状必须被明确拒绝：${tail}`,
+    );
+  }
 });
