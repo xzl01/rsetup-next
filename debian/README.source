@@ -127,18 +127,16 @@ Unreleased changes and the changelog
 The working tree carries the system-image installation feature set: core gates
 and image validation, the CLI, the TUI panel, the HTTP routes, the Tauri
 commands, the browser page, the new `xz-utils` dependency, and the install
-guide. `debian/changelog` currently ends at the released `0.5.0-1` entry, and the
-repository keeps no "unreleased" placeholder entry: every entry was written when
-the maintainer chose the version (the `0.5.0-1` entry arrived in the same commit
-whose subject names that version).
+guide. `debian/changelog` now opens with the `0.6.0-1` entry whose only update
+note is「添加主控和板端」, and the repository keeps no "unreleased" placeholder
+entry: every entry was written when the maintainer chose the version (the
+`0.5.0-1` entry arrived in the same commit whose subject names that version).
 
-Choosing the next version number and its release date is a maintainer decision,
-so no entry was invented here. Candidates to pick from:
-
-- `0.5.1-1` - patch release: the same surfaces with a new runtime dependency and
-  the packaged install guide.
-- `0.6.0-1` - minor release: a large new user-visible capability (guided,
-  irreversible system-image installation on four surfaces) plus that dependency.
+Choosing the next version number and its release date is a maintainer decision.
+For this roll that decision is recorded: `0.6.0-1` with the release date
+2026-10-25 and the update note「添加主控和板端」. Writing the entry records that
+choice only; it does not claim a completed remote publication or a passed
+verification run.
 
 The distribution (`bookworm`), urgency (`medium`), bullet style and trailer
 format follow the existing entries. The trailer date must be the actual release

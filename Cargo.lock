@@ -1504,7 +1504,7 @@ dependencies = [
 
 [[package]]
 name = "rsetup-board-agent"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "hex",
  "rsetup-core",
@@ -1519,7 +1519,7 @@ dependencies = [
 
 [[package]]
 name = "rsetup-controller"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "argon2",
  "axum",
@@ -1545,7 +1545,7 @@ dependencies = [
 
 [[package]]
 name = "rsetup-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1559,7 +1559,7 @@ dependencies = [
 
 [[package]]
 name = "rsetup-next"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1580,7 +1580,7 @@ dependencies = [
 
 [[package]]
 name = "rsetup-protocol"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "hex",
  "ring",
@@ -1589,7 +1589,7 @@ dependencies = [
 
 [[package]]
 name = "rsetup-tunnel"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bytes",
  "h2",
