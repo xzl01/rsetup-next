@@ -36,6 +36,7 @@ crates/rsetup-tunnel/target/
 /.pc
 
 # Editors, local environment, and review artifacts
+/.cargo-local/
 /.vscode*
 /.impeccable/review
 .env

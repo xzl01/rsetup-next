@@ -69,6 +69,7 @@ use uuid::Uuid;
 
 use rsetup_controller::ControllerError;
 use rsetup_controller::tasks::board_client::{BoardClient, BoardClientError, BoardFuture};
+use rsetup_controller::tasks::evidence::{ApplyOutcome, TaskEvidenceApplier};
 use rsetup_controller::tasks::model::{
     MainTaskOutcome, MainTaskState, ReasonCode, SubTaskState, TaskIntent,
 };
@@ -628,7 +629,7 @@ impl SchedulerStore for FakeStore {
 
 // ---- 板端 fake（6 方法，记账 prepare/execute 次序）-------------------------
 
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug)]
 enum ExecOutcome {
     Ok,
     Timeout,
@@ -2599,4 +2600,216 @@ async fn finalize_write_is_cas_guarded() {
             .main_summary(store.main_task_of(other_id).expect("主任务"))
             .is_none()
     );
+}
+
+// ============================================================================
+// 执行结果持久化：注入 `TaskEvidenceApplier` 后 execute 返回记录的落库行为
+// ============================================================================
+
+/// 可注入的 fake 证据应用器：记录每次调用的 `(device_id, sub_task_id)` 并返回
+/// 预置结果（与 `transport_listener.rs` 测试内 `RecordingApplier` 同一套路）。
+struct FakeApplier {
+    /// `None` 模拟应用出错（连接/存储失败）。
+    outcome: Option<ApplyOutcome>,
+    calls: Mutex<Vec<([u8; 32], String)>>,
+}
+
+impl FakeApplier {
+    fn new(outcome: Option<ApplyOutcome>) -> Arc<Self> {
+        Arc::new(Self {
+            outcome,
+            calls: Mutex::new(Vec::new()),
+        })
+    }
+    fn applied() -> Arc<Self> {
+        Self::new(Some(ApplyOutcome::Applied {
+            subtask_id: v4(0x0a91),
+            new_state: SubTaskState::Accepted,
+        }))
+    }
+    fn calls(&self) -> Vec<([u8; 32], String)> {
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl TaskEvidenceApplier for FakeApplier {
+    fn apply_task_record(
+        &self,
+        device_id: &[u8; 32],
+        record: &TaskRecord,
+    ) -> Pin<Box<dyn Future<Output = Result<ApplyOutcome, ControllerError>> + Send + '_>> {
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((*device_id, record.sub_task_id.clone()));
+        let result = self.outcome.ok_or(ControllerError::NotFound);
+        Box::pin(async move { result })
+    }
+}
+
+#[tokio::test]
+async fn execute_record_is_applied_via_injected_applier() {
+    // 装配 applier 后：execute 返回的合法派发确认态记录被落库推进，且
+    // **绑定本次候选的设备与子任务**；内存 accepted 计数口径不变。
+    let trace = Trace::default();
+    let store = FakeStore::new(trace.clone());
+    let board = FakeBoard::new(trace.clone());
+    let clock = FakeClock::new(1_000, true);
+    let id = v4(701);
+    let device = [0x71; 32];
+    store.push_row(admissible_candidate(id, device, 10_000));
+    let applier = FakeApplier::applied();
+
+    let sched = build_scheduler(store.clone(), board.clone(), clock).with_applier(applier.clone());
+    let summary = sched.run_once(0).await.expect("run_once 成功");
+
+    assert_eq!(summary.execute_accepted, 1, "内存计数口径不因落库而改变");
+    assert_eq!(summary.execute_records_applied, 1, "applier 确认 Applied");
+    let calls = applier.calls();
+    assert_eq!(calls.len(), 1, "至多一次 execute，落库也恰好一次");
+    assert_eq!(calls[0].0, device, "落库绑定候选所属设备");
+    assert_eq!(calls[0].1, id.to_string(), "交落库的记录就是本子任务的记录");
+}
+
+#[tokio::test]
+async fn illegal_execute_record_never_reaches_applier() {
+    // 非法/错绑记录（错任务 + 错 boot）：记 record_rejects，但**绝不**交给 applier
+    // ——不可信的字节不入库。
+    let trace = Trace::default();
+    let store = FakeStore::new(trace.clone());
+    let board = FakeBoard::new(trace.clone());
+    let clock = FakeClock::new(1_000, true);
+    let id = v4(702);
+    store.push_row(admissible_candidate(id, [0x72; 32], 10_000));
+    board.set_record(id, board_record(v4(0xdead)));
+    let applier = FakeApplier::applied();
+
+    let sched = build_scheduler(store.clone(), board.clone(), clock).with_applier(applier.clone());
+    let summary = sched.run_once(0).await.expect("run_once 成功");
+
+    assert_eq!(summary.record_rejects, 1);
+    assert_eq!(summary.execute_records_applied, 0);
+    assert!(
+        applier.calls().is_empty(),
+        "非法/错绑记录绝不交给 applier（不可信字节不入库）"
+    );
+}
+
+#[tokio::test]
+async fn legal_terminal_record_is_forwarded_to_applier() {
+    // 合法终态记录（failed）：三分类口径不变（不记 accepted、不记 record_rejects、
+    // 转只读核验），但它**是**合法记录——跃迁合法性由 applier 状态机统一裁决，
+    // 因此同样交其落库尝试推进。
+    let trace = Trace::default();
+    let store = FakeStore::new(trace.clone());
+    let board = FakeBoard::new(trace.clone());
+    let clock = FakeClock::new(1_000, true);
+    let id = v4(703);
+    store.push_row(admissible_candidate(id, [0x73; 32], 10_000));
+    board.set_record(id, terminal_record(id, "failed", Some("OS_ERROR"), false));
+    let applier = FakeApplier::applied();
+
+    let sched = build_scheduler(store.clone(), board.clone(), clock).with_applier(applier.clone());
+    let summary = sched.run_once(0).await.expect("run_once 成功");
+
+    assert_eq!(summary.execute_accepted, 0);
+    assert_eq!(summary.record_rejects, 0);
+    assert_eq!(summary.execute_unverified, 1, "非确认态仍只转只读核验");
+    assert_eq!(
+        summary.execute_records_applied, 1,
+        "合法记录交给 applier 并 Applied"
+    );
+    assert_eq!(applier.calls().len(), 1);
+}
+
+#[tokio::test]
+async fn applier_negative_or_error_keeps_read_only_semantics() {
+    // applier 判否（陈旧/错配/未找到）或应用出错：`execute_records_applied` 不增长，
+    // 内存计数与无落库时**完全一致**——落库失败绝不上抛、绝不改判、绝不重发。
+    for outcome in [
+        ApplyOutcome::IgnoredStale,
+        ApplyOutcome::RejectedMismatch,
+        ApplyOutcome::NotFound,
+    ] {
+        let trace = Trace::default();
+        let store = FakeStore::new(trace.clone());
+        let board = FakeBoard::new(trace.clone());
+        let clock = FakeClock::new(1_000, true);
+        let id = v4(704);
+        store.push_row(admissible_candidate(id, [0x74; 32], 10_000));
+        let applier = FakeApplier::new(Some(outcome));
+
+        let sched =
+            build_scheduler(store.clone(), board.clone(), clock).with_applier(applier.clone());
+        let summary = sched.run_once(0).await.expect("run_once 成功");
+
+        assert_eq!(summary.execute_accepted, 1, "判否不改内存计数口径");
+        assert_eq!(summary.execute_records_applied, 0);
+        assert_eq!(applier.calls().len(), 1);
+    }
+
+    // 应用出错（Err）：同上，且错误被吞并——run_once 整体仍然成功。
+    let trace = Trace::default();
+    let store = FakeStore::new(trace.clone());
+    let board = FakeBoard::new(trace.clone());
+    let clock = FakeClock::new(1_000, true);
+    let id = v4(705);
+    store.push_row(admissible_candidate(id, [0x75; 32], 10_000));
+    let applier = FakeApplier::new(None);
+
+    let sched = build_scheduler(store.clone(), board.clone(), clock).with_applier(applier.clone());
+    let summary = sched.run_once(0).await.expect("落库失败不上抛");
+
+    assert_eq!(summary.execute_accepted, 1);
+    assert_eq!(summary.execute_records_applied, 0);
+    assert_eq!(applier.calls().len(), 1);
+}
+
+#[tokio::test]
+async fn execute_timeout_or_rejection_never_reaches_applier() {
+    // 结果未知（Timeout/Transport）与明确拒绝都**没有**可落库的返回记录：
+    // applier 恒不被调用，收敛由核验/恢复路径负责。
+    for outcome in [
+        ExecOutcome::Timeout,
+        ExecOutcome::Transport,
+        ExecOutcome::Rejected,
+    ] {
+        let trace = Trace::default();
+        let store = FakeStore::new(trace.clone());
+        let board = FakeBoard::new(trace.clone());
+        let clock = FakeClock::new(1_000, true);
+        let id = v4(706);
+        store.push_row(admissible_candidate(id, [0x76; 32], 10_000));
+        board.set_execute(id, outcome);
+        let applier = FakeApplier::applied();
+
+        let sched =
+            build_scheduler(store.clone(), board.clone(), clock).with_applier(applier.clone());
+        let summary = sched.run_once(0).await.expect("run_once 成功");
+
+        assert!(summary.execute_accepted + summary.execute_rejected <= 1);
+        assert_eq!(summary.execute_records_applied, 0);
+        assert!(applier.calls().is_empty(), "{outcome:?}：无返回记录可落库");
+    }
+}
+
+#[tokio::test]
+async fn scheduler_without_applier_keeps_records_unpersisted() {
+    // 缺省构造（None applier）：与修复前行为完全一致——计数不变、
+    // `execute_records_applied` 恒 0（内存计数绝不冒充已落库）。
+    let trace = Trace::default();
+    let store = FakeStore::new(trace.clone());
+    let board = FakeBoard::new(trace.clone());
+    let clock = FakeClock::new(1_000, true);
+    let id = v4(707);
+    store.push_row(admissible_candidate(id, [0x77; 32], 10_000));
+
+    let sched = build_scheduler(store.clone(), board.clone(), clock);
+    let summary = sched.run_once(0).await.expect("run_once 成功");
+
+    assert_eq!(summary.execute_accepted, 1);
+    assert_eq!(summary.execute_records_applied, 0, "无 applier 即无落库");
 }

@@ -10,6 +10,8 @@
 //! - 状态机严格合法跃迁（不反向跃迁，queued/held -> accepted -> verifying ->
 //!   succeeded/failed/unknown；`dispatching` 不得直跳 `succeeded`，`queued`/`held`
 //!   不得直跳 `verifying`/`succeeded`/`unknown`）；
+//! - `succeeded` 判定严格核验 04 §6 成功证据：必须携带 `boot_transition_observed`
+//!   证据，且 `observed_boot_id` 存在并与 `pre_boot_id` 不同，缺一即拒；
 //! - 板端 `attempted` 记录（03 §5 词表）按派发确认态 `accepted` 收敛；
 //! - 终态以**物理删除**释放设备锁（与取消/过期/手工释放同一口径），但 `unknown`
 //!   保留设备锁；
@@ -30,7 +32,9 @@ use crate::ControllerError;
 use crate::events::{EventBus, EventEnvelope, EventObjectAudience};
 use crate::tasks::model::{ReasonCode, SubTaskState};
 use crate::tasks::recovery::calculate_main_task_outcome;
-use crate::tasks::repository::{column, enum_wire, mysql_uuid, task_row_decode_error};
+use crate::tasks::repository::{
+    column, enum_wire, fixed_mysql_bytes, mysql_uuid, task_row_decode_error,
+};
 use crate::tasks::service::counts_json_of;
 
 /// 位置绑定：与 `tasks::params!` 宏完全同口径（编码失败 → `Database(Encode)` 503）。
@@ -47,6 +51,11 @@ where
 /// 中控十态无对应项，证据侧与 `accepted` 同义收敛；派发侧同一口径见
 /// [`crate::tasks::scheduler::DISPATCH_ACCEPT_STATES`]。
 const BOARD_STATE_ATTEMPTED: &str = "attempted";
+
+/// 04 §6 成功证据词表（03 §5，与 `rsetup_protocol::wire::EVIDENCE_KINDS` 同一词表）
+/// 中唯一的**可靠启动切换证据**标识：`succeeded` 必须携带该证据，且
+/// `observed_boot_id` 与 `pre_boot_id` 不同，否则不得判成功、不得释放设备锁。
+const EVIDENCE_KIND_BOOT_TRANSITION: &str = "boot_transition_observed";
 
 /// 状态跃迁判定裁决
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -185,6 +194,36 @@ pub fn evaluate_record_transition(
         };
     }
 
+    // 04 §6：`succeeded` 不是"记录里出现了 succeeded 字样"就成立，必须同时满足——
+    // 1. `observed_boot_id` 存在且非空（缺失即拒绝）；
+    // 2. `evidence_kind` 为可靠启动切换证据 `boot_transition_observed`（缺失即拒绝）；
+    // 3. `observed_boot_id` 与 `pre_boot_id` 不同（boot 未切换即拒绝）。
+    // 该校验必须放在合法跃迁判定**之后**：`dispatching -> succeeded` 这类非法跃迁
+    // 仍优先返回 `InvalidStateTransition`，不被证据缺失误报为内容不符。记录已在前
+    // 方核验 `record.pre_boot_id == expected_pre_boot_id`，此处对两者都比对，防御
+    // 纯函数被其他调用方直接复用。
+    if target_state == SubTaskState::Succeeded {
+        let Some(observed_boot_id) = record
+            .observed_boot_id
+            .as_deref()
+            .filter(|observed| !observed.is_empty())
+        else {
+            return TransitionVerdict::RejectMismatch {
+                reason: "missing_observed_boot_id",
+            };
+        };
+        if record.evidence_kind.as_deref() != Some(EVIDENCE_KIND_BOOT_TRANSITION) {
+            return TransitionVerdict::RejectMismatch {
+                reason: "missing_boot_transition_evidence",
+            };
+        }
+        if observed_boot_id == expected_pre_boot_id || observed_boot_id == record.pre_boot_id {
+            return TransitionVerdict::RejectMismatch {
+                reason: "boot_id_unchanged",
+            };
+        }
+    }
+
     let parsed_reason = record
         .reason_code
         .as_deref()
@@ -287,7 +326,7 @@ impl TaskEvidenceApplier for SqlxTaskEvidenceApplier {
 
             // 1. 查询并锁住子任务行（`lock_generation` 是本子任务持有设备锁的代际，
             //    释放锁时必须按代际 CAS，绝不触碰该设备后续任务的新锁）
-            let select_sql = "SELECT id, main_task_id, state, reason_code, pre_boot_id, \
+            let select_sql = "SELECT id, main_task_id, device_id, state, reason_code, pre_boot_id, \
                               revision, lock_generation, \
                               JSON_EXTRACT(evidence_json, '$.record_version') AS curr_rec_ver \
                               FROM sub_tasks WHERE id = ? FOR UPDATE";
@@ -303,6 +342,14 @@ impl TaskEvidenceApplier for SqlxTaskEvidenceApplier {
             }
             let row = &rows[0];
 
+            // 1.1 结果写入必须绑定所属设备：认证公钥与任务归属设备不一致时，
+            //     说明该设备上报了不属于自己的子任务 ID，回滚并以错配拒绝。
+            let task_dev_id = fixed_mysql_bytes::<32>(&column::<Vec<u8>>(row, "device_id")?)?;
+            if task_dev_id != dev_id {
+                tx.rollback().await.ok();
+                return Ok(ApplyOutcome::RejectedMismatch);
+            }
+
             let main_task_id = mysql_uuid(
                 &row.try_get::<Vec<u8>, _>("main_task_id")
                     .map_err(|_| task_row_decode_error())?,
@@ -315,9 +362,9 @@ impl TaskEvidenceApplier for SqlxTaskEvidenceApplier {
                 .try_get("pre_boot_id")
                 .map_err(|_| task_row_decode_error())?;
             let pre_boot_id_str = current_pre_boot.unwrap_or_default();
-            let revision: i64 = row
-                .try_get("revision")
-                .map_err(|_| task_row_decode_error())?;
+            // revision 为 BIGINT UNSIGNED，按 u64 严格解码（与 lock_generation 同一
+            // 口径）；i64 解码会被 SQLx MySQL 驱动以类型不兼容拒绝（503）。
+            let revision: u64 = column(row, "revision")?;
             // lock_generation 为 BIGINT UNSIGNED，按 u64 严格解码（与 service 释放
             // 路径同一口径）；未持锁时为 0，DELETE 按代际自然不命中任何行。
             let lock_generation: u64 = column(row, "lock_generation")?;
@@ -447,7 +494,7 @@ impl TaskEvidenceApplier for SqlxTaskEvidenceApplier {
             if let Some(bus) = events {
                 bus.publish(EventEnvelope::task_updated(
                     &main_task_id.to_string(),
-                    revision.saturating_add(1) as u64,
+                    revision.saturating_add(1),
                     EventObjectAudience::admins(),
                 ));
             }

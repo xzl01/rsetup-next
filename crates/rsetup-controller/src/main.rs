@@ -952,17 +952,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // 启动生产任务调度与持续核验循环
                 let sched_pool = db_for_scheduler;
-                let sched_store = Arc::new(SqlxSchedulerStore::new(sched_pool.clone()));
+                // 存储侧与调度器侧**共用同一个**单调时钟：候选的排队截止由存储侧折算成
+                // 该时钟原点的单调毫秒，调度器再以同一时钟的读数比较，原点不同即恒不等。
+                let sched_clock = Arc::new(SystemMonoClock::new());
+                let sched_store = Arc::new(SqlxSchedulerStore::with_clock(
+                    sched_pool.clone(),
+                    sched_clock.clone(),
+                ));
                 let sched_board =
                     Arc::new(TransportBoardClient::new(transport_manager.as_device_rpc()));
-                let sched_clock = Arc::new(SystemMonoClock::new());
-                let scheduler = Arc::new(TaskScheduler::new(
-                    sched_store,
-                    sched_board,
-                    sched_clock,
-                    SchedulerPolicy::default(),
-                    process_epoch,
-                ));
+                // 执行结果落库线：与板端主动上报同一个 `SqlxTaskEvidenceApplier`
+                // 语义——`execute` 同步返回的合法记录经同一状态机短事务推进并回写
+                // 主任务汇总；未装配时调度器只有内存计数 + 只读核验。
+                let sched_applier =
+                    Arc::new(SqlxTaskEvidenceApplier::new(sched_pool.clone(), None));
+                let scheduler = Arc::new(
+                    TaskScheduler::new(
+                        sched_store.clone(),
+                        sched_board,
+                        sched_clock,
+                        SchedulerPolicy::default(),
+                        process_epoch,
+                    )
+                    .with_applier(sched_applier),
+                );
+                // 持续核验扫尾（04 §5.3/§6）：`dispatching` 超过 `observe_deadline`
+                // 仍无结果的子任务收敛为 `unknown` + `RESULT_TIMEOUT`（保留设备锁），
+                // 不让丢失结果的未决任务无限期霸占设备锁导致后续任务饥饿。
+                let sched_reap_store = sched_store;
                 let mut sched_shutdown = shutdown_rx.clone();
                 // 恢复模式闸门：与 transport 探针、HTTP `/system/status` 是同一个
                 // `Arc<RuntimeRecoveryController>`（05 §9 唯一真源）。
@@ -973,6 +990,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let sched_task = tokio::spawn(async move {
                     let mut interval =
                         tokio::time::interval(std::time::Duration::from_millis(1000));
+                    // 扫尾节流计数：派发每 tick 一次，超时收敛每 5 秒一次
+                    //（观察期限本身是分钟级，无需每秒全表重判）。
+                    let mut reap_ticks: u32 = 0;
                     loop {
                         tokio::select! {
                             _ = sched_shutdown.changed() => {
@@ -986,6 +1006,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // 登录、改密、注销、审计、只读核验与退出恢复模式）。
                                 if !sched_recovery.allows_scheduling() {
                                     continue;
+                                }
+                                // 超时未决扫尾先于取槽计数：已超观察期限、结果丢失
+                                // 的 `dispatching` 先收敛为 `unknown`（04 §3 保留锁、
+                                // 占槽语义不变），收敛本身让库里状态可审计。
+                                reap_ticks = reap_ticks.wrapping_add(1);
+                                if reap_ticks.is_multiple_of(5) {
+                                    match sched_reap_store.converge_timed_out_dispatching().await {
+                                        Ok(0) => {}
+                                        Ok(n) => eprintln!(
+                                            "controller task scheduler 超时dispatching收敛为unknown: {n}"
+                                        ),
+                                        Err(e) => eprintln!(
+                                            "controller task scheduler 超时dispatching扫尾失败: {e}"
+                                        ),
+                                    }
                                 }
                                 let active_slots: usize = sqlx::query_scalar::<_, i64>(
                                     "SELECT COUNT(*) FROM sub_tasks WHERE state IN ('dispatching', 'accepted', 'verifying')"

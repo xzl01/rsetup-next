@@ -16,6 +16,11 @@
 //! `execute` 的 `Timeout`/`Transport` 结果未知**只转只读核验、绝不重发、绝不判成功**；
 //! 提交失败/未知、未准入、非 queued、无锁/撤权路径下 `execute` 恒为 0。
 //!
+//! 执行结果持久化（04 §5.2/§6）：装配了 [`TaskEvidenceApplier`] 时，`execute` 同步
+//! 返回的**合法**记录（派发确认态或合法终态）会交给 applier 落库推进（与板端主动
+//! 上报同一状态机口径）；未装配、applier 判否（陈旧/错配/未找到）或应用失败时
+//! **仅保留只读核验**——内存计数不冒充已落库，状态收敛由核验/恢复路径兜底。
+//!
 //! 时间纪律（同一切片的第二道闸）：一次周期会在候选之间反复 `.await`（`prepare`
 //! 往返、短事务提交），周期起点的那一次读时**只**够回答"本轮是否值得开始"，**不得**
 //! 当作任何候选 TTL/票据寿命的基线。因此队列期限与票据剩余寿命都在**逐候选**重取的
@@ -47,6 +52,7 @@ use uuid::Uuid;
 
 use crate::ControllerError;
 use crate::tasks::board_client::{BoardClient, BoardClientError};
+use crate::tasks::evidence::{ApplyOutcome, TaskEvidenceApplier};
 use crate::tasks::model::{ReasonCode, SubTaskState, TaskIntent};
 
 /// 全局并发分派槽位上限（05 §5 待审默认）。
@@ -573,6 +579,12 @@ pub struct ScheduleSummary {
     /// （[`DISPATCH_ACCEPT_STATES`]）的数（可记为已受理）。合法但非确认态的终态
     /// 记录（`succeeded`/`failed`/`unknown`）不计入本数。
     pub execute_accepted: usize,
+    /// 上条的**观察子集**（不是额外的发送）：execute 返回的**合法**记录中，经注入的
+    /// [`TaskEvidenceApplier`] 实际落库推进（[`ApplyOutcome::Applied`]）的数。
+    /// 非法/错绑记录**绝不**交给 applier；未装配 applier、applier 判否
+    /// （陈旧/错配/未找到）或应用出错都不计——那些记录仍只有只读核验，内存计数
+    /// 不冒充已落库。
+    pub execute_records_applied: usize,
     /// 结果未知、只转只读核验的数：四种情形并入计数——`Timeout`/`Transport`；
     /// 记录非法/错绑（[`ScheduleSummary::record_rejects`]）；记录合法但 `state`
     /// 非派发确认态（`succeeded`/`failed`/`unknown`）；已 `Confirmed` 但发 execute
@@ -641,7 +653,7 @@ impl Default for SchedulerPolicy {
     }
 }
 
-/// 一次调度周期的编排器：持有三个可注入边界 + 策略。
+/// 一次调度周期的编排器：持有三个可注入边界 + 策略 + 可选的证据落库 applier。
 pub struct TaskScheduler<S, C, K> {
     store: Arc<S>,
     board: Arc<C>,
@@ -649,6 +661,10 @@ pub struct TaskScheduler<S, C, K> {
     policy: SchedulerPolicy,
     /// 本进程 controller_epoch（落 intent.controller_epoch）；非去重 seen 集合。
     controller_epoch: Uuid,
+    /// 执行结果落库应用器（04 §5.2/§6）：`execute` 同步返回的合法记录经它推进
+    /// 持久状态机（与板端主动上报同一实现、同一口径）。`None` 时调度器退回
+    /// 纯内存计数 + 只读核验——缺省构造保持无库环境可用，生产装配必须注入。
+    applier: Option<Arc<dyn TaskEvidenceApplier>>,
 }
 
 impl<S, C, K> TaskScheduler<S, C, K>
@@ -657,6 +673,7 @@ where
     C: BoardClient,
     K: MonoClock,
 {
+    /// 缺省构造：不带证据落库 applier（执行结果只计数、转只读核验）。
     pub fn new(
         store: Arc<S>,
         board: Arc<C>,
@@ -670,7 +687,16 @@ where
             clock,
             policy,
             controller_epoch,
+            applier: None,
         }
+    }
+
+    /// 注入执行结果落库 applier（生产装配位）：`execute` 返回的合法记录将交其
+    /// 持久推进；落库失败/判否不影响本周期其余候选，也不改变只读核验语义。
+    #[must_use]
+    pub fn with_applier(mut self, applier: Arc<dyn TaskEvidenceApplier>) -> Self {
+        self.applier = Some(applier);
+        self
     }
 
     /// 单个候选的准入预筛（复用 [`admit_for_dispatch`] 严格顺序）。
@@ -848,6 +874,30 @@ where
     /// 既不记 accepted、也不是非法记录，只能转只读核验。
     fn is_dispatch_accepted(record: &TaskRecord) -> bool {
         DISPATCH_ACCEPT_STATES.contains(&record.state.as_str())
+    }
+
+    /// 把 `execute` 同步返回的**合法**记录交给注入的 [`TaskEvidenceApplier`] 落库
+    /// 推进（04 §5.2/§6：execute 返回、主动上报、核验查询三条路径共用同一状态机，
+    /// 陈旧/错绑/非法跃迁由 applier 内部裁决，调度器不复算）。
+    ///
+    /// 返回 `true` 当且仅当 applier 已装配且确认 [`ApplyOutcome::Applied`]。
+    /// 未装配、判否（陈旧/错配/未找到）与出错一律返回 `false`——**绝不**上抛、
+    /// **绝不**改判、**绝不**重发：记录本身已计数，状态收敛由核验/恢复路径兜底。
+    async fn persist_execute_record(
+        &self,
+        candidate: &DispatchCandidate,
+        record: &TaskRecord,
+    ) -> bool {
+        let Some(applier) = self.applier.as_ref() else {
+            return false;
+        };
+        match applier
+            .apply_task_record(&candidate.device_id, record)
+            .await
+        {
+            Ok(ApplyOutcome::Applied { .. }) => true,
+            Ok(_) | Err(_) => false,
+        }
     }
 
     /// 运行一次调度周期（04 §5.1/§5.2 核心边界）。
@@ -1162,19 +1212,28 @@ where
             summary.executed += 1;
             match self.board.execute(&cand.device_id, &ticket, &request).await {
                 // 返回记录三分类（互斥，不得合并计数）：
-                //   a) 非法/错绑记录（DTO、任务、boot、journal）→ record_rejects + 只读核验；
+                //   a) 非法/错绑记录（DTO、任务、boot、journal）→ record_rejects + 只读核验，
+                //      **绝不**交给 applier（不可信的字节不入库）；
                 //   b) 合法但非派发确认态（succeeded/failed/unknown）→ 只转只读核验，
                 //      它不是非法记录（不计 record_rejects），也不是派发确认（不计 accepted）；
                 //   c) 合法且 state ∈ DISPATCH_ACCEPT_STATES → 记 accepted。
+                // b) 与 c) 都是合法记录：装配了 applier 时先交其落库推进（跃迁合法性、
+                // 版本陈旧、成功证据等由 applier 状态机统一裁决），Applied 计入
+                // execute_records_applied 观察子集；未装配/判否/出错仅保留只读核验，
+                // 上面的内存计数口径不因落库结果而改变。
                 // 三类一律不重发（至多一次 execute 由单调用点保证）。
                 Ok(record) => {
                     if Self::record_rejection_reason(&cand, &ticket, &record).is_some() {
                         summary.record_rejects += 1;
                         summary.execute_unverified += 1;
-                    } else if !Self::is_dispatch_accepted(&record) {
-                        summary.execute_unverified += 1;
                     } else {
-                        summary.execute_accepted += 1;
+                        let applied = self.persist_execute_record(&cand, &record).await;
+                        summary.execute_records_applied += usize::from(applied);
+                        if !Self::is_dispatch_accepted(&record) {
+                            summary.execute_unverified += 1;
+                        } else {
+                            summary.execute_accepted += 1;
+                        }
                     }
                 }
                 // 超时/传输：结果未知，只转只读核验（由恢复/核验路径处理），绝不重发。

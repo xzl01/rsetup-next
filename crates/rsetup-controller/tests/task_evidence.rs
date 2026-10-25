@@ -31,6 +31,23 @@ fn board_record(
     }
 }
 
+/// 由 `pre_boot_id` 确定性地派生一个与之**不同**的规范 UUIDv4 字符串（只翻转
+/// time_low 区间的低位，不触碰 version/variant 位），用作 `observed_boot_id`。
+fn observed_boot_of(pre_boot_id: &str) -> String {
+    let base = Uuid::parse_str(pre_boot_id).expect("pre_boot_id 必须是合法 UUID");
+    let mut bytes = *base.as_bytes();
+    bytes[0] ^= 0x0f;
+    Uuid::from_bytes(bytes).to_string()
+}
+
+/// 为记录补齐 04 §6 要求的完整成功证据：`evidence_kind=boot_transition_observed`
+/// 且 `observed_boot_id` 存在并与 `pre_boot_id` 不同。
+fn with_success_evidence(mut record: TaskRecord, pre_boot_id: &str) -> TaskRecord {
+    record.observed_boot_id = Some(observed_boot_of(pre_boot_id));
+    record.evidence_kind = Some("boot_transition_observed".into());
+    record
+}
+
 #[test]
 fn evaluate_record_transition_accepts_valid_accepted_progression() {
     let subtask_id = Uuid::new_v4();
@@ -96,6 +113,98 @@ fn evaluate_record_transition_releases_lock_on_terminal_success() {
             reason_code: None,
             release_lock: true,
         }
+    );
+}
+
+#[test]
+fn evaluate_record_transition_rejects_succeeded_without_observed_boot_id() {
+    let subtask_id = Uuid::new_v4();
+    let pre_boot_id = Uuid::new_v4().to_string();
+
+    // 04 §6：跃迁合法（accepted/verifying/unknown 均可前进到 succeeded），但记录
+    // 缺少 observed_boot_id 时不得判成功，必须按证据缺失拒绝。
+    for from in [
+        SubTaskState::Accepted,
+        SubTaskState::Verifying,
+        SubTaskState::Unknown,
+    ] {
+        let record = board_record(subtask_id, &pre_boot_id, "succeeded", 2);
+        assert!(
+            record.observed_boot_id.is_none(),
+            "夹具必须缺 observed_boot_id"
+        );
+        let verdict = evaluate_record_transition(subtask_id, &pre_boot_id, from, 1, &record);
+        assert_eq!(
+            verdict,
+            TransitionVerdict::RejectMismatch {
+                reason: "missing_observed_boot_id"
+            },
+            "{from:?} -> succeeded 缺 observed_boot_id 必须被拒"
+        );
+    }
+}
+
+#[test]
+fn evaluate_record_transition_rejects_succeeded_without_boot_transition_evidence() {
+    let subtask_id = Uuid::new_v4();
+    let pre_boot_id = Uuid::new_v4().to_string();
+    let observed_boot = observed_boot_of(&pre_boot_id);
+
+    // observed_boot_id 已存在，但没有任何启动切换证据：boot 变化可能与本指令无关
+    // （如人工重启），缺 boot_transition_observed 证据不得判成功。
+    let mut record = board_record(subtask_id, &pre_boot_id, "succeeded", 2);
+    record.observed_boot_id = Some(observed_boot.clone());
+    let verdict = evaluate_record_transition(
+        subtask_id,
+        &pre_boot_id,
+        SubTaskState::Verifying,
+        1,
+        &record,
+    );
+    assert_eq!(
+        verdict,
+        TransitionVerdict::RejectMismatch {
+            reason: "missing_boot_transition_evidence"
+        },
+        "缺 evidence_kind 的 succeeded 必须被拒"
+    );
+
+    // evidence_kind 为词表内其他证据（如板端确认态 attempted）同样不是启动切换
+    // 证据：DTO 词表校验或证据核验必须拒绝，绝不放行。
+    let mut record = board_record(subtask_id, &pre_boot_id, "succeeded", 2);
+    record.observed_boot_id = Some(observed_boot);
+    record.evidence_kind = Some("attempted".into());
+    let verdict = evaluate_record_transition(
+        subtask_id,
+        &pre_boot_id,
+        SubTaskState::Verifying,
+        1,
+        &record,
+    );
+    assert!(
+        matches!(verdict, TransitionVerdict::RejectMismatch { .. }),
+        "非 boot_transition_observed 证据的 succeeded 必须被拒，实际 {verdict:?}"
+    );
+}
+
+#[test]
+fn evaluate_record_transition_rejects_succeeded_with_unchanged_boot_id() {
+    let subtask_id = Uuid::new_v4();
+    let pre_boot_id = Uuid::new_v4().to_string();
+
+    // 04 §6：observed_boot_id 与 pre_boot_id 相同 = 没有发生启动切换，证据不足，
+    // 即使证据字段齐全也必须拒绝，绝不释放设备锁。
+    let mut record = board_record(subtask_id, &pre_boot_id, "succeeded", 2);
+    record.observed_boot_id = Some(pre_boot_id.clone());
+    record.evidence_kind = Some("boot_transition_observed".into());
+    let verdict =
+        evaluate_record_transition(subtask_id, &pre_boot_id, SubTaskState::Accepted, 1, &record);
+    assert_eq!(
+        verdict,
+        TransitionVerdict::RejectMismatch {
+            reason: "boot_id_unchanged"
+        },
+        "observed_boot_id == pre_boot_id 的 succeeded 必须被拒"
     );
 }
 
@@ -259,6 +368,12 @@ fn evaluate_record_transition_accepts_legal_forward_matrix() {
     ];
     for (from, state) in legal {
         let record = board_record(subtask_id, &pre_boot_id, state, 2);
+        // 04 §6：succeeded 跃迁必须携带完整启动切换证据，矩阵夹具统一补齐。
+        let record = if *state == "succeeded" {
+            with_success_evidence(record, &pre_boot_id)
+        } else {
+            record
+        };
         let verdict = evaluate_record_transition(subtask_id, &pre_boot_id, *from, 1, &record);
         assert!(
             matches!(verdict, TransitionVerdict::Apply { .. }),
