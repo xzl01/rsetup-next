@@ -412,7 +412,12 @@ jobs:
         run: |
           printf '%s\tinstall-begin\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$RSETUP_POLICY_LOG"
           apt-get update
-          apt-get install -y ./artifacts/rsetup-next_*_${{ matrix.architecture }}.deb ./artifacts/rsetup-controller_*_${{ matrix.architecture }}.deb ./artifacts/rsetup-board-agent_*_${{ matrix.architecture }}.deb
+          # 根因（CI run 40124668180）：bookworm-slim 镜像的 /etc/dpkg/dpkg.cfg.d/docker
+          # 有 path-exclude /usr/share/doc/*（只保留 copyright），把包内确有的配置示例
+          # rsetup-controller.default 在安装时裁掉，smoke 的 test -f 当场 exit 1。
+          # 同一条 apt-get install 传精确 --path-include：命令行规则排在镜像配置文件
+          # 规则之后生效，仅豁免这一个文件——不取消全局裁剪，也不全量保留 docs。
+          apt-get install -y -o 'Dpkg::Options::=--path-include=/usr/share/doc/rsetup-controller/rsetup-controller.default' ./artifacts/rsetup-next_*_${{ matrix.architecture }}.deb ./artifacts/rsetup-controller_*_${{ matrix.architecture }}.deb ./artifacts/rsetup-board-agent_*_${{ matrix.architecture }}.deb
           printf '%s\tinstall-end\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$RSETUP_POLICY_LOG"
       - name: Smoke test on Debian 12
         run: |

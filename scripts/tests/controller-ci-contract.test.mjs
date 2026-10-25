@@ -1648,3 +1648,308 @@ test('aptInstallPackages 在 shell 分隔符处截断包名，粘连形状明确
     );
   }
 });
+
+// ---------------------------------------------------------------------------
+// debian-12-runtime：同一条 apt-get install 传精确 --path-include，保留
+// rsetup-controller 包内配置示例（CI run 40124668180 根因回归）
+// ---------------------------------------------------------------------------
+//
+// 根因（官方 Debian12 rootfs 现场复现，/tmp/rsetup-smoke-40124668180-repro-complete.txt）：
+// debian:bookworm-slim 镜像自带 /etc/dpkg/dpkg.cfg.d/docker 的
+// `path-exclude /usr/share/doc/*` 只保留 copyright，把包内确实携带的配置示例
+// rsetup-controller.default 在安装时裁掉，smoke 步骤的
+// `test -f /usr/share/doc/rsetup-controller/rsetup-controller.default`
+// 装完当场 exit 1（job 120965967035；amd64/arm64 产物内均含该文件）。
+// 同一 .deb 用 dpkg --path-include=<精确目标> 重装后原 smoke 全过 exit 0
+// （/tmp/rsetup-smoke-40124668180-include-validation.txt）。
+//
+// 修复口径：**原 apt-get install 同一个调用**追加
+// `-o Dpkg::Options::=--path-include=<精确目标>`——命令行规则排在镜像配置文件
+// 规则之后生效（后规则优先），只放行这一个文件：不取消 slim 全局裁剪、不全量
+// 保留 /usr/share/doc、不换镜像、不把示例搬去 /etc/default、不削弱 smoke 断言。
+//
+// 合同不变量（负例逐一演示）：选项与三个本地 .deb 必须接在**同一条** apt-get
+// install 调用里，该步骤只允许出现这一条该命令；选项只出现在整行注释里
+// （extractStepBlock 的输入是剔除整行注释的 text）、只出现在**行尾**注释里
+// （stripShellTrailingComment 折叠逻辑行前剥掉未加引号的行尾 `#` 尾巴）、或挪进
+// 另一条独立 shell 命令，都不算——注释根本没传给 dpkg，后者要么不作用于这次解包、
+// 要么时机不对。
+const DEBIAN12_INSTALL_STEP = 'Install on Debian 12';
+const CONTROLLER_DOC_EXAMPLE = '/usr/share/doc/rsetup-controller/rsetup-controller.default';
+const DPKG_PATH_INCLUDE_OPTION = `Dpkg::Options::=--path-include=${CONTROLLER_DOC_EXAMPLE}`;
+
+const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// 剥掉单个物理行的 shell 行尾注释（review Minor 1）：parseJobs 只剔除整行注释，
+// 行尾 `#` 注释的字样保留在 job.text 里，合同必须只认命令代码部分。刻意只支持
+// 当前严格命令语法，不造通用 shell 解释器（$()、heredoc 等一概不管，遇到也只按
+// 下述规则处理）：
+//   * 跟踪单引号（引号内反斜杠是字面量）、双引号（反斜杠转义下一字符）与未加引号
+//     的反斜杠转义；
+//   * 只在未加引号、且前面是行首或空白的 `#` 处起注释（shell 的 word 边界语义），
+//     引号内的 `#` 与粘在 token 里的 `a#b` 都是普通字符；
+//   * 引号未闭合时该行剩余部分视为字符串内容、不剥注释，并把引号状态返回给调用方
+//     跨续行传递。
+const stripShellTrailingComment = (line, quote = null) => {
+  let state = quote;
+  let code = '';
+  for (let index = 0; index < line.length; index += 1) {
+    const ch = line[index];
+    if (state === "'") {
+      if (ch === "'") state = null;
+      code += ch;
+    } else if (state === '"') {
+      if (ch === '\\' && index + 1 < line.length) {
+        code += ch + line[index + 1];
+        index += 1;
+      } else {
+        if (ch === '"') state = null;
+        code += ch;
+      }
+    } else if (ch === '\\' && index + 1 < line.length) {
+      code += ch + line[index + 1];
+      index += 1;
+    } else {
+      if (ch === "'" || ch === '"') state = ch;
+      else if (ch === '#' && (index === 0 || /\s/.test(line[index - 1]))) break;
+      code += ch;
+    }
+  }
+  return { code, quote: state };
+};
+
+const assertDebian12DocExampleWiring = (jobText) => {
+  const step = extractStepBlock(jobText, DEBIAN12_INSTALL_STEP);
+  const lines = step.split('\n');
+  const markerIndexes = [];
+  lines.forEach((line, index) => {
+    if (line.includes('apt-get install')) markerIndexes.push(index);
+  });
+  assert.equal(
+    markerIndexes.length,
+    1,
+    'Install on Debian 12 步骤里必须恰好一条 apt-get install：选项与包清单的「同一调用」接线才没有归属歧义（拆成两条安装同样被拒）',
+  );
+  // run: | 逐行成命令；反斜杠续行是唯一跨行形状，先折叠成单条逻辑行再断言。
+  // 折叠时逐行剥掉未加引号的行尾注释：真选项若被挪进行尾注释，剥完的代码部分里
+  // 就没有选项字样，注释冒充必须落空（review Minor 1 封堵的假绿形状）。
+  let logical = '';
+  let quote = null;
+  for (let index = markerIndexes[0]; ; index += 1) {
+    assert.ok(index < lines.length, 'apt-get install 的反斜杠续行在步骤内没有结束');
+    const line = lines[index].trim();
+    const stripped = stripShellTrailingComment(line, quote);
+    quote = stripped.quote;
+    if (line.endsWith('\\')) {
+      assert.ok(stripped.code.endsWith('\\'), 'apt-get install 续行的行尾反斜杠不能落在引号内');
+      logical += `${stripped.code.slice(0, -1)} `;
+      continue;
+    }
+    logical += stripped.code;
+    break;
+  }
+  // `-o` 与赋值必须相邻成对（赋值参数允许整体加单/双引号），或 -o<赋值> 连写；
+  // 目标按完整精确路径逐字匹配：通配符、别的目录、文件名后缀差一个字符都不算。
+  const option = escapeRegExp(DPKG_PATH_INCLUDE_OPTION);
+  assert.match(
+    logical,
+    new RegExp(
+      `(?:^|\\s)-o\\s+["']?${option}["']?(?:\\s|$)|(?:^|\\s)-o["']?${option}["']?(?:\\s|$)`,
+    ),
+    `apt-get install 必须同一个调用传 -o ${DPKG_PATH_INCLUDE_OPTION}：` +
+      'slim 镜像 path-exclude /usr/share/doc/* 会裁掉包内配置示例，该选项是唯一豁免；' +
+      '去掉 -o 的裸赋值、目标写成通配或改放到其它命令都不生效',
+  );
+  // 同一调用安装三个本地 .deb：任一包被拆去别的 apt 调用，上一条唯一性断言已拒；
+  // 这里再钉住三个包 token 本身，防止「装了选项但漏装某个本地包」。
+  // `${{ matrix.architecture }}` 是带空格的 Actions 表达式，按 stepRunScript 的既有
+  // 口径先换成常量，防止表达式自身的空格截断包 token 匹配。
+  const logicalCmd = logical.replace(/\$\{\{[^}]*\}\}/g, 'x');
+  for (const pkg of ['rsetup-next', 'rsetup-controller', 'rsetup-board-agent']) {
+    assert.match(
+      logicalCmd,
+      new RegExp(`artifacts/${pkg}_\\S*\\.deb`),
+      `${pkg} 的本地 .deb 必须与 path-include 选项在同一条 apt-get install 里安装`,
+    );
+  }
+  // smoke 不许被反向削弱来「适配」裁剪：示例的磁盘存在断言删掉，裁剪回归就会重新
+  // 全绿（dpkg 数据库列表在文件被裁掉后仍能列名，证明不了落盘，不能代替 test -f）；
+  // /etc/default 不存在断言删掉，「把示例搬去 /etc/default」就能绕过整个议题。
+  const smoke = extractStepBlock(jobText, 'Smoke test on Debian 12');
+  assert.ok(
+    smoke.includes(`test -f ${CONTROLLER_DOC_EXAMPLE}`),
+    'Smoke 步骤必须保留配置示例的 test -f 磁盘存在断言，不许降级或删起来适配裁剪',
+  );
+  assert.ok(
+    smoke.includes('test ! -e /etc/default/rsetup-controller'),
+    'Smoke 步骤必须保留 /etc/default/rsetup-controller 不存在的反向断言：配置示例不许被搬去 /etc/default',
+  );
+};
+
+test('debian-12-runtime 同一条 apt-get install 传精确 path-include 选项保留 controller 配置示例（CI run 40124668180 回归）', () => {
+  const job = jobCalled('debian-12-runtime');
+  assert.ok(job, 'ci.yml 里找不到 debian-12-runtime 作业');
+  assertDebian12DocExampleWiring(job.text);
+
+  // 变异前提断言（review P3 教训）：变异模板必须命中当前 CI 现文——选项赋值以
+  // 单引号参数紧跟 `-o` 写在 apt 行里；模板一旦与现文脱节，负例会静默空跑成假负。
+  const optionToken = `'${DPKG_PATH_INCLUDE_OPTION}'`;
+  assert.ok(
+    job.text.includes(`-o ${optionToken}`),
+    '前提：当前 CI 的 apt 命令逐字包含 -o 与单引号包裹的选项赋值（以下变异模板依赖该现文）',
+  );
+
+  // 负例 1（根因本身）：删掉选项——回到被镜像裁剪配置的安装，smoke 会重新 exit 1。
+  const withoutOption = job.text.replace(` -o ${optionToken}`, '');
+  assert.notEqual(withoutOption, job.text, '变异模板必须命中当前 CI 文本：整段删除选项');
+  assert.throws(
+    () => assertDebian12DocExampleWiring(withoutOption),
+    /path-include/,
+    '删除 path-include 选项必须被拒绝：配置示例会被 slim 的 path-exclude 裁掉',
+  );
+
+  // 负例 2：目标写成通配 /usr/share/doc/*——等于全量豁免 docs、超出「仅保留这一个
+  // 文件」的口径，也放回了镜像裁剪想省的东西，必须被拒绝。
+  const wildcardTarget = job.text.replace(
+    optionToken,
+    `'Dpkg::Options::=--path-include=/usr/share/doc/*'`,
+  );
+  assert.notEqual(wildcardTarget, job.text, '变异模板必须命中当前 CI 文本：精确目标换成通配');
+  assert.throws(
+    () => assertDebian12DocExampleWiring(wildcardTarget),
+    /path-include/,
+    '--path-include 目标必须是精确文件路径，/usr/share/doc/* 这种全量通配必须被拒绝',
+  );
+
+  // 负例 3：路径差一个字符（.defaults）——选项形状齐全但豁免的不是被裁的那个文件。
+  const wrongFileName = job.text.replace(
+    optionToken,
+    `'Dpkg::Options::=--path-include=/usr/share/doc/rsetup-controller/rsetup-controller.defaults'`,
+  );
+  assert.notEqual(wrongFileName, job.text, '变异模板必须命中当前 CI 文本：示例文件名多一个 s');
+  assert.throws(
+    () => assertDebian12DocExampleWiring(wrongFileName),
+    /path-include/,
+    '目标文件名必须与包内示例逐字一致，rsetup-controller.defaults 这类近似路径必须被拒绝',
+  );
+
+  // 负例 4（仅注释冒充）：apt 行删掉选项，在原位置上方补一条含完整选项文本的注释。
+  // extractStepBlock 输入是剔除整行注释的 text，注释永远替 run 命令喂不饱断言。
+  const commentedOut = withoutOption.replace(
+    /(^[ \t]*)apt-get install -y /m,
+    (_match, indent) => `${indent}# -o ${optionToken}\n${indent}apt-get install -y `,
+  );
+  assert.ok(
+    commentedOut.includes(optionToken),
+    '前提：选项字样必须仍在变异文本的步骤内（以注释形式存在，非真空演示）',
+  );
+  assert.throws(
+    () => assertDebian12DocExampleWiring(commentedOut),
+    /path-include/,
+    '选项只写在注释里必须被拒绝：注释不会传给 dpkg',
+  );
+
+  // 负例 5（安装之后的独立 shell 命令冒充）：apt 行不带选项，安装完成后再单起一条
+  // 真 dpkg --path-include 命令——字样再真也不作用于本次解包，必须被拒绝。
+  const standaloneAfter = withoutOption.replace(
+    /(^[ \t]*apt-get install -y .*\n)/m,
+    `$1          dpkg --path-include=${CONTROLLER_DOC_EXAMPLE} --configure -a\n`,
+  );
+  assert.ok(
+    standaloneAfter.includes(`dpkg --path-include=${CONTROLLER_DOC_EXAMPLE}`),
+    '前提：独立 dpkg 命令必须已在变异文本的安装步骤内（非真空演示）',
+  );
+  assert.throws(
+    () => assertDebian12DocExampleWiring(standaloneAfter),
+    /path-include/,
+    '选项挪到 apt-get install 之后的独立 shell 命令必须被拒绝：豁免必须与本次安装同调用',
+  );
+
+  // 负例 6：只留赋值、丢掉 `-o`——apt 把裸赋值当包选择器，dpkg 根本收不到豁免。
+  const missingDashO = job.text.replace(`-o ${optionToken}`, optionToken);
+  assert.notEqual(missingDashO, job.text, '变异模板必须命中当前 CI 文本：删除 -o 前缀');
+  assert.throws(
+    () => assertDebian12DocExampleWiring(missingDashO),
+    /path-include/,
+    'Dpkg::Options::=… 赋值必须紧跟 -o 交给 apt-get，裸赋值 token 必须被拒绝',
+  );
+
+  // 负例 7（拆调用）：controller 的 .deb 单独拆成第二条带同一选项的 apt-get install——
+  // 选项字样都在，但「安装三个本地包的同一条调用」被拆散，唯一性断言必须拒绝。
+  const controllerDeb = ' ./artifacts/rsetup-controller_*_${{ matrix.architecture }}.deb';
+  const splitInstall = job.text
+    .replace(controllerDeb, '')
+    .replace(
+      'apt-get install -y',
+      'apt-get install -y -o ' +
+        optionToken +
+        controllerDeb.trim() +
+        '\n          apt-get install -y',
+    );
+  assert.notEqual(splitInstall, job.text, '变异模板必须命中当前 CI 文本：controller 包拆去第二条 apt 调用');
+  assert.throws(
+    () => assertDebian12DocExampleWiring(splitInstall),
+    /apt-get install|同一/,
+    '三个本地 .deb 与选项必须接在同一条 apt-get install 里，拆成两条调用必须被拒绝',
+  );
+
+  // 负例 8（行尾注释冒充，review Minor 1）：真选项从 apt 命令里删除、原样挪到同一
+  // 物理行的行尾 `#` 注释里。parseJobs 只剔除**整行**注释，行尾注释字样保留在
+  // job.text；合同若不剥离未加引号的行尾注释，选项正则会继续匹配注释里的字样而假绿。
+  const lastDebToken = ' ./artifacts/rsetup-board-agent_*_${{ matrix.architecture }}.deb';
+  const tailCommented = withoutOption.replace(lastDebToken, `${lastDebToken} # -o ${optionToken}`);
+  assert.notEqual(
+    tailCommented,
+    withoutOption,
+    '变异模板必须命中当前 CI 文本：apt 行最后一个包 token 后追加行尾注释',
+  );
+  assert.match(
+    tailCommented,
+    /^[ \t]*apt-get install -y[^\n]*# -o /m,
+    '前提：选项字样必须以行尾注释形式留在 apt 行命令文本之后（非真空演示）',
+  );
+  assert.throws(
+    () => assertDebian12DocExampleWiring(tailCommented),
+    /path-include/,
+    '选项挪到同一行行尾注释必须被拒绝：shell 行尾注释不会传给 apt/dpkg，旧合同该形状会假绿',
+  );
+
+  // 正例对照（封堵口径是「剥离注释」而非「禁止注释」）：不带选项字样的普通行尾注释
+  // 不得影响合同——命令代码部分里的真选项照常供给断言。
+  const benignTailComment = job.text.replace(lastDebToken, `${lastDebToken} # 保留 controller 配置示例`);
+  assert.notEqual(benignTailComment, job.text, '变异模板必须命中当前 CI 文本：apt 行末尾追加普通注释');
+  assertDebian12DocExampleWiring(benignTailComment);
+});
+
+// stripShellTrailingComment 的最小行为测试：只剥「未加引号、且起于行首或空白」的
+// `#` 及其后内容；引号内、反斜杠转义、粘在 token 里的 `#` 全部原样保留；引号
+// 未闭合时整行不剥并回传引号状态。
+test('stripShellTrailingComment 只剥 token 边界上未加引号的行尾 #，其余形状不碰', () => {
+  const codeOf = (line, quote = null) => stripShellTrailingComment(line, quote).code;
+
+  // 剥：未加引号、前面是空白或行首的 #。
+  assert.equal(codeOf('apt-get install -y a.deb b.deb # -o 选项挪到这里不算'), 'apt-get install -y a.deb b.deb ');
+  assert.equal(codeOf('# 整行注释的输入形状'), '');
+  assert.equal(codeOf('echo "a" \\# b # 转义 # 保留、末尾注释剥掉'), 'echo "a" \\# b ');
+
+  // 不剥：单/双引号内（含双引号内转义引号之后）的 #、粘在 token 里的 a#b。
+  assert.equal(
+    codeOf(`-o 'Dpkg::Options::=--path-include=/usr/share/doc/a#b/f.default' x.deb`),
+    `-o 'Dpkg::Options::=--path-include=/usr/share/doc/a#b/f.default' x.deb`,
+  );
+  assert.equal(codeOf('echo "a\\"# b" tail'), 'echo "a\\"# b" tail');
+  assert.equal(codeOf('echo a#b # c'), 'echo a#b ');
+
+  // 引号未闭合：整行都是字符串内容，不剥注释，回传引号状态供跨续行传递。
+  assert.deepEqual(stripShellTrailingComment(`echo '未闭合 # 字符串`), {
+    code: `echo '未闭合 # 字符串`,
+    quote: `'`,
+  });
+  assert.deepEqual(stripShellTrailingComment('echo "未闭合 # 字符串', null), {
+    code: 'echo "未闭合 # 字符串',
+    quote: `"`,
+  });
+
+  // 续行反斜杠原样保留，由调用方处理折叠。
+  assert.equal(codeOf('apt-get install -y a.deb \\'), 'apt-get install -y a.deb \\');
+});
