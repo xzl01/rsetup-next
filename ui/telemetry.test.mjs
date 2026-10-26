@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import fs from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
+import { loadRuntimeSource } from "./app-manifest.mjs";
 
-const source = fs.readFileSync(new URL("./app.js", import.meta.url), "utf8");
+const source = loadRuntimeSource();
 const render = source.slice(source.indexOf("function renderCpuMetric("), source.indexOf("\nfunction byteUnit("));
 
 for (const locale of ["en-US", "zh-CN"]) {

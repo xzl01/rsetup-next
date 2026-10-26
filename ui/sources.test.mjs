@@ -1,16 +1,10 @@
 import assert from "node:assert/strict";
-import fs from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
+import { handler as sharedHandler, loadRuntimeSource } from "./app-manifest.mjs";
 
-const source = fs.readFileSync(new URL("./app.js", import.meta.url), "utf8");
-function handler(name) {
-  const start = source.search(new RegExp(`(?:async )?function ${name}\\(`));
-  assert.ok(start >= 0);
-  const rest = source.slice(start);
-  const next = rest.slice(1).search(/\n(?:async )?function /);
-  return next < 0 ? rest : rest.slice(0, next + 1);
-}
+const source = loadRuntimeSource();
+const handler = (name) => sharedHandler(source, name);
 function harness() {
   const c = {
     state: { sources: { supported: true, sourceRevision: "v1", providers: [{ id: "official" }, { id: "ustc" }] }, sourceBenchmark: { version: 0, running: false } },

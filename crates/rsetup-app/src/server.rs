@@ -30,6 +30,24 @@ const INDEX_HTML: &str = include_str!("../../../ui/index.html");
 const STYLES_CSS: &str = include_str!("../../../ui/styles.css");
 const I18N_JS: &str = include_str!("../../../ui/i18n.js");
 const APP_JS: &str = include_str!("../../../ui/app.js");
+const APP_CONST_JS: &str = include_str!("../../../ui/modules/app-const.js");
+const APP_STATE_JS: &str = include_str!("../../../ui/modules/app-state.js");
+const APP_TRANSPORT_JS: &str = include_str!("../../../ui/modules/app-transport.js");
+const APP_FORMAT_JS: &str = include_str!("../../../ui/modules/app-format.js");
+const APP_DEBUG_JS: &str = include_str!("../../../ui/modules/app-debug.js");
+const APP_REFRESH_JS: &str = include_str!("../../../ui/modules/app-refresh.js");
+const APP_RENDER_JS: &str = include_str!("../../../ui/modules/app-render.js");
+const APP_SOURCES_JS: &str = include_str!("../../../ui/modules/app-sources.js");
+const APP_HARDWARE_JS: &str = include_str!("../../../ui/modules/app-hardware.js");
+const APP_OVERLAY_JS: &str = include_str!("../../../ui/modules/app-overlay.js");
+const APP_SPI_JS: &str = include_str!("../../../ui/modules/app-spi.js");
+const APP_GPIO_VIDEO_JS: &str = include_str!("../../../ui/modules/app-gpio-video.js");
+const APP_THERMAL_JS: &str = include_str!("../../../ui/modules/app-thermal.js");
+const APP_LED_JS: &str = include_str!("../../../ui/modules/app-led.js");
+const APP_STORAGE_JS: &str = include_str!("../../../ui/modules/app-storage.js");
+const APP_INSTALL_JS: &str = include_str!("../../../ui/modules/app-install.js");
+const APP_ACTIONS_JS: &str = include_str!("../../../ui/modules/app-actions.js");
+const APP_CONTROL_JS: &str = include_str!("../../../ui/modules/app-control.js");
 const VENDOR_PARTNERS: &[u8] = include_bytes!("../../../ui/assets/vendor-partners.webp");
 const VENDOR_CIX: &[u8] = include_bytes!("../../../ui/assets/vendor-cix.png");
 const COMMUNITY_QQ: &[u8] = include_bytes!("../../../ui/assets/community-qq.webp");
@@ -148,6 +166,24 @@ pub fn router(controller: Controller) -> Router {
         .route("/styles.css", get(styles))
         .route("/i18n.js", get(i18n_script))
         .route("/app.js", get(script))
+        .route("/modules/app-const.js", get(app_const_script))
+        .route("/modules/app-state.js", get(app_state_script))
+        .route("/modules/app-transport.js", get(app_transport_script))
+        .route("/modules/app-format.js", get(app_format_script))
+        .route("/modules/app-debug.js", get(app_debug_script))
+        .route("/modules/app-refresh.js", get(app_refresh_script))
+        .route("/modules/app-render.js", get(app_render_script))
+        .route("/modules/app-sources.js", get(app_sources_script))
+        .route("/modules/app-hardware.js", get(app_hardware_script))
+        .route("/modules/app-overlay.js", get(app_overlay_script))
+        .route("/modules/app-spi.js", get(app_spi_script))
+        .route("/modules/app-gpio-video.js", get(app_gpio_video_script))
+        .route("/modules/app-thermal.js", get(app_thermal_script))
+        .route("/modules/app-led.js", get(app_led_script))
+        .route("/modules/app-storage.js", get(app_storage_script))
+        .route("/modules/app-install.js", get(app_install_script))
+        .route("/modules/app-actions.js", get(app_actions_script))
+        .route("/modules/app-control.js", get(app_control_script))
         .route("/assets/vendor-partners.webp", get(vendor_partners))
         .route("/assets/vendor-cix.png", get(vendor_cix))
         .route("/assets/community-qq.webp", get(community_qq))
@@ -314,6 +350,132 @@ async fn i18n_script() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         I18N_JS,
+    )
+}
+
+async fn app_const_script() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        APP_CONST_JS,
+    )
+}
+
+async fn app_state_script() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        APP_STATE_JS,
+    )
+}
+
+async fn app_transport_script() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        APP_TRANSPORT_JS,
+    )
+}
+
+async fn app_format_script() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        APP_FORMAT_JS,
+    )
+}
+
+async fn app_debug_script() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        APP_DEBUG_JS,
+    )
+}
+
+async fn app_refresh_script() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        APP_REFRESH_JS,
+    )
+}
+
+async fn app_render_script() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        APP_RENDER_JS,
+    )
+}
+
+async fn app_sources_script() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        APP_SOURCES_JS,
+    )
+}
+
+async fn app_hardware_script() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        APP_HARDWARE_JS,
+    )
+}
+
+async fn app_overlay_script() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        APP_OVERLAY_JS,
+    )
+}
+
+async fn app_spi_script() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        APP_SPI_JS,
+    )
+}
+
+async fn app_gpio_video_script() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        APP_GPIO_VIDEO_JS,
+    )
+}
+
+async fn app_thermal_script() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        APP_THERMAL_JS,
+    )
+}
+
+async fn app_led_script() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        APP_LED_JS,
+    )
+}
+
+async fn app_storage_script() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        APP_STORAGE_JS,
+    )
+}
+
+async fn app_install_script() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        APP_INSTALL_JS,
+    )
+}
+
+async fn app_actions_script() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        APP_ACTIONS_JS,
+    )
+}
+
+async fn app_control_script() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        APP_CONTROL_JS,
     )
 }
 
@@ -2392,6 +2554,71 @@ mod boundary_tests {
                 .unwrap()
                 .contains("style-src 'self'")
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_scripts_served_as_javascript_with_security_headers() {
+        const RUNTIME_URLS: [&str; 20] = [
+            "/i18n.js",
+            "/modules/app-const.js",
+            "/modules/app-state.js",
+            "/modules/app-transport.js",
+            "/modules/app-format.js",
+            "/modules/app-debug.js",
+            "/modules/app-refresh.js",
+            "/modules/app-render.js",
+            "/modules/app-sources.js",
+            "/modules/app-hardware.js",
+            "/modules/app-overlay.js",
+            "/modules/app-spi.js",
+            "/modules/app-gpio-video.js",
+            "/modules/app-thermal.js",
+            "/modules/app-led.js",
+            "/modules/app-storage.js",
+            "/modules/app-install.js",
+            "/modules/app-actions.js",
+            "/modules/app-control.js",
+            "/app.js",
+        ];
+        for url in RUNTIME_URLS {
+            for method in ["GET", "HEAD"] {
+                let request = Request::builder()
+                    .method(method)
+                    .uri(url)
+                    .header("host", "127.0.0.1:8788")
+                    .body(Body::empty())
+                    .unwrap();
+                let response = app().oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{method} {url}");
+                assert_eq!(
+                    response.headers()["content-type"],
+                    "text/javascript; charset=utf-8",
+                    "{method} {url}"
+                );
+                assert_eq!(
+                    response.headers()["cache-control"],
+                    "no-store",
+                    "{method} {url}"
+                );
+                assert_eq!(
+                    response.headers()["x-content-type-options"],
+                    "nosniff",
+                    "{method} {url}"
+                );
+                assert_eq!(
+                    response.headers()["referrer-policy"],
+                    "no-referrer",
+                    "{method} {url}"
+                );
+                assert!(
+                    response.headers()["content-security-policy"]
+                        .to_str()
+                        .unwrap()
+                        .contains("script-src 'self'"),
+                    "{method} {url}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

@@ -67,8 +67,9 @@ use std::time::{Duration, SystemTime};
 /// Files copied verbatim into the root of the published frontend.
 const ROOT_FILES: [&str; 4] = ["index.html", "app.js", "i18n.js", "styles.css"];
 
-/// Directories copied recursively into the published frontend.
-const TREE_DIRS: [&str; 2] = ["assets", "fonts"];
+/// Directories copied recursively into the published frontend. `modules`
+/// holds the runtime script fragments referenced by `index.html`.
+const TREE_DIRS: [&str; 3] = ["assets", "fonts", "modules"];
 
 /// Container holding one staging directory per build process.
 const STAGING_CONTAINER: &str = "rsetup-dist-staging";

@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
+import { loadRuntimeSource } from "./app-manifest.mjs";
 
 test("desktop registers every literal shared UI IPC command", () => {
-  const ui = fs.readFileSync(new URL("./app.js", import.meta.url), "utf8");
+  // 扫描作用域 = manifest 中 i18n 之后的 19 项运行时脚本拼接串（18 片段 + 薄 app.js），
+  // 与原 app.js 全文逐字等价；i18n.js 实测 0 处 tauriInvoke(，不在扫描集内。
+  const ui = loadRuntimeSource();
   const rust = fs.readFileSync(new URL(
     "../apps/desktop/src-tauri/src/main.rs", import.meta.url,
   ), "utf8");
