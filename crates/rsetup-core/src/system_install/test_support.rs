@@ -2,6 +2,10 @@
 //! modules: scratch directories under `target/`, MBR/GPT/xz image builders
 //! and the fixture backends.
 
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::process::{Command, Stdio};
+
 use super::*;
 
 /// Scratch space under the workspace `target/` directory, so tests only ever
