@@ -1,13 +1,11 @@
-use crate::{AdmissionSnapshot, AdmissionState, ControllerConfig, ControllerError, ReviewDecision};
+use crate::{AdmissionSnapshot, AdmissionState, ControllerError, ReviewDecision};
 use sqlx::Row;
 
-#[derive(Clone)]
-pub struct DbPool(pub sqlx::MySqlPool);
-impl DbPool {
-    pub async fn connect(config: &ControllerConfig) -> Result<Self, ControllerError> {
-        Ok(Self(sqlx::MySqlPool::connect(&config.database_url).await?))
-    }
-}
+mod pool;
+mod username;
+
+pub use pool::DbPool;
+pub(crate) use username::valid_username;
 
 /// v4 唯一基线 DDL（`schema/v4.sql`，恰好 16 张表、无 FOREIGN KEY、无 CHECK）。
 ///
@@ -258,19 +256,6 @@ struct ColumnMeta {
     character_set_name: Option<String>,
     collation_name: Option<String>,
     default: Option<String>,
-}
-
-// v4 形状校验与数据扫描共用的用户名纯规则；不提供旧版升级预检入口。
-#[allow(dead_code)]
-pub(crate) fn valid_username(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    (3..=64).contains(&bytes.len())
-        && bytes
-            .first()
-            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-        && bytes.iter().all(|b| {
-            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(*b, b'.' | b'_' | b'-')
-        })
 }
 
 fn validate_column_shape(
@@ -2848,26 +2833,6 @@ mod tests {
         let mut prefix = expected.clone();
         prefix[1].sub_parts = vec![Some(3)];
         assert!(validate_indexes("users", &expected, &prefix).is_err());
-    }
-
-    #[test]
-    fn username_rules_reject_noncanonical_input() {
-        let long_ok = "a".repeat(64);
-        let long_bad = "a".repeat(65);
-        for good in ["abc", "a.b_c-1", long_ok.as_str()] {
-            assert!(valid_username(good));
-        }
-        for bad in [
-            "ab",
-            long_bad.as_str(),
-            "Éric",
-            "Alice",
-            "alice!",
-            "-alice",
-            "a b",
-        ] {
-            assert!(!valid_username(bad), "{bad:?}");
-        }
     }
 
     #[test]

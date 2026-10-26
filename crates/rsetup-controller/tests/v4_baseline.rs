@@ -29,6 +29,48 @@ fn read_source(relative: &str) -> String {
     })
 }
 
+/// 收集 db 模块树全部源文件（`src/db.rs` + `src/db/**/*.rs`），按路径升序去重拼接。
+///
+/// 目录化后扫描面必须覆盖整个 db 私有模块树，防止禁止 token 或越权写入在子文件漏检。
+fn read_db_sources() -> String {
+    let root = manifest_dir().join("src/db.rs");
+    if !root.is_file() {
+        panic!("missing src/db.rs root");
+    }
+
+    let mut paths = vec![root];
+    let db_dir = manifest_dir().join("src/db");
+    if db_dir.is_dir() {
+        collect_rs_files(&db_dir, &mut paths);
+    }
+    paths.sort();
+    paths.dedup();
+
+    let mut combined = String::new();
+    for path in paths {
+        let content = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("读取 {} 失败：{error}", path.display()));
+        combined.push_str(&content);
+        combined.push('\n');
+    }
+    combined
+}
+
+fn collect_rs_files(dir: &Path, acc: &mut Vec<PathBuf>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_files(&path, acc);
+        } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+            acc.push(path);
+        }
+    }
+}
+
 fn migrate_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_rsetup-controller-migrate"));
     // 清空环境：入口只允许从环境读配置，任何继承来的真实变量都可能把测试变成真连库。
@@ -79,9 +121,11 @@ fn legacy_schema_carriers_are_gone() {
         "Cargo.toml 不得再注册 legacy 迁移 CLI"
     );
     // 生产代码里不得再有任何按旧版本分支的迁移/放行路线。
-    for (file, forbidden) in [
+    let db_source = read_db_sources();
+    for (name, source, forbidden) in [
         (
-            "src/db.rs",
+            "src/db (root + db/**/*.rs)",
+            db_source.as_str(),
             &[
                 "TestMigrationMode",
                 "check_v3_ready",
@@ -93,12 +137,12 @@ fn legacy_schema_carriers_are_gone() {
         ),
         (
             "src/integrity.rs",
+            read_source("src/integrity.rs").as_str(),
             &["MIN_SUPPORTED_SCHEMA_VERSION", "legacy_expected_version"][..],
         ),
     ] {
-        let source = read_source(file);
         for token in forbidden {
-            assert!(!source.contains(token), "{file} 仍含旧版本路线标记 {token}");
+            assert!(!source.contains(token), "{name} 仍含旧版本路线标记 {token}");
         }
     }
     // 库导出面同样不得再暴露 legacy 入口。
@@ -410,8 +454,8 @@ fn startup_path_stays_read_only_and_the_entry_point_is_the_only_writer() {
         !main.contains("run_production_migration") && !main.contains("create_v4_schema"),
         "普通启动绝不得调用显式建库/迁移入口"
     );
-    // db.rs 内 v4 建库只由显式入口链路调用（run_production_migration_at）。
-    let db = read_source("src/db.rs");
+    // db 模块树内 v4 建库只由显式入口链路调用（run_production_migration_at）。
+    let db = read_db_sources();
     let callers: Vec<&str> = db
         .lines()
         .filter(|line| line.contains("create_v4_schema(") && !line.contains("async fn "))
