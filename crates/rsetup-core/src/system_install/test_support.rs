@@ -2,9 +2,15 @@
 //! modules: scratch directories under `target/`, MBR/GPT/xz image builders
 //! and the fixture backends.
 
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::fs::{self, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+
+use uuid::Uuid;
+
+use crate::model::SystemInstallRequest;
 
 use super::*;
 

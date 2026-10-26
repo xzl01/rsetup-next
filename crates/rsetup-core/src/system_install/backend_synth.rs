@@ -134,11 +134,9 @@ impl BlockDeviceBackend for SyntheticBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::SystemInstallRequest;
+    use crate::model::{SystemInstallRequest, SystemInstallVerificationState};
     use crate::system_install::test_support::*;
-    use crate::system_install::{
-        MIB, SystemInstallError, SystemInstallManager, SystemInstallVerificationState,
-    };
+    use crate::system_install::{MIB, SystemInstallError, SystemInstallManager};
 
     #[test]
     fn the_demo_provider_is_labelled_and_never_writes() {

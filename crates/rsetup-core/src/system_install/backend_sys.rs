@@ -280,9 +280,9 @@ fn reread_partition_table(path: &Path) -> Result<(), SystemInstallError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::SystemInstallRequest;
+    use crate::model::{SystemInstallRequest, SystemInstallVerificationState};
     use crate::system_install::test_support::*;
-    use crate::system_install::{MIB, SystemInstallManager, SystemInstallVerificationState};
+    use crate::system_install::{MIB, SystemInstallManager};
 
     #[test]
     fn enumerates_devices_from_an_injected_root() {
