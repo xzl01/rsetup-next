@@ -1,5 +1,5 @@
 //! GPIO pin domain of the hardware module tree.
-use super::{HardwareError, HardwareManager, read_trimmed};
+use super::{HardwareError, HardwareManager, shared::read_trimmed};
 use crate::hardware::OverlayStatus;
 use crate::pinout::{
     FunctionEvidence, PinoutPin, PinoutProfile, profile_by_id, profile_for_root,

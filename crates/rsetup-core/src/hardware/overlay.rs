@@ -1,7 +1,7 @@
 //! Device-tree overlay domain of the hardware module tree (U-Boot track).
 use super::{
-    HardwareError, HardwareManager, display_path, fingerprint, hardware_run, read_trimmed,
-    shared::command_exists, with_rollback_result,
+    HardwareError, HardwareManager, display_path, fingerprint, hardware_run,
+    shared::{command_exists, read_trimmed, with_rollback_result},
 };
 use crate::{ActionRun, ActionStatus, transaction::ProcessLock};
 use chrono::{DateTime, Utc};
