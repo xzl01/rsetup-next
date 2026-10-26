@@ -110,7 +110,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -127,16 +127,20 @@ use crate::model::{
 
 mod crypto;
 mod error;
+mod image;
 mod mounts;
 
 #[cfg(test)]
 mod test_support;
 mod token;
+mod xz;
 
 use self::crypto::*;
 pub use self::error::*;
+use self::image::*;
 use self::mounts::*;
 use self::token::*;
+use self::xz::*;
 
 /// One chunk of the image is held in memory at a time.
 const CHUNK_BYTES: u64 = 4 * 1024 * 1024;
@@ -163,24 +167,6 @@ const INSTALL_ACTION_TITLE: &str = "Install a system image";
 const SECTOR_BYTES: u64 = 512;
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
-
-/// CRC-32 as xz uses it: reflected, polynomial 0xEDB88320, initial and final xor.
-/// The stream header, the index and the stream footer each carry one, so a
-/// damaged file is refused while planning instead of being written as an image.
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
-    }
-    !crc
-}
-
-const XZ_MAGIC: [u8; 6] = [0xFD, b'7', b'z', b'X', b'Z', 0x00];
-const XZ_FOOTER_MAGIC: [u8; 2] = [0x59, 0x5A];
 
 /// `ioctl` that asks the kernel to re-read a block device's partition table.
 /// Linux encodes it as `_IO(0x12, 81)`; `libc` does not export the name.
@@ -877,24 +863,6 @@ impl SystemInstallManager {
     }
 }
 
-/// Compares partitions by geometry: names differ between an image and the
-/// kernel's view, but the layout a system boots from does not.
-/// Identity of an image file, from an open handle rather than a path.
-///
-/// The prefix digest only covers `prefix_bytes`, so this is what notices an edit
-/// further into the file; device and inode notice a replacement.
-fn file_identity(metadata: &fs::Metadata) -> String {
-    format!(
-        "{}:{}:{}:{}:{}:{}",
-        metadata.dev(),
-        metadata.ino(),
-        metadata.mtime(),
-        metadata.mtime_nsec(),
-        metadata.ctime(),
-        metadata.ctime_nsec()
-    )
-}
-
 /// Bytes to ask the image stream for next.
 ///
 /// The remainder is compared in `u64` and narrowed only afterwards. Narrowing
@@ -904,20 +872,6 @@ fn file_identity(metadata: &fs::Metadata) -> String {
 /// tiny chunk that wrote a partial image before failing.
 fn chunk_len(buffer_len: usize, remaining: u64) -> usize {
     (buffer_len as u64).min(remaining) as usize
-}
-
-fn same_partition_layout(
-    expected: &[SystemInstallPartition],
-    observed: &[SystemInstallPartition],
-) -> bool {
-    if expected.len() != observed.len() {
-        return false;
-    }
-    expected.iter().zip(observed).all(|(left, right)| {
-        left.number == right.number
-            && left.start_bytes == right.start_bytes
-            && left.size_bytes == right.size_bytes
-    })
 }
 
 /// Live backend. Everything it touches is resolved under `root`, so tests can
@@ -1458,317 +1412,6 @@ impl BlockDeviceKind {
     }
 }
 
-/// Reads the partition table of a raw image: MBR, or GPT behind a protective
-/// MBR.
-fn read_partition_table<R: Read + Seek>(
-    file: &mut R,
-) -> Result<(String, Vec<SystemInstallPartition>), SystemInstallError> {
-    let mut sector = [0u8; 512];
-    if file
-        .seek(SeekFrom::Start(0))
-        .and_then(|_| file.read_exact(&mut sector))
-        .is_err()
-    {
-        return Err(SystemInstallError::InvalidInput(
-            "the image is smaller than one sector and cannot hold a partition table".into(),
-        ));
-    }
-    if sector[510] != 0x55 || sector[511] != 0xAA {
-        return Err(SystemInstallError::InvalidInput(
-            "the image has no MBR or GPT partition table; it is not a bootable system image".into(),
-        ));
-    }
-    let mut primary = Vec::new();
-    let mut protective = false;
-    for index in 0..4 {
-        let base = 446 + index * 16;
-        let kind = sector[base + 4];
-        let start =
-            u32::from_le_bytes(sector[base + 8..base + 12].try_into().unwrap_or_default()) as u64;
-        let sectors =
-            u32::from_le_bytes(sector[base + 12..base + 16].try_into().unwrap_or_default()) as u64;
-        if kind == 0xEE {
-            protective = true;
-            continue;
-        }
-        if kind == 0 && start == 0 && sectors == 0 {
-            continue;
-        }
-        primary.push(SystemInstallPartition {
-            name: format!("p{}", index + 1),
-            number: index as u32 + 1,
-            start_bytes: start * SECTOR_BYTES,
-            size_bytes: sectors * SECTOR_BYTES,
-            mount_point: None,
-        });
-    }
-    if protective {
-        return Ok(("gpt".into(), read_gpt(file)?));
-    }
-    if primary.is_empty() {
-        return Err(SystemInstallError::InvalidInput(
-            "the image MBR declares no partitions".into(),
-        ));
-    }
-    Ok(("mbr".into(), primary))
-}
-
-fn read_gpt<R: Read + Seek>(
-    file: &mut R,
-) -> Result<Vec<SystemInstallPartition>, SystemInstallError> {
-    let mut header = [0u8; 92];
-    if file
-        .seek(SeekFrom::Start(SECTOR_BYTES))
-        .and_then(|_| file.read_exact(&mut header))
-        .is_err()
-    {
-        return Err(SystemInstallError::InvalidInput(
-            "the image is truncated inside its GPT header".into(),
-        ));
-    }
-    if &header[0..8] != b"EFI PART" {
-        return Err(SystemInstallError::InvalidInput(
-            "the image declares a protective MBR but has no GPT header".into(),
-        ));
-    }
-    let entries_lba = u64::from_le_bytes(header[72..80].try_into().unwrap_or_default());
-    let count = u32::from_le_bytes(header[80..84].try_into().unwrap_or_default()) as usize;
-    let entry_size = u32::from_le_bytes(header[84..88].try_into().unwrap_or_default()) as usize;
-    if !(128..=4096).contains(&entry_size) || count == 0 || count > 4096 {
-        return Err(SystemInstallError::InvalidInput(
-            "the image GPT declares an implausible entry table".into(),
-        ));
-    }
-    let readable = count.min(128);
-    let mut table = vec![0u8; readable * entry_size];
-    if file
-        .seek(SeekFrom::Start(entries_lba * SECTOR_BYTES))
-        .and_then(|_| file.read_exact(&mut table))
-        .is_err()
-    {
-        return Err(SystemInstallError::InvalidInput(
-            "the image is truncated inside its GPT entries".into(),
-        ));
-    }
-    let mut partitions = Vec::new();
-    for index in 0..readable {
-        let base = index * entry_size;
-        if table[base..base + 16].iter().all(|byte| *byte == 0) {
-            continue;
-        }
-        let first = u64::from_le_bytes(table[base + 32..base + 40].try_into().unwrap_or_default());
-        let last = u64::from_le_bytes(table[base + 40..base + 48].try_into().unwrap_or_default());
-        if last < first {
-            continue;
-        }
-        partitions.push(SystemInstallPartition {
-            name: format!("p{}", index + 1),
-            number: index as u32 + 1,
-            start_bytes: first * SECTOR_BYTES,
-            size_bytes: (last - first + 1) * SECTOR_BYTES,
-            mount_point: None,
-        });
-    }
-    if partitions.is_empty() {
-        return Err(SystemInstallError::InvalidInput(
-            "the image GPT declares no used partitions".into(),
-        ));
-    }
-    Ok(partitions)
-}
-
-/// Sums the uncompressed size of **every** stream in an `.xz` file, so a
-/// concatenated multi-stream image is measured in full instead of only its last
-/// stream (which is what silently truncated one). Streams are walked backwards
-/// from the end of the file:
-///
-/// * a stream footer gives the size of its own index (the stored value is
-///   `index size / 4 - 1`, and that size includes the index CRC32),
-/// * the index records give every block's unpadded size and its uncompressed
-///   size, so the block area plus the two 12-byte frames is the stream's total
-///   size,
-/// * subtracting that total gives the previous stream, skipping the stream
-///   padding (null bytes, a multiple of four) that may sit in between,
-/// * the stream header magic must sit exactly where the arithmetic says, so a
-///   mis-walk is an error instead of a guessed size.
-fn read_xz_size(file: &mut File) -> Result<u64, SystemInstallError> {
-    let length = file
-        .metadata()
-        .map_err(|error| SystemInstallError::Io(error.to_string()))?
-        .len();
-    if length < 32 {
-        return Err(SystemInstallError::InvalidInput(
-            "the .xz image is too short to hold a stream".into(),
-        ));
-    }
-    let implausible = |detail: &str| SystemInstallError::InvalidInput(detail.to_owned());
-    let overflow = || SystemInstallError::InvalidInput("the .xz size overflows".into());
-    let mut end = length;
-    let mut total = 0u64;
-    let mut streams = 0usize;
-    while end > 0 {
-        let padding = trailing_null_bytes(file, end)?;
-        if padding % 4 != 0 {
-            return Err(implausible(
-                "the .xz stream padding is not a multiple of four",
-            ));
-        }
-        end -= padding;
-        if end == 0 {
-            break;
-        }
-        if end < 32 {
-            return Err(implausible("the .xz image is too short to hold a stream"));
-        }
-        let mut footer = [0u8; 12];
-        file.seek(SeekFrom::Start(end - 12))
-            .and_then(|_| file.read_exact(&mut footer))
-            .map_err(|error| SystemInstallError::Io(error.to_string()))?;
-        if footer[10..12] != XZ_FOOTER_MAGIC {
-            return Err(implausible("the .xz stream footer is malformed"));
-        }
-        if crc32(&footer[4..10]) != u32::from_le_bytes(footer[0..4].try_into().unwrap_or_default())
-        {
-            return Err(implausible("the .xz stream footer checksum is wrong"));
-        }
-        let backward_size = (u64::from(u32::from_le_bytes(
-            footer[4..8].try_into().unwrap_or_default(),
-        )) + 1)
-            * 4;
-        if backward_size + 12 > end {
-            return Err(implausible("the .xz index size is implausible"));
-        }
-        // The index sits before the 12-byte stream footer, not at the file end.
-        let index_start = end - 12 - backward_size;
-        let mut index = vec![0u8; backward_size as usize];
-        file.seek(SeekFrom::Start(index_start))
-            .and_then(|_| file.read_exact(&mut index))
-            .map_err(|error| SystemInstallError::Io(error.to_string()))?;
-        if index.first() != Some(&0x00) {
-            return Err(implausible("the .xz index is malformed"));
-        }
-        if index.len() < 4 {
-            return Err(implausible("the .xz index is too short"));
-        }
-        let split = index.len() - 4;
-        if crc32(&index[..split])
-            != u32::from_le_bytes(index[split..].try_into().unwrap_or_default())
-        {
-            return Err(implausible("the .xz index checksum is wrong"));
-        }
-        let mut cursor = 1usize;
-        let (records, used) = read_xz_vli(&index[cursor..])?;
-        cursor += used;
-        let mut blocks_bytes = 0u64;
-        let mut stream_bytes = 0u64;
-        for _ in 0..records {
-            let (unpadded, used) = read_xz_vli(&index[cursor..])?;
-            cursor += used;
-            let (uncompressed, used) = read_xz_vli(&index[cursor..])?;
-            cursor += used;
-            // An index record stores the block size *without* the block padding,
-            // while the file holds the padding too: each block is rounded up to a
-            // multiple of four bytes, and a block header is always a multiple of
-            // four, so rounding the unpadded size is enough.
-            let padded = unpadded + (4 - unpadded % 4) % 4;
-            blocks_bytes = blocks_bytes.checked_add(padded).ok_or_else(overflow)?;
-            stream_bytes = stream_bytes
-                .checked_add(uncompressed)
-                .ok_or_else(overflow)?;
-        }
-        // Stream header (12) + blocks (their headers and compressed data) + index
-        // (which already counts its own CRC32) + stream footer (12).
-        let stream_length = 12u64
-            .checked_add(blocks_bytes)
-            .ok_or_else(overflow)?
-            .checked_add(backward_size)
-            .ok_or_else(overflow)?
-            .checked_add(12)
-            .ok_or_else(overflow)?;
-        if stream_length > end {
-            return Err(implausible("the .xz stream size is implausible"));
-        }
-        let start = end - stream_length;
-        let mut header = [0u8; 12];
-        file.seek(SeekFrom::Start(start))
-            .and_then(|_| file.read_exact(&mut header))
-            .map_err(|error| SystemInstallError::Io(error.to_string()))?;
-        if header[..6] != XZ_MAGIC {
-            return Err(implausible("the .xz stream header is malformed"));
-        }
-        // Stream flags: the first byte is reserved and must be zero.
-        if header[6] != 0 {
-            return Err(implausible("the .xz stream flags are malformed"));
-        }
-        if crc32(&header[6..8]) != u32::from_le_bytes(header[8..12].try_into().unwrap_or_default())
-        {
-            return Err(implausible("the .xz stream header checksum is wrong"));
-        }
-        total = total.checked_add(stream_bytes).ok_or_else(overflow)?;
-        streams += 1;
-        end = start;
-    }
-    if streams == 0 {
-        return Err(implausible("the image is not an xz stream"));
-    }
-    if total == 0 {
-        return Err(implausible("the .xz image holds no data"));
-    }
-    Ok(total)
-}
-
-/// Counts the null bytes that end `[0, end)`. Stream padding sits between streams
-/// and may also trail the file; a valid stream never ends with a null byte (its
-/// footer ends with `YZ`), so everything skipped here is padding.
-fn trailing_null_bytes(file: &mut File, end: u64) -> Result<u64, SystemInstallError> {
-    /// Padding only ever aligns a stream, so anything beyond this is a malformed
-    /// file rather than padding worth scanning.
-    const MAX_PADDING: u64 = 4 * 1024 * 1024;
-    const STEP: u64 = 64;
-    let mut count = 0u64;
-    let mut cursor = end;
-    while cursor > 0 && count < MAX_PADDING {
-        let size = STEP.min(cursor);
-        let mut buffer = vec![0u8; size as usize];
-        file.seek(SeekFrom::Start(cursor - size))
-            .and_then(|_| file.read_exact(&mut buffer))
-            .map_err(|error| SystemInstallError::Io(error.to_string()))?;
-        let trailing = buffer.iter().rev().take_while(|byte| **byte == 0).count() as u64;
-        count += trailing;
-        if trailing < size {
-            break;
-        }
-        cursor -= size;
-    }
-    if count >= MAX_PADDING {
-        return Err(SystemInstallError::InvalidInput(
-            "the .xz stream padding is implausibly long".into(),
-        ));
-    }
-    Ok(count)
-}
-
-/// xz stores variable-length integers as little-endian base-128.
-fn read_xz_vli(bytes: &[u8]) -> Result<(u64, usize), SystemInstallError> {
-    let mut value = 0u64;
-    let mut shift = 0u32;
-    for (index, byte) in bytes.iter().enumerate() {
-        if shift > 63 {
-            return Err(SystemInstallError::InvalidInput(
-                "the .xz variable length integer is too large".into(),
-            ));
-        }
-        value |= u64::from(byte & 0x7F) << shift;
-        if byte & 0x80 == 0 {
-            return Ok((value, index + 1));
-        }
-        shift += 7;
-    }
-    Err(SystemInstallError::InvalidInput(
-        "the .xz variable length integer is truncated".into(),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2044,43 +1687,6 @@ mod tests {
         assert_eq!(result.bytes_written, plan.image.uncompressed_bytes);
     }
 
-    /// The frames xz itself checks — stream header, index, stream footer — are
-    /// checked while planning, so a damaged file never reaches the write path.
-    /// The offsets below are the frame bytes of the embedded fixtures (the header
-    /// CRC lives at 8, the index CRC at length-16, the footer CRC at length-12).
-    #[test]
-    fn xz_frame_checksums_are_checked_while_planning() {
-        let harness = fixture("xz-crc", boot_mounts(), RereadBehavior::Matches);
-        let cases: Vec<(&str, usize)> = vec![
-            ("header crc", 8),
-            ("header flags", 7),
-            ("index crc", XZ_FIXTURE.len() - 16),
-            ("footer crc", XZ_FIXTURE.len() - 12),
-        ];
-        for (label, offset) in cases {
-            let path = harness.root.join(format!("{label}.img.xz"));
-            write_file(&path, flip(XZ_FIXTURE, offset));
-            match harness.manager.plan(&install_request(&path)) {
-                Err(SystemInstallError::InvalidInput(detail)) => {
-                    assert!(
-                        detail.contains("checksum") || detail.contains("flags"),
-                        "{label}: {detail}"
-                    );
-                }
-                other => panic!("{label} must be refused while planning: {other:?}"),
-            }
-        }
-        // The same file with intact frames still plans, so the refusals above are
-        // about the damaged bytes.
-        let intact = harness.root.join("intact.img.xz");
-        write_file(&intact, XZ_FIXTURE);
-        harness
-            .manager
-            .plan(&install_request(&intact))
-            .expect("the intact fixture plans");
-    }
-
-    /// The F-T20-002 regression, real tool: the decompressor produces the whole
     /// expected output and only then reports a CRC failure. Before the fix the
     /// product reported success for exactly this file.
     ///
@@ -2264,17 +1870,6 @@ mod tests {
     /// token is only usable by the process that signed and issued it. A second
     /// manager stands in for a second process (the privileged helper), and the
     /// token it carries — even a well formed one — buys it nothing.
-    /// The CRC-32 that xz frames are checked with.
-    #[test]
-    fn crc32_matches_the_reference_vectors() {
-        assert_eq!(crc32(b""), 0x0000_0000);
-        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
-        assert_eq!(
-            crc32(b"The quick brown fox jumps over the lazy dog"),
-            0x414F_A339
-        );
-    }
-
     /// The reproduction from the finding: the plan bound the file's identity, but
     /// the write re-opened the path without checking the handle it got, so a
     /// replacement between the check and the write was written and reported as a
@@ -2676,176 +2271,6 @@ mod tests {
     }
 
     #[test]
-    fn identifies_gpt_and_xz_images() {
-        let harness = fixture("formats", boot_mounts(), RereadBehavior::Matches);
-        let gpt = harness.root.join("gpt.img");
-        write_file(&gpt, gpt_image(&[(2048, 2048 + 4096), (8192, 8192 + 8192)]));
-        let plan = harness
-            .manager
-            .plan(&install_request(&gpt))
-            .expect("plan a GPT image");
-        assert_eq!(plan.image.partition_table.as_deref(), Some("gpt"));
-        assert_eq!(plan.image.partitions.len(), 2);
-        assert_eq!(plan.image.partitions[0].start_bytes, 2048 * SECTOR_BYTES);
-        assert_eq!(plan.image.partitions[0].size_bytes, 4097 * SECTOR_BYTES);
-
-        let xz = harness.root.join("system.img.xz");
-        write_file(&xz, XZ_FIXTURE);
-        let plan = harness
-            .manager
-            .plan(&install_request(&xz))
-            .expect("plan an xz image");
-        assert_eq!(plan.image.format, InstallImageFormat::Xz);
-        assert_eq!(
-            plan.image.uncompressed_bytes, XZ_FIXTURE_BYTES,
-            "the xz index declares it"
-        );
-        assert_eq!(plan.image.size_bytes, XZ_FIXTURE.len() as u64);
-        assert_eq!(
-            plan.image.partition_table.as_deref(),
-            Some("mbr"),
-            "the decompressed payload header is parsed while planning"
-        );
-        assert_eq!(plan.image.partitions.len(), 1);
-        assert!(
-            plan.warnings
-                .contains(&"the_image_is_compressed_and_is_decompressed_while_writing".to_owned())
-        );
-
-        let corrupt = harness.root.join("corrupt.img.xz");
-        write_file(&corrupt, &XZ_FIXTURE[..XZ_FIXTURE.len() - 4]);
-        assert!(matches!(
-            harness.manager.plan(&install_request(&corrupt)),
-            Err(SystemInstallError::InvalidInput(_))
-        ));
-
-        let not_xz = harness.root.join("pretend.img.xz");
-        write_file(&not_xz, mbr_image(1, 4 * MIB));
-        let plan = harness
-            .manager
-            .plan(&install_request(&not_xz))
-            .expect("a raw image keeps working despite the extension");
-        assert_eq!(plan.image.format, InstallImageFormat::Raw);
-    }
-
-    /// Every fixture's uncompressed size is compared against the reference
-    /// implementation, not against this module's own arithmetic:
-    ///
-    /// ```text
-    /// fixture                                     streams        xz -dc | wc -c
-    /// XZ_FIXTURE                                  1                     512
-    /// XZ_FIXTURE + XZ_FIXTURE                     2                     1024
-    /// XZ_FIXTURE + 0x00 * 4 + XZ_FIXTURE          2 (stream padding)    1024
-    /// XZ_FIXTURE + 0x00 * 4 + XZ_FIXTURE * 2      3 (stream padding)    1536
-    /// XZ_FIXTURE + 0x00 * 4                       1 (trailing padding)  512
-    /// XZ_MULTI_BLOCK_FIXTURE                      1 (4 blocks)        1024
-    /// ```
-    #[test]
-    fn xz_uncompressed_size_adds_up_every_stream() {
-        let harness = fixture("xz-streams", boot_mounts(), RereadBehavior::Matches);
-        let padding = [0u8; 4];
-        let cases: Vec<(&str, Vec<u8>, u64)> = vec![
-            ("single.img.xz", XZ_FIXTURE.to_vec(), XZ_FIXTURE_BYTES),
-            (
-                "two.img.xz",
-                [XZ_FIXTURE, XZ_FIXTURE].concat(),
-                XZ_FIXTURE_BYTES * 2,
-            ),
-            (
-                "padded.img.xz",
-                [XZ_FIXTURE, &padding, XZ_FIXTURE].concat(),
-                XZ_FIXTURE_BYTES * 2,
-            ),
-            (
-                "three.img.xz",
-                [XZ_FIXTURE, &padding, XZ_FIXTURE, XZ_FIXTURE].concat(),
-                XZ_FIXTURE_BYTES * 3,
-            ),
-            (
-                "trailing.img.xz",
-                [XZ_FIXTURE, &padding].concat(),
-                XZ_FIXTURE_BYTES,
-            ),
-            ("multi-block.img.xz", XZ_MULTI_BLOCK_FIXTURE.to_vec(), 1024),
-        ];
-        for (name, bytes, expected) in cases {
-            let path = harness.root.join(name);
-            write_file(&path, &bytes);
-            let plan = harness
-                .manager
-                .plan(&install_request(&path))
-                .unwrap_or_else(|error| panic!("{name} must be planned: {error}"));
-            assert_eq!(plan.image.format, InstallImageFormat::Xz, "{name}");
-            assert_eq!(plan.image.size_bytes, bytes.len() as u64, "{name}");
-            assert_eq!(
-                plan.image.uncompressed_bytes, expected,
-                "{name}: the uncompressed size must add up every stream"
-            );
-        }
-    }
-
-    /// Stream padding is a multiple of four; the reference implementation refuses
-    /// the same file (`xz -dc` exits 1 on it), so refusing it here agrees with it
-    /// instead of inventing a size.
-    #[test]
-    fn xz_padding_that_is_not_a_multiple_of_four_is_rejected() {
-        let harness = fixture("xz-padding", boot_mounts(), RereadBehavior::Matches);
-        let path = harness.root.join("bad-padding.img.xz");
-        write_file(&path, [XZ_FIXTURE, XZ_FIXTURE, &[0u8; 2]].concat());
-        match harness.manager.plan(&install_request(&path)) {
-            Err(SystemInstallError::InvalidInput(detail)) => {
-                assert!(detail.contains("padding"), "{detail}");
-            }
-            other => panic!("two padding bytes must be refused: {other:?}"),
-        }
-    }
-
-    /// The reproduction from the finding, end to end: two concatenated streams
-    /// plan as the sum of both and are written in full. A last-stream-only size
-    /// would have written half the image and reported success.
-    #[test]
-    fn a_concatenated_image_is_planned_and_written_in_full() {
-        struct TotalOpener(u64);
-        impl ImageOpener for TotalOpener {
-            fn open(
-                &self,
-                _image: &SystemInstallImage,
-            ) -> Result<Box<dyn Read + Send>, SystemInstallError> {
-                Ok(Box::new(std::io::Cursor::new(mbr_bytes(self.0 as usize))))
-            }
-        }
-        let total = XZ_FIXTURE_BYTES * 2;
-        let harness = fixture(
-            "xz-two-streams-write",
-            boot_mounts(),
-            RereadBehavior::Unsupported,
-        );
-        let xz = harness.root.join("two-stream.img.xz");
-        write_file(&xz, [XZ_FIXTURE, XZ_FIXTURE].concat());
-        let manager = SystemInstallManager::with_backend(
-            harness.backend.clone(),
-            Arc::new(TotalOpener(total)),
-            false,
-        );
-        let request = install_request(&xz);
-        let plan = manager.plan(&request).expect("plan");
-        assert_eq!(
-            plan.image.uncompressed_bytes, total,
-            "both streams are counted, so the plan describes the whole image"
-        );
-        let result = manager
-            .apply_live(&request, &plan.plan_token, "sda")
-            .expect("write the concatenated image");
-        assert_eq!(result.bytes_written, total);
-        let device = fs::read(&harness.device).expect("read the fixture device");
-        assert_eq!(
-            &device[510..512],
-            &[0x55, 0xAA],
-            "both streams reached the device"
-        );
-    }
-
-    #[test]
     fn a_stream_with_more_data_than_the_plan_fails_instead_of_truncating() {
         /// Yields more bytes than the plan declares, the way a stream whose size
         /// was under-counted would.
@@ -2885,85 +2310,6 @@ mod tests {
         let chunks = harness.backend.chunks.lock().expect("chunk lock");
         let written: u64 = chunks.iter().map(|size| *size as u64).sum();
         assert_eq!(written, declared, "the write stops at the declared size");
-    }
-
-    /// A compressed image's header is parsed while planning, so its table is now
-    /// compared like a raw image's. The opener returns a valid MBR and the fixture
-    /// device re-reads a different table, so the result must be a mismatch — the
-    /// "unsupported, nothing to compare" this used to report is what let a
-    /// compressed non-image be written and only then found unverifiable.
-    #[test]
-    fn a_compressed_image_table_is_parsed_and_compared() {
-        struct MbrOpener;
-        impl ImageOpener for MbrOpener {
-            fn open(
-                &self,
-                _image: &SystemInstallImage,
-            ) -> Result<Box<dyn Read + Send>, SystemInstallError> {
-                Ok(Box::new(std::io::Cursor::new(mbr_bytes(
-                    XZ_FIXTURE_BYTES as usize,
-                ))))
-            }
-        }
-        let harness = fixture("xz-verify", boot_mounts(), RereadBehavior::Differs);
-        let xz = harness.root.join("system.img.xz");
-        write_file(&xz, XZ_FIXTURE);
-        let manager =
-            SystemInstallManager::with_backend(harness.backend.clone(), Arc::new(MbrOpener), false);
-        let request = install_request(&xz);
-        let plan = manager.plan(&request).expect("plan");
-        assert_eq!(
-            plan.image.partition_table.as_deref(),
-            Some("mbr"),
-            "the decompressed header was parsed while planning"
-        );
-        assert_eq!(plan.image.partitions.len(), 1);
-        let result = manager
-            .apply_live(&request, &plan.plan_token, "sda")
-            .expect("write the compressed image");
-        assert_eq!(
-            result.verification.state,
-            SystemInstallVerificationState::Mismatched,
-            "{result:?}"
-        );
-        assert!(
-            !result.verification.expected.is_empty(),
-            "there is an expected layout to compare against"
-        );
-        let output = result.run.output.clone().unwrap_or_default();
-        assert!(output.contains("DOES NOT match"), "{output}");
-    }
-
-    /// A compressed payload that is not a disk image must be refused while
-    /// planning. A valid `.xz` container is not evidence of a bootable image: a
-    /// compressed text file satisfies every container check.
-    #[test]
-    fn a_compressed_payload_that_is_not_a_disk_image_is_refused() {
-        struct TextOpener;
-        impl ImageOpener for TextOpener {
-            fn open(
-                &self,
-                _image: &SystemInstallImage,
-            ) -> Result<Box<dyn Read + Send>, SystemInstallError> {
-                Ok(Box::new(std::io::Cursor::new(
-                    b"this is not a disk image\n".to_vec(),
-                )))
-            }
-        }
-        let harness = fixture("xz-not-an-image", boot_mounts(), RereadBehavior::Matches);
-        let xz = harness.root.join("notes.txt.xz");
-        write_file(&xz, XZ_FIXTURE);
-        let manager = SystemInstallManager::with_backend(
-            harness.backend.clone(),
-            Arc::new(TextOpener),
-            false,
-        );
-        match manager.plan(&install_request(&xz)) {
-            Err(SystemInstallError::InvalidInput(detail)) => {
-                assert!(detail.contains("partition table"), "{detail}");
-            }
-            other => panic!("a compressed text file must never be plannable: {other:?}"),
-        }
     }
 
     #[test]
@@ -3247,33 +2593,5 @@ mod tests {
             result.verification.state,
             SystemInstallVerificationState::Unsupported
         );
-    }
-
-    #[test]
-    fn partition_layout_comparison_ignores_kernel_names() {
-        let expected = vec![SystemInstallPartition {
-            name: "p1".into(),
-            number: 1,
-            start_bytes: 2048 * SECTOR_BYTES,
-            size_bytes: 8 * MIB,
-            mount_point: None,
-        }];
-        let observed = vec![SystemInstallPartition {
-            name: "sda1".into(),
-            number: 1,
-            start_bytes: 2048 * SECTOR_BYTES,
-            size_bytes: 8 * MIB,
-            mount_point: None,
-        }];
-        assert!(same_partition_layout(&expected, &observed));
-        let moved = vec![SystemInstallPartition {
-            name: "sda1".into(),
-            number: 1,
-            start_bytes: 4096 * SECTOR_BYTES,
-            size_bytes: 8 * MIB,
-            mount_point: None,
-        }];
-        assert!(!same_partition_layout(&expected, &moved));
-        assert!(!same_partition_layout(&expected, &[]));
     }
 }
