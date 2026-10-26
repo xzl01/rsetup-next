@@ -1,5 +1,5 @@
 use crate::i18n::Locale;
-use crate::tui::App;
+use crate::tui::app::App;
 use crate::tui::storage::mmc::mmc_device_lines;
 use crate::tui::storage::nvme::nvme_device_lines;
 use crate::tui::storage::{render_storage_summary, storage_error_lines};

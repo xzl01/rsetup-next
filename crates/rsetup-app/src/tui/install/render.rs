@@ -1,6 +1,6 @@
 use super::{InstallFocus, InstallStatus};
 use crate::i18n::Locale;
-use crate::tui::App;
+use crate::tui::app::App;
 use crate::tui::theme::{AMBER, BONE, CORAL, INK, MUTED, SIGNAL, instrument};
 use ratatui::{
     Frame,

@@ -260,7 +260,7 @@ impl InstallPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::{App, render};
+    use crate::tui::{app::App, shell::render};
     use crossterm::event::KeyCode;
     use ratatui::Terminal;
     use rsetup_core::{

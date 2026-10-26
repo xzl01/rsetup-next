@@ -5,7 +5,7 @@ use crate::tui::fixtures::{
     eol_text, flatten_screen, render_mission_rows, rock3a_mmc_app, rock3a_warning_app,
 };
 use crate::tui::textfit::text_width;
-use crate::tui::{App, render};
+use crate::tui::{app::App, shell::render};
 use ratatui::{Terminal, layout::Rect};
 use rsetup_core::{Controller, ExecutionPolicy, ProbeMode};
 

@@ -5,7 +5,7 @@ pub(in crate::tui) mod nvme;
 mod card_tests;
 
 use crate::i18n::Locale;
-use crate::tui::App;
+use crate::tui::app::App;
 use crate::tui::textfit::{
     MAX_WRAP_ROWS, RowFit, fit_line_in_rows, wrapped_rows, wrapped_rows_capped,
 };

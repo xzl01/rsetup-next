@@ -1,4 +1,4 @@
-use crate::tui::App;
+use crate::tui::app::App;
 use crate::tui::textfit::fit_block;
 use crate::tui::theme::{AMBER, BONE, CORAL, MUTED, SIGNAL};
 use ratatui::{

@@ -1,4 +1,4 @@
-use crate::tui::App;
+use crate::tui::app::App;
 use crate::tui::textfit::{RowFit, ellipsize, fit_block, join_identity, text_width, wrapped_rows};
 use crate::tui::theme::{AMBER, BONE, CORAL, MUTED, SIGNAL};
 use ratatui::{
