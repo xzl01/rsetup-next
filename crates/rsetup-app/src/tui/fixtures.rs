@@ -1,6 +1,6 @@
 use crate::i18n::Locale;
 use crate::tui::App;
-use crate::tui::render_mission;
+use crate::tui::mission::render_mission;
 use ratatui::{Terminal, layout::Rect, text::Line};
 use rsetup_core::{Controller, ExecutionPolicy, ProbeMode};
 
