@@ -66,3 +66,26 @@ pub(in crate::tui) fn render_mission_rows(app: &App, width: u16, height: u16) ->
         })
         .collect()
 }
+
+// ---- P2: the pre-EOL warning must never be clipped by the row budget ----
+
+/// The pre-EOL wording the card has to show for `pre_eol`.
+pub(in crate::tui) fn eol_text(locale: Locale, pre_eol: u8) -> &'static str {
+    let (zh, en) = match pre_eol {
+        2 => ("预警(80%)", "Warning(80%)"),
+        3 => ("紧急", "Urgent"),
+        _ => ("正常", "Normal"),
+    };
+    if locale.is_zh() { zh } else { en }
+}
+
+/// The screen without its borders and padding, so a value that the word
+/// wrap moved onto the next row is still found.
+pub(in crate::tui) fn flatten_screen(rows: &[String]) -> String {
+    rows.iter()
+        .flat_map(|row| row.chars())
+        .filter(|c| {
+            !c.is_whitespace() && !matches!(c, '│' | '─' | '┌' | '┐' | '└' | '┘' | '├' | '┤')
+        })
+        .collect()
+}

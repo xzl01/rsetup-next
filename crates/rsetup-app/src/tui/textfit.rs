@@ -272,7 +272,7 @@ mod tests {
     use super::*;
     use crate::i18n::Locale;
     use crate::tui::fixtures::{line_text, render_mission_rows, rock3a_warning_app};
-    use crate::tui::mmc_device_lines;
+    use crate::tui::storage::mmc::mmc_device_lines;
     use ratatui::Terminal;
 
     /// Rows the paragraph widget really consumes for `lines` at `inner_width`.
