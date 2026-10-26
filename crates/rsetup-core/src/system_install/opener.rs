@@ -176,6 +176,11 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    /// expected output and only then reports a CRC failure. Before the fix the
+    /// product reported success for exactly this file.
+    ///
+    /// Reference, `xz -dc <file>` on this fixture: exit 1 with 12 bytes of output
+    /// for the single stream (24 bytes for the concatenated one).
     #[test]
     fn a_corrupt_stream_that_produced_all_of_its_output_is_refused() {
         if !xz_available() {
@@ -303,10 +308,6 @@ mod tests {
         assert_eq!(reader.read(&mut buffer).expect("clean end of output"), 0);
     }
 
-    /// The F-T13-002 / F-T20-001 property, restated for the current design: a
-    /// token is only usable by the process that signed and issued it. A second
-    /// manager stands in for a second process (the privileged helper), and the
-    /// token it carries — even a well formed one — buys it nothing.
     /// The reproduction from the finding: the plan bound the file's identity, but
     /// the write re-opened the path without checking the handle it got, so a
     /// replacement between the check and the write was written and reported as a

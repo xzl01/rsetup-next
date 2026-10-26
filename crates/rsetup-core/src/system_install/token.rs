@@ -227,6 +227,10 @@ mod tests {
         ));
     }
 
+    /// The F-T13-002 / F-T20-001 property, restated for the current design: a
+    /// token is only usable by the process that signed and issued it. A second
+    /// manager stands in for a second process (the privileged helper), and the
+    /// token it carries — even a well formed one — buys it nothing.
     #[test]
     fn another_process_cannot_use_a_token_it_did_not_issue() {
         let harness = fixture(

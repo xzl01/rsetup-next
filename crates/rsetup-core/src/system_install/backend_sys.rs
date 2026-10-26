@@ -16,13 +16,13 @@ use super::error::SystemInstallError;
 use super::mounts::{expand_mounts, parse_mounts, partition_number_of, read_attr};
 use super::{BlockDeviceBackend, SECTOR_BYTES, SystemMount};
 
-/// Virtual devices an image must never be written to.
-const VIRTUAL_DEVICE_PREFIXES: [&str; 7] = ["loop", "ram", "zram", "sr", "dm-", "md", "fd"];
-
 /// `ioctl` that asks the kernel to re-read a block device's partition table.
 /// Linux encodes it as `_IO(0x12, 81)`; `libc` does not export the name.
 #[cfg(target_os = "linux")]
 const BLKRRPART: libc::c_ulong = 0x1251;
+
+/// Virtual devices an image must never be written to.
+const VIRTUAL_DEVICE_PREFIXES: [&str; 7] = ["loop", "ram", "zram", "sr", "dm-", "md", "fd"];
 
 /// Live backend. Everything it touches is resolved under `root`, so tests can
 /// drive it with fixtures and can never reach a real device node.
