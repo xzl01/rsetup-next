@@ -138,6 +138,16 @@ impl<K: Hash + Eq + Clone> RateWindowLimiter<K> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    use axum::http::{StatusCode, header};
+
+    use super::super::router::build_http_router;
+    use super::super::tests_support::{
+        FakeAuth, FakeLogin, FakePassword, HOST, ORIGIN, app_state, assert_error, call,
+        logout_request, me_request, password_body, password_request, seed_session_and_csrf,
+        valid_cookie,
+    };
 
     // ---------------- Task 3e: Rate Window Limiter unit tests ----------------
 
@@ -358,6 +368,220 @@ mod tests {
             limiter.entries.len(),
             2,
             "expired 4095 keys must be pruned away, leaving only key 0 and new_key"
+        );
+    }
+
+    #[tokio::test]
+    async fn password_session_write_rate_gate_oneshot() {
+        let auth = FakeAuth::new(FakeLogin::Ok);
+        let state = app_state(auth.clone());
+        let (cookie, csrf) = seed_session_and_csrf(&state);
+        let router = build_http_router(state);
+
+        // Precheck: missing/invalid CSRF before 20 valid requests must NOT consume quota
+        for _ in 0..5 {
+            let req = password_request(
+                password_body("wrong-old", "new-pass"),
+                Some(HOST),
+                Some(ORIGIN),
+                Some(&cookie),
+                Some("wrong-csrf-token"),
+                Some("application/json"),
+            );
+            let (status, _h, _v, text) = call(&router, req).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_error(&text, "CSRF_INVALID", "security.csrf");
+        }
+
+        // Configure auth to return WrongOld so requests fail with 400 (business error) without revoking session
+        auth.set_password_behavior(FakePassword::WrongOld);
+
+        // 20 valid-CSRF requests consume the quota
+        for i in 0..20 {
+            let req = password_request(
+                password_body("wrong-old", "new-pass"),
+                Some(HOST),
+                Some(ORIGIN),
+                Some(&cookie),
+                Some(&csrf),
+                Some("application/json"),
+            );
+            let (status, _h, _v, text) = call(&router, req).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "attempt {i} should be 400");
+            assert_error(&text, "INVALID_ARGUMENT", "auth.password.change_failed");
+        }
+        assert_eq!(auth.change_password_calls(), 20);
+
+        // 21st valid-CSRF request must be 429 RATE_LIMITED, Retry-After: 1
+        let req = password_request(
+            password_body("wrong-old", "new-pass"),
+            Some(HOST),
+            Some(ORIGIN),
+            Some(&cookie),
+            Some(&csrf),
+            Some("application/json"),
+        );
+        let (status, headers, _v, text) = call(&router, req).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_error(&text, "RATE_LIMITED", "auth.rate_limited");
+        assert_eq!(
+            headers.get(header::RETRY_AFTER).unwrap().to_str().unwrap(),
+            "1"
+        );
+        assert_eq!(
+            auth.change_password_calls(),
+            20,
+            "blocked request must not reach service"
+        );
+
+        // Logout shares the same session write budget: 22nd request to logout must also 429
+        let req_logout = logout_request(
+            "{}".into(),
+            Some(HOST),
+            Some(ORIGIN),
+            Some(&cookie),
+            Some(&csrf),
+            Some("application/json"),
+        );
+        let (status_logout, headers_logout, _v, text_logout) = call(&router, req_logout).await;
+        assert_eq!(status_logout, StatusCode::TOO_MANY_REQUESTS);
+        assert_error(&text_logout, "RATE_LIMITED", "auth.rate_limited");
+        assert_eq!(
+            headers_logout
+                .get(header::RETRY_AFTER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "1"
+        );
+        assert_eq!(
+            auth.logout_calls(),
+            0,
+            "logout must not be called when rate limited"
+        );
+    }
+
+    #[tokio::test]
+    async fn me_endpoint_read_rate_gate_oneshot() {
+        let auth = FakeAuth::new(FakeLogin::Ok);
+        let state = app_state(auth.clone());
+        let router = build_http_router(state);
+        let cookie = valid_cookie();
+
+        // 1. Missing cookie requests do not consume read quota
+        for _ in 0..10 {
+            let req = me_request(None);
+            let (status, _h, _v, text) = call(&router, req).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_error(&text, "AUTH_REQUIRED", "auth.required");
+        }
+
+        // 2. 50 authenticated requests on this session digest
+        for i in 0..50 {
+            let req = me_request(Some(&cookie));
+            let (status, _h, _v, _text) = call(&router, req).await;
+            assert_eq!(status, StatusCode::OK, "read {i} should be 200 OK");
+        }
+        assert_eq!(auth.authenticate_calls(), 50);
+
+        // 3. 51st request must be 429 RATE_LIMITED, Retry-After: 1
+        let req = me_request(Some(&cookie));
+        let (status, headers, _v, text) = call(&router, req).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_error(&text, "RATE_LIMITED", "auth.rate_limited");
+        assert_eq!(
+            headers.get(header::RETRY_AFTER).unwrap().to_str().unwrap(),
+            "1"
+        );
+        // authenticate is called to verify session before gate
+        assert_eq!(auth.authenticate_calls(), 51);
+    }
+
+    #[tokio::test]
+    async fn password_session_write_rate_gate_bad_json_consumes_quota() {
+        let auth = FakeAuth::new(FakeLogin::Ok);
+        let state = app_state(auth.clone());
+        let (cookie, csrf) = seed_session_and_csrf(&state);
+        let router = build_http_router(state);
+
+        // 20 requests with malformed JSON body AFTER valid CSRF
+        for _ in 0..20 {
+            let req = password_request(
+                "invalid-json".into(),
+                Some(HOST),
+                Some(ORIGIN),
+                Some(&cookie),
+                Some(&csrf),
+                Some("application/json"),
+            );
+            let (status, _h, _v, text) = call(&router, req).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_error(&text, "INVALID_ARGUMENT", "auth.password.bad_body");
+        }
+
+        // 21st request must be 429 RATE_LIMITED even if body is valid
+        let req = password_request(
+            password_body("correct-old", "new-pass"),
+            Some(HOST),
+            Some(ORIGIN),
+            Some(&cookie),
+            Some(&csrf),
+            Some("application/json"),
+        );
+        let (status, headers, _v, text) = call(&router, req).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_error(&text, "RATE_LIMITED", "auth.rate_limited");
+        assert_eq!(
+            headers.get(header::RETRY_AFTER).unwrap().to_str().unwrap(),
+            "1"
+        );
+    }
+
+    #[tokio::test]
+    async fn me_endpoint_read_capacity_exhaustion_503() {
+        let auth = FakeAuth::new(FakeLogin::Ok);
+        let state = app_state(auth.clone());
+        let router = build_http_router(state.clone());
+
+        // Pre-fill read_limiter to MAX_RATE_LIMITER_KEYS with dummy keys
+        let now = Instant::now();
+        {
+            let mut read_limiter = state.auth.read_limiter.lock().unwrap();
+            for i in 0..MAX_RATE_LIMITER_KEYS {
+                let mut dummy_digest = [0u8; 32];
+                dummy_digest[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+                read_limiter
+                    .check_and_record(now, &(EndpointId::Me, dummy_digest))
+                    .unwrap();
+            }
+        }
+
+        // Now a request with valid session token whose digest is not in the map
+        // Note: call(&router, req) creates a fresh router with now = Instant::now().
+        // If some small execution time passed since `now` in the pre-fill above,
+        // we must make sure the dummy entries are recorded at a time that does NOT expire immediately.
+        let now = Instant::now();
+        {
+            let mut read_limiter = state.auth.read_limiter.lock().unwrap();
+            read_limiter.entries.clear();
+            for i in 0..MAX_RATE_LIMITER_KEYS {
+                let mut dummy_digest = [0u8; 32];
+                dummy_digest[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+                // Push an instant that is now (within 1s)
+                let mut dq = VecDeque::new();
+                dq.push_back(now);
+                read_limiter
+                    .entries
+                    .insert((EndpointId::Me, dummy_digest), dq);
+            }
+        }
+        let req = me_request(Some(&valid_cookie()));
+        let (status, headers, _v, text) = call(&router, req).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_error(&text, "RESOURCE_EXHAUSTED", "system.resource_exhausted");
+        assert_eq!(
+            headers.get(header::RETRY_AFTER).unwrap().to_str().unwrap(),
+            "60"
         );
     }
 }

@@ -102,8 +102,8 @@ mod tests {
 
     use axum::http::StatusCode;
 
-    use super::super::build_http_router;
-    use super::super::tests::{
+    use super::super::router::build_http_router;
+    use super::super::tests_support::{
         FakeAuth, FakeLogin, app_state, call, fake_token, me_request, valid_cookie, valid_request,
     };
     use super::*;

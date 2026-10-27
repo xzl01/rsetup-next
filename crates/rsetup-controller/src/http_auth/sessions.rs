@@ -443,8 +443,8 @@ fn sessions_not_found() -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::super::build_http_router;
-    use super::super::tests::{
+    use super::super::router::build_http_router;
+    use super::super::tests_support::{
         FakeAuth, FakeLogin, FakeSession, HOST, ORIGIN, app_state, assert_error, call, fake_token,
         seed_session_and_csrf, valid_cookie,
     };

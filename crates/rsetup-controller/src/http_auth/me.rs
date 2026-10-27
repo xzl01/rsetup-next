@@ -127,8 +127,8 @@ pub(super) async fn me(State(state): State<Arc<HttpAuthState>>, headers: HeaderM
 
 #[cfg(test)]
 mod tests {
-    use super::super::build_http_router;
-    use super::super::tests::{
+    use super::super::router::build_http_router;
+    use super::super::tests_support::{
         FakeAuth, FakeLogin, FakeSession, USERNAME, app_state, assert_error, call, fake_token,
         me_request, router, seed_live_csrf_bindings, valid_cookie,
     };

@@ -215,8 +215,8 @@ fn login_success(state: &HttpAuthState, login: Login) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::super::build_http_router;
-    use super::super::tests::{
+    use super::super::router::build_http_router;
+    use super::super::tests_support::{
         FakeAuth, FakeLogin, HOST, ORIGIN, PASSWORD, PEER, PEER2, USERNAME, app_state,
         assert_error, body_json, call, fake_token, login_request, router, seed_live_csrf_bindings,
         valid_request,

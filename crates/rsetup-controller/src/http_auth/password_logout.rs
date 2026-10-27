@@ -302,79 +302,15 @@ fn bad_logout_body() -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::super::build_http_router;
     use super::super::csrf::CsrfBinding;
-    use super::super::tests::{
+    use super::super::router::build_http_router;
+    use super::super::tests_support::{
         FakeAuth, FakeLogin, FakeLogout, FakePassword, FakeSession, HOST, ORIGIN, app_state,
-        assert_error, call, fake_token, seed_session_and_csrf, seed_session_and_csrf_custom,
+        assert_error, call, fake_token, logout_request, password_body, password_request,
+        seed_session_and_csrf, seed_session_and_csrf_custom,
     };
     use super::*;
-    use axum::body::Body;
-    use axum::http::{HeaderName, HeaderValue, Request, StatusCode, header};
-
-    fn password_request(
-        body: String,
-        host: Option<&str>,
-        origin: Option<&str>,
-        cookie: Option<&str>,
-        csrf: Option<&str>,
-        content_type: Option<&str>,
-    ) -> Request<Body> {
-        let mut builder = Request::builder()
-            .method("POST")
-            .uri("/api/v1/auth/password");
-        if let Some(h) = host {
-            builder = builder.header(header::HOST, h);
-        }
-        if let Some(o) = origin {
-            builder = builder.header("origin", o);
-        }
-        if let Some(c) = cookie {
-            builder = builder.header(header::COOKIE, c);
-        }
-        if let Some(token) = csrf {
-            builder = builder.header("x-csrf-token", token);
-        }
-        if let Some(ct) = content_type {
-            builder = builder.header(header::CONTENT_TYPE, ct);
-        }
-        builder.body(Body::from(body)).unwrap()
-    }
-
-    fn logout_request(
-        body: String,
-        host: Option<&str>,
-        origin: Option<&str>,
-        cookie: Option<&str>,
-        csrf: Option<&str>,
-        content_type: Option<&str>,
-    ) -> Request<Body> {
-        let mut builder = Request::builder().method("POST").uri("/api/v1/auth/logout");
-        if let Some(h) = host {
-            builder = builder.header(header::HOST, h);
-        }
-        if let Some(o) = origin {
-            builder = builder.header("origin", o);
-        }
-        if let Some(c) = cookie {
-            builder = builder.header(header::COOKIE, c);
-        }
-        if let Some(token) = csrf {
-            builder = builder.header("x-csrf-token", token);
-        }
-        if let Some(ct) = content_type {
-            builder = builder.header(header::CONTENT_TYPE, ct);
-        }
-        builder.body(Body::from(body)).unwrap()
-    }
-
-    fn password_body(current: &str, new_pass: &str) -> String {
-        serde_json::to_string(&json!({
-            "current_password": current,
-            "new_password": new_pass,
-        }))
-        .unwrap()
-    }
+    use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 
     #[tokio::test]
     async fn password_success_contract() {

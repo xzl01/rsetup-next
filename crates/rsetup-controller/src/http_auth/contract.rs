@@ -79,17 +79,8 @@ pub trait AuthServiceApi: Send + Sync {
 mod tests {
     use std::sync::Arc;
 
+    use super::super::tests_support::lazy_db;
     use super::*;
-    use crate::db::DbPool;
-
-    fn lazy_db() -> DbPool {
-        DbPool(
-            sqlx::mysql::MySqlPoolOptions::new()
-                .acquire_timeout(std::time::Duration::from_millis(100))
-                .connect_lazy("mysql://invalid:invalid@127.0.0.1:1/test")
-                .unwrap(),
-        )
-    }
 
     // 11. 对象安全编译证明
     #[tokio::test]
