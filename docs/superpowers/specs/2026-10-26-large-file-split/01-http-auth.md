@@ -149,7 +149,7 @@ mod.rs     → 声明全部子模块并逐项 pub use
 | 批次 | 内容 | 回滚单位 |
 | --- | --- | --- |
 | B1 | 原子替换：`http_auth.rs` → `http_auth/mod.rs`（未迁实现与测试整体暂留 mod.rs；对照 authz/sqlx_repo 批次 E 先例）——同一提交内删旧建新，禁二者并存（E0761）；拆出 contract.rs、rate_limit.rs、state.rs（含 FromRef）的实现；仅 rate_limit 的 8 个纯 unit 测试随迁<br><br>批次 1 实施收窄（2026-10-27，提交 99de683）：本批落地为原子替换+rate_limit 域（8 纯 unit 测试随迁）+RateWindowLimiter.entries #[cfg(test)] pub(super)（实施前修订第2项）；contract/state 顺延后续批次，§7 B1 原列 contract.rs/state.rs 未在本批，不构成越批或遗漏。 | 单提交 revert |
-| B2 | csrf.rs + router.rs 的实现（`build_http_router` 从门面移入 router.rs）；本批不迁测试 | 单提交 revert |
+| B2 | csrf.rs + router.rs 的实现（`build_http_router` 从门面移入 router.rs）；本批不迁测试<br><br>批次 2 实施重排（2026-10-27，提交 3beb061）：批次 2 实际落地 contract.rs+state.rs（B1 原列顺延）；B2 原列 csrf.rs+router.rs 的 csrf 部分顺延批次 3（提交 164f1a0）、router.rs 继续顺延后续批次，均不构成越批或遗漏。 | 单提交 revert |
 | B3 | sessions.rs 的实现（含可见性提升与 `super::parse_logout_body` 临时引用）；不迁测试 | 单提交 revert |
 | B4 | login.rs + me.rs 的实现（含可见性提升与本批 rustdoc 断链修复）；不迁测试 | 单提交 revert |
 | B5 | password_logout.rs 的实现；创建 tests_support.rs，B1–B4 暂存测试全部按 §5 归位（rate_limit 4 oneshot、csrf prune 组 7、router 探测 1、login 14、me 17、password_logout 15、sessions 10、contract 1） | 单提交 revert |
@@ -208,3 +208,4 @@ DoD：C1 门面逐项 re-export 与 §1.1 清单逐字一致（对照 `lib.rs` �
 
 批次1实施收窄追记（已修订，2026-10-27，提交99de683；审查PASS）
 批次2实施登记（已修订，2026-10-27，提交3beb061；审查PASS——contract测试test_group_11提前至批次2随迁含lazy_db临时副本，批D/B5收敛时只删重复副本保留唯一份、不合并形似helper；另修复既有transport/manager.rs:302 [`classify_row`]跨模块rustdoc断链为全路径链接，使§8登记的RUSTDOCFLAGS=-D rustdoc::broken_intra_doc_links验证口径恢复可PASS——该断链为存量缺陷非批次2引入）
+批次3实施登记（已修订，2026-10-27，提交164f1a0；审查PASS——csrf.rs 537行：MAX_CSRF_ENTRIES/CsrfBinding/CSRF_PRUNE_THRESHOLD保持pub、prune_csrf_table pub(super)供暂留handlers、prune_expired/prune_dead私有；7条csrf测试+prune_boundary_coverage helper随csrf同模块迁入；门面tests模块及fake_token/FakeLogin/FakeAuth/app_state/valid_request/valid_cookie/me_request/call等11处#[cfg(test)]项提升pub(super)供csrf::tests跨模块取用（清单外test-only accommodation，比照批次1 entries字段项登记先例）；prune_expired_csrf doc首句改写为含already-held lock前提的等价表述（审查判定语义等价、登记供人工核准）；router.rs顺延后续批次）
