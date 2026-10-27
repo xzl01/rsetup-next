@@ -460,7 +460,7 @@ pub(super) fn validate_column_charset(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{IndexMeta, ddl_parts, expected_indexes, validate_indexes};
+    use super::super::schema_parse::{IndexMeta, ddl_parts, expected_indexes, validate_indexes};
     use super::*;
 
     #[test]
