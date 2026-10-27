@@ -1,14 +1,13 @@
 mod i18n;
-mod output;
 mod server;
+mod storage_format;
 mod tui;
 
-pub(crate) use output::format_bytes;
+pub(crate) use storage_format::format_bytes;
 
 use anyhow::{Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use i18n::{Locale, LocaleArg};
-use output::{format_mmc_status, format_nvme_status, format_storage_status};
 use rsetup_core::{
     BlockDeviceBackend, Controller, ExecutionPolicy, FanCurveConfig, FanCurvePoint,
     FanCurveRequest, ProbeMode, RgbLedConfig, SourceApplyResult, SourcePlan, SourceStatus,
@@ -24,6 +23,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+use storage_format::{format_mmc_status, format_nvme_status, format_storage_status};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
