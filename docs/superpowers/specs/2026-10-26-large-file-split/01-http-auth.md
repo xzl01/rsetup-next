@@ -207,3 +207,4 @@ DoD：C1 门面逐项 re-export 与 §1.1 清单逐字一致（对照 `lib.rs` �
 3. §8 验收命令：测试过滤器由 `auth::http_auth::` 修正为 `http_auth::`（`http_auth` 是 `lib.rs:13` 顶层 pub mod，不在 `auth::` 命名空间下；77 条测试前缀为 `http_auth::tests::`），相关定向命令全部同步。
 
 批次1实施收窄追记（已修订，2026-10-27，提交99de683；审查PASS）
+批次2实施登记（已修订，2026-10-27，提交3beb061；审查PASS——contract测试test_group_11提前至批次2随迁含lazy_db临时副本，批D/B5收敛时只删重复副本保留唯一份、不合并形似helper；另修复既有transport/manager.rs:302 [`classify_row`]跨模块rustdoc断链为全路径链接，使§8登记的RUSTDOCFLAGS=-D rustdoc::broken_intra_doc_links验证口径恢复可PASS——该断链为存量缺陷非批次2引入）

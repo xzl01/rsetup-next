@@ -299,7 +299,7 @@ pub type AdmissionDecisionFuture<'a> =
 
 /// 只读准入真相的注入点（撤销 fallback 与握手取消复查的**唯一**判据）。
 ///
-/// 返回的是已审 [`classify_row`] 的产物 [`AdmissionDecision`]，因此本入口的判定与握手
+/// 返回的是已审 [`classify_row`](crate::transport::admission::classify_row) 的产物 [`AdmissionDecision`]，因此本入口的判定与握手
 /// 路径**同一真源**：归档行、`archived` 非 0/1、合法域之外的组合、读取失败全部是
 /// `Err`（调用方 fail-closed 撤销既有会话），不存在「`APPROVED`+`approved` 但已归档仍被
 /// 当作批准」的第二套口径（审查 P1-8）。
