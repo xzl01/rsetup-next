@@ -339,7 +339,7 @@ fn validate_column_default(
         }
     };
     if expected == Some("0") {
-        return super::validate_false_default_metadata(table, column, default);
+        return super::probe::validate_false_default_metadata(table, column, default);
     }
     if default.is_some() {
         return Err(ControllerError::Config(format!(
