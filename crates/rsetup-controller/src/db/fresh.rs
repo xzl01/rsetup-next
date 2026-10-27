@@ -23,7 +23,7 @@ async fn validate_v4_tables_are_empty(db: &DbPool) -> Result<(), ControllerError
 /// v4 fresh 建库探针：在只读门禁探针之上补上唯一的写路径三件事
 /// （按固定 DDL 建一张表、确认 16 表皆空、写入 v4 元数据行）。
 /// 真实实现仅由 `DbPool` 提供；离线测试注入受控 fake 验证顺序与失败即停。
-pub(super) trait FreshV4Probe: IdentitySchemaProbe {
+trait FreshV4Probe: IdentitySchemaProbe {
     /// 当前库中已存在的全部表名（information_schema 视角）。
     fn schema_tables(
         &self,
@@ -53,9 +53,7 @@ pub(super) trait FreshV4Probe: IdentitySchemaProbe {
 /// 4. 完整形状 + 无 FK + 16 表皆空；
 /// 5. 写入 `schema_meta(schema_version = 4)`；结果不确定时绝不宣称成功；
 /// 6. 复核版本落定为 4，再跑一次与普通启动完全相同的只读闭合门禁。
-pub(super) async fn create_v4_schema_with_probe(
-    probe: &impl FreshV4Probe,
-) -> Result<(), ControllerError> {
+async fn create_v4_schema_with_probe(probe: &impl FreshV4Probe) -> Result<(), ControllerError> {
     if probe.read_version().await?.is_some() {
         return Err(v4_schema_error("fresh create requires an empty database"));
     }

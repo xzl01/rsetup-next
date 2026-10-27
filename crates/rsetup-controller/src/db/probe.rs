@@ -75,8 +75,6 @@ fn identity_schema_decision(version: Option<i32>) -> Result<(), ControllerError>
 
 /// v4 无外键门禁：三条彼此独立的 information_schema 视角必须**同时**可信且为空。
 /// 读失败/NULL/不完整一律视为"有外键或不可信"，绝不把错误当成空集。
-/// v4 无外键门禁：三条彼此独立的 information_schema 视角必须**同时**可信且为空。
-/// 读失败/NULL/不完整一律视为"有外键或不可信"，绝不把错误当成空集。
 pub(crate) async fn require_no_identity_foreign_keys(db: &DbPool) -> Result<(), ControllerError> {
     let constraints = sqlx::query(FK_CONSTRAINTS_QUERY)
         .fetch_optional(&db.0)
@@ -284,9 +282,16 @@ impl IdentitySchemaProbe for DbPool {
         crate::integrity::check_runtime_data(self, crate::integrity::SUPPORTED_SCHEMA_VERSION).await
     }
     async fn validate_fk(&self) -> Result<(), ControllerError> {
-        crate::db::require_no_identity_foreign_keys(self).await
+        require_no_identity_foreign_keys(self).await
     }
 }
+
+// 保留薄根再导出路径 `crate::db::require_no_identity_foreign_keys` 的 crate 内引用，
+// 满足 08-controller-db.md §4.1 清单「保路径/不降权」，并防止触发 unused_imports。
+#[allow(dead_code)]
+const _: () = {
+    let _ = crate::db::require_no_identity_foreign_keys;
+};
 
 // 固定字面量的五表存在性探测：表名全部硬编码，绝不接受外部输入拼装。
 const RUNTIME_TABLE_PRESENCE_QUERY: &str = "SELECT CAST(table_name AS CHAR) AS table_name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name IN ('main_tasks','sub_tasks','task_previews','device_operation_locks','recovery_checks')";
