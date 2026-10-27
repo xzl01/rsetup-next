@@ -1,14 +1,7 @@
-mod codec;
-mod model;
-mod queries;
-mod snapshot_codec;
-mod snapshot_read;
-mod snapshot_repo;
-mod traits;
-mod tx_guard;
-
-#[cfg(test)]
-pub(crate) mod sql_shape;
+//! 授权仓储 SQLx 实现（管理写/读仓储与事务骨架）。
+//!
+//! 巨型 `impl AuthzRepository for SqlxAuthzRepository` 承载全部 21 个管理写/读方法，
+//! 严格遵守事务骨架、UUID 锁序、LastAdmin 守卫、CAS revision、epoch CAS 与审计插入不变量。
 
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -20,47 +13,25 @@ use crate::authz::policy::{
 use crate::db::DbPool;
 use crate::error::ControllerError;
 
-use self::codec::validate_role_restore;
-pub(crate) use self::codec::{admin_change_removes_admin_state, read_error, validate_group_name};
-pub use self::codec::{
-    decode_grant, decode_user, grant_columns, page_cursor, validate_display_name,
+use super::codec::{
+    admin_change_removes_admin_state, decode_grant, decode_user, grant_columns, read_error,
+    validate_display_name, validate_group_name, validate_role_restore,
 };
-pub use self::model::{AuthorizationSnapshot, GrantColumns, GroupRecord, RepoFuture, UserRecord};
-pub(crate) use self::queries::{
+use super::model::{GroupRecord, RepoFuture, UserRecord};
+use super::queries::{
     DEVICE_GROUPS_FOR_DEVICE_SQL, FIND_GRANT_SQL, FIND_GROUP_SQL, FIND_ROLE_SQL, FIND_USER_SQL,
     LIST_GRANTS_FOR_USER_SQL, LIST_GRANTS_SQL, LIST_GROUP_DEVICE_IDS_SQL, LIST_GROUPS_FIRST_SQL,
     LIST_GROUPS_SQL, LIST_ROLES_FIRST_SQL, LIST_ROLES_SQL, LIST_USERS_FIRST_SQL, LIST_USERS_SQL,
     ROLES_BY_IDS_SQL_TEMPLATE,
 };
-pub use self::snapshot_codec::{
-    build_authorization_snapshot, decode_device_admin_view, decode_group_memberships_for_device,
-    decode_snapshot_actor, decode_snapshot_group_rows, decode_snapshot_meta, decode_snapshot_roles,
-    require_snapshot_isolation, validate_snapshot_grant_references,
+use super::snapshot_codec::{
+    decode_group_memberships_for_device, validate_snapshot_grant_references,
 };
-pub(crate) use self::snapshot_read::{
-    acquire_authorization_read_connection, load_actor_authorization_in_tx,
-    load_device_snapshot_in_tx, load_snapshot_in_tx, verify_management_read,
+use super::snapshot_read::{acquire_authorization_read_connection, verify_management_read};
+use super::traits::AuthzRepository;
+use super::tx_guard::{
+    begin_guard, bump_authz_epoch, lock_user_pair_and_verify_actor, placeholders,
 };
-// 批次 D 内部暂留：供外部同域/跨域按 §4.2 清单消费但当前文件剩余实现体暂未直接引用的条目。
-// 待批次 E 迁出巨型 impl 后，mod.rs 将收敛为最终再导出形式。
-#[allow(unused_imports)]
-mod _batch_d_exports {
-    pub(crate) use super::codec::ordered_user_ids;
-    pub(crate) use super::queries::{
-        ACTOR_READONLY_SQL, ADMIN_TARGET_DEVICE_KEYS_SQL, DEVICES_BY_IDS_SQL_TEMPLATE,
-        GROUPS_FOR_DEVICES_SQL_TEMPLATE, LIST_ACTOR_GRANTS_SQL,
-        ROLE_PERMISSIONS_BY_ROLE_IDS_SQL_TEMPLATE, SNAPSHOT_META_SQL,
-    };
-    pub(crate) use super::snapshot_read::{
-        ActorAuthorization, ensure_actor_admin_readonly, load_admin_target_snapshot_in_tx,
-    };
-}
-#[allow(unused_imports)]
-pub(crate) use self::_batch_d_exports::*;
-pub use self::snapshot_repo::SqlxAuthorizationSnapshotRepository;
-pub use self::traits::{AuthorizationSnapshotRepository, AuthzRepository};
-pub(crate) use self::tx_guard::bump_authz_epoch;
-use self::tx_guard::{begin_guard, lock_user_pair_and_verify_actor, placeholders};
 
 pub struct SqlxAuthzRepository {
     pub(crate) db: DbPool,
