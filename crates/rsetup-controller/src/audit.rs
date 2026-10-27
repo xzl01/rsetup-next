@@ -110,7 +110,7 @@ mod tests {
         let auth = include_str!("auth/sqlx_repo.rs");
         assert!(auth.contains("static AUTH_PROCESS_EPOCH"));
         assert!(auth.contains("static AUTH_EVENT_SEQ"));
-        let db = include_str!("db.rs");
+        let db = include_str!("db/admission.rs");
         assert!(db.contains("static PROCESS_EPOCH"));
         assert!(db.contains("static EVENT_SEQ"));
         assert!(db.contains("INSERT INTO audit_events"));
