@@ -1,8 +1,11 @@
 use super::*;
 use crate::auth::session::IDLE;
-use std::sync::{
-    Mutex,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+use std::{
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Instant,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
