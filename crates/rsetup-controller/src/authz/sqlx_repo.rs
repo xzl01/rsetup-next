@@ -2,42 +2,65 @@ mod codec;
 mod model;
 mod queries;
 mod snapshot_codec;
+mod snapshot_read;
+mod snapshot_repo;
 mod traits;
+mod tx_guard;
+
+#[cfg(test)]
+pub(crate) mod sql_shape;
 
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::auth::service::Session;
 use crate::authz::policy::{
-    GrantRecord, GrantScope, GrantSource, Permission, RoleRecord, SnapshotActor,
-    check_admin_demotion_allowed,
+    GrantRecord, GrantScope, GrantSource, Permission, RoleRecord, check_admin_demotion_allowed,
 };
 use crate::db::DbPool;
-use crate::devices::repository::DeviceAdminView;
 use crate::error::ControllerError;
 
 use self::codec::validate_role_restore;
-pub(crate) use self::codec::{
-    admin_change_removes_admin_state, ordered_user_ids, read_error, validate_group_name,
-};
+pub(crate) use self::codec::{admin_change_removes_admin_state, read_error, validate_group_name};
 pub use self::codec::{
     decode_grant, decode_user, grant_columns, page_cursor, validate_display_name,
 };
 pub use self::model::{AuthorizationSnapshot, GrantColumns, GroupRecord, RepoFuture, UserRecord};
 pub(crate) use self::queries::{
-    ACTOR_READONLY_SQL, ADMIN_TARGET_DEVICE_KEYS_SQL, DEVICE_GROUPS_FOR_DEVICE_SQL,
-    DEVICES_BY_IDS_SQL_TEMPLATE, FIND_GRANT_SQL, FIND_GROUP_SQL, FIND_ROLE_SQL, FIND_USER_SQL,
-    GROUPS_FOR_DEVICES_SQL_TEMPLATE, LIST_ACTOR_GRANTS_SQL, LIST_GRANTS_FOR_USER_SQL,
-    LIST_GRANTS_SQL, LIST_GROUP_DEVICE_IDS_SQL, LIST_GROUPS_FIRST_SQL, LIST_GROUPS_SQL,
-    LIST_ROLES_FIRST_SQL, LIST_ROLES_SQL, LIST_USERS_FIRST_SQL, LIST_USERS_SQL,
-    ROLE_PERMISSIONS_BY_ROLE_IDS_SQL_TEMPLATE, ROLES_BY_IDS_SQL_TEMPLATE, SNAPSHOT_META_SQL,
+    DEVICE_GROUPS_FOR_DEVICE_SQL, FIND_GRANT_SQL, FIND_GROUP_SQL, FIND_ROLE_SQL, FIND_USER_SQL,
+    LIST_GRANTS_FOR_USER_SQL, LIST_GRANTS_SQL, LIST_GROUP_DEVICE_IDS_SQL, LIST_GROUPS_FIRST_SQL,
+    LIST_GROUPS_SQL, LIST_ROLES_FIRST_SQL, LIST_ROLES_SQL, LIST_USERS_FIRST_SQL, LIST_USERS_SQL,
+    ROLES_BY_IDS_SQL_TEMPLATE,
 };
 pub use self::snapshot_codec::{
     build_authorization_snapshot, decode_device_admin_view, decode_group_memberships_for_device,
     decode_snapshot_actor, decode_snapshot_group_rows, decode_snapshot_meta, decode_snapshot_roles,
     require_snapshot_isolation, validate_snapshot_grant_references,
 };
+pub(crate) use self::snapshot_read::{
+    acquire_authorization_read_connection, load_actor_authorization_in_tx,
+    load_device_snapshot_in_tx, load_snapshot_in_tx, verify_management_read,
+};
+// 批次 D 内部暂留：供外部同域/跨域按 §4.2 清单消费但当前文件剩余实现体暂未直接引用的条目。
+// 待批次 E 迁出巨型 impl 后，mod.rs 将收敛为最终再导出形式。
+#[allow(unused_imports)]
+mod _batch_d_exports {
+    pub(crate) use super::codec::ordered_user_ids;
+    pub(crate) use super::queries::{
+        ACTOR_READONLY_SQL, ADMIN_TARGET_DEVICE_KEYS_SQL, DEVICES_BY_IDS_SQL_TEMPLATE,
+        GROUPS_FOR_DEVICES_SQL_TEMPLATE, LIST_ACTOR_GRANTS_SQL,
+        ROLE_PERMISSIONS_BY_ROLE_IDS_SQL_TEMPLATE, SNAPSHOT_META_SQL,
+    };
+    pub(crate) use super::snapshot_read::{
+        ActorAuthorization, ensure_actor_admin_readonly, load_admin_target_snapshot_in_tx,
+    };
+}
+#[allow(unused_imports)]
+pub(crate) use self::_batch_d_exports::*;
+pub use self::snapshot_repo::SqlxAuthorizationSnapshotRepository;
 pub use self::traits::{AuthorizationSnapshotRepository, AuthzRepository};
+pub(crate) use self::tx_guard::bump_authz_epoch;
+use self::tx_guard::{begin_guard, lock_user_pair_and_verify_actor, placeholders};
 
 pub struct SqlxAuthzRepository {
     pub(crate) db: DbPool,
@@ -46,604 +69,6 @@ pub struct SqlxAuthzRepository {
 impl SqlxAuthzRepository {
     pub fn new(db: DbPool) -> Self {
         Self { db }
-    }
-}
-
-pub struct SqlxAuthorizationSnapshotRepository {
-    pub(crate) db: DbPool,
-}
-
-impl SqlxAuthorizationSnapshotRepository {
-    pub fn new(db: DbPool) -> Self {
-        Self { db }
-    }
-}
-
-/// 目标为 users 行时的行锁快照（`FOR UPDATE`），解码为安全 `UserRecord`。
-type UserRow = UserRecord;
-
-async fn select_user_for_update(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    id: [u8; 16],
-) -> Result<Option<UserRow>, ControllerError> {
-    use sqlx::Row;
-    let row = sqlx::query(
-        "SELECT id,username,display_name,CAST(active AS SIGNED) AS active,CAST(is_admin AS SIGNED) AS is_admin,CAST(must_change_password AS SIGNED) AS must_change_password,revision FROM users WHERE id=? FOR UPDATE",
-    )
-    .bind(id.as_slice())
-    .fetch_optional(&mut **tx)
-    .await?;
-    row.map(|row| {
-        decode_user(
-            row.try_get("id")?,
-            row.try_get("username")?,
-            row.try_get("display_name")?,
-            row.try_get("active")?,
-            row.try_get("is_admin")?,
-            row.try_get("must_change_password")?,
-            row.try_get("revision")?,
-        )
-    })
-    .transpose()
-}
-
-/// 管理写事务统一入口：begin 后立即取 schema guard 行锁（期望版本固定为
-/// 编译期 `SUPPORTED_SCHEMA_VERSION`），串行化全部管理写。
-async fn begin_guard(db: &DbPool) -> Result<sqlx::Transaction<'_, sqlx::MySql>, ControllerError> {
-    let mut tx = db.0.begin().await?;
-    crate::integrity::lock_integrity_guard(&mut tx).await?;
-    Ok(tx)
-}
-
-/// 目标为 users 行时：guard → 按 UUID 字节序锁 actor/target → 用**锁定行**
-/// 严格重验 actor 仍为有效管理员 → 返回目标行（缺失即 NotFound）。
-async fn lock_user_pair_and_verify_actor(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    actor: [u8; 16],
-    target: [u8; 16],
-) -> Result<Option<UserRow>, ControllerError> {
-    let (first, second) = ordered_user_ids(actor, target);
-    let first_row = select_user_for_update(tx, first).await?;
-    let second_row = match second {
-        Some(id) => select_user_for_update(tx, id).await?,
-        None => None,
-    };
-    let actor_row = if first == actor {
-        first_row.as_ref()
-    } else {
-        second_row.as_ref()
-    };
-    let actor_row = actor_row.ok_or(ControllerError::PermissionDenied)?;
-    if !(actor_row.active && actor_row.is_admin && !actor_row.must_change_password) {
-        return Err(ControllerError::PermissionDenied);
-    }
-    Ok(if first == target {
-        first_row
-    } else {
-        second_row
-    })
-}
-
-/// `authz_epoch` checked CAS 自增；singleton 行已被 guard 锁定，CAS 仍防未走 guard 的写者。
-pub(crate) async fn bump_authz_epoch(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-) -> Result<u64, ControllerError> {
-    let current: u64 =
-        sqlx::query_scalar("SELECT authz_epoch FROM schema_meta WHERE singleton = 1")
-            .fetch_one(&mut **tx)
-            .await?;
-    let next = current
-        .checked_add(1)
-        .ok_or(ControllerError::RevisionConflict)?;
-    let changed = sqlx::query(
-        "UPDATE schema_meta SET authz_epoch = ? WHERE singleton = 1 AND authz_epoch = ?",
-    )
-    .bind(next)
-    .bind(current)
-    .execute(&mut **tx)
-    .await?
-    .rows_affected();
-    if changed != 1 {
-        return Err(ControllerError::RevisionConflict);
-    }
-    Ok(next)
-}
-
-pub(crate) async fn acquire_authorization_read_connection(
-    db: &DbPool,
-) -> Result<sqlx::pool::PoolConnection<sqlx::MySql>, ControllerError> {
-    let mut connection =
-        db.0.acquire()
-            .await
-            .map_err(|_| read_error("snapshot.tx"))?;
-    let isolation: String = sqlx::query_scalar("SELECT @@session.transaction_isolation")
-        .fetch_one(&mut *connection)
-        .await
-        .map_err(|_| read_error("snapshot.isolation"))?;
-    require_snapshot_isolation(&isolation)?;
-    Ok(connection)
-}
-
-pub(crate) async fn ensure_actor_admin_readonly(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    actor: &crate::auth::service::Session,
-) -> Result<(), ControllerError> {
-    use sqlx::Row;
-    let row = sqlx::query(ACTOR_READONLY_SQL)
-        .bind(actor.user.id.as_slice())
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(|_| read_error("users.actor"))?;
-    let row = row.ok_or(ControllerError::PermissionDenied)?;
-    let active = crate::integrity::raw_bool(
-        row.try_get::<i64, _>("active")
-            .map_err(|_| read_error("users.active"))?,
-        "users.active",
-    )?;
-    let is_admin = crate::integrity::raw_bool(
-        row.try_get::<i64, _>("is_admin")
-            .map_err(|_| read_error("users.is_admin"))?,
-        "users.is_admin",
-    )?;
-    let must_change_password = crate::integrity::raw_bool(
-        row.try_get::<i64, _>("must_change_password")
-            .map_err(|_| read_error("users.must_change_password"))?,
-        "users.must_change_password",
-    )?;
-    if active && is_admin && !must_change_password {
-        Ok(())
-    } else {
-        Err(ControllerError::PermissionDenied)
-    }
-}
-
-pub(crate) async fn verify_management_read(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    actor: &crate::auth::service::Session,
-) -> Result<(), ControllerError> {
-    use sqlx::Row;
-    let rows = sqlx::query(SNAPSHOT_META_SQL)
-        .fetch_all(&mut **tx)
-        .await
-        .map_err(|_| read_error("snapshot.epoch"))?;
-    let raw = rows
-        .iter()
-        .map(|row| -> Result<(i64, i64, u64), ControllerError> {
-            Ok((
-                row.try_get("singleton")
-                    .map_err(|_| read_error("snapshot.epoch"))?,
-                row.try_get("schema_version")
-                    .map_err(|_| read_error("snapshot.epoch"))?,
-                row.try_get("authz_epoch")
-                    .map_err(|_| read_error("snapshot.epoch"))?,
-            ))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    decode_snapshot_meta(&raw, crate::integrity::SUPPORTED_SCHEMA_VERSION)?;
-    ensure_actor_admin_readonly(tx, actor).await
-}
-
-pub(crate) struct ActorAuthorization {
-    pub actor: SnapshotActor,
-    pub authz_epoch: u64,
-    pub grants: Vec<GrantRecord>,
-    pub roles: HashMap<Uuid, RoleRecord>,
-}
-
-fn placeholders(n: usize) -> String {
-    vec!["?"; n].join(", ")
-}
-
-pub(crate) async fn load_actor_authorization_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    actor_id: [u8; 16],
-) -> Result<ActorAuthorization, ControllerError> {
-    use sqlx::Row;
-    let row = sqlx::query(ACTOR_READONLY_SQL)
-        .bind(actor_id.as_slice())
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(|_| read_error("snapshot.actor"))?;
-    let actor = decode_snapshot_actor(
-        actor_id,
-        match row {
-            None => None,
-            Some(r) => Some((
-                r.try_get::<i64, _>("active")
-                    .map_err(|_| read_error("snapshot.actor"))?,
-                r.try_get::<i64, _>("is_admin")
-                    .map_err(|_| read_error("snapshot.actor"))?,
-                r.try_get::<i64, _>("must_change_password")
-                    .map_err(|_| read_error("snapshot.actor"))?,
-            )),
-        },
-    )?;
-
-    let meta_rows = sqlx::query(SNAPSHOT_META_SQL)
-        .fetch_all(&mut **tx)
-        .await
-        .map_err(|_| read_error("snapshot.epoch"))?;
-    let raw_meta = meta_rows
-        .iter()
-        .map(|row| -> Result<(i64, i64, u64), ControllerError> {
-            Ok((
-                row.try_get("singleton")
-                    .map_err(|_| read_error("snapshot.epoch"))?,
-                row.try_get("schema_version")
-                    .map_err(|_| read_error("snapshot.epoch"))?,
-                row.try_get("authz_epoch")
-                    .map_err(|_| read_error("snapshot.epoch"))?,
-            ))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let authz_epoch = decode_snapshot_meta(&raw_meta, crate::integrity::SUPPORTED_SCHEMA_VERSION)?;
-
-    let grant_rows = sqlx::query(LIST_ACTOR_GRANTS_SQL)
-        .bind(actor_id.as_slice())
-        .fetch_all(&mut **tx)
-        .await
-        .map_err(|_| read_error("snapshot.grants"))?;
-    let grants: Vec<GrantRecord> = grant_rows
-        .iter()
-        .map(|r| -> Result<GrantRecord, ControllerError> {
-            let permissions_raw: Option<String> = r
-                .try_get("permissions")
-                .map_err(|_| read_error("snapshot.grants"))?;
-            let permissions = match permissions_raw {
-                Some(text) => {
-                    Some(serde_json::from_str(&text).map_err(|_| read_error("snapshot.grants"))?)
-                }
-                None => None,
-            };
-            let grant = decode_grant(
-                r.try_get("id").map_err(|_| read_error("snapshot.grants"))?,
-                r.try_get("user_id")
-                    .map_err(|_| read_error("snapshot.grants"))?,
-                r.try_get("source_kind")
-                    .map_err(|_| read_error("snapshot.grants"))?,
-                r.try_get("role_id")
-                    .map_err(|_| read_error("snapshot.grants"))?,
-                permissions,
-                r.try_get("scope_kind")
-                    .map_err(|_| read_error("snapshot.grants"))?,
-                r.try_get("scope_group_id")
-                    .map_err(|_| read_error("snapshot.grants"))?,
-                r.try_get("scope_device_id")
-                    .map_err(|_| read_error("snapshot.grants"))?,
-                r.try_get("revision")
-                    .map_err(|_| read_error("snapshot.grants"))?,
-            )
-            .map_err(|_| read_error("snapshot.grants"))?;
-            validate_snapshot_grant_references(
-                &grant,
-                r.try_get("owner_exists")
-                    .map_err(|_| read_error("snapshot.reference"))?,
-                r.try_get("role_exists")
-                    .map_err(|_| read_error("snapshot.reference"))?,
-                r.try_get("group_exists")
-                    .map_err(|_| read_error("snapshot.reference"))?,
-                r.try_get("device_exists")
-                    .map_err(|_| read_error("snapshot.reference"))?,
-            )?;
-            Ok(grant)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let mut role_ids: Vec<Uuid> = grants
-        .iter()
-        .filter_map(|g| match &g.source {
-            GrantSource::Role(rid) => Some(*rid),
-            _ => None,
-        })
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-    role_ids.sort();
-    let roles: HashMap<Uuid, RoleRecord> = if role_ids.is_empty() {
-        HashMap::new()
-    } else {
-        let ph = placeholders(role_ids.len());
-        let roles_sql = ROLES_BY_IDS_SQL_TEMPLATE.replace("{placeholders}", &ph);
-        let mut q = sqlx::query(&roles_sql);
-        for rid in &role_ids {
-            q = q.bind(rid.as_bytes().as_slice());
-        }
-        let role_rows = q
-            .fetch_all(&mut **tx)
-            .await
-            .map_err(|_| read_error("snapshot.roles"))?;
-        let raw_roles: Vec<(Vec<u8>, String, i64, i64, u64)> = role_rows
-            .iter()
-            .map(|r| -> Result<_, ControllerError> {
-                Ok((
-                    r.try_get("id").map_err(|_| read_error("snapshot.roles"))?,
-                    r.try_get("name")
-                        .map_err(|_| read_error("snapshot.roles"))?,
-                    r.try_get("builtin")
-                        .map_err(|_| read_error("snapshot.roles"))?,
-                    r.try_get("archived")
-                        .map_err(|_| read_error("snapshot.roles"))?,
-                    r.try_get("revision")
-                        .map_err(|_| read_error("snapshot.roles"))?,
-                ))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let ph = placeholders(role_ids.len());
-        let perms_sql = ROLE_PERMISSIONS_BY_ROLE_IDS_SQL_TEMPLATE.replace("{placeholders}", &ph);
-        let mut q = sqlx::query(&perms_sql);
-        for rid in &role_ids {
-            q = q.bind(rid.as_bytes().as_slice());
-        }
-        let perm_rows = q
-            .fetch_all(&mut **tx)
-            .await
-            .map_err(|_| read_error("snapshot.roles"))?;
-        let raw_perms: Vec<(Vec<u8>, String)> = perm_rows
-            .iter()
-            .map(|r| -> Result<_, ControllerError> {
-                Ok((
-                    r.try_get("role_id")
-                        .map_err(|_| read_error("snapshot.role_permission"))?,
-                    r.try_get("permission")
-                        .map_err(|_| read_error("snapshot.role_permission"))?,
-                ))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        decode_snapshot_roles(&raw_roles, &raw_perms)?
-    };
-
-    for role_id in &role_ids {
-        if !roles.contains_key(role_id) {
-            return Err(read_error("snapshot.role_missing"));
-        }
-    }
-    Ok(ActorAuthorization {
-        actor,
-        authz_epoch,
-        grants,
-        roles,
-    })
-}
-
-pub(crate) async fn load_device_snapshot_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    device_ids: &[[u8; 32]],
-) -> Result<
-    (
-        HashMap<[u8; 32], HashSet<Uuid>>,
-        HashMap<[u8; 32], DeviceAdminView>,
-    ),
-    ControllerError,
-> {
-    if device_ids.is_empty() {
-        return Ok((HashMap::new(), HashMap::new()));
-    }
-    let ph = placeholders(device_ids.len());
-
-    use sqlx::Row;
-    let groups_sql = GROUPS_FOR_DEVICES_SQL_TEMPLATE.replace("{placeholders}", &ph);
-    let mut q = sqlx::query(&groups_sql);
-    for key in device_ids {
-        q = q.bind(key.as_slice());
-    }
-    let group_rows = q
-        .fetch_all(&mut **tx)
-        .await
-        .map_err(|_| read_error("snapshot.groups"))?;
-    let raw_groups: Vec<(Vec<u8>, Vec<u8>, Option<i64>)> = group_rows
-        .iter()
-        .map(|r| -> Result<_, ControllerError> {
-            let raw_exists: i64 = r
-                .try_get("member_device_exists")
-                .map_err(|_| read_error("snapshot.reference"))?;
-            let exists = crate::integrity::raw_bool(raw_exists, "snapshot.reference")
-                .map_err(|_| read_error("snapshot.reference"))?;
-            if !exists {
-                return Err(read_error("snapshot.reference"));
-            }
-            Ok((
-                r.try_get("device_id")
-                    .map_err(|_| read_error("snapshot.groups"))?,
-                r.try_get("group_id")
-                    .map_err(|_| read_error("snapshot.groups"))?,
-                r.try_get("group_archived")
-                    .map_err(|_| read_error("snapshot.groups"))?,
-            ))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let device_groups = decode_snapshot_group_rows(&raw_groups)?;
-
-    let devices_sql = DEVICES_BY_IDS_SQL_TEMPLATE.replace("{placeholders}", &ph);
-    let mut q = sqlx::query(&devices_sql);
-    for key in device_ids {
-        q = q.bind(key.as_slice());
-    }
-    let device_rows = q
-        .fetch_all(&mut **tx)
-        .await
-        .map_err(|_| read_error("snapshot.devices"))?;
-    let mut devices: HashMap<[u8; 32], DeviceAdminView> = HashMap::new();
-    for r in &device_rows {
-        let view = decode_device_admin_view(
-            r.try_get("public_key")
-                .map_err(|_| read_error("snapshot.devices"))?,
-            r.try_get("display_name")
-                .map_err(|_| read_error("snapshot.devices"))?,
-            r.try_get("descriptor_json")
-                .map_err(|_| read_error("snapshot.devices"))?,
-            r.try_get("admission_state")
-                .map_err(|_| read_error("snapshot.devices"))?,
-            r.try_get("review_decision")
-                .map_err(|_| read_error("snapshot.devices"))?,
-            r.try_get("revision")
-                .map_err(|_| read_error("snapshot.devices"))?,
-            r.try_get("archived")
-                .map_err(|_| read_error("snapshot.devices"))?,
-        )?;
-        devices.insert(view.public_key, view);
-    }
-    Ok((device_groups, devices))
-}
-
-pub(crate) async fn load_snapshot_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    actor_id: [u8; 16],
-    device_ids: &[[u8; 32]],
-) -> Result<AuthorizationSnapshot, ControllerError> {
-    let actor_auth = load_actor_authorization_in_tx(tx, actor_id).await?;
-    let (device_groups, devices) = load_device_snapshot_in_tx(tx, device_ids).await?;
-    build_authorization_snapshot(
-        actor_auth.actor,
-        actor_auth.authz_epoch,
-        actor_auth.grants,
-        actor_auth.roles,
-        device_groups,
-        devices,
-    )
-}
-
-pub(crate) async fn load_admin_target_snapshot_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    caller: &crate::auth::service::Session,
-    target_user: [u8; 16],
-    device_ids: &[[u8; 32]],
-) -> Result<AuthorizationSnapshot, ControllerError> {
-    ensure_actor_admin_readonly(tx, caller).await?;
-    load_snapshot_in_tx(tx, target_user, device_ids).await
-}
-
-impl AuthorizationSnapshotRepository for SqlxAuthorizationSnapshotRepository {
-    fn load_snapshot<'a>(
-        &'a self,
-        actor_id: [u8; 16],
-        device_ids: &'a [[u8; 32]],
-    ) -> RepoFuture<'a, AuthorizationSnapshot> {
-        let db = self.db.clone();
-        Box::pin(async move {
-            let mut connection = acquire_authorization_read_connection(&db).await?;
-            let mut tx = sqlx::Connection::begin(&mut *connection)
-                .await
-                .map_err(|_| read_error("snapshot.tx"))?;
-            let snapshot = load_snapshot_in_tx(&mut tx, actor_id, device_ids).await?;
-            tx.commit().await.map_err(|_| read_error("snapshot.tx"))?;
-            Ok(snapshot)
-        })
-    }
-
-    fn load_admin_target_snapshot<'a>(
-        &'a self,
-        caller: &'a crate::auth::service::Session,
-        target_user: [u8; 16],
-        device_ids: &'a [[u8; 32]],
-    ) -> RepoFuture<'a, AuthorizationSnapshot> {
-        let db = self.db.clone();
-        Box::pin(async move {
-            let mut connection = acquire_authorization_read_connection(&db).await?;
-            let mut tx = sqlx::Connection::begin(&mut *connection)
-                .await
-                .map_err(|_| read_error("snapshot.tx"))?;
-            let snapshot =
-                load_admin_target_snapshot_in_tx(&mut tx, caller, target_user, device_ids).await?;
-            tx.commit().await.map_err(|_| read_error("snapshot.tx"))?;
-            Ok(snapshot)
-        })
-    }
-
-    fn load_admin_target_page<'a>(
-        &'a self,
-        caller: &'a Session,
-        target: [u8; 16],
-        device_id: Option<[u8; 32]>,
-        cursor: Option<[u8; 32]>,
-        limit: usize,
-    ) -> RepoFuture<'a, serde_json::Value> {
-        let db = &self.db;
-        Box::pin(async move {
-            if !(1..=200).contains(&limit) {
-                return Err(ControllerError::InvalidArgument);
-            }
-            let mut connection = acquire_authorization_read_connection(db).await?;
-            let mut tx = sqlx::Connection::begin(&mut *connection).await?;
-            // 同连接同事务：caller 当前 admin（DB raw_bool），行缺失 → PermissionDenied。
-            ensure_actor_admin_readonly(&mut tx, caller).await?;
-            // target 存在性同 tx 检查：缺失是 protected 目标 404，不误映 PermissionDenied；
-            // target inactive / must_change_password 属合法存在，来源/权限可为空。
-            let exists = sqlx::query_scalar::<_, Vec<u8>>("SELECT id FROM users WHERE id=?")
-                .bind(target.as_slice())
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|_| read_error("snapshot.actor"))?;
-            if exists.is_none() {
-                return Err(ControllerError::NotFound);
-            }
-            let keys: Vec<[u8; 32]> = match device_id {
-                Some(id) => vec![id],
-                None => {
-                    let scan_limit =
-                        u64::try_from(limit + 1).map_err(|_| ControllerError::InvalidArgument)?;
-                    sqlx::query_scalar::<_, Vec<u8>>(ADMIN_TARGET_DEVICE_KEYS_SQL)
-                        .bind(cursor.map(|key| key.to_vec()))
-                        .bind(cursor.map(|key| key.to_vec()))
-                        .bind(scan_limit)
-                        .fetch_all(&mut *tx)
-                        .await?
-                        .into_iter()
-                        .map(|raw| raw.try_into().map_err(|_| read_error("snapshot.device_id")))
-                        .collect::<Result<Vec<_>, _>>()?
-                }
-            };
-            // 单快照：target 的 grants/roles/device_groups/devices 全部在同一 tx 内加载，
-            // schema_meta 单例与版本防线由 load_snapshot_in_tx 承担，不另开第二套。
-            let snapshot = load_snapshot_in_tx(&mut tx, target, &keys).await?;
-            if let Some(id) = device_id
-                && !snapshot.devices.get(&id).is_some_and(|view| !view.archived)
-            {
-                return Err(ControllerError::NotFound);
-            }
-            let has_next = device_id.is_none() && keys.len() > limit;
-            let mut items = Vec::new();
-            let mut last = None;
-            for key in keys.iter().take(limit) {
-                let permissions =
-                    crate::authz::service::snapshot_effective_permissions(&snapshot, *key);
-                let mut effective: Vec<_> = permissions
-                    .iter()
-                    .map(|permission| permission.as_str())
-                    .collect();
-                effective.sort_unstable();
-                let sources = crate::authz::service::snapshot_permission_sources(&snapshot, *key)
-                    .into_iter()
-                    .map(|entry| {
-                        let source = match entry.source {
-                            crate::authz::policy::PermissionSourceKind::Admin => {
-                                serde_json::json!({"kind":"admin"})
-                            }
-                            crate::authz::policy::PermissionSourceKind::Role(id) => {
-                                serde_json::json!({"kind":"role","role_id":id.to_string()})
-                            }
-                            crate::authz::policy::PermissionSourceKind::Direct(id) => {
-                                serde_json::json!({"kind":"direct","grant_id":id.to_string()})
-                            }
-                        };
-                        serde_json::json!({"permission":entry.permission.as_str(),"source":source})
-                    })
-                    .collect::<Vec<_>>();
-                items.push(serde_json::json!({
-                    "device_id": hex::encode(key),
-                    "effective_permissions": effective,
-                    "sources": sources,
-                }));
-                last = Some(*key);
-            }
-            tx.commit().await?;
-            // 内部 raw key（末项公钥 hex64）；出口签名归 HTTP 层。
-            Ok(serde_json::json!({
-                "items": items,
-                "next_cursor": if has_next { last.map(hex::encode) } else { None },
-            }))
-        })
     }
 }
 
@@ -2275,39 +1700,5 @@ impl AuthzRepository for SqlxAuthzRepository {
             tx.commit().await?;
             Ok(record)
         })
-    }
-}
-
-/// 测试专用 fixture：生产 SQL 常量的文本形状门禁。只解析字符串，不连引擎、不伪造
-/// `MySqlRow`，因此不声称任何真实引擎行为（真库端到端由受控 executor 复跑）。
-#[cfg(test)]
-pub(crate) mod sql_shape;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 执行位门禁：设备批量读必须消费被上面回归钉住的模板常量，且本文件生产段内不得
-    /// 出现第二条未被钉的 `descriptor_json` 读 SQL 字面量（内联副本会绕过形状回归）。
-    #[test]
-    fn device_snapshot_read_consumes_pinned_template_without_inline_copy() {
-        let src = sql_shape::production_source(include_str!("sqlx_repo.rs"));
-        assert!(
-            src.contains("DEVICES_BY_IDS_SQL_TEMPLATE.replace(\"{placeholders}\", &ph)"),
-            "load_device_snapshot_in_tx 必须消费 DEVICES_BY_IDS_SQL_TEMPLATE 常量"
-        );
-        assert!(
-            src.contains("r.try_get(\"descriptor_json\")"),
-            "设备快照必须以 descriptor_json 列名取列，别名改名会静默改变解码输入"
-        );
-        let pinned = sql_shape::normalize_sql(DEVICES_BY_IDS_SQL_TEMPLATE);
-        for literal in sql_shape::select_string_literals(src) {
-            if literal.contains("descriptor_json") {
-                assert_eq!(
-                    literal, pinned,
-                    "本文件生产段内的 descriptor_json 读 SQL 必须是 DEVICES_BY_IDS_SQL_TEMPLATE 本体"
-                );
-            }
-        }
     }
 }
