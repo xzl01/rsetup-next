@@ -260,6 +260,7 @@ pub fn decode_snapshot_meta(
 
 #[cfg(test)]
 mod tests {
+    use super::super::queries::SNAPSHOT_META_SQL;
     use super::*;
     use crate::authz::policy::{GrantScope, GrantSource, Permission};
 
@@ -845,8 +846,8 @@ mod tests {
                 Err(ControllerError::Config(_))
             ));
         }
-        assert!(!super::super::queries::SNAPSHOT_META_SQL.contains("WHERE"));
-        assert!(super::super::queries::SNAPSHOT_META_SQL.ends_with("LIMIT 2"));
+        assert!(!SNAPSHOT_META_SQL.contains("WHERE"));
+        assert!(SNAPSHOT_META_SQL.ends_with("LIMIT 2"));
     }
 
     #[test]

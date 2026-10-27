@@ -1,6 +1,6 @@
 mod codec;
 mod model;
-pub(crate) mod queries;
+mod queries;
 mod snapshot_codec;
 mod traits;
 
