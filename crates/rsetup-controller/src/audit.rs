@@ -1,5 +1,5 @@
 //! 新管理/任务写者的独立审计命名空间：与 `auth/sqlx_repo.rs` 的
-//! `AUTH_PROCESS_EPOCH`/`AUTH_EVENT_SEQ`、`db.rs` 函数内局部
+//! `AUTH_PROCESS_EPOCH`/`AUTH_EVENT_SEQ`、`db/admission.rs` 函数内局部
 //! `PROCESS_EPOCH`/`EVENT_SEQ` 完全独立——`uq_audit_epoch_seq
 //! (process_epoch, event_seq)` 下三个 epoch 各自由 CSPRNG 独立采样，随机碰撞
 //! 概率极低但非数学零碰撞；DB 唯一约束 `uq_audit_epoch_seq` 失败关闭，
