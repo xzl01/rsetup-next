@@ -2,6 +2,14 @@
 //!
 //! 包含 constant_time_eq、PreviewSnapshotFixed、NewSubTask，
 //! 以及 submit_in_tx 固有实现与提交流程 7 个 private helper。
+//!
+//! 事务纪律：一律「短事务 + 事务内零网络」，事务内绝不调用任何 Board 客户端；
+//! 锁序固定为 `schema_meta → users → roles → device_groups → devices →
+//! device_operation_locks`，不得逆序、不得重复锁同一行。
+//!
+//! 行读取口径：本 crate 的 `sqlx` 未启用 `derive` 特性，原始行统一经
+//! [`crate::tasks::repository::tx_rows`] / [`crate::tasks::repository::tx_row`] +
+//! [`crate::tasks::repository::column`] 显式解码，checked 转换失败一律 503。
 
 use std::collections::BTreeSet;
 

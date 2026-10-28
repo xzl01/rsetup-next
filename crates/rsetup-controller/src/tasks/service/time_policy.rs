@@ -3,6 +3,12 @@
 //! 时钟纪律：时限复核只接受服务端可信时钟快照（[`TimeEvidence`]），
 //! 决不接受请求侧自报时钟或自报证据种类参与分派；任何路径都不会把
 //! `created_at` / `observe_deadline` 改成更晚的值。
+//!
+//! 两条期限列各记各的含义，绝不互相顶替（`sub_tasks` DDL 为真相源）：
+//! `queue_deadline` 是**排队截止**（04 §5.1 排队有效期），由创建时可信时基
+//! （[`queue_deadline_of`]）算出，是时限复核判定 `held` 是否过期的唯一比对依据；
+//! `observe_deadline` 是**观察窗截止**（04 §5.2/§5.3，自 `dispatching` 起算），
+//! 由派发路径持有，复核路径只读不写、更不拿它替代排队截止。
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

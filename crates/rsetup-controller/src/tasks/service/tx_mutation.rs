@@ -2,6 +2,10 @@
 //!
 //! 包含 cancel_in_tx、time_review_in_tx、release_lock_in_tx、
 //! read_sub_task_states 与 sync_main_task_summary。
+//!
+//! 行读取口径：本 crate 的 `sqlx` 未启用 `derive` 特性，原始行统一经
+//! [`crate::tasks::repository::tx_rows`] / [`crate::tasks::repository::tx_row`] +
+//! [`crate::tasks::repository::column`] 显式解码，checked 转换失败一律 503。
 
 use chrono::{DateTime, Utc};
 use sqlx::Transaction;
