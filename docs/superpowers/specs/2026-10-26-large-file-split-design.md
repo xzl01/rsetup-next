@@ -124,18 +124,18 @@
 
 | # | 源文件 | 拟建子规格路径 | 状态 | 边界与风险摘要（详设归子规格） |
 | --- | --- | --- | --- | --- |
-| 01 | controller `http_auth.rs` | [01-http-auth.md](2026-10-26-large-file-split/01-http-auth.md) | 已通过静态审查；未开始 | 与 auth/service（11）、authz（04）同属认证/授权域，域内序列化；内联测试占 3/4，C3 为主要难度 |
-| 02 | app `tui.rs` | [02-tui.md](2026-10-26-large-file-split/02-tui.md) | 已通过静态审查；实施完成（见§9） | bin 私有模块，无对外路径约束；UI 渲染与按键状态机耦合，按面板/事件域切 |
-| 03 | core `system_install.rs` | [03-system-install.md](2026-10-26-large-file-split/03-system-install.md) | 已通过静态审查；实施完成（见§9） | 私有模块 + `lib.rs` 的 `pub use` 清单逐字不变（C1）；安装流程副作用顺序敏感（C2） |
-| 04 | controller `authz/sqlx_repo.rs` | [04-authz-sqlx-repo.md](2026-10-26-large-file-split/04-authz-sqlx-repo.md) | 已通过静态审查；实施完成（见§9） | SQL 文本/绑定/事务/锁范围逐字不变；行映射与查询成对迁移；真库验证仅登记（§6.3） |
-| 05 | `ui/app.js` | [05-ui-app.md](2026-10-26-large-file-split/05-ui-app.md) | 已通过静态审查；实施完成（批次2审查PASS，见§9） | C5 专项：经典脚本/全局变量/vm 测试兼容；拆分方案须在该子规格真实代码会话中盘点后定案 |
-| 06 | controller `tasks/http.rs` | [06-tasks-http.md](2026-10-26-large-file-split/06-tasks-http.md) | 已通过静态审查；未开始 | tasks 域 handler 层，与 12 同域序列化；端点级鉴权/幂等/错误映射逐端点不变 |
-| 07 | app `main.rs` | [07-app-main.md](2026-10-26-large-file-split/07-app-main.md) | 已通过静态审查；未开始 | bin 装配 + CLI 参数面（行为=对外协议）；文件内测试模块随职责走；宜晚于同 crate 的 02 |
-| 08 | controller `db.rs` | [08-controller-db.md](2026-10-26-large-file-split/08-controller-db.md) | 已通过静态审查；实施完成（见§9） | `pub mod db` 路径与公开面不变；连接池/迁移语义敏感；工作树有并行改动，锚点须现采 |
-| 09 | core `hardware.rs` | [09-hardware.md](2026-10-26-large-file-split/09-hardware.md) | 已通过静态审查；实施完成（见§9） | 私有模块 + `pub use` 清单不变；硬件探测副作用与外部命令调用顺序不变 |
-| 10 | controller `main.rs` | [10-controller-main.md](2026-10-26-large-file-split/10-controller-main.md) | 已通过静态审查；未开始 | **专属风险（实测）**：`make metrics-static-gates` 第 6 条按路径 grep `src/main.rs` 且文件缺失时 Fail-Closed 报错；若改模块树须按 §6.4 门禁演进链路处理。装配层，宜最后批 |
-| 11 | controller `auth/service.rs` | [11-auth-service.md](2026-10-26-large-file-split/11-auth-service.md) | 已通过静态审查；实施中（批次1完成，批次2进行中） | 认证服务域核心，测试占近 4/5；凭据/会话语义与 01、04 边界须在 auth 域内先定稿 |
-| 12 | controller `tasks/service.rs` | [12-tasks-service.md](2026-10-26-large-file-split/12-tasks-service.md) | 已通过静态审查；未开始 | 任务状态机与并发/锁语义密集（C2）；快照注明多个测试块，须逐块归属 |
+| 01 | controller `http_auth.rs` | [01-http-auth.md](2026-10-26-large-file-split/01-http-auth.md) | 已通过静态审查；实施完成（见§9.1） | 与 auth/service（11）、authz（04）同属认证/授权域，域内序列化；内联测试占 3/4，C3 为主要难度 |
+| 02 | app `tui.rs` | [02-tui.md](2026-10-26-large-file-split/02-tui.md) | 已通过静态审查；实施完成（见§9.1） | bin 私有模块，无对外路径约束；UI 渲染与按键状态机耦合，按面板/事件域切 |
+| 03 | core `system_install.rs` | [03-system-install.md](2026-10-26-large-file-split/03-system-install.md) | 已通过静态审查；实施完成（见§9.1） | 私有模块 + `lib.rs` 的 `pub use` 清单逐字不变（C1）；安装流程副作用顺序敏感（C2） |
+| 04 | controller `authz/sqlx_repo.rs` | [04-authz-sqlx-repo.md](2026-10-26-large-file-split/04-authz-sqlx-repo.md) | 已通过静态审查；实施完成（见§9.1） | SQL 文本/绑定/事务/锁范围逐字不变；行映射与查询成对迁移；真库验证仅登记（§6.3） |
+| 05 | `ui/app.js` | [05-ui-app.md](2026-10-26-large-file-split/05-ui-app.md) | 已通过静态审查；实施完成（见§9.1） | C5 专项：经典脚本/全局变量/vm 测试兼容；拆分方案须在该子规格真实代码会话中盘点后定案 |
+| 06 | controller `tasks/http.rs` | [06-tasks-http.md](2026-10-26-large-file-split/06-tasks-http.md) | 已通过静态审查；实施完成（见§9.1） | tasks 域 handler 层，与 12 同域序列化；端点级鉴权/幂等/错误映射逐端点不变 |
+| 07 | app `main.rs` | [07-app-main.md](2026-10-26-large-file-split/07-app-main.md) | 已通过静态审查；实施完成（见§9.1） | bin 装配 + CLI 参数面（行为=对外协议）；文件内测试模块随职责走；宜晚于同 crate 的 02 |
+| 08 | controller `db.rs` | [08-controller-db.md](2026-10-26-large-file-split/08-controller-db.md) | 已通过静态审查；实施完成（见§9.1） | `pub mod db` 路径与公开面不变；连接池/迁移语义敏感；工作树有并行改动，锚点须现采 |
+| 09 | core `hardware.rs` | [09-hardware.md](2026-10-26-large-file-split/09-hardware.md) | 已通过静态审查；实施完成（见§9.1） | 私有模块 + `pub use` 清单不变；硬件探测副作用与外部命令调用顺序不变 |
+| 10 | controller `main.rs` | [10-controller-main.md](2026-10-26-large-file-split/10-controller-main.md) | 已通过静态审查；实施完成（批A–E 收官，见§9.1） | **专属风险（实测）**：`make metrics-static-gates` 第 6 条按路径 grep `src/main.rs` 且文件缺失时 Fail-Closed 报错；若改模块树须按 §6.4 门禁演进链路处理。装配层，宜最后批 |
+| 11 | controller `auth/service.rs` | [11-auth-service.md](2026-10-26-large-file-split/11-auth-service.md) | 已通过静态审查；实施完成（见§9.1） | 认证服务域核心，测试占近 4/5；凭据/会话语义与 01、04 边界须在 auth 域内先定稿 |
+| 12 | controller `tasks/service.rs` | [12-tasks-service.md](2026-10-26-large-file-split/12-tasks-service.md) | 已通过静态审查；实施完成（见§9.1） | 任务状态机与并发/锁语义密集（C2）；快照注明多个测试块，须逐块归属 |
 
 登记表顺序为盘点序号（约按行数降序），**不是实施顺序**；实施顺序见 §5。
 
@@ -219,7 +219,7 @@ B–E 各批次之间跨域可重叠；**跨批次重叠不解除 §5.1 的同�
 
 ### 9.1 已完成实施模块及提交清单
 
-截至当前，已完成 10 个模块（09 hardware、03 system_install、02 tui、05 ui/app.js、08 controller/db、04 controller/authz、11 controller/auth/service、01 controller/http_auth、12 controller/tasks/service、06 controller/tasks/http）的全部批次拆分与收敛（经 `git log --oneline` 逐一核实）：
+12 个模块全部实施完成（全量收官）：09 hardware、03 system_install、02 tui、05 ui/app.js、08 controller/db、04 controller/authz、11 controller/auth/service、01 controller/http_auth、12 controller/tasks/service、06 controller/tasks/http、07 app/main.rs、10 controller/main.rs。各模块逐批独立提交、逐批通过独立代码审查，并在子规格文末留下逐批实施登记（经 `git log --oneline` 逐一核实）：
 
 1. **09 core `hardware.rs`（完成，共 6 批次，6 次提交）**
    - `051fb44` refactor(core): 拆分 hardware 共享原语至 hardware/shared（批次 B1）
@@ -306,18 +306,30 @@ B–E 各批次之间跨域可重叠；**跨批次重叠不解除 §5.1 的同�
     - `8508fd2` refactor(controller): 收敛 tasks/http 根入口文档与导出清单至终态（批次 6 B6 根入口 73 行终态）
     - 逐批审查 PASS；54 条测试守恒；规格登记 `57853bc`、`9c24b4d`、`aac0ee4`、`e8253e6`、`308a83e`、`a64fc6b`、`8d504da`、`5f5181c`。
 
-### 9.2 实施中模块（10 controller main.rs）
+11. **07 app `main.rs`（完成，共 4 批次 5 次提交）**
+    - `1083a9e` refactor(app): 拆分格式化域至 output 并先行根回导（批次 1）
+    - `cc77d04` fix(app): 修正批次1格式化域文件归属至 storage_format（批次 1 修复）
+    - `55f3ce7` refactor(app): 拆分 CLI 解析与输出辅助至 cli、output、fan_curve（批次 2）
+    - `2f7e7d9` refactor(app): 拆分安装域至 system_install 子树（批次 3）
+    - `e05c489` docs(app): 登记 main.rs 拆分批次3/4 实施裁决与终态（批次 4 登记）
+    - 终态 `main.rs` 382 行；逐批审查 PASS。
 
-- **10 controller `main.rs`（实施中，批次 A/B/C 完成，批次 D 推进中）**：
-  - 批次 A（已提交）：`108929f` refactor(controller): 等价扩展 main.rs 源码文本门禁作用域至目录收集（批次 A）；审查 PASS；登记 `e942177`。
-  - 批次 B（已提交）：`110add3` refactor(controller): 拆分 main.rs 凭据落盘与受控恢复域至 main/secret_log、recovery（批次 B）；审查 PASS；登记 `264acc3`。
-  - 批次 C（已提交）：`7056c8a` refactor(controller): 拆分 main.rs 生命周期监督域至 main/lifecycle（批次 C）；审查 PASS；登记 `e158cab`。
-  - 批次 D（实施中）：当前正在开展批次 D 的拆分与实施。
-  - 批次 E（待实施）：后续待推进。
+12. **10 controller `main.rs`（完成，共 5 批次 8 次提交 + 1 次定点修复）**
+    - `108929f` refactor(controller): 等价扩展 main.rs 源码文本门禁作用域至目录收集（批次 A）；审查 PASS；登记 `e942177`
+    - `110add3` refactor(controller): 拆分 main.rs 凭据落盘与受控恢复域至 main/secret_log、recovery（批次 B）；审查 PASS；登记 `264acc3`
+    - `7056c8a` refactor(controller): 拆分 main.rs 生命周期监督域至 main/lifecycle（批次 C，1262 行 + 17 测试）；审查 PASS；登记 `e158cab`
+    - `2ca986a` refactor(controller): 拆分 main.rs 后台调度域至 main/background（批次 D，162 行 + 形状用例）；审查 PASS；登记 `7b56bb4`
+    - `1c7ae9e` refactor(controller): 拆分 main.rs 装配与启动门禁域并完成模块树收敛（批次 E，薄根 299 行终态 + assembly 195 + startup_gate 654）；审查 PASS；登记 `fd1f249`
+    - `6be74f3` fix(controller): 修正 main 子树 4 处 rustdoc 私有项文档断链（批次 E 修复）
+    - 终态：薄根 `main.rs` 299 行 + 6 个域文件；主 bin 30 条测试守恒；三处源码文本门禁（Makefile G-M6 / v4_baseline G-V4 / production_composition G-PC1）等价扩展为目录收集并复核；按用户裁决方案 A 收窄（G-PC2 取消）。
+
+### 9.2 实施中模块
+
+无（10 controller `main.rs` 已于批 A–E 全部完成后并入 §9.1）。
 
 ### 9.3 剩余未开始模块
 
-**仅剩 10 controller main.rs**（10 号已启动实施：批 A 108929f/e942177、批 B 110add3/264acc3、批 C 7056c8a/e158cab 已完成并逐批审查 PASS；批 D 实施中，批 E 待实施）。
+无（12 模块全部实施完成）。
 
 ### 9.4 验证口径与审查门禁声明
 
@@ -326,8 +338,12 @@ B–E 各批次之间跨域可重叠；**跨批次重叠不解除 §5.1 的同�
    - 包含全量离线回归出口 `make controller-test-offline` 全部通过（包含 Vitest 前端单测、前端 typecheck、web_assets 集成测试、工作区测试与 `node --test ui/*.test.mjs` 等全部通过）。
    - 明确环境限制：`desktop-test` 因本地执行沙箱环境缺失 `libdbus-1.so.3` / `libdbus` 开发库，已如实登记为环境限制项，未在沙箱内完成运行，归 CI 兜底验证。
 3. **真实性声明**：本记录严格按实际执行结果与 git 历史记录核实登记，绝不虚称任何未执行或因环境限制无法执行的验证。如实说明：06 号批次 2 出现过 fmt-check 门禁红（首轮审查 FAIL），已由独立修复提交 `520f761` 修正并复核五条全绿；10 号批 A 因 main.rs 基线漂移（保留期清理段被回退）经用户裁决按方案 A 收窄实施（G-PC2 接线取消，G-M6/G-V4/G-PC1 照做），处置已在 10 号规格 §12 登记。
+4. **10 号门禁接线与文档修正**：三处源码文本门禁已等价扩展为目录收集——Makefile `metrics-static-gates` 第 6 条三段式（薄根必在 + `src/main/` 目录枚举 + 逐文件生产段截断，find 不进管道、空集与缺失 Fail-Closed、薄根 `build_production_router(` 正向锚点）、`tests/v4_baseline.rs` 的 `read_main_sources()`、`tests/production_composition.rs` 的 `main_production_sources()`；全部断言逐字不变，CI 合同测试 `node --test scripts/tests/*.test.mjs` 已复核通过。
+5. **批 E 文档断链修正**：`main/` 子树 4 处 rustdoc 私有项文档断链（main.rs 2 处本批引入、recovery.rs 2 处批 B 存量）由 `6be74f3` 以完整限定路径/纯 code 文本形式修正，`--document-private-items` 探针转 RC0；必需门禁 `cargo doc -D rustdoc::broken_intra_doc_links` 全程 RC0。
 
-### 9.5 后续待办
+### 9.5 收官状态与后续事项
 
-1. 剩余 10 号批 D/E 与收官动作（全量出口 `make controller-test-offline`、workspace clippy、总览最终一致化）。
-2. 真库轨道与 desktop 真机冒烟仍归 CI/授权。
+1. **已收官**：12 模块实施、逐批独立审查、子规格逐批实施登记（`01`/`12`/`06` 逐批；`02`/`03`/`04`/`07`/`08`/`09`/`11` 由 `f018311` 补录）、总览一致化均已完成。
+2. **收官门禁**：`make fmt-check`、`make metrics-static-gates`、`cargo clippy --workspace --all-targets -- -D warnings`、`make controller-test-offline`、`node --test scripts/tests/*.test.mjs` 由收官验证会话执行并另行记录结果；各批次内的模块级门禁已在对应登记段逐批记录。
+3. **仍归 CI/授权**：真库轨道（`--ignored` 用例，需操作员按引擎逐条授权专用开发库）与 desktop 真机冒烟（本沙箱缺 `libdbus-1` 依赖）不在本地执行，不作通过声明。
+4. **分支状态**：`dev-aghost` 领先 origin，全部提交均保留在本地、未推送，推送时机待用户决定。
