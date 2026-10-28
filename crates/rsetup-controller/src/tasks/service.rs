@@ -17,7 +17,7 @@
 //! 行读取口径：本 crate 的 `sqlx` 未启用 `derive` 特性，原始行统一经
 //! [`tx_rows`] / [`tx_row`] + [`column`] 显式解码，checked 转换失败一律 503。
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 
@@ -29,7 +29,7 @@ use uuid::Uuid;
 use crate::authz::policy::{Permission, eval_memory_permissions};
 use crate::authz::sqlx_repo::{AuthorizationSnapshot, load_snapshot_in_tx};
 use crate::error::ControllerError;
-use crate::tasks::model::{MainTaskOutcome, MainTaskState, ReasonCode, SubTaskState};
+use crate::tasks::model::{MainTaskState, ReasonCode, SubTaskState};
 use crate::tasks::preview::{
     PREVIEW_TTL, PreviewOutcome, PreviewTarget, decode_preview_targets, device_target_hash,
     is_canonical_uuid_v4_key, new_preview_token, preview_generation_bytes, preview_mono_valid,
@@ -42,12 +42,17 @@ use crate::tasks::repository::{
 use crate::time::evidence::TimeEvidence;
 
 mod contracts;
+mod state_rules;
 mod time_policy;
 
 pub use contracts::{
     AuthCtx, CancelError, CancelOutcome, CancelRequest, ReleaseLockError, ReleaseLockOutcome,
     ReleaseRequest, SubmitError, SubmitOutcome, SubmitRequest, TimeReviewError, TimeReviewOutcome,
     TimeReviewRequest,
+};
+pub use state_rules::{
+    cancel_precondition, counts_json_of, empty_counts_json, main_task_convergence,
+    submit_counts_json,
 };
 pub(crate) use time_policy::parse_created_time_evidence;
 pub use time_policy::{
@@ -60,117 +65,6 @@ use contracts::{preview_ttl_error, time_evidence_error};
 /// 进程内审计事件序号；与 `audit_events` 的 `(process_epoch, event_seq)` 唯一键同源。
 static TASK_PROCESS_EPOCH: OnceLock<Uuid> = OnceLock::new();
 static TASK_EVENT_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// 取消前置条件：只有 `queued` / `held` 可取消，且要求管理员或持有该设备的
-/// reboot 权限（04 §8：`dispatching` 及之后的状态一律不可取消）。
-pub fn cancel_precondition(state: SubTaskState, is_admin: bool, has_reboot: bool) -> bool {
-    matches!(state, SubTaskState::Queued | SubTaskState::Held) && (is_admin || has_reboot)
-}
-
-/// 终态判定（本地口径；Task 5 聚合器落地后由其统一提供，两者必须同口径）。
-fn is_terminal_state(state: SubTaskState) -> bool {
-    matches!(
-        state,
-        SubTaskState::Succeeded
-            | SubTaskState::Failed
-            | SubTaskState::Unknown
-            | SubTaskState::Cancelled
-            | SubTaskState::Expired
-    )
-}
-
-/// 十态全集的固定写出顺序与 wire 键（`counts_json` 十键口径的唯一生产者）。
-/// 键与 Task 2 serde 定义的一致性由 `state_keys_match_serde_wire` 钉死。
-const SUB_TASK_STATE_KEYS: [(SubTaskState, &str); 10] = [
-    (SubTaskState::Queued, "queued"),
-    (SubTaskState::Held, "held"),
-    (SubTaskState::Dispatching, "dispatching"),
-    (SubTaskState::Accepted, "accepted"),
-    (SubTaskState::Verifying, "verifying"),
-    (SubTaskState::Succeeded, "succeeded"),
-    (SubTaskState::Failed, "failed"),
-    (SubTaskState::Unknown, "unknown"),
-    (SubTaskState::Cancelled, "cancelled"),
-    (SubTaskState::Expired, "expired"),
-];
-
-/// `counts_json` 唯一生产者：十键频数对象，值为十进制字符串（与 Task 6
-/// `project_main_task_summary` 十键口径同源）。未列出的状态计 0。
-pub fn counts_json_of(counts: &[(SubTaskState, u64)]) -> String {
-    let mut totals: HashMap<SubTaskState, u64> = HashMap::new();
-    for (state, count) in counts {
-        *totals.entry(*state).or_insert(0) += count;
-    }
-    let mut object = serde_json::Map::new();
-    for (state, key) in SUB_TASK_STATE_KEYS {
-        object.insert(
-            key.to_owned(),
-            serde_json::Value::String(totals.get(&state).copied().unwrap_or(0).to_string()),
-        );
-    }
-    serde_json::Value::Object(object).to_string()
-}
-
-/// 主任务创建时的十键全零占位；真实频数在子任务落库后同事务回写。
-pub fn empty_counts_json() -> String {
-    counts_json_of(&[])
-}
-
-/// 提交路径的 counts：`queued = 抢到锁的目标数`、`failed = 设备忙 + 无权目标数`。
-pub fn submit_counts_json(locked: u64, device_busy: u64) -> String {
-    counts_json_of(&[
-        (SubTaskState::Queued, locked),
-        (SubTaskState::Failed, device_busy),
-    ])
-}
-
-/// 主任务收敛（本地实现；Task 5 唯一聚合器 `calculate_main_task_outcome` 落地后由其
-/// 替换，两者口径必须一致）：严格按 04 §4 的优先级汇总，**顺序不可调换**。
-///
-/// 1. `running`：存在 `dispatching`/`accepted`/`verifying`，或批次已开始（至少一个
-///    子任务已离开 `queued`）且仍有可运行 `queued`；
-/// 2. `queued`：尚未开始（全部仍为 `queued`）；
-/// 3. `held`：无执行中、无可运行 `queued`，且至少一个 `held`（**不是** `running`）；
-/// 4. `completed`：全部属于批次终态，outcome 优先级为
-///    含 `unknown` → `unknown` ＞ 全 `succeeded` → `success` ＞ 全 `cancelled` →
-///    `cancelled` ＞ 有 `succeeded` 且有非成功 → `partial` ＞ 其余（含仅 `expired`、
-///    `failed`+`cancelled` 组合）→ `failed`。
-pub fn main_task_convergence(states: &[SubTaskState]) -> (MainTaskState, Option<MainTaskOutcome>) {
-    if states.is_empty() {
-        return (MainTaskState::Queued, None);
-    }
-    let any = |target: SubTaskState| states.contains(&target);
-    let all = |target: SubTaskState| states.iter().all(|state| *state == target);
-    let executing = states.iter().any(|state| {
-        matches!(
-            state,
-            SubTaskState::Dispatching | SubTaskState::Accepted | SubTaskState::Verifying
-        )
-    });
-    // 「批次已开始」= 至少一个子任务已离开 queued；与「仍有可运行 queued」同时成立即 running
-    if executing || (any(SubTaskState::Queued) && !all(SubTaskState::Queued)) {
-        return (MainTaskState::Running, None);
-    }
-    if all(SubTaskState::Queued) {
-        return (MainTaskState::Queued, None);
-    }
-    if any(SubTaskState::Held) {
-        return (MainTaskState::Held, None);
-    }
-    // 走到这里全部子任务都是批次终态（succeeded/failed/unknown/cancelled/expired）
-    let outcome = if any(SubTaskState::Unknown) {
-        MainTaskOutcome::Unknown
-    } else if all(SubTaskState::Succeeded) {
-        MainTaskOutcome::Success
-    } else if all(SubTaskState::Cancelled) {
-        MainTaskOutcome::Cancelled
-    } else if any(SubTaskState::Succeeded) {
-        MainTaskOutcome::Partial
-    } else {
-        MainTaskOutcome::Failed
-    };
-    (MainTaskState::Completed, Some(outcome))
-}
 
 /// 恒定时间字节比较：不短路，避免把摘要差异做成时序侧信道。
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -493,7 +387,7 @@ impl<R: TaskRepository> TaskService<R> {
 
         // ⑩ counts 真实回写 + 主任务收敛（与实际子状态分布同源，不写假持久化）
         let (state, outcome) = main_task_convergence(&created);
-        let counts_json = counts_json_of(&tally(&created));
+        let counts_json = counts_json_of(&state_rules::tally(&created));
         tx_execute(
             tx,
             "UPDATE main_tasks SET state = ?, outcome = ?, revision = revision + 1, \
@@ -605,15 +499,6 @@ impl<R: TaskRepository> TaskService<R> {
             }
         }
     }
-}
-
-/// 把状态序列折叠成 `(状态, 频数)` 列表，供 `counts_json_of` 消费。
-fn tally(states: &[SubTaskState]) -> Vec<(SubTaskState, u64)> {
-    let mut totals: HashMap<SubTaskState, u64> = HashMap::new();
-    for state in states {
-        *totals.entry(*state).or_insert(0) += 1;
-    }
-    totals.into_iter().collect()
 }
 
 /// actor 行事务内重验：`CAST(... AS SIGNED)` 严格解码，污染值即 DB 损坏（503）。
@@ -897,8 +782,8 @@ async fn cancel_in_tx(
     if column::<u64>(&row, "revision")? != req.expected_revision {
         return Ok(CancelOutcome::RevisionConflict);
     }
-    let state = sub_task_state_from_str(&column::<String>(&row, "state")?)?;
-    if is_terminal_state(state) {
+    let state = state_rules::sub_task_state_from_str(&column::<String>(&row, "state")?)?;
+    if state_rules::is_terminal_state(state) {
         return Ok(CancelOutcome::AlreadyTerminal { state });
     }
     let device_id = fixed_mysql_bytes::<32>(&column::<Vec<u8>>(&row, "device_id")?)?;
@@ -1108,7 +993,9 @@ async fn release_lock_in_tx(
         return Err(ReleaseLockError::RevisionConflict);
     }
     // CAS 之前先真实解析状态：非法值即 DB 损坏（503），绝不当作 unknown 放行
-    if sub_task_state_from_str(&column::<String>(&row, "state")?)? != SubTaskState::Unknown {
+    if state_rules::sub_task_state_from_str(&column::<String>(&row, "state")?)?
+        != SubTaskState::Unknown
+    {
         return Err(ReleaseLockError::InvalidArgument);
     }
     let device_id = fixed_mysql_bytes::<32>(&column::<Vec<u8>>(&row, "device_id")?)?;
@@ -1173,7 +1060,9 @@ async fn read_sub_task_states(
     .await?;
     let mut states = Vec::with_capacity(rows.len());
     for row in &rows {
-        states.push(sub_task_state_from_str(&column::<String>(row, "state")?)?);
+        states.push(state_rules::sub_task_state_from_str(&column::<String>(
+            row, "state",
+        )?)?);
     }
     Ok(states)
 }
@@ -1201,7 +1090,7 @@ async fn sync_main_task_summary(
                 None => None,
                 Some(outcome) => Some(enum_wire(&outcome)?),
             },
-            &counts_json_of(&tally(&states)),
+            &counts_json_of(&state_rules::tally(&states)),
             main_task_id.as_bytes().as_slice(),
             expected_revision,
         ],
@@ -1211,13 +1100,6 @@ async fn sync_main_task_summary(
         return Err(ControllerError::RevisionConflict);
     }
     Ok(())
-}
-
-/// 以既有 serde 定义（snake_case，Task 2 唯一真相源）解析 `sub_tasks.state`。
-/// 非法值视为 DB 损坏返回 `ControllerError::Database`（503），绝不返回 400，
-/// 也绝不把非法值当合法 `Unknown` 放行；与 `SubTaskState::from_str_exact` 同源。
-fn sub_task_state_from_str(raw: &str) -> Result<SubTaskState, ControllerError> {
-    SubTaskState::from_str_exact(raw).ok_or_else(task_row_decode_error)
 }
 
 /// 严格 `0`/`1` 解码 `CAST(... AS SIGNED)` 布尔列；污染值即 DB 损坏（503）。
@@ -1420,201 +1302,6 @@ mod tests {
     }
 
     #[test]
-    fn cancel_is_only_for_queued_or_held() {
-        use SubTaskState::*;
-        assert!(cancel_precondition(Queued, false, true));
-        assert!(cancel_precondition(Held, false, true));
-        assert!(!cancel_precondition(Dispatching, true, true));
-        assert!(!cancel_precondition(Accepted, true, true));
-        assert!(!cancel_precondition(Verifying, true, true));
-        assert!(!cancel_precondition(Unknown, true, true));
-        assert!(!cancel_precondition(Succeeded, true, true));
-        assert!(!cancel_precondition(Cancelled, true, true));
-        assert!(!cancel_precondition(Expired, true, true));
-        assert!(!cancel_precondition(Failed, true, true));
-        // 普通用户失去 device.reboot 即不可取消
-        assert!(!cancel_precondition(Queued, false, false));
-    }
-
-    #[test]
-    fn counts_json_is_ten_string_keys_and_sums_batches() {
-        let empty: serde_json::Value =
-            serde_json::from_str(&empty_counts_json()).expect("json object");
-        let object = empty.as_object().expect("object");
-        assert_eq!(object.len(), 10);
-        for (key, value) in object {
-            assert_eq!(value.as_str(), Some("0"), "{key} 必须为零频数字符串");
-        }
-        let batch: serde_json::Value =
-            serde_json::from_str(&submit_counts_json(3, 2)).expect("json object");
-        assert_eq!(batch["queued"].as_str(), Some("3"));
-        assert_eq!(batch["failed"].as_str(), Some("2"));
-        assert_eq!(batch["held"].as_str(), Some("0"));
-        // 同一状态多次出现必须累加，不得互相覆盖
-        let merged = counts_json_of(&[
-            (SubTaskState::Queued, 1),
-            (SubTaskState::Queued, 2),
-            (SubTaskState::Unknown, 4),
-        ]);
-        let merged: serde_json::Value = serde_json::from_str(&merged).expect("json");
-        assert_eq!(merged["queued"].as_str(), Some("3"));
-        assert_eq!(merged["unknown"].as_str(), Some("4"));
-    }
-
-    #[test]
-    fn state_keys_match_serde_wire() {
-        for (state, key) in SUB_TASK_STATE_KEYS {
-            assert_eq!(enum_wire(&state).expect("wire string"), key);
-        }
-    }
-
-    #[test]
-    fn main_task_convergence_follows_sub_task_distribution() {
-        use SubTaskState::*;
-        assert_eq!(main_task_convergence(&[]), (MainTaskState::Queued, None));
-        assert_eq!(
-            main_task_convergence(&[Queued, Queued]),
-            (MainTaskState::Queued, None)
-        );
-        // 混合 [queued, failed] → running 且 outcome 仍为空（04 规格 L79–83）
-        assert_eq!(
-            main_task_convergence(&[Queued, Failed]),
-            (MainTaskState::Running, None)
-        );
-        assert_eq!(
-            main_task_convergence(&[Accepted, Queued]),
-            (MainTaskState::Running, None)
-        );
-        assert_eq!(
-            main_task_convergence(&[Failed, Failed]),
-            (MainTaskState::Completed, Some(MainTaskOutcome::Failed))
-        );
-        assert_eq!(
-            main_task_convergence(&[Succeeded, Succeeded]),
-            (MainTaskState::Completed, Some(MainTaskOutcome::Success))
-        );
-        assert_eq!(
-            main_task_convergence(&[Cancelled]),
-            (MainTaskState::Completed, Some(MainTaskOutcome::Cancelled))
-        );
-        assert_eq!(
-            main_task_convergence(&[Unknown]),
-            (MainTaskState::Completed, Some(MainTaskOutcome::Unknown))
-        );
-        assert_eq!(
-            main_task_convergence(&[Succeeded, Failed]),
-            (MainTaskState::Completed, Some(MainTaskOutcome::Partial))
-        );
-    }
-
-    #[test]
-    fn main_task_convergence_priority_follows_spec_04() {
-        use SubTaskState::*;
-        let completed = |outcome: MainTaskOutcome| (MainTaskState::Completed, Some(outcome));
-        // 全体 held → held（不是 running）
-        assert_eq!(
-            main_task_convergence(&[Held, Held]),
-            (MainTaskState::Held, None)
-        );
-        // 无执行中、无可运行 queued，至少一个 held → held
-        assert_eq!(
-            main_task_convergence(&[Held, Succeeded]),
-            (MainTaskState::Held, None)
-        );
-        assert_eq!(
-            main_task_convergence(&[Held, Expired, Cancelled]),
-            (MainTaskState::Held, None)
-        );
-        // 批次已开始且仍有可运行 queued → running
-        assert_eq!(
-            main_task_convergence(&[Queued, Held]),
-            (MainTaskState::Running, None)
-        );
-        assert_eq!(
-            main_task_convergence(&[Queued, Expired]),
-            (MainTaskState::Running, None)
-        );
-        // 执行中优先一切
-        assert_eq!(
-            main_task_convergence(&[Verifying, Held, Succeeded]),
-            (MainTaskState::Running, None)
-        );
-        // 含 unknown 优先 unknown（不是 partial/failed）
-        assert_eq!(
-            main_task_convergence(&[Unknown, Failed]),
-            completed(MainTaskOutcome::Unknown)
-        );
-        assert_eq!(
-            main_task_convergence(&[Succeeded, Unknown]),
-            completed(MainTaskOutcome::Unknown)
-        );
-        assert_eq!(
-            main_task_convergence(&[Cancelled, Unknown]),
-            completed(MainTaskOutcome::Unknown)
-        );
-        // 仅 expired、failed + cancelled → failed（不是 partial）
-        assert_eq!(
-            main_task_convergence(&[Expired]),
-            completed(MainTaskOutcome::Failed)
-        );
-        assert_eq!(
-            main_task_convergence(&[Expired, Expired]),
-            completed(MainTaskOutcome::Failed)
-        );
-        assert_eq!(
-            main_task_convergence(&[Failed, Cancelled]),
-            completed(MainTaskOutcome::Failed)
-        );
-        // 有成功且有非成功 → partial
-        assert_eq!(
-            main_task_convergence(&[Succeeded, Expired]),
-            completed(MainTaskOutcome::Partial)
-        );
-        assert_eq!(
-            main_task_convergence(&[Succeeded, Cancelled]),
-            completed(MainTaskOutcome::Partial)
-        );
-    }
-
-    #[test]
-    fn every_created_sub_task_is_counted_including_visible_forbidden() {
-        // 提交期三种落库结局（queued / failed:PERMISSION_DENIED / failed:DEVICE_BUSY）
-        // 一律计入 created：漏计失败目标会让十键频数少算、主任务永不收敛。
-        let created = [
-            SubTaskState::Queued,
-            SubTaskState::Failed,
-            SubTaskState::Failed,
-        ];
-        let counts: serde_json::Value =
-            serde_json::from_str(&counts_json_of(&tally(&created))).expect("json");
-        let total: u64 = counts
-            .as_object()
-            .expect("object")
-            .values()
-            .map(|value| {
-                value
-                    .as_str()
-                    .expect("decimal string")
-                    .parse::<u64>()
-                    .expect("decimal")
-            })
-            .sum();
-        assert_eq!(
-            total,
-            created.len() as u64,
-            "十键频数之和必须等于子任务行数"
-        );
-        assert_eq!(counts["queued"].as_str(), Some("1"));
-        assert_eq!(counts["failed"].as_str(), Some("2"));
-        // 全部目标都因 VisibleForbidden 落 failed：主任务必须直接收敛 completed/failed；
-        // 漏计时 created 为空，只会得到 (queued, None) 并永远停在非终态。
-        assert_eq!(
-            main_task_convergence(&[SubTaskState::Failed, SubTaskState::Failed]),
-            (MainTaskState::Completed, Some(MainTaskOutcome::Failed))
-        );
-    }
-
-    #[test]
     fn constant_time_eq_is_length_and_content_sensitive() {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
@@ -1628,24 +1315,6 @@ mod tests {
         assert!(!redacted.contains("operator"));
         assert!(!redacted.contains("retries"));
         assert_eq!(redacted, "redacted:6");
-    }
-
-    #[test]
-    fn sub_task_state_parser_rejects_polluted_values() {
-        assert_eq!(
-            sub_task_state_from_str("dispatching").expect("valid"),
-            SubTaskState::Dispatching
-        );
-        // 非法值必须是 503 语义的 DB 损坏，绝不返回 400 或当作 Unknown 放行
-        for raw in ["", "DISPATCHING", "unknown_state", "Unknown"] {
-            assert!(
-                matches!(
-                    sub_task_state_from_str(raw),
-                    Err(ControllerError::Database(_))
-                ),
-                "非法状态串 {raw:?} 必须判为 DB 损坏"
-            );
-        }
     }
 
     #[tokio::test]
