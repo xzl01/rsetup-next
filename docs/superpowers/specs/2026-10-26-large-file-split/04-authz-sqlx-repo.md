@@ -166,3 +166,14 @@ Rust 中一个类型对一个 trait 的实现**只能有一个 `impl Trait for T
 
 - **`authz_repo.rs`（约 1,650 行，> 1,500）**：理由——同一类型对 `AuthzRepository` 的实现只能是一个不可跨文件分割的 impl 块（§4.1）；21 个方法共享同一事务骨架、锁次序、epoch/审计顺序与错误映射（§2），方法间成对共享内联 DML 形状，属同一「管理写/读仓储」职责内聚体。后续再拆方案：若审阅后需要更薄的 impl，下一轮按「每方法一个独立变更」把方法体提取为同实体域自由函数 + impl 内一行薄封装（`Box::pin(async move { f(&self.db, …).await })`），每次一个方法、单独审查形状等价（SQL/绑定/commit 位点零 diff）；本轮不做，因它逐方法改动业务代码体，超出拆分边界。
 - **`snapshot_codec.rs`（约 880 行，900 内不申请例外）**：9 个快照 fail-closed 解码器共享同一「原始列元组形状 → 固定去敏」契约与同形 fixture，14 个回归测试与其同文件同位（C3），再拆会复制元组构造工具、破坏断言同位。
+
+## 10. 实施登记
+
+实施登记（补录，2026-10-28；批次实施期间未逐批追记，现据 git 历史补录）：
+- `d46f0db` refactor(controller): 目录化 authz/sqlx_repo 并迁出 sql_shape fixture（批次 A，审查 PASS）
+- `9d1877c` refactor(controller): 拆分 authz/sqlx_repo model 与 traits 至 sqlx_repo/model、traits（批次 B，审查 PASS）
+- `62bcf95` refactor(controller): 拆分 authz/sqlx_repo 编解码与 SQL 常量至 sqlx_repo/codec、snapshot_codec、queries（批次 C，审查 PASS）
+- `6a574e9` fix(controller): 收敛 authz 批次 C 清单外模块可见性（批次 C 修复，审查 PASS）
+- `49948c0` refactor(controller): 拆分 authz/sqlx_repo 事务骨架与快照读取至 sqlx_repo/tx_guard、snapshot_read、snapshot_repo（批次 D，审查 PASS）
+- `0676bd1` refactor(controller): 拆分 authz_repo 巨型实现并完成 sqlx_repo 模块树收敛（批次 E，审查 PASS）
+

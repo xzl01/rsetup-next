@@ -210,3 +210,11 @@ DoD（专属部分，通用部分按总览 §6.3）：C1 = §1.3 七项路径与
 | `print_doctor` 的 `serde_json::json!` 折行保持现状 | `src/output.rs:217-222` | 批次 2 拆分时 `print_doctor` 中 `checks.iter().map(...)` 内的 `serde_json::json!` 由单行折为 6 行。经 `make fmt-check`（rustfmt 稳定工具链）实测，该多行排版处于 rustfmt 格式化稳定区间（fmt-check 零差异通过）；按实证保持现状并在规格登记，不作回改。 |
 | 拆分终态验收 | 全模块树与 25 测试 | `main.rs` 终态 382 行（仅 mod 声明、根回导、CLI 启动与顶级 match 分发，无任何业务实现体残留）；拆分目标树包含 `cli.rs` (577)、`fan_curve.rs` (81)、`output.rs` (332)、`storage_format.rs` (691) 与 `system_install/` (command.rs 381, mod.rs 171, privileged.rs 298, render.rs 452)，均 ≤ 900 行；main.rs 既有 25 个单测全数就位并按 4/1/7/13 分布保持无损。全套门禁（fmt-check、clippy、test）全绿。 |
 
+实施登记（补录，2026-10-28；批次实施期间未逐批追记，现据 git 历史补录）：
+- `1083a9e` refactor(app): 拆分格式化域至 output 并先行根回导（批次 1，审查 PASS）
+- `cc77d04` fix(app): 修正批次1格式化域文件归属至 storage_format（批次 1 修复，审查 PASS）
+- `55f3ce7` refactor(app): 拆分 CLI 解析与输出辅助至 cli、output、fan_curve（批次 2，审查 PASS）
+- `2f7e7d9` refactor(app): 拆分安装域至 system_install 子树（批次 3，审查 PASS）
+- `e05c489` docs(app): 登记 main.rs 拆分批次3/4 实施裁决与终态（批次 4 登记，审查 PASS）
+
+

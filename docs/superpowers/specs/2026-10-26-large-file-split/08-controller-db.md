@@ -253,3 +253,14 @@ crates/rsetup-controller/src/db/
   - **M4**：§4.3 `migration` 不依赖 `production` 的论据更正——原「文本一致性由测试侧 `use super::super::production::` 引入」在 gate helpers 定档随 `production.rs` 后已不成立；改为由 `production.rs::tests` 域内消费 `MIGRATION_ACK_CONFIRMATION`（实测 2277/2372）并跨域调用共享授权器 `authorize_test_migration`（2374/2376）验证，migration 域零引用 `production`，无环结论不变。
   - **补修两处残留（已修订，待复核）**：§9 阈值处 `schema_shape.rs`「9 条测试」→「7 条测试」（与 §3 行58 及 §5 的 7 条口径一致）；§1.3 形状校验纯函数锚点「254–395」→「254–263 + 276–395」（`valid_username` 264–275 归 username，与 §3 口径一致）。
   - **复核5条残留补修（已修订，待复核）**：§7 批 A 暂留句「全部 40 测试」→「除随 username.rs 本批落域的 1 条外的 39 条测试」，与批 B 算式「40 − username 1 − schema 12 = 27」及本记录批次分布「A 1 / B 12 / C 9 / D 10 / E 8」三者互斥消除；§3 `schema_shape.rs` 区间「12–23」→「20–23」（12–17 doc 注释与 18 `V4_SCHEMA_SQL` 常量本体留薄根，与 §4.0 一致），§1.3「12–252」→「20–252」并就地注明 12–18 留薄根；§1.3 探针域区间随 §3 `probe.rs` 行（第 2 轮 M3 与第 3 轮 M2 的口径）同步为「638–688 + 716–721 + 911–935 + 1011–1090 + 1103–1201 + 1359–1374」，列举内注明 `validate_table_set`(692–714) 归 schema_shape、`validate_v4_tables_are_empty`(1091–1102) 归 fresh；§1.3 测试迁移授权域「723–936」→「723–798 + 801–907」（911–935 归 probe，与 §3 `migration.rs` 行一致）；§1.3 形状校验域列举注明 `require_no_identity_foreign_keys`(911) 归 probe 域（911–935，原属探针域区间）。
+
+实施登记（补录，2026-10-28；批次实施期间未逐批追记，现据 git 历史补录）：
+- `7b7bd9a` refactor(controller): 拆分 db pool 与 username 域并等价扩展基线扫描（批次 A，审查 PASS）
+- `73c605e` refactor(controller): 拆分 db schema 契约与形状校验至 db/schema_shape（批次 B，审查 PASS）
+- `f60f510` refactor(controller): 拆分 db schema 解析至 db/schema_parse（批次 B2，审查 PASS）
+- `4d8cc2f` refactor(controller): 拆分 db probe 探针与 fresh 建库域至 db/probe、fresh（批次 C，审查 PASS）
+- `e6b35da` fix(controller): 收敛 db 批次 C 清单外可见性并修正注释归属（批次 C 修复，审查 PASS）
+- `036c5fe` refactor(controller): 拆分 db 迁移授权与生产迁移入口至 db/migration、production（批次 D，审查 PASS）
+- `9c28dfc` refactor(controller): 拆分 db admission 域并完成 db 模块树收敛（批次 E，审查 PASS）
+- `0b8bd9d` docs(controller): 同步 audit 探测注释路径并追记规格第三探测点（08 收尾，审查 PASS）
+

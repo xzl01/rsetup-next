@@ -192,3 +192,10 @@ test_support →（仅测试构建）manager 及任意子模块的测试所需�
 修订记录：B2偏差追记（已修订，2026-10-26，提交 49e16ee；见 §7 批次表统一追记）。
 B6偏差追记（已修订，2026-10-26，提交 a937e67/419f9c7；见 §7 统一追记）。
 B7裁决追记（已修订，2026-10-26，提交 6aaddfa；见 §7 统一追记）。
+
+实施登记（补录，2026-10-28；批次实施期间未逐批追记，现据 git 历史补录；B1–B7 全批次状态：B2/B6/B7 见上，其余补录如下）：
+- `52ca7b1` refactor(core): 拆分 system_install 测试夹具至 system_install/test_support（批次 B1，审查 PASS）
+- `d6d7e51` refactor(core): 拆分 system_install token 域至 system_install/token.rs（批次 B3，审查 PASS）
+- `222b900` refactor(core): 拆分 system_install mounts 域至 system_install/mounts（批次 B4，审查 PASS）
+- `cb865dc` refactor(core): 拆分 system_install image 与 xz 域至 system_install/image、xz（批次 B5，审查 PASS）
+

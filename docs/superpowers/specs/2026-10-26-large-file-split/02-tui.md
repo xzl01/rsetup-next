@@ -214,3 +214,7 @@ DoD（专属部分，通用部分按总览 §6.3）：C1 自检=对外仅 `tui::
 批次 3 实施登记（已修订，2026-10-26，提交 c9a9f1b；mission 6 测试内联于 `mission.rs`，§2/§5 分文件表述同步修订；另入口 `render_storage_summary` use 下沉 `mod tests` 属 clippy 必需）：6 个任务卡测试以 `#[cfg(test)] mod tests` 内联于 `mission.rs`（沿用批次 1 textfit 先例，审查判定 C3 实质——断言同位/零改写/职责对应/禁整块搬——全部满足，体量 ≤900），未创建 `mission/tests.rs` 分文件；§2 树后总注与 §5 表 mission 行短注据此同步。其余不动，未提交、未编译、未测试、未读 `secret/`。
 
 批次 4 实施登记（已修订，2026-10-26，提交 1530847；`mod backend` 与 `render_install_footer` 可见性、`install/mod.rs` 944 行 C4 例外）：批次 4（install 树）实施登记三处派生事项，审查判定均合规、不改代码——① `install/mod.rs` 将 `backend` 声明为 `pub(in crate::tui) mod`：`App::new` 跨树调 `system_install_manager`（私有 `mod` 仅 install 子树可见），与 §3 表 `system_install_manager` 行目标可见性一致，已同步 §3 表 `install/mod.rs` 行与 §4.2 模块路径级；② `render_install_footer` 设 `pub(in crate::tui)`：入口 `render` 现值 399 行直调、`shell.rs` 终态同需，§3 表 install/render 行原「其余私有」相应收窄为「其余 `install_*` 文本构件与 `verification_text` 私有」；③ `install/mod.rs` 实测 944 行入 C4 例外：11 个面板行为测试与安装 fixture 群沿用测试内联先例（批次 1/3）内联于域文件，未创建 `install/tests.rs` 分文件（§7 批次 4 已登记载体沿用），沿用 `card_tests` 同型论证（同域测试共享 fixture、再拆将文件间重复 helper 或扩大跨文件可见性），落 900–1,500 档且 <1,500，§2 体量估算行与 §9 DoD C4 据此同步。其余不动，未提交、未编译、未测试、未读 `secret/`。
+
+实施登记（补录，2026-10-28；批次实施期间未逐批追记，现据 git 历史补录）：
+- `1bce13e` refactor(app): 拆分 tui app 与 shell 域并完成模块树收敛（批次 5，审查 PASS）
+

@@ -189,3 +189,14 @@ thermal → shared(read_trimmed/with_rollback_result/hardware_run), crate::trans
 - **R-3**：§1.2 `RootRequired` 的 efi_overlay.rs 侧定性补全为三项并列——466 构造（`io_error` 函数内）、1,211 为测试侧 `matches!` 匹配、32 为生产侧 `matches!` 匹配（status 函数内）；实测该文件 `RootRequired` 仅且恰此三处。
 
 本轮为文档级定点修订，未改任何源码/测试、未编译、未运行测试、未执行设备命令、未读 `secret/`、未提交；正文各处的旧变体计数表述已全部更新（本记录所述修正本身属修订历史）。
+
+## 11. 实施登记
+
+实施登记（补录，2026-10-28；批次实施期间未逐批追记，现据 git 历史补录）：
+- `051fb44` refactor(core): 拆分 hardware 共享原语至 hardware/shared（批次 B1，审查 PASS）
+- `6fdc84f` refactor(core): 拆分 hardware overlay 域至 hardware/overlay（批次 B2，审查 PASS）
+- `ade0462` refactor(core): 拆分 hardware gpio 域至 hardware/gpio（批次 B3，审查 PASS）
+- `fed631a` refactor(core): 拆分 hardware video 域至 hardware/video（批次 B4，审查 PASS）
+- `b9cd42a` refactor(core): 拆分 hardware led 域至 hardware/led（批次 B5，审查 PASS）
+- `b65d4a8` refactor(core): 拆分 hardware thermal 域至 hardware/thermal 并完成模块树收敛（批次 B6，审查 PASS）
+
