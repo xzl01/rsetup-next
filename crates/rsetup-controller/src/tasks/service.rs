@@ -39,14 +39,20 @@ use crate::tasks::repository::{
     TaskRepository, column, enum_wire, fixed_mysql_bytes, mysql_uuid, task_row_decode_error,
     tx_execute, tx_row, tx_rows,
 };
-use crate::time::evidence::{TimeEvidence, TimeQuality};
+use crate::time::evidence::TimeEvidence;
 
 mod contracts;
+mod time_policy;
 
 pub use contracts::{
     AuthCtx, CancelError, CancelOutcome, CancelRequest, ReleaseLockError, ReleaseLockOutcome,
     ReleaseRequest, SubmitError, SubmitOutcome, SubmitRequest, TimeReviewError, TimeReviewOutcome,
     TimeReviewRequest,
+};
+pub(crate) use time_policy::parse_created_time_evidence;
+pub use time_policy::{
+    QUEUE_TTL_MS, TimeReviewDecision, TimeReviewEvidenceKind, TimeReviewVerdict,
+    advanced_reference_utc, queue_deadline_of, time_review_allows_extend, time_review_verdict,
 };
 
 use contracts::{preview_ttl_error, time_evidence_error};
@@ -54,141 +60,6 @@ use contracts::{preview_ttl_error, time_evidence_error};
 /// 进程内审计事件序号；与 `audit_events` 的 `(process_epoch, event_seq)` 唯一键同源。
 static TASK_PROCESS_EPOCH: OnceLock<Uuid> = OnceLock::new();
 static TASK_EVENT_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// 时限复核的证据种类（仅记审计，绝不作为分派依据）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TimeReviewEvidenceKind {
-    ReferenceDeadlineProven,
-    ReferenceDeadlineExpired,
-    Inconclusive,
-}
-
-/// 复核结论：只能恢复**原**期限或判过期，绝不写入更晚的期限。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TimeReviewDecision {
-    ResumeOriginalDeadline,
-    Expire,
-}
-
-/// 是否允许「延长」期限：仅当证据为 `ReferenceDeadlineProven` 且延长量为 `0`
-/// （即恢复原期限）时放行；任何正数延长一律拒绝，绝不延长。
-pub fn time_review_allows_extend(
-    requested_extension_ms: i64,
-    kind: TimeReviewEvidenceKind,
-) -> bool {
-    matches!(kind, TimeReviewEvidenceKind::ReferenceDeadlineProven) && requested_extension_ms == 0
-}
-
-/// 排队有效期（04 §5.1 建议 60min）：`sub_tasks.queue_deadline` 的唯一 TTL 来源。
-pub const QUEUE_TTL_MS: i64 = 3_600_000;
-
-/// 排队截止：与时限复核的比对处于**同一可信时基**，绝不由 DB 宿主墙钟
-/// （`DATE_ADD(NOW(6), …)`）生成——数据库漂移会变成排队寿命错配。
-///
-/// - `NtpValid`：`reference_utc` 是静态采样时刻，须累加样本年龄 `sample_age_ms`，
-///   否则样本越旧、排队寿命被隐性拉长（缺失按 0 处理）；
-/// - `SystemFallback` / `Stale`：`reference_utc` 已由时钟源刷新为当前墙钟，
-///   直接加 TTL，不重复累加历史 age，否则排队截止被双重放大。
-///
-/// 溢出（TTL 或 age 大到不可表示）返回 `None`，由调用方 fail-closed 拒绝创建。
-pub fn queue_deadline_of(created: &TimeEvidence) -> Option<DateTime<Utc>> {
-    let age_ms = match created.quality {
-        // 样本年龄缺失按 0 处理：缺列不等于「无限陈旧」，更不得让创建失败。
-        TimeQuality::NtpValid => created.sample_age_ms.unwrap_or(0),
-        TimeQuality::SystemFallback | TimeQuality::Stale => 0,
-    };
-    let age = chrono::Duration::try_milliseconds(i64::try_from(age_ms).ok()?)?;
-    let ttl = chrono::Duration::try_milliseconds(QUEUE_TTL_MS)?;
-    created
-        .reference_utc
-        .checked_add_signed(age)?
-        .checked_add_signed(ttl)
-}
-
-/// 推进后的当前参考时刻：`reference_utc` 是静态 NTP 采样时刻（driver 周期性复验
-/// 才刷新），直接当当前时刻比对，会把「采样时刻 < 期限 < 真实当前时刻」的已过期
-/// 任务误判为未过期，因此必须先累加样本年龄再比对。
-///
-/// 溢出（age 大到不可表示）取 `DateTime::MAX_UTC`：视为早已越过任何合理期限，
-/// 绝不回退到采样时刻。
-pub fn advanced_reference_utc(clock: &TimeEvidence) -> DateTime<Utc> {
-    let age = match clock.sample_age_ms {
-        None => chrono::Duration::zero(),
-        Some(ms) => chrono::Duration::try_milliseconds(i64::try_from(ms).unwrap_or(i64::MAX))
-            .unwrap_or_else(|| chrono::Duration::seconds(i64::MAX / 4)),
-    };
-    clock
-        .reference_utc
-        .checked_add_signed(age)
-        .unwrap_or(DateTime::<Utc>::MAX_UTC)
-}
-
-/// 时间安全核验的纯策略结论：时限复核分派的唯一依据（`evidence_kind` 只记审计）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TimeReviewVerdict {
-    /// 原排队期限的有效性**无法证明**：当前或创建时时钟不可信、时钟纪元不连续、
-    /// 创建证据缺失/不可解析，或恢复决策下已存在过期子任务。
-    /// 一律保持 `held`、零状态变更（回滚），绝不盲目恢复。
-    Unverifiable,
-    /// 全部未过期且请求恢复原期限：整批 `held → queued`，不写任何更晚期限。
-    Resume,
-    /// 全部已过期且请求判过期：整批 `expired` + `QUEUE_EXPIRED` 并释放本代际设备锁。
-    Expire,
-    /// 请求与服务端真实比对矛盾（仍有未过期子任务却请求整批判过期）：拒绝。
-    Contradiction,
-}
-
-/// 纯策略 seam：由创建时证据、当前时钟快照与全部 `held` 子任务的**排队截止**
-/// 推出唯一允许的处置，零 IO、零副作用。
-///
-/// `queue_deadlines` 是被锁定的全部 `held` 子任务的 `queue_deadline`；`None`
-/// 表示列值缺失，无法证明未过期，按已过期处置。空集合由调用方先行拒绝。
-pub fn time_review_verdict(
-    created: Option<&TimeEvidence>,
-    clock: &TimeEvidence,
-    decision: TimeReviewDecision,
-    queue_deadlines: &[Option<DateTime<Utc>>],
-) -> TimeReviewVerdict {
-    // 当前时钟不可信（Stale/SystemFallback）：无法证明任何期限的有效性。
-    if clock.quality != TimeQuality::NtpValid {
-        return TimeReviewVerdict::Unverifiable;
-    }
-    // 创建证据缺失或不可解析：`queue_deadline` 的来源时基无法证明可信。
-    let Some(created) = created else {
-        return TimeReviewVerdict::Unverifiable;
-    };
-    // 创建当时时钟不可信（纪元虽连续也一样），或跳钟/进程换代导致纪元不连续：
-    // 原排队期限的参考系连续性无法证明，绝不盲目恢复。
-    if created.quality != TimeQuality::NtpValid || created.clock_epoch != clock.clock_epoch {
-        return TimeReviewVerdict::Unverifiable;
-    }
-    let now = advanced_reference_utc(clock);
-    let expired = |deadline: &Option<DateTime<Utc>>| deadline.is_none_or(|deadline| now > deadline);
-    let expired_count = queue_deadlines
-        .iter()
-        .filter(|deadline| expired(deadline))
-        .count();
-    match decision {
-        // 要求**全部**未过期才允许整批恢复；存在任一过期即绝不整批恢复。
-        TimeReviewDecision::ResumeOriginalDeadline if expired_count == 0 => {
-            TimeReviewVerdict::Resume
-        }
-        TimeReviewDecision::ResumeOriginalDeadline => TimeReviewVerdict::Unverifiable,
-        // 要求**全部**已过期才允许整批判过期；仍有未过期者即误伤，拒绝矛盾请求。
-        TimeReviewDecision::Expire if expired_count == queue_deadlines.len() => {
-            TimeReviewVerdict::Expire
-        }
-        TimeReviewDecision::Expire => TimeReviewVerdict::Contradiction,
-    }
-}
-
-/// 解析主任务 `created_time_json` 为创建时时钟证据；缺失或不可解析一律 `None`
-/// （无法证明原期限有效，fail-closed 保持 `held`），绝不猜测近似值。
-/// 生产 `TaskApi` 适配器组装 `TaskDetail.created_time` 时复用同一解析口径。
-pub(crate) fn parse_created_time_evidence(raw: &str) -> Option<TimeEvidence> {
-    serde_json::from_str(raw).ok()
-}
 
 /// 取消前置条件：只有 `queued` / `held` 可取消，且要求管理员或持有该设备的
 /// reboot 权限（04 §8：`dispatching` 及之后的状态一律不可取消）。
@@ -1399,6 +1270,7 @@ async fn insert_task_audit(
 mod tests {
     use super::*;
     use crate::tasks::preview::{preview_token_bytes, preview_token_digest, preview_token_nonce};
+    use crate::time::evidence::TimeQuality;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1548,36 +1420,6 @@ mod tests {
     }
 
     #[test]
-    fn time_review_never_extends_deadline() {
-        // 核验只能恢复原期限或判过期，绝不允许延长
-        assert!(!time_review_allows_extend(
-            60_000,
-            TimeReviewEvidenceKind::ReferenceDeadlineProven
-        ));
-        assert!(!time_review_allows_extend(
-            1,
-            TimeReviewEvidenceKind::Inconclusive
-        ));
-        assert!(!time_review_allows_extend(
-            -1,
-            TimeReviewEvidenceKind::ReferenceDeadlineExpired
-        ));
-        // 任何证据种类下的正数延长都必须拒绝
-        for kind in [
-            TimeReviewEvidenceKind::ReferenceDeadlineProven,
-            TimeReviewEvidenceKind::ReferenceDeadlineExpired,
-            TimeReviewEvidenceKind::Inconclusive,
-        ] {
-            assert!(!time_review_allows_extend(1, kind));
-            // 只有「证据已证明 + 延长量为 0」才允许恢复原期限
-            assert_eq!(
-                time_review_allows_extend(0, kind),
-                matches!(kind, TimeReviewEvidenceKind::ReferenceDeadlineProven)
-            );
-        }
-    }
-
-    #[test]
     fn cancel_is_only_for_queued_or_held() {
         use SubTaskState::*;
         assert!(cancel_precondition(Queued, false, true));
@@ -1663,38 +1505,6 @@ mod tests {
             main_task_convergence(&[Succeeded, Failed]),
             (MainTaskState::Completed, Some(MainTaskOutcome::Partial))
         );
-    }
-
-    /// 固定可复现时刻（不依赖测试运行时刻）。
-    fn fixed_instant() -> DateTime<Utc> {
-        DateTime::<Utc>::from_timestamp(1_800_000_000, 0).expect("fixed instant in range")
-    }
-
-    fn evidence_at(
-        quality: TimeQuality,
-        reference: DateTime<Utc>,
-        age_ms: Option<u64>,
-    ) -> TimeEvidence {
-        TimeEvidence {
-            system_wall_utc: reference,
-            reference_utc: reference,
-            quality,
-            clock_epoch: Uuid::new_v4(),
-            source: None,
-            sample_age_ms: age_ms,
-            offset_ms: None,
-            uncertainty_ms: None,
-        }
-    }
-
-    /// 同一纪元下的「创建时证据 + 当前时钟」对（时间安全核验用例的共用夹具）。
-    fn same_epoch_pair(age_ms: Option<u64>) -> (TimeEvidence, TimeEvidence) {
-        let epoch = Uuid::new_v4();
-        let mut created = evidence_at(TimeQuality::NtpValid, fixed_instant(), None);
-        let mut clock = evidence_at(TimeQuality::NtpValid, fixed_instant(), age_ms);
-        created.clock_epoch = epoch;
-        clock.clock_epoch = epoch;
-        (created, clock)
     }
 
     #[test]
@@ -1802,211 +1612,6 @@ mod tests {
             main_task_convergence(&[SubTaskState::Failed, SubTaskState::Failed]),
             (MainTaskState::Completed, Some(MainTaskOutcome::Failed))
         );
-    }
-
-    #[test]
-    fn queue_deadline_uses_trusted_time_base_and_sample_age() {
-        let reference = fixed_instant();
-        let ttl = chrono::Duration::milliseconds(QUEUE_TTL_MS);
-        // NtpValid：reference + 样本年龄 + TTL（样本越旧，排队寿命不得被隐性拉长）
-        let ntp = queue_deadline_of(&evidence_at(TimeQuality::NtpValid, reference, Some(150)))
-            .expect("deadline");
-        assert_eq!(ntp, reference + ttl + chrono::Duration::milliseconds(150));
-        // NtpValid 且样本年龄缺失：按 0 处理，绝不让创建失败
-        let no_age = queue_deadline_of(&evidence_at(TimeQuality::NtpValid, reference, None))
-            .expect("deadline");
-        assert_eq!(no_age, reference + ttl);
-        // SystemFallback/Stale：reference_utc 已是当前墙钟，不重复累加历史 age
-        for quality in [TimeQuality::SystemFallback, TimeQuality::Stale] {
-            let fallback =
-                queue_deadline_of(&evidence_at(quality, reference, Some(9_999))).expect("deadline");
-            assert_eq!(
-                fallback,
-                reference + ttl,
-                "{quality:?} 不得重复累加样本年龄"
-            );
-        }
-        assert!(ntp > reference, "排队截止必须晚于创建参考时刻");
-    }
-
-    #[test]
-    fn time_review_resumes_only_when_every_queue_deadline_is_live() {
-        use TimeReviewDecision::ResumeOriginalDeadline;
-        use TimeReviewVerdict::*;
-        let (created, clock) = same_epoch_pair(None);
-        let live = fixed_instant() + chrono::Duration::seconds(60);
-        let past = fixed_instant() - chrono::Duration::seconds(1);
-        // 全部未过期 + Resume → 整批恢复
-        assert_eq!(
-            time_review_verdict(
-                Some(&created),
-                &clock,
-                ResumeOriginalDeadline,
-                &[Some(live), Some(live)]
-            ),
-            Resume
-        );
-        // 部分过期 + Resume → 绝不允许整批恢复（保持 held，不是错误恢复）
-        assert_eq!(
-            time_review_verdict(
-                Some(&created),
-                &clock,
-                ResumeOriginalDeadline,
-                &[Some(live), Some(past)]
-            ),
-            Unverifiable
-        );
-        // 全部过期 + Resume → 同样不得恢复
-        assert_eq!(
-            time_review_verdict(
-                Some(&created),
-                &clock,
-                ResumeOriginalDeadline,
-                &[Some(past)]
-            ),
-            Unverifiable
-        );
-        // 缺失 queue_deadline 无法证明未过期，按已过期处置
-        assert_eq!(
-            time_review_verdict(
-                Some(&created),
-                &clock,
-                ResumeOriginalDeadline,
-                &[Some(live), None]
-            ),
-            Unverifiable
-        );
-        // 全部已过期 + Expire → 整批 expired
-        assert_eq!(
-            time_review_verdict(
-                Some(&created),
-                &clock,
-                TimeReviewDecision::Expire,
-                &[Some(past), None]
-            ),
-            Expire
-        );
-        // 部分过期 + Expire → 矛盾请求（整批判过期会误伤未过期者）
-        assert_eq!(
-            time_review_verdict(
-                Some(&created),
-                &clock,
-                TimeReviewDecision::Expire,
-                &[Some(past), Some(live)]
-            ),
-            Contradiction
-        );
-    }
-
-    #[test]
-    fn time_review_fails_closed_on_untrusted_or_discontinuous_clock() {
-        use TimeReviewDecision::ResumeOriginalDeadline;
-        use TimeReviewVerdict::{Resume, Unverifiable};
-        let live = fixed_instant() + chrono::Duration::seconds(60);
-        let deadlines = [Some(live)];
-        let (created, clock) = same_epoch_pair(None);
-        // 基线：同纪元、双方 NtpValid、未过期 → 允许恢复
-        assert_eq!(
-            time_review_verdict(Some(&created), &clock, ResumeOriginalDeadline, &deadlines),
-            Resume
-        );
-        // ① 当前时钟不可信
-        for quality in [TimeQuality::SystemFallback, TimeQuality::Stale] {
-            let mut untrusted = clock.clone();
-            untrusted.quality = quality;
-            assert_eq!(
-                time_review_verdict(
-                    Some(&created),
-                    &untrusted,
-                    ResumeOriginalDeadline,
-                    &deadlines
-                ),
-                Unverifiable,
-                "{quality:?} 的当前时钟不得参与恢复判定"
-            );
-        }
-        // ② 创建当时时钟不可信（纪元虽连续也一样）
-        for quality in [TimeQuality::SystemFallback, TimeQuality::Stale] {
-            let mut created_at = created.clone();
-            created_at.quality = quality;
-            assert_eq!(
-                time_review_verdict(
-                    Some(&created_at),
-                    &clock,
-                    ResumeOriginalDeadline,
-                    &deadlines
-                ),
-                Unverifiable,
-                "创建时 {quality:?} 的原排队期限无法证明有效"
-            );
-        }
-        // ③ 时钟纪元不连续（跳钟/进程换代）：参考系连续性无法证明
-        let mut shifted = clock.clone();
-        shifted.clock_epoch = Uuid::new_v4();
-        assert_eq!(
-            time_review_verdict(Some(&created), &shifted, ResumeOriginalDeadline, &deadlines),
-            Unverifiable
-        );
-        // ④ 创建证据缺失（created_time_json 缺失或不可解析）
-        assert_eq!(
-            time_review_verdict(None, &clock, ResumeOriginalDeadline, &deadlines),
-            Unverifiable
-        );
-    }
-
-    #[test]
-    fn stale_sample_clock_cannot_keep_an_expired_task_alive() {
-        use TimeReviewDecision::ResumeOriginalDeadline;
-        use TimeReviewVerdict::*;
-        // 采样时刻 < queue_deadline < 采样时刻 + 样本年龄：必须判过期，
-        // 否则陈旧时钟会把已越期的任务错误恢复为 queued。
-        let (created, mut clock) = same_epoch_pair(Some(50));
-        let deadline = fixed_instant() + chrono::Duration::milliseconds(10);
-        assert!(advanced_reference_utc(&clock) > deadline);
-        assert_eq!(
-            time_review_verdict(
-                Some(&created),
-                &clock,
-                ResumeOriginalDeadline,
-                &[Some(deadline)]
-            ),
-            Unverifiable
-        );
-        assert_eq!(
-            time_review_verdict(
-                Some(&created),
-                &clock,
-                TimeReviewDecision::Expire,
-                &[Some(deadline)]
-            ),
-            Expire
-        );
-        // 样本年龄缺失按 0 推进：同一期限此刻仍未过期，允许恢复
-        clock.sample_age_ms = None;
-        assert_eq!(
-            time_review_verdict(
-                Some(&created),
-                &clock,
-                ResumeOriginalDeadline,
-                &[Some(deadline)]
-            ),
-            Resume
-        );
-    }
-
-    #[test]
-    fn created_time_evidence_parser_is_fail_closed() {
-        let evidence = evidence_at(TimeQuality::NtpValid, fixed_instant(), Some(7));
-        let raw = serde_json::to_string(&evidence).expect("serialize");
-        assert_eq!(parse_created_time_evidence(&raw), Some(evidence));
-        // 空串、非对象、缺字段一律 None（无法证明原期限有效，fail-closed）
-        for raw in ["", "null", "\"x\"", "{}", "{\"clock_epoch\":\"nope\"}"] {
-            assert_eq!(
-                parse_created_time_evidence(raw),
-                None,
-                "{raw:?} 必须解析失败"
-            );
-        }
     }
 
     #[test]
