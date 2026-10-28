@@ -6,9 +6,9 @@
 //! 七线再经 [`build_production_router`] 合并成唯一顶层 router。
 //! 本入口不构造测试网关、`connect_lazy` 占位池、固定 offline/空能力或 authz
 //! epoch 0，也不构造任何返回伪造取值的常量源；设备实时视图、准入变更通知、板端
-//! `BoardClient` 与状态快照都由 [`TransportManager`]（连接管理器）与其
+//! `BoardClient` 与状态快照都由 [`rsetup_controller::transport::manager::TransportManager`]（连接管理器）与其
 //! [`TransportBoardClient`] 适配真实承担；Runtime 恢复控制器真源由生产
-//! [`RuntimeRecoveryController`] 装配（见 `operations` 模块），HTTP 探针与任务调度
+//! [`rsetup_controller::operations::RuntimeRecoveryController`] 装配（见 `operations` 模块），HTTP 探针与任务调度
 //! 循环共享同一个实例，不存在第二套恢复模式快照。
 
 use std::sync::Arc;

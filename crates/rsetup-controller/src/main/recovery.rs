@@ -34,10 +34,10 @@ fn controlled_recovery_flag(raw: Option<&std::ffi::OsStr>) -> bool {
 
 /// Runtime 恢复控制器真源的生产装配形态（05 §9 / 04 §5.2）。
 ///
-/// [`RecoveryModeProbe`] 的契约要求 `ready`/`mode` 必须来自 Runtime 当前真实快照：
+/// [`rsetup_controller::api::system::RecoveryModeProbe`] 的契约要求 `ready`/`mode` 必须来自 Runtime 当前真实快照：
 /// [`RuntimeRecoveryController`] 就是这份快照本身（进程内唯一实例，正常模式启动，
 /// 管理员可进入/解除受控恢复模式），绝不返回伪造取值，也不造第二套恢复模式真源。
-/// [`TransportManager::current_mode`] 只委托到本装配位。
+/// `TransportManager::current_mode` 只委托到本装配位。
 ///
 /// 冷启动触发：[`CONTROLLED_RECOVERY_ENV`] 置 `"1"`/`"true"` 时，本函数在返回句柄
 /// **之前**就调用 [`RuntimeRecoveryController::enter_controlled_recovery`]，因此
