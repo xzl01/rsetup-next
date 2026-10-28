@@ -17,7 +17,7 @@
 //! 行读取口径：本 crate 的 `sqlx` 未启用 `derive` 特性，原始行统一经
 //! [`tx_rows`] / [`tx_row`] + [`column`] 显式解码，checked 转换失败一律 503。
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 
@@ -26,8 +26,7 @@ use sqlx::Transaction;
 use sqlx::mysql::{MySql, MySqlArguments};
 use uuid::Uuid;
 
-use crate::authz::policy::{Permission, eval_memory_permissions};
-use crate::authz::sqlx_repo::{AuthorizationSnapshot, load_snapshot_in_tx};
+use crate::authz::sqlx_repo::load_snapshot_in_tx;
 use crate::error::ControllerError;
 use crate::tasks::model::{MainTaskState, ReasonCode, SubTaskState};
 use crate::tasks::preview::{
@@ -41,10 +40,12 @@ use crate::tasks::repository::{
 };
 use crate::time::evidence::TimeEvidence;
 
+mod authz_policy;
 mod contracts;
 mod state_rules;
 mod time_policy;
 
+pub use authz_policy::{TargetAuthz, snapshot_effective_permissions};
 pub use contracts::{
     AuthCtx, CancelError, CancelOutcome, CancelRequest, ReleaseLockError, ReleaseLockOutcome,
     ReleaseRequest, SubmitError, SubmitOutcome, SubmitRequest, TimeReviewError, TimeReviewOutcome,
@@ -76,66 +77,6 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         diff |= a ^ b;
     }
     diff == 0
-}
-
-/// 目标授权三态（RT-N6：可见性与 reboot 权限解耦）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TargetAuthz {
-    /// 可见且持有 `Permission::DeviceReboot`：抢设备锁、创建 `queued` 子任务。
-    Permitted,
-    /// 可见但缺 `DeviceReboot`：**不**伪装成不可见、不抢锁，直接落 `failed` 子任务。
-    VisibleForbidden,
-    /// 完全不可见（无任何有效权限）：整体回滚 404，不泄露部分结果。
-    NotVisible,
-}
-
-/// 对 Identity 真源快照求该设备的当前有效权限集：先排除 missing/archived 设备，
-/// 再交 `eval_memory_permissions`（其内部已排除 inactive/must-change actor，
-/// admin shortcut 亦按事务内新读 actor 行判定）。
-pub fn snapshot_effective_permissions(
-    snapshot: &AuthorizationSnapshot,
-    device_id: [u8; 32],
-) -> HashSet<Permission> {
-    let Some(device) = snapshot.devices.get(&device_id) else {
-        return HashSet::new();
-    };
-    if device.archived {
-        return HashSet::new();
-    }
-    let empty_groups: HashSet<Uuid> = HashSet::new();
-    let groups = snapshot
-        .device_groups
-        .get(&device_id)
-        .unwrap_or(&empty_groups);
-    eval_memory_permissions(
-        &snapshot.actor,
-        device_id,
-        &snapshot.grants,
-        &snapshot.roles,
-        groups,
-    )
-}
-
-/// 纯判定 seam：含 reboot → `Permitted`；有其他有效权限 → `VisibleForbidden`；
-/// 空集 → `NotVisible`。提交路径的唯一授权判定实现。
-fn check_target_authz(snapshot: &AuthorizationSnapshot, device_id: [u8; 32]) -> TargetAuthz {
-    let effective = snapshot_effective_permissions(snapshot, device_id);
-    if effective.contains(&Permission::DeviceReboot) {
-        return TargetAuthz::Permitted;
-    }
-    if !effective.is_empty() {
-        return TargetAuthz::VisibleForbidden;
-    }
-    TargetAuthz::NotVisible
-}
-
-/// 纯策略单测的布尔薄包装（`Permitted` 投影）；提交路径不消费本包装。
-#[cfg(test)]
-fn snapshot_allows_task_creation(snapshot: &AuthorizationSnapshot, device_id: [u8; 32]) -> bool {
-    matches!(
-        check_target_authz(snapshot, device_id),
-        TargetAuthz::Permitted
-    )
 }
 
 /// 事务内重验后的 actor 行（`users` 环节的唯一取锁点）。
@@ -345,7 +286,7 @@ impl<R: TaskRepository> TaskService<R> {
             queue_deadline_of(&req.time_evidence).ok_or_else(time_evidence_error)?;
         let mut created = Vec::with_capacity(targets.len());
         for device_id in &targets {
-            let (state, reason_code) = match check_target_authz(&authz, *device_id) {
+            let (state, reason_code) = match authz_policy::check_target_authz(&authz, *device_id) {
                 TargetAuthz::NotVisible => return Err(SubmitError::NotVisible),
                 // 可见但无权：保留固定目标清单、不申请设备锁，直接落 failed
                 TargetAuthz::VisibleForbidden => {
@@ -794,7 +735,7 @@ async fn cancel_in_tx(
     )
     .await?;
     let has_reboot = matches!(
-        check_target_authz(&authz, device_id),
+        authz_policy::check_target_authz(&authz, device_id),
         TargetAuthz::Permitted
     );
     if !cancel_precondition(state, caller_admin, has_reboot) {
@@ -1462,124 +1403,5 @@ mod tests {
             Err(ReleaseLockError::InvalidArgument)
         ));
         assert_eq!(repo.begins.load(Ordering::Relaxed), 0);
-    }
-}
-
-#[cfg(test)]
-mod policy_tests {
-    use super::snapshot_allows_task_creation;
-    use crate::authz::policy::{GrantRecord, GrantScope, GrantSource, Permission, SnapshotActor};
-    use crate::authz::sqlx_repo::AuthorizationSnapshot;
-    use crate::devices::repository::DeviceAdminView;
-    use crate::model::{AdmissionState, ReviewDecision};
-    use std::collections::HashMap;
-    use uuid::Uuid;
-
-    const POLICY_DEVICE: [u8; 32] = [3u8; 32];
-    const ACTIVE_USER: SnapshotActor = SnapshotActor {
-        id: [2u8; 16],
-        active: true,
-        is_admin: false,
-        must_change_password: false,
-    };
-
-    fn policy_device_fixture(id: [u8; 32], archived: bool) -> DeviceAdminView {
-        DeviceAdminView {
-            public_key: id,
-            display_name: "policy-fixture".into(),
-            admission_state: AdmissionState::Approved,
-            review_decision: ReviewDecision::Approved,
-            revision: 1,
-            descriptor: None,
-            archived,
-        }
-    }
-
-    fn policy_snapshot(
-        actor: SnapshotActor,
-        grants: Vec<GrantRecord>,
-        devices: Vec<([u8; 32], bool)>,
-    ) -> AuthorizationSnapshot {
-        AuthorizationSnapshot {
-            actor,
-            authz_epoch: 1,
-            grants,
-            roles: HashMap::new(),
-            device_groups: HashMap::new(),
-            devices: devices
-                .into_iter()
-                .map(|(id, archived)| (id, policy_device_fixture(id, archived)))
-                .collect(),
-        }
-    }
-
-    fn policy_direct_grant(user_id: [u8; 16], permissions: Vec<Permission>) -> GrantRecord {
-        GrantRecord {
-            id: Uuid::new_v4(),
-            user_id,
-            source: GrantSource::Direct(permissions),
-            scope: GrantScope::All,
-            revision: 1,
-        }
-    }
-
-    #[test]
-    fn snapshot_allows_task_creation_accepts_reboot_only_grant() {
-        let snapshot = policy_snapshot(
-            ACTIVE_USER,
-            vec![policy_direct_grant(
-                ACTIVE_USER.id,
-                vec![Permission::DeviceReboot],
-            )],
-            vec![(POLICY_DEVICE, false)],
-        );
-        assert!(snapshot_allows_task_creation(&snapshot, POLICY_DEVICE));
-    }
-
-    #[test]
-    fn snapshot_allows_task_creation_rejects_task_read_only_grant() {
-        let snapshot = policy_snapshot(
-            ACTIVE_USER,
-            vec![policy_direct_grant(
-                ACTIVE_USER.id,
-                vec![Permission::DeviceTaskRead],
-            )],
-            vec![(POLICY_DEVICE, false)],
-        );
-        // task_read-only 是 VisibleForbidden，不是 Permitted
-        assert!(!snapshot_allows_task_creation(&snapshot, POLICY_DEVICE));
-    }
-
-    #[test]
-    fn snapshot_allows_task_creation_rejects_inactive_or_must_change_actor() {
-        let grants = vec![policy_direct_grant(
-            ACTIVE_USER.id,
-            vec![Permission::DeviceReboot],
-        )];
-        for actor in [
-            SnapshotActor {
-                active: false,
-                ..ACTIVE_USER
-            },
-            SnapshotActor {
-                must_change_password: true,
-                ..ACTIVE_USER
-            },
-        ] {
-            let snapshot = policy_snapshot(actor, grants.clone(), vec![(POLICY_DEVICE, false)]);
-            assert!(!snapshot_allows_task_creation(&snapshot, POLICY_DEVICE));
-        }
-    }
-
-    #[test]
-    fn snapshot_allows_task_creation_rejects_missing_or_archived_device() {
-        let grants = vec![policy_direct_grant(
-            ACTIVE_USER.id,
-            vec![Permission::DeviceReboot],
-        )];
-        let missing = policy_snapshot(ACTIVE_USER, grants.clone(), vec![]);
-        let archived = policy_snapshot(ACTIVE_USER, grants, vec![(POLICY_DEVICE, true)]);
-        assert!(!snapshot_allows_task_creation(&missing, POLICY_DEVICE));
-        assert!(!snapshot_allows_task_creation(&archived, POLICY_DEVICE));
     }
 }
