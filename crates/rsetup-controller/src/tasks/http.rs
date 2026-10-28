@@ -20,34 +20,34 @@
 //! 零发布，`events = None` 时与接入事件总线之前行为完全一致。事件只是变化提示，
 //! 权威事实始终来自 GET 快照。
 
-use std::sync::Arc;
-
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{FromRef, Path, RawQuery, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::ControllerError;
 use crate::auth::service::Session;
-use crate::events::{EventBus, EventEnvelope, EventObjectAudience};
+#[cfg(doc)]
+use crate::events::EventBus;
+use crate::events::{EventEnvelope, EventObjectAudience};
 use crate::http_api::{err_response, ok_response, request_id};
-use crate::http_auth::{EndpointId, HttpAuthState};
+use crate::http_auth::EndpointId;
 use crate::http_gate::{
     authenticate_read, authenticate_write, exhausted, not_ready, read_json_body,
     require_admin_session, single_header,
 };
 use crate::model::decimal_u64_json;
-use crate::operations::{RecoveryMode, RecoveryOperation, RuntimeRecoveryController};
+use crate::operations::RecoveryMode;
 use crate::parse_device_id;
-use crate::tasks::model::{EvidenceKind, MainTaskOutcome, MainTaskState, ReasonCode, SubTaskState};
-use crate::tasks::preview::{PREVIEW_TTL, PreviewOutcome, is_canonical_uuid_v4_key};
+use crate::tasks::model::{MainTaskOutcome, MainTaskState, SubTaskState};
+use crate::tasks::preview::{PREVIEW_TTL, is_canonical_uuid_v4_key};
 use crate::tasks::recovery::calculate_main_task_outcome;
-use crate::tasks::service::{SubmitOutcome, TimeReviewEvidenceKind};
+use crate::tasks::service::SubmitOutcome;
 use crate::time::evidence::TimeEvidence;
 
 /// 默认分页大小（02 §1 `Page`）。
@@ -60,340 +60,16 @@ const IDEMPOTENCY_KEY_HEADER: HeaderName = HeaderName::from_static("idempotency-
 mod cursor;
 pub use cursor::{TaskCursorScope, decode_task_cursor, encode_task_cursor};
 
-/// 本任务唯一 operation（02 §6）：JSON 为 `"reboot"`。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskOperation {
-    Reboot,
-}
+mod contract;
+pub use contract::{
+    CancelTaskRequest, CancelTaskResponse, CancelledTarget, ChildEntry, ChildItem, ChildrenPage,
+    CreatePreviewRequest, CreateTaskRequest, ReleaseLockRequest, ReleaseLockResponse, TaskActions,
+    TaskApi, TaskCounts, TaskDetail, TaskFuture, TaskOperation, TaskPage, TimeReviewDecision,
+    TimeReviewTaskRequest, ViewScope,
+};
 
-/// 视图范围：全权 `full` 与授权子集 `authorized_subset`。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ViewScope {
-    Full,
-    AuthorizedSubset,
-}
-
-/// 内部全集计数：10×u64（**不用 usize**）。跨 serde 时逐键 `to_string()` 输出
-/// 十进制字符串，故不派生 `Serialize`（直接派生会退化成 JSON number）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TaskCounts {
-    pub queued: u64,
-    pub held: u64,
-    pub dispatching: u64,
-    pub accepted: u64,
-    pub verifying: u64,
-    pub succeeded: u64,
-    pub failed: u64,
-    pub unknown: u64,
-    pub cancelled: u64,
-    pub expired: u64,
-}
-
-/// 唯一响应动作字段（仅表示"可请求取消"，不保证一定成功）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TaskActions {
-    pub can_cancel: bool,
-}
-
-/// MainTask 授权投影：**只是内部 TaskApi 返回值/投影入参**，不是直接 serde HTTP 模型。
-#[derive(Clone, Debug, PartialEq)]
-pub struct TaskDetail {
-    pub id: Uuid,
-    pub operation: TaskOperation,
-    pub state: MainTaskState,
-    pub outcome: Option<MainTaskOutcome>,
-    pub revision: u64,
-    pub created_time: TimeEvidence,
-    pub view_scope: ViewScope,
-    /// 服务层自带全集计数：**投影层不读它**（F06：state/outcome/counts 的唯一
-    /// 真相源是 `visible_states`），保留该字段只为与 TaskApi 契约同形。
-    pub counts: TaskCounts,
-    pub actions: TaskActions,
-    /// 内部字段（非 HTTP 外部字段）：当前可见全集 states，与 state/outcome 同源。
-    pub visible_states: Vec<SubTaskState>,
-}
-
-/// SubTask 授权投影条目（服务层入参）：`eligible` 由调用方按当前身份计算
-/// （普通 = 当前持 `device.task.read`；admin = 事务内重验后恒 true）。
-#[derive(Clone, Debug, PartialEq)]
-pub struct ChildEntry {
-    pub id: Uuid,
-    pub device_id: String,
-    pub state: SubTaskState,
-    pub reason_code: Option<ReasonCode>,
-    pub revision: u64,
-    pub result_evidence: Option<EvidenceKind>,
-    pub eligible: bool,
-}
-
-/// SubTask 授权投影（02 §1）：不暴露 `execution_token` 或其 token 摘要。
-#[derive(Clone, Debug, PartialEq)]
-pub struct ChildItem {
-    pub id: Uuid,
-    pub device_id: String,
-    pub state: SubTaskState,
-    pub reason_code: Option<ReasonCode>,
-    /// 内部 u64；HTTP 输出十进制字符串（见 [`project_task_children`]）。
-    pub revision: u64,
-    pub result_evidence: Option<EvidenceKind>,
-}
-
-/// 主任务分页（02 §1 `Page{items,next_cursor}`）：内部返回值，不派生 serde。
-#[derive(Clone, Debug, PartialEq)]
-pub struct TaskPage {
-    pub items: Vec<TaskDetail>,
-    pub next_cursor: Option<String>,
-}
-
-/// 子任务分页（02 §1 `Page{items,next_cursor}`）：内部返回值，不派生 serde。
-///
-/// 与计划文本的 `items: Vec<ChildItem>` 相比改为 [`ChildEntry`]：`eligible` 是
-/// 授权可见性的唯一判据，必须由服务层随条目一并给出、由投影层统一剔除，
-/// 否则 HTTP 层无从区分"可见"与"已按身份过滤"（两处真相源）。
-#[derive(Clone, Debug, PartialEq)]
-pub struct ChildrenPage {
-    pub items: Vec<ChildEntry>,
-    pub next_cursor: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CreatePreviewRequest {
-    pub operation: TaskOperation,
-    #[serde(default)]
-    pub device_ids: Vec<String>,
-    #[serde(default)]
-    pub group_ids: Vec<Uuid>,
-}
-
-#[derive(Clone, Debug, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CreateTaskRequest {
-    pub preview_token: String,
-    pub confirm: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CancelTaskRequest {
-    pub expected_revision: String,
-    pub confirm: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TimeReviewDecision {
-    ResumeOriginalDeadline,
-    Expire,
-}
-
-#[derive(Clone, Debug, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TimeReviewTaskRequest {
-    pub expected_revision: String,
-    pub decision: TimeReviewDecision,
-    pub evidence: TimeReviewEvidenceKind,
-}
-
-#[derive(Clone, Debug, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReleaseLockRequest {
-    pub expected_revision: String,
-    pub acknowledge_unknown: bool,
-    pub reason: String,
-}
-
-/// `POST /subtasks/{id}/release-lock` 响应：仅两字段。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReleaseLockResponse {
-    pub released: bool,
-    pub state: SubTaskState,
-}
-
-/// `POST /tasks/{id}/cancel` 响应：接收确认 + 逐目标可读取结果。
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CancelTaskResponse {
-    pub accepted: bool,
-    pub cancelled: Option<Vec<Uuid>>,
-}
-
-/// 本事务实际 CAS 取消成功的目标（内部小类型，不暴露到 HTTP wire）。
-///
-/// `readable_in_tx` 生产组装来自当前 actor（或有效 admin）及该 device 的
-/// `device.task.read` **事务授权快照**——不来自客户端声明、旧 `Session.is_admin`
-/// 或 `has_any_taskread` 类整批布尔；该组装是 TaskApi 生产实现必须履约的依赖，
-/// 本切片只钉投影契约，不假称已实现。
-pub struct CancelledTarget {
-    pub id: Uuid,
-    pub device_id: [u8; 32],
-    pub readable_in_tx: bool,
-}
-
-/// 对象安全 future 别名，保证 [`TaskApi`] object-safe。
-pub type TaskFuture<'a, T> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, ControllerError>> + Send + 'a>>;
-
-/// HTTP 边界消费的任务业务网关：只返回契约形状，内部服务类型不外泄。
-///
-/// 生产实现（`TaskService<SqlxTaskRepository>` 适配器）由唯一独立集成任务 owner
-/// 装配；游标密钥（32B）由该生产实现持有，HTTP handler 层不经手密钥。
-pub trait TaskApi: Send + Sync {
-    fn preview<'a>(
-        &'a self,
-        actor: &'a Session,
-        device_ids: &'a [[u8; 32]],
-        group_ids: &'a [Uuid],
-    ) -> TaskFuture<'a, PreviewOutcome>;
-    fn submit<'a>(
-        &'a self,
-        actor: &'a Session,
-        preview_token: &'a str,
-        idempotency_key: &'a str,
-    ) -> TaskFuture<'a, SubmitOutcome>;
-    fn list_tasks<'a>(
-        &'a self,
-        actor: &'a Session,
-        state: Option<MainTaskState>,
-        cursor: Option<&'a str>,
-        limit: usize,
-    ) -> TaskFuture<'a, TaskPage>;
-    fn task_detail<'a>(&'a self, actor: &'a Session, task_id: Uuid) -> TaskFuture<'a, TaskDetail>;
-    fn task_children<'a>(
-        &'a self,
-        actor: &'a Session,
-        task_id: Uuid,
-        cursor: Option<&'a str>,
-        limit: usize,
-    ) -> TaskFuture<'a, ChildrenPage>;
-    fn cancel<'a>(
-        &'a self,
-        actor: &'a Session,
-        task_id: Uuid,
-        request: CancelTaskRequest,
-    ) -> TaskFuture<'a, CancelTaskResponse>;
-    fn time_review<'a>(
-        &'a self,
-        actor: &'a Session,
-        task_id: Uuid,
-        request: TimeReviewTaskRequest,
-    ) -> TaskFuture<'a, TaskDetail>;
-    fn release_lock<'a>(
-        &'a self,
-        actor: &'a Session,
-        subtask_id: Uuid,
-        request: ReleaseLockRequest,
-    ) -> TaskFuture<'a, ReleaseLockResponse>;
-}
-
-/// 任务路由 state：业务依赖仍只有 `api` 与 `auth` 两项（游标密钥由 `api` 的生产
-/// 实现持有），`events` 是**可选**的业务事件发布面（06 §4 `task.updated`），
-/// `recovery` 是**可选**的受控恢复模式真源句柄（05 §9 提交闸门）。
-///
-/// `events` 为 `None` 时所有写端点行为与接入事件总线之前完全一致（不发布、不
-/// 报错、不阻塞）；发布失败在 [`EventBus::publish`] 的契约里即「无在线订阅者
-/// 即丢弃」，因此任何 handler 都不得依据发布返回值改变响应。
-///
-/// `recovery` 为 `None` 表示本装配不提供受控恢复闸门（单测、嵌入式装配），提交
-/// 行为与接入该闸门之前一致；生产装配必须注入与 transport 探针、调度循环**同一个**
-/// `Arc<RuntimeRecoveryController>`，不得为闸门再造一套模式快照。
-#[derive(Clone)]
-pub struct HttpTasksState {
-    pub api: Arc<dyn TaskApi>,
-    pub auth: Arc<HttpAuthState>,
-    /// 进程内事件总线句柄；`None` 表示本部署未开启 SSE 事件线（单测与嵌入式装配）。
-    pub events: Option<EventBus>,
-    /// 受控恢复模式唯一真源（05 §9）；`None` 表示本装配不启用提交闸门。
-    pub recovery: Option<Arc<RuntimeRecoveryController>>,
-}
-
-impl HttpTasksState {
-    /// 不接事件总线的构造（保持既有 `{api, auth}` 两字段装配语义的入口）。
-    pub fn new(api: Arc<dyn TaskApi>, auth: Arc<HttpAuthState>) -> Self {
-        Self {
-            api,
-            auth,
-            events: None,
-            recovery: None,
-        }
-    }
-
-    /// 接上生产事件总线（与 SSE 读线 `EventsState.bus` 必须是同一通道句柄）。
-    pub fn with_events(mut self, events: EventBus) -> Self {
-        self.events = Some(events);
-        self
-    }
-
-    /// 接上受控恢复模式唯一真源（05 §9）。必须与 transport 探针、`/system/status`、
-    /// 调度循环用的是同一个 `Arc<RuntimeRecoveryController>`；本模块只读它的当前
-    /// 模式，不改模式（进入/解除归管理员侧管理写线）。
-    pub fn with_recovery(mut self, recovery: Arc<RuntimeRecoveryController>) -> Self {
-        self.recovery = Some(recovery);
-        self
-    }
-
-    /// 受控恢复模式提交闸门（05 §9「禁止变更任务调度/提交」）。
-    ///
-    /// 每条请求实时读控制器当前模式，不缓存模式快照：管理员解除受控模式后，下一条
-    /// 提交即放行。`recovery = None`（未装配闸门）与正常模式同为「不阻止」；
-    /// 只读端点、管理与只读核验类操作不经本闸门。
-    fn blocks_mutation_task(&self) -> bool {
-        self.recovery
-            .as_ref()
-            .is_some_and(|controller| !controller.permits(RecoveryOperation::MutationTask))
-    }
-
-    /// 任务写操作成功后的统一 `task.updated` 发布：
-    ///
-    /// 1. 先投给**任务创建者本人**（对象级受众 `User(creator_user_id)`，普通
-    ///    用户由此看到自己任务的变化）；
-    /// 2. 操作者不是管理员时再补投一份**管理员受众**——管理员不是「任何合法
-    ///    会话」，也不是创建者的旁路，需要独立受众的一条事件（02 §7 逐事件过滤）；
-    ///    管理员本人已收到第 1 条（其本人受众即覆盖其会话），不重复投递。
-    ///
-    /// `revision` 只作同一 `kind + id` 内的单调提示：调用方给不出精确新值时给
-    /// **递增下界**（CAS 的 `expected_revision.saturating_add(1)`，饱和加以防客户端
-    /// 传入 `u64::MAX` 时 panic 或回绕成倒退版本），不得给任意定值。
-    fn publish_task_update(
-        &self,
-        task_id: &str,
-        revision: u64,
-        creator_user_id: [u8; 16],
-        is_admin_actor: bool,
-    ) {
-        let Some(bus) = self.events.as_ref() else {
-            return;
-        };
-        bus.publish(EventEnvelope::task_updated(
-            task_id,
-            revision,
-            EventObjectAudience::user(creator_user_id),
-        ));
-        if !is_admin_actor {
-            bus.publish(EventEnvelope::task_updated(
-                task_id,
-                revision,
-                EventObjectAudience::admins(),
-            ));
-        }
-    }
-}
-
-impl FromRef<HttpTasksState> for Arc<HttpAuthState> {
-    fn from_ref(state: &HttpTasksState) -> Self {
-        Arc::clone(&state.auth)
-    }
-}
-
-impl FromRef<HttpTasksState> for Arc<dyn TaskApi> {
-    fn from_ref(state: &HttpTasksState) -> Self {
-        Arc::clone(&state.api)
-    }
-}
+mod state;
+pub use state::HttpTasksState;
 
 /// 业务会话前置：`must_change_password`（规格 01 A-02 临时密码）一律 403
 /// `PASSWORD_CHANGE_REQUIRED`——**不要求** `is_admin`（admin 临时密码同样 403）、
@@ -1205,13 +881,15 @@ mod routes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use crate::auth::service::{IdentityUser, Login, SessionPage};
     use crate::auth::session::token_digest;
-    use crate::events::{EventAudience, EventName};
-    use crate::http_auth::{AuthFuture, AuthServiceApi, CsrfBinding, SessionAuthority};
+    use crate::events::{EventAudience, EventBus, EventEnvelope, EventName};
+    use crate::http_auth::{AuthFuture, AuthServiceApi, CsrfBinding, HttpAuthState, SessionAuthority};
     use crate::http_security::HttpSecurityConfig;
-    use crate::tasks::model::ReasonCode;
-    use crate::tasks::preview::PreviewTarget;
+    use crate::operations::RuntimeRecoveryController;
+    use crate::tasks::model::{EvidenceKind, ReasonCode};
+    use crate::tasks::preview::{PreviewOutcome, PreviewTarget};
     use crate::time::evidence::{TimeEvidence, TimeQuality};
     use axum::body::to_bytes;
     use axum::http::{Request, StatusCode};
