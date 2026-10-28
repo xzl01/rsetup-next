@@ -2,6 +2,14 @@
 //!
 //! 提供任务预览创建、任务提交/取消/详情/分页/时间复核与锁释放等 8 个端点 handler，
 //! 以及严格查询串解析和统一 202 成功信封。
+//!
+//! 固定 handler 顺序（8 条路由一致，复用 Identity 共享 gate，本模块**不自写**
+//! Host/Cookie/CSRF）：①`authenticate_read`/`authenticate_write`（Host → Origin →
+//! 严格单值会话 Cookie → 活会话预检 → 权威 authenticate → CSRF → 限速）→
+//! ②[`require_business_session`]（临时密码 403）→ ③body/参数（`read_json_body`
+//! ≤1 MiB + `deny_unknown_fields`、`parse_decimal_u64`、`parse_idempotency_key`、
+//! `clamp_page_limit`）→ ④管理员前置（**仅** time-review / release-lock）→
+//! ⑤[`TaskApi`] → ⑥[`task_error_response`] 统一映射。
 
 use axum::body::Body;
 use axum::extract::{Path, RawQuery, State};

@@ -5,14 +5,6 @@
 //! 顶层生产装配（合并三子 router、路径集互斥、不重复注册 `/healthz`/`/readyz`）
 //! 归唯一独立集成任务所有者。
 //!
-//! 固定 handler 顺序（8 条路由一致，复用 Identity 共享 gate，本模块**不自写**
-//! Host/Cookie/CSRF）：①`authenticate_read`/`authenticate_write`（Host → Origin →
-//! 严格单值会话 Cookie → 活会话预检 → 权威 authenticate → CSRF → 限速）→
-//! ②[`require_business_session`]（临时密码 403）→ ③body/参数（`read_json_body`
-//! ≤1 MiB + `deny_unknown_fields`、`parse_decimal_u64`、`parse_idempotency_key`、
-//! `clamp_page_limit`）→ ④管理员前置（**仅** time-review / release-lock）→
-//! ⑤[`TaskApi`] → ⑥[`task_error_response`] 统一映射。
-//!
 //! 业务事件（06 §4 `task.updated`）：`state.events` 配置了 [`EventBus`] 时，改变
 //! 任务状态的 4 个写端点（create / cancel / time-review / release-lock）在各自
 //! 成功分支返回响应之前发布一次变化提示；受众由 [`HttpTasksState`] 的发布入口
