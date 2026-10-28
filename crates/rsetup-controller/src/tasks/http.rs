@@ -881,11 +881,12 @@ mod routes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use crate::auth::service::{IdentityUser, Login, SessionPage};
     use crate::auth::session::token_digest;
     use crate::events::{EventAudience, EventBus, EventEnvelope, EventName};
-    use crate::http_auth::{AuthFuture, AuthServiceApi, CsrfBinding, HttpAuthState, SessionAuthority};
+    use crate::http_auth::{
+        AuthFuture, AuthServiceApi, CsrfBinding, HttpAuthState, SessionAuthority,
+    };
     use crate::http_security::HttpSecurityConfig;
     use crate::operations::RuntimeRecoveryController;
     use crate::tasks::model::{EvidenceKind, ReasonCode};
@@ -894,6 +895,7 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::{Request, StatusCode};
     use chrono::{DateTime, Utc};
+    use std::sync::Arc;
     use std::sync::Mutex;
     use std::time::Instant;
     use tower::ServiceExt;
