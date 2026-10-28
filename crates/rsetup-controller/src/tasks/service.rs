@@ -18,8 +18,6 @@
 //! [`tx_rows`] / [`tx_row`] + [`column`] 显式解码，checked 转换失败一律 503。
 
 use std::collections::BTreeSet;
-use std::sync::OnceLock;
-use std::sync::atomic::AtomicU64;
 
 use chrono::{DateTime, Utc};
 use sqlx::Transaction;
@@ -40,6 +38,8 @@ use crate::tasks::repository::{
 };
 use crate::time::evidence::TimeEvidence;
 
+mod actor;
+mod audit;
 mod authz_policy;
 mod contracts;
 mod state_rules;
@@ -63,10 +63,6 @@ pub use time_policy::{
 
 use contracts::{preview_ttl_error, time_evidence_error};
 
-/// 进程内审计事件序号；与 `audit_events` 的 `(process_epoch, event_seq)` 唯一键同源。
-static TASK_PROCESS_EPOCH: OnceLock<Uuid> = OnceLock::new();
-static TASK_EVENT_SEQ: AtomicU64 = AtomicU64::new(0);
-
 /// 恒定时间字节比较：不短路，避免把摘要差异做成时序侧信道。
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
@@ -77,28 +73,6 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         diff |= a ^ b;
     }
     diff == 0
-}
-
-/// 事务内重验后的 actor 行（`users` 环节的唯一取锁点）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ActorRow {
-    active: bool,
-    is_admin: bool,
-    must_change_password: bool,
-}
-
-impl ActorRow {
-    /// `integrity::require_active_admin` 同语义：`active && is_admin &&
-    /// !must_change_password` 三条件缺一即拒绝管理写操作（并发降权/停用/未改
-    /// 初始口令都必须在事务内失败关闭，绝不信 HTTP 层快照的 `is_admin` 布尔）。
-    fn active_admin(&self) -> bool {
-        self.active && self.is_admin && !self.must_change_password
-    }
-
-    /// 提交/取消等业务写操作的最低要求：账号有效且未待改初始口令（不要求 admin）。
-    fn writable(&self) -> bool {
-        self.active && !self.must_change_password
-    }
 }
 
 /// 预览快照在锁内读出并校验后的固定值。
@@ -123,18 +97,6 @@ struct NewSubTask {
     reason_code: Option<ReasonCode>,
     queue_deadline: DateTime<Utc>,
     observe_deadline: DateTime<Utc>,
-}
-
-/// 11 字段脱敏审计的入参集合。
-#[derive(Clone, Copy, Debug)]
-struct TaskAudit<'a> {
-    actor_user_id: Option<Uuid>,
-    event_type: &'a str,
-    target_kind: &'a str,
-    target_id: &'a str,
-    params_redacted: &'a str,
-    outcome: &'a str,
-    time_evidence: &'a str,
 }
 
 /// 任务编排服务：仓储是唯一事务入口，本类型不直接持有连接池。
@@ -218,7 +180,7 @@ impl<R: TaskRepository> TaskService<R> {
         crate::integrity::lock_integrity_guard(tx).await?;
 
         // ③ actor 事务内重验（`users` 环节的唯一取锁点）：账号失效或待改初始口令即拒绝
-        let actor = read_actor_in_tx(tx, ctx.user_id).await?;
+        let actor = actor::read_actor_in_tx(tx, ctx.user_id).await?;
         if !actor.writable() {
             return Err(SubmitError::ActorInactive);
         }
@@ -352,9 +314,9 @@ impl<R: TaskRepository> TaskService<R> {
             "failed": created.iter().filter(|s| **s == SubTaskState::Failed).count(),
         })
         .to_string();
-        insert_task_audit(
+        audit::insert_task_audit(
             tx,
-            &TaskAudit {
+            &audit::TaskAudit {
                 actor_user_id: Some(ctx.user_id),
                 event_type: "task.submit",
                 target_kind: "main_task",
@@ -440,29 +402,6 @@ impl<R: TaskRepository> TaskService<R> {
             }
         }
     }
-}
-
-/// actor 行事务内重验：`CAST(... AS SIGNED)` 严格解码，污染值即 DB 损坏（503）。
-/// 三列一次读全（`active`/`is_admin`/`must_change_password`），写操作路径不得只读其中
-/// 一部分而漏掉「未改初始口令」这一 fail-closed 条件。
-async fn read_actor_in_tx(
-    tx: &mut Transaction<'_, MySql>,
-    user_id: Uuid,
-) -> Result<ActorRow, ControllerError> {
-    let row = tx_row(
-        tx,
-        "SELECT CAST(active AS SIGNED) AS active, CAST(is_admin AS SIGNED) AS is_admin, \
-         CAST(must_change_password AS SIGNED) AS must_change_password \
-         FROM users WHERE id = ? FOR UPDATE",
-        params![user_id.as_bytes().as_slice()],
-    )
-    .await?
-    .ok_or(ControllerError::PermissionDenied)?;
-    Ok(ActorRow {
-        active: strict_bool(column::<i64>(&row, "active")?)?,
-        is_admin: strict_bool(column::<i64>(&row, "is_admin")?)?,
-        must_change_password: strict_bool(column::<i64>(&row, "must_change_password")?)?,
-    })
 }
 
 /// 锁定并校验预览快照，随后原子单次消费（`DELETE`；禁止 `UPDATE consumed_at` 两段式）。
@@ -698,7 +637,7 @@ async fn cancel_in_tx(
     crate::integrity::lock_integrity_guard(tx).await?;
     // 事务内完整重验 actor（active && !must_change_password）：HTTP 层快照不可信，
     // 并发停用/待改初始口令必须失败关闭；is_admin 只作 admin 直通判定输入。
-    let caller = read_actor_in_tx(tx, ctx.user_id).await?;
+    let caller = actor::read_actor_in_tx(tx, ctx.user_id).await?;
     if !caller.writable() {
         return Err(CancelError::PermissionDenied);
     }
@@ -769,9 +708,9 @@ async fn cancel_in_tx(
     let main_task_id = mysql_uuid(&column::<Vec<u8>>(&row, "main_task_id")?)?;
     let main_revision = column::<u64>(&row, "main_revision")?;
     sync_main_task_summary(tx, main_task_id, main_revision).await?;
-    insert_task_audit(
+    audit::insert_task_audit(
         tx,
-        &TaskAudit {
+        &audit::TaskAudit {
             actor_user_id: Some(ctx.user_id),
             event_type: "task.cancel",
             target_kind: "sub_task",
@@ -793,7 +732,7 @@ async fn time_review_in_tx(
 ) -> Result<TimeReviewOutcome, TimeReviewError> {
     crate::integrity::lock_integrity_guard(tx).await?;
     // 管理写操作在事务内完整重验 actor：active && is_admin && !must_change_password
-    let caller = read_actor_in_tx(tx, ctx.user_id).await?;
+    let caller = actor::read_actor_in_tx(tx, ctx.user_id).await?;
     if !caller.active_admin() {
         return Err(TimeReviewError::PermissionDenied);
     }
@@ -894,9 +833,9 @@ async fn time_review_in_tx(
         "affected": held.len(),
     })
     .to_string();
-    insert_task_audit(
+    audit::insert_task_audit(
         tx,
-        &TaskAudit {
+        &audit::TaskAudit {
             actor_user_id: Some(ctx.user_id),
             event_type: "task.time_review",
             target_kind: "main_task",
@@ -919,7 +858,7 @@ async fn release_lock_in_tx(
 ) -> Result<ReleaseLockOutcome, ReleaseLockError> {
     crate::integrity::lock_integrity_guard(tx).await?;
     // 管理写操作在事务内完整重验 actor：active && is_admin && !must_change_password
-    let caller = read_actor_in_tx(tx, ctx.user_id).await?;
+    let caller = actor::read_actor_in_tx(tx, ctx.user_id).await?;
     if !caller.active_admin() {
         return Err(ReleaseLockError::PermissionDenied);
     }
@@ -966,13 +905,13 @@ async fn release_lock_in_tx(
         return Err(ReleaseLockError::RevisionConflict);
     }
     let audit_params = serde_json::json!({
-        "reason": redact_reason(&req.reason),
+        "reason": audit::redact_reason(&req.reason),
         "acknowledge_unknown": true,
     })
     .to_string();
-    insert_task_audit(
+    audit::insert_task_audit(
         tx,
-        &TaskAudit {
+        &audit::TaskAudit {
             actor_user_id: Some(ctx.user_id),
             event_type: "task.release_lock",
             target_kind: "sub_task",
@@ -1040,52 +979,6 @@ async fn sync_main_task_summary(
     if updated != 1 {
         return Err(ControllerError::RevisionConflict);
     }
-    Ok(())
-}
-
-/// 严格 `0`/`1` 解码 `CAST(... AS SIGNED)` 布尔列；污染值即 DB 损坏（503）。
-fn strict_bool(raw: i64) -> Result<bool, ControllerError> {
-    match raw {
-        0 => Ok(false),
-        1 => Ok(true),
-        _ => Err(task_row_decode_error()),
-    }
-}
-
-/// 审计原因脱敏：只保留词数指纹，绝不把自由文本原样写进审计。
-fn redact_reason(reason: &str) -> String {
-    format!("redacted:{}", reason.split_whitespace().count())
-}
-
-/// 11 字段脱敏审计写入：`id` 与 `time_evidence` 由服务端生成，绝不取请求自报值。
-async fn insert_task_audit(
-    tx: &mut Transaction<'_, MySql>,
-    audit: &TaskAudit<'_>,
-) -> Result<(), ControllerError> {
-    let seq = crate::db::next_event_seq(&TASK_EVENT_SEQ)?;
-    let epoch = TASK_PROCESS_EPOCH.get_or_init(Uuid::new_v4);
-    let actor_user_id = audit.actor_user_id;
-    let actor_user_bytes: Option<&[u8]> = actor_user_id.as_ref().map(|id| id.as_bytes().as_slice());
-    tx_execute(
-        tx,
-        "INSERT INTO audit_events (id, actor_kind, actor_user_id, event_type, target_kind, \
-         target_id, params_redacted, outcome, time_evidence, process_epoch, event_seq) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        params![
-            Uuid::new_v4().as_bytes().as_slice(),
-            "user",
-            actor_user_bytes,
-            audit.event_type,
-            audit.target_kind,
-            audit.target_id,
-            audit.params_redacted,
-            audit.outcome,
-            audit.time_evidence,
-            epoch.as_bytes().as_slice(),
-            seq,
-        ],
-    )
-    .await?;
     Ok(())
 }
 
@@ -1248,14 +1141,6 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"abcd"));
         assert!(constant_time_eq(&[], &[]));
-    }
-
-    #[test]
-    fn audit_reason_is_never_echoed_verbatim() {
-        let redacted = redact_reason("operator forced release after 3 retries");
-        assert!(!redacted.contains("operator"));
-        assert!(!redacted.contains("retries"));
-        assert_eq!(redacted, "redacted:6");
     }
 
     #[tokio::test]
