@@ -10,6 +10,7 @@
 //!    同一顶层 router 上可达」；认证桩与 lazy 连接池只用于把 router 立起来，
 //!    **不**证明认证语义、SQL 来源、真实设备数据或资源内容。
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::{
@@ -36,6 +37,54 @@ fn composed() -> Router<()> {
         component("/metrics", "metrics"),
         component("/", "web"),
     )
+}
+
+fn manifest_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// 收集 main 模块树全部源文件的生产段（`src/main.rs` + `src/main/**/*.rs`），按路径升序拼接。
+///
+/// 对收集到的每个文件，各自按首个顶格 `\n#[cfg(test)]` 截断取生产段，杜绝测试代码中的
+/// 负向字面量或测试专用结构伪造静态门禁。
+fn main_production_sources() -> String {
+    let root = manifest_dir().join("src/main.rs");
+    if !root.is_file() {
+        panic!("missing src/main.rs root");
+    }
+
+    let mut paths = vec![root];
+    let main_dir = manifest_dir().join("src/main");
+    if main_dir.is_dir() {
+        collect_rs_files(&main_dir, &mut paths);
+    }
+    paths.sort();
+    paths.dedup();
+
+    let mut combined = String::new();
+    for path in paths {
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("读取 {} 失败：{error}", path.display()));
+        let prod_part = content.split("\n#[cfg(test)]").next().unwrap_or(&content);
+        combined.push_str(prod_part);
+        combined.push('\n');
+    }
+    combined
+}
+
+fn collect_rs_files(dir: &Path, acc: &mut Vec<PathBuf>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_files(&path, acc);
+        } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+            acc.push(path);
+        }
+    }
 }
 
 #[tokio::test]
@@ -1122,7 +1171,7 @@ mod typed {
         let _runtime: Arc<MetricsRuntime> = Arc::clone(&inputs.runtime);
         // 源码级静态门禁（§6.3、§7.8）：main.rs 只调用 build_production_router，
         // 真实源与测试注入缝只出现在 production.rs。
-        let main = include_str!("../src/main.rs");
+        let main = main_production_sources();
         assert!(
             main.contains("build_production_router("),
             "main.rs 必须经唯一入口装配"

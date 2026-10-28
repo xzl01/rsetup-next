@@ -56,6 +56,33 @@ fn read_db_sources() -> String {
     combined
 }
 
+/// 收集 main 模块树全部源文件（`src/main.rs` + `src/main/**/*.rs`），按路径升序去重拼接。
+///
+/// 目录化后扫描面必须覆盖整个 main 私有模块树，防止禁止 token 或越权写入在子文件漏检。
+fn read_main_sources() -> String {
+    let root = manifest_dir().join("src/main.rs");
+    if !root.is_file() {
+        panic!("missing src/main.rs root");
+    }
+
+    let mut paths = vec![root];
+    let main_dir = manifest_dir().join("src/main");
+    if main_dir.is_dir() {
+        collect_rs_files(&main_dir, &mut paths);
+    }
+    paths.sort();
+    paths.dedup();
+
+    let mut combined = String::new();
+    for path in paths {
+        let content = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("读取 {} 失败：{error}", path.display()));
+        combined.push_str(&content);
+        combined.push('\n');
+    }
+    combined
+}
+
 fn collect_rs_files(dir: &Path, acc: &mut Vec<PathBuf>) {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
@@ -445,7 +472,7 @@ fn help_documents_the_v4_only_contract() {
 #[test]
 fn startup_path_stays_read_only_and_the_entry_point_is_the_only_writer() {
     // 普通服务启动必须零 DDL：main.rs 只调用只读门禁，不引用任何建库/迁移入口。
-    let main = read_source("src/main.rs");
+    let main = read_main_sources();
     assert!(
         main.contains("check_identity_schema"),
         "普通启动必须继续调用只读门禁 check_identity_schema"
