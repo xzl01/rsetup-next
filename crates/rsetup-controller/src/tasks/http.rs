@@ -23,12 +23,10 @@
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, RawQuery, State};
-use axum::http::{HeaderMap, HeaderName, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use serde::Serialize;
 use serde_json::{Value, json};
-use uuid::Uuid;
 
 use crate::ControllerError;
 #[cfg(doc)]
@@ -39,20 +37,9 @@ use crate::http_auth::EndpointId;
 use crate::http_gate::{
     authenticate_read, authenticate_write, read_json_body, require_admin_session, single_header,
 };
-use crate::model::decimal_u64_json;
 use crate::parse_device_id;
-use crate::tasks::model::{MainTaskOutcome, MainTaskState, SubTaskState};
-use crate::tasks::preview::{PREVIEW_TTL, is_canonical_uuid_v4_key};
-use crate::tasks::recovery::calculate_main_task_outcome;
+use crate::tasks::model::{MainTaskState, SubTaskState};
 use crate::tasks::service::SubmitOutcome;
-use crate::time::evidence::TimeEvidence;
-
-/// 默认分页大小（02 §1 `Page`）。
-pub const DEFAULT_PAGE_LIMIT: usize = 50;
-/// 单页上限（02 §3 批量上限 200）。
-pub const MAX_PAGE_LIMIT: usize = 200;
-/// 幂等键请求头（仅 `POST /tasks` 校验）。
-const IDEMPOTENCY_KEY_HEADER: HeaderName = HeaderName::from_static("idempotency-key");
 
 mod cursor;
 pub use cursor::{TaskCursorScope, decode_task_cursor, encode_task_cursor};
@@ -73,196 +60,19 @@ pub(crate) use gate::{
     controlled_recovery_response, require_business_session, task_error_response,
 };
 
+mod query;
+pub use query::{
+    DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, clamp_page_limit, parse_decimal_u64, parse_idempotency_key,
+};
+
+mod projection;
+pub use projection::{
+    cancel_permitted, project_cancel_result, project_main_task_summary, project_task_children,
+    release_lock_permitted, time_review_permitted,
+};
+
 #[cfg(test)]
 mod fixtures;
-
-/// 单元枚举 / `TimeEvidence` 的 serde 编码恒不失败（无自定义 `Serialize`），
-/// 失败即为实现级缺陷，故 `expect` 而非静默降级为 `null`。
-fn strict_json<T: Serialize>(value: &T) -> Value {
-    serde_json::to_value(value).expect("内部枚举与时间证据的 serde 编码不会失败")
-}
-
-/// 预览有效期毫秒数：与 Task 4 `PREVIEW_TTL` 同源，由路由层补齐
-/// （不改 `PreviewOutcome` 形状）。
-fn preview_expires_in_ms() -> u64 {
-    u64::try_from(PREVIEW_TTL.as_millis()).unwrap_or(60_000)
-}
-
-/// 严格无符号十进制 u64 解析：拒绝空串、非数字、正负号、下划线、小数点、
-/// 前导零（`"0"` 除外）与溢出。
-pub fn parse_decimal_u64(value: &str) -> Result<u64, ControllerError> {
-    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(ControllerError::InvalidArgument);
-    }
-    if value.len() > 1 && value.starts_with('0') {
-        return Err(ControllerError::InvalidArgument);
-    }
-    value
-        .parse::<u64>()
-        .map_err(|_| ControllerError::InvalidArgument)
-}
-
-/// 分页 limit：缺省 50，`1..=200` 合法，其余 `InvalidArgument`。
-pub fn clamp_page_limit(requested: Option<usize>) -> Result<usize, ControllerError> {
-    match requested {
-        None => Ok(DEFAULT_PAGE_LIMIT),
-        Some(value) if (1..=MAX_PAGE_LIMIT).contains(&value) => Ok(value),
-        Some(_) => Err(ControllerError::InvalidArgument),
-    }
-}
-
-/// 严格 canonical 小写 UUIDv4 幂等键（复用 Task 4 `is_canonical_uuid_v4_key`）；
-/// 缺失或非法一律 `InvalidArgument`。
-pub fn parse_idempotency_key(value: Option<&str>) -> Result<String, ControllerError> {
-    match value.filter(|key| is_canonical_uuid_v4_key(key)) {
-        Some(key) => Ok((*key).to_owned()),
-        None => Err(ControllerError::InvalidArgument),
-    }
-}
-
-/// 路径 ID：恰 36 字符 canonical 小写带连字符 UUIDv4（与 `is_canonical_uuid_v4_key`
-/// 同一口径），其余一律 `InvalidArgument`（不交给 axum 默认 400 纯文本）。
-fn parse_path_id(raw: &str) -> Result<Uuid, ControllerError> {
-    if !is_canonical_uuid_v4_key(raw) {
-        return Err(ControllerError::InvalidArgument);
-    }
-    Uuid::parse_str(raw).map_err(|_| ControllerError::InvalidArgument)
-}
-
-/// 取消前置判定（纯函数）：仅 `queued`/`held` 可取消；admin 无需逐目标资格，
-/// 普通用户须同时是 owner 且持有该 device 的 `device.task.reboot`。
-pub fn cancel_permitted(
-    is_admin: bool,
-    is_owner: bool,
-    has_target_reboot: bool,
-    state: SubTaskState,
-) -> bool {
-    let cancellable = matches!(state, SubTaskState::Queued | SubTaskState::Held);
-    if is_admin {
-        return cancellable;
-    }
-    is_owner && has_target_reboot && cancellable
-}
-
-/// release-lock 前置判定（纯函数）：管理员 + 风险确认 + 非空 reason + 目标 `unknown`。
-pub fn release_lock_permitted(
-    is_admin: bool,
-    acknowledge_unknown: bool,
-    reason: &str,
-    state: SubTaskState,
-) -> bool {
-    is_admin && acknowledge_unknown && !reason.trim().is_empty() && state == SubTaskState::Unknown
-}
-
-/// time-review 前置判定（纯函数）：管理员且**至少一个** `held` 子任务（无 held → 400）。
-pub fn time_review_permitted(is_admin: bool, held_count: usize) -> bool {
-    is_admin && held_count > 0
-}
-
-/// 逐目标取消结果投影：仅 map `readable_in_tx == true` 的目标 id；空可读结果
-/// （含无 CAS 成功目标）→ `cancelled = None`（非 `Some([])`，不误称取消全部）；
-/// `accepted` 恒 true（仅为取消请求接收确认，非全部成功保证）。
-pub fn project_cancel_result(targets: &[CancelledTarget]) -> CancelTaskResponse {
-    let readable_ids: Vec<Uuid> = targets
-        .iter()
-        .filter(|target| target.readable_in_tx)
-        .map(|target| target.id)
-        .collect();
-    CancelTaskResponse {
-        accepted: true,
-        cancelled: if readable_ids.is_empty() {
-            None
-        } else {
-            Some(readable_ids)
-        },
-    }
-}
-
-/// MainTask 授权投影（详情与列表项**共用**）：state/outcome/counts 一律由
-/// `visible_states` 全集重算（F06：绝不透传 caller 传入的全量 state/outcome）；
-/// 可见全集为空 → `NotFound`（与"不存在"同投影，不输出零值汇总）。
-#[allow(clippy::too_many_arguments)]
-pub fn project_main_task_summary(
-    id: Uuid,
-    operation: TaskOperation,
-    _state: MainTaskState,
-    _outcome: Option<MainTaskOutcome>,
-    revision: u64,
-    created_time: &TimeEvidence,
-    visible_states: &[SubTaskState],
-    can_cancel: bool,
-    is_full_access: bool,
-) -> Result<Value, ControllerError> {
-    if visible_states.is_empty() {
-        return Err(ControllerError::NotFound);
-    }
-    let (calc_state, calc_outcome) = calculate_main_task_outcome(visible_states);
-    let count = |want: SubTaskState| -> u64 {
-        u64::try_from(
-            visible_states
-                .iter()
-                .filter(|state| **state == want)
-                .count(),
-        )
-        .unwrap_or(u64::MAX)
-    };
-    Ok(json!({
-        "id": id.to_string(),
-        "operation": strict_json(&operation),
-        "state": strict_json(&calc_state),
-        "outcome": strict_json(&calc_outcome),
-        "revision": decimal_u64_json(revision),
-        "created_time": strict_json(created_time),
-        "view_scope": if is_full_access { "full" } else { "authorized_subset" },
-        "counts": {
-            "queued": decimal_u64_json(count(SubTaskState::Queued)),
-            "held": decimal_u64_json(count(SubTaskState::Held)),
-            "dispatching": decimal_u64_json(count(SubTaskState::Dispatching)),
-            "accepted": decimal_u64_json(count(SubTaskState::Accepted)),
-            "verifying": decimal_u64_json(count(SubTaskState::Verifying)),
-            "succeeded": decimal_u64_json(count(SubTaskState::Succeeded)),
-            "failed": decimal_u64_json(count(SubTaskState::Failed)),
-            "unknown": decimal_u64_json(count(SubTaskState::Unknown)),
-            "cancelled": decimal_u64_json(count(SubTaskState::Cancelled)),
-            "expired": decimal_u64_json(count(SubTaskState::Expired)),
-        },
-        "actions": { "can_cancel": can_cancel }
-    }))
-}
-
-/// 单个可见子任务条目的 HTTP 形状：`revision` 十进制字符串，不含
-/// `execution_token`/token 摘要/`view_scope`/`counts`。
-fn child_item_json(item: &ChildItem) -> Value {
-    json!({
-        "id": item.id.to_string(),
-        "device_id": item.device_id,
-        "state": strict_json(&item.state),
-        "reason_code": strict_json(&item.reason_code),
-        "revision": decimal_u64_json(item.revision),
-        "result_evidence": strict_json(&item.result_evidence),
-    })
-}
-
-/// `/tasks/{id}/children` 分页投影：`eligible == false` 的项**完全剔除**（不返回
-/// `device_id`、不计入任何计数）；顶层恰 `items` + `next_cursor`，**绝不**输出
-/// `view_scope`/`counts`/`total_targets`/`hidden_count`（main counts 独立重算）。
-pub fn project_task_children(entries: &[ChildEntry], next_cursor: Option<&str>) -> Value {
-    let items: Vec<Value> = entries
-        .iter()
-        .filter(|entry| entry.eligible)
-        .map(|entry| {
-            child_item_json(&ChildItem {
-                id: entry.id,
-                device_id: entry.device_id.clone(),
-                state: entry.state,
-                reason_code: entry.reason_code,
-                revision: entry.revision,
-                result_evidence: entry.result_evidence,
-            })
-        })
-        .collect();
-    json!({ "items": items, "next_cursor": next_cursor })
-}
 
 /// 任务子路由：8 条端点对齐 Web 专题白名单。
 pub fn build_tasks_router(state: HttpTasksState) -> Router<()> {
@@ -284,6 +94,8 @@ pub fn build_tasks_router(state: HttpTasksState) -> Router<()> {
 }
 
 mod routes {
+    use super::projection::strict_json;
+    use super::query::{IDEMPOTENCY_KEY_HEADER, parse_path_id, preview_expires_in_ms};
     use super::*;
 
     /// 分页查询参数（`/tasks` 另带 `state`）：缺省即"未提供该查询键"。
@@ -804,7 +616,7 @@ mod routes {
 }
 #[cfg(test)]
 mod tests {
-    use super::fixtures::{RAW_TOKEN, fixture_session};
+    use super::fixtures::{IDEMPOTENCY_KEY, RAW_TOKEN, fixture_detail, fixture_session};
     use super::*;
     use crate::auth::service::{Login, Session, SessionPage};
     use crate::events::{EventAudience, EventBus, EventEnvelope, EventName};
@@ -815,414 +627,15 @@ mod tests {
     use crate::operations::{RecoveryMode, RuntimeRecoveryController};
     use crate::tasks::model::{EvidenceKind, ReasonCode};
     use crate::tasks::preview::{PreviewOutcome, PreviewTarget};
-    use crate::time::evidence::{TimeEvidence, TimeQuality};
     use axum::body::to_bytes;
     use axum::http::{Request, StatusCode};
-    use chrono::{DateTime, Utc};
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::time::Instant;
     use tower::ServiceExt;
+    use uuid::Uuid;
 
     const CSRF_TOKEN: &str = "csrf-token-fixture";
-    const IDEMPOTENCY_KEY: &str = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
-
-    fn fixture_time_evidence() -> TimeEvidence {
-        let ts = DateTime::parse_from_rfc3339("2026-10-16T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        TimeEvidence {
-            system_wall_utc: ts,
-            reference_utc: ts,
-            quality: TimeQuality::SystemFallback,
-            clock_epoch: Uuid::new_v4(),
-            source: None,
-            sample_age_ms: None,
-            offset_ms: None,
-            uncertainty_ms: None,
-        }
-    }
-
-    fn fixture_detail() -> TaskDetail {
-        TaskDetail {
-            id: Uuid::from_u128(0x1234567812344abc80de123456789a01),
-            operation: TaskOperation::Reboot,
-            state: MainTaskState::Running,
-            outcome: None,
-            revision: 4,
-            created_time: fixture_time_evidence(),
-            view_scope: ViewScope::AuthorizedSubset,
-            counts: TaskCounts {
-                queued: 0,
-                held: 0,
-                dispatching: 0,
-                accepted: 0,
-                verifying: 0,
-                succeeded: 1,
-                failed: 0,
-                unknown: 1,
-                cancelled: 0,
-                expired: 0,
-            },
-            actions: TaskActions { can_cancel: false },
-            visible_states: vec![SubTaskState::Succeeded, SubTaskState::Unknown],
-        }
-    }
-
-    // ── 授权投影纯函数 ────────────────────────────────────────────────
-
-    #[test]
-    fn main_detail_summary_counts_are_decimal_strings_over_authorized_full_set() {
-        let main_id = Uuid::new_v4();
-        let created = fixture_time_evidence();
-        let visible = [SubTaskState::Succeeded, SubTaskState::Unknown];
-        let view = project_main_task_summary(
-            main_id,
-            TaskOperation::Reboot,
-            MainTaskState::Running,
-            None,
-            4,
-            &created,
-            &visible,
-            false,
-            false,
-        )
-        .unwrap();
-        assert_eq!(view["view_scope"], "authorized_subset");
-        assert_eq!(view["counts"]["succeeded"], "1");
-        assert_eq!(view["counts"]["unknown"], "1");
-        assert_eq!(view["counts"]["failed"], "0");
-        assert_eq!(view["counts"]["dispatching"], "0");
-        assert_eq!(view["counts"]["expired"], "0");
-        assert!(view.get("total_targets").is_none());
-        assert!(view.get("hidden_count").is_none());
-        assert_eq!(view["revision"], "4");
-        assert_eq!(view["operation"], "reboot");
-        assert_eq!(view["actions"]["can_cancel"], false);
-        assert!(view["created_time"]["quality"].is_string());
-        assert!(view["created_time"]["clock_epoch"].is_string());
-
-        let full = project_main_task_summary(
-            main_id,
-            TaskOperation::Reboot,
-            MainTaskState::Running,
-            None,
-            4,
-            &created,
-            &visible,
-            true,
-            true,
-        )
-        .unwrap();
-        assert_eq!(full["view_scope"], "full");
-        assert!(full.get("total_targets").is_none());
-    }
-
-    #[test]
-    fn main_summary_recomputes_from_visible_full_set_ignoring_full_state() {
-        let main_id = Uuid::new_v4();
-        let created = fixture_time_evidence();
-        let visible = [
-            SubTaskState::Succeeded,
-            SubTaskState::Succeeded,
-            SubTaskState::Succeeded,
-        ];
-        let view = project_main_task_summary(
-            main_id,
-            TaskOperation::Reboot,
-            MainTaskState::Running,
-            None,
-            7,
-            &created,
-            &visible,
-            false,
-            false,
-        )
-        .unwrap();
-        assert_eq!(view["state"], "completed");
-        assert_eq!(view["outcome"], "success");
-        assert_eq!(view["counts"]["succeeded"], "3");
-        assert_eq!(view["counts"]["failed"], "0");
-        assert_eq!(view["counts"]["unknown"], "0");
-        assert_eq!(view["counts"]["queued"], "0");
-        assert_eq!(view["view_scope"], "authorized_subset");
-        assert!(view.get("total_targets").is_none());
-        assert!(view.get("hidden_count").is_none());
-        assert_eq!(view["revision"], "7");
-
-        let view2 = project_main_task_summary(
-            main_id,
-            TaskOperation::Reboot,
-            MainTaskState::Completed,
-            Some(MainTaskOutcome::Partial),
-            7,
-            &created,
-            &visible,
-            false,
-            false,
-        )
-        .unwrap();
-        assert_eq!(view2["state"], "completed");
-        assert_eq!(view2["outcome"], "success");
-        assert_eq!(view2["counts"]["succeeded"], "3");
-
-        let empty = project_main_task_summary(
-            main_id,
-            TaskOperation::Reboot,
-            MainTaskState::Completed,
-            Some(MainTaskOutcome::Success),
-            7,
-            &created,
-            &[],
-            false,
-            false,
-        );
-        assert!(
-            matches!(empty, Err(ControllerError::NotFound)),
-            "空 visible 全集必须 NotFound（404），不得输出零值汇总"
-        );
-    }
-
-    #[test]
-    fn children_page_projection_is_independent_from_main_counts() {
-        let dev_ok = "aa".repeat(32);
-        let dev_hidden = "bb".repeat(32);
-        let entries = vec![
-            ChildEntry {
-                id: Uuid::new_v4(),
-                device_id: dev_ok.clone(),
-                state: SubTaskState::Succeeded,
-                reason_code: None,
-                revision: 3,
-                result_evidence: Some(EvidenceKind::BootTransitionObserved),
-                eligible: true,
-            },
-            ChildEntry {
-                id: Uuid::new_v4(),
-                device_id: dev_hidden.clone(),
-                state: SubTaskState::Succeeded,
-                reason_code: None,
-                revision: 3,
-                result_evidence: None,
-                eligible: false,
-            },
-        ];
-        let view = project_task_children(&entries, None);
-        assert!(view.get("view_scope").is_none());
-        assert!(view.get("counts").is_none());
-        assert!(
-            view.get("next_cursor")
-                .expect("Page 必须含 next_cursor")
-                .is_null(),
-            "无下一页时 next_cursor 必须是 JSON null"
-        );
-        let items = view["items"].as_array().unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0]["state"], "succeeded");
-        assert_eq!(items[0]["revision"], "3");
-        assert_eq!(items[0]["result_evidence"], "boot_transition_observed");
-        assert!(items[0].get("total_targets").is_none());
-        assert!(items[0].get("execution_token").is_none());
-
-        let full_entries = vec![
-            ChildEntry {
-                id: Uuid::new_v4(),
-                device_id: dev_ok,
-                state: SubTaskState::Succeeded,
-                reason_code: None,
-                revision: 3,
-                result_evidence: Some(EvidenceKind::BootTransitionObserved),
-                eligible: true,
-            },
-            ChildEntry {
-                id: Uuid::new_v4(),
-                device_id: dev_hidden,
-                state: SubTaskState::Succeeded,
-                reason_code: None,
-                revision: 3,
-                result_evidence: None,
-                eligible: true,
-            },
-        ];
-        let cursor = "01".repeat(32);
-        let full = project_task_children(&full_entries, Some(cursor.as_str()));
-        let full_items = full["items"].as_array().unwrap();
-        assert_eq!(full_items.len(), 2);
-        assert_eq!(full_items[1]["device_id"], "bb".repeat(32));
-        assert_eq!(full["next_cursor"], "01".repeat(32));
-        assert!(full.get("counts").is_none());
-    }
-
-    #[test]
-    fn cancel_permission_matrix_is_exact() {
-        assert!(cancel_permitted(true, false, false, SubTaskState::Queued));
-        assert!(cancel_permitted(true, false, false, SubTaskState::Held));
-        assert!(!cancel_permitted(
-            true,
-            true,
-            true,
-            SubTaskState::Dispatching
-        ));
-        assert!(!cancel_permitted(true, true, true, SubTaskState::Accepted));
-        assert!(!cancel_permitted(true, true, true, SubTaskState::Verifying));
-        assert!(!cancel_permitted(true, true, true, SubTaskState::Unknown));
-        assert!(cancel_permitted(false, true, true, SubTaskState::Queued));
-        assert!(!cancel_permitted(false, true, false, SubTaskState::Queued));
-        assert!(!cancel_permitted(false, false, true, SubTaskState::Queued));
-    }
-
-    #[test]
-    fn cancel_result_projection_filters_unreadable_targets() {
-        let a_id = Uuid::from_u128(0x1234567812344abc80de123456789a01);
-        let b_id = Uuid::from_u128(0x1234567812344abc80de123456789a02);
-
-        let targets = vec![
-            CancelledTarget {
-                id: a_id,
-                device_id: [0xAA; 32],
-                readable_in_tx: true,
-            },
-            CancelledTarget {
-                id: b_id,
-                device_id: [0xBB; 32],
-                readable_in_tx: false,
-            },
-        ];
-        let resp = project_cancel_result(&targets);
-        assert!(resp.accepted, "accepted 仅为取消请求接收确认，恒 true");
-        assert_eq!(resp.cancelled, Some(vec![a_id]), "不可读 B 不得泄露");
-
-        let all_hidden = vec![
-            CancelledTarget {
-                id: a_id,
-                device_id: [0xAA; 32],
-                readable_in_tx: false,
-            },
-            CancelledTarget {
-                id: b_id,
-                device_id: [0xBB; 32],
-                readable_in_tx: false,
-            },
-        ];
-        let hidden = project_cancel_result(&all_hidden);
-        assert!(hidden.accepted);
-        assert_eq!(hidden.cancelled, None);
-
-        let empty = project_cancel_result(&[]);
-        assert!(empty.accepted);
-        assert_eq!(empty.cancelled, None);
-    }
-
-    #[test]
-    fn release_lock_requires_admin_ack_and_nonempty_reason() {
-        assert!(release_lock_permitted(
-            true,
-            true,
-            "现场已人工核实",
-            SubTaskState::Unknown
-        ));
-        assert!(!release_lock_permitted(
-            false,
-            true,
-            "现场已人工核实",
-            SubTaskState::Unknown
-        ));
-        assert!(!release_lock_permitted(
-            true,
-            false,
-            "现场已人工核实",
-            SubTaskState::Unknown
-        ));
-        assert!(!release_lock_permitted(
-            true,
-            true,
-            "   ",
-            SubTaskState::Unknown
-        ));
-        assert!(!release_lock_permitted(
-            true,
-            true,
-            "ok",
-            SubTaskState::Succeeded
-        ));
-    }
-
-    #[test]
-    fn time_review_requires_at_least_one_held_subtask() {
-        assert!(time_review_permitted(true, 1));
-        assert!(time_review_permitted(true, 5));
-        assert!(!time_review_permitted(true, 0));
-        assert!(!time_review_permitted(false, 3));
-    }
-
-    #[test]
-    fn decimal_u64_rejects_negative_leading_zero_and_overflow() {
-        assert_eq!(parse_decimal_u64("0").unwrap(), 0);
-        assert_eq!(parse_decimal_u64("18446744073709551615").unwrap(), u64::MAX);
-        for bad in [
-            "",
-            " ",
-            "-1",
-            "+1",
-            "01",
-            "007",
-            "1_0",
-            "1.0",
-            "abc",
-            "99999999999999999999999",
-        ] {
-            assert!(
-                matches!(
-                    parse_decimal_u64(bad),
-                    Err(ControllerError::InvalidArgument)
-                ),
-                "非法十进制字符串必须 InvalidArgument: {bad:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn page_limit_defaults_to_50_and_caps_at_200() {
-        assert_eq!(clamp_page_limit(None).unwrap(), 50);
-        assert_eq!(clamp_page_limit(Some(1)).unwrap(), 1);
-        assert_eq!(clamp_page_limit(Some(200)).unwrap(), 200);
-        for bad in [0usize, 201, 1_000] {
-            assert!(
-                matches!(
-                    clamp_page_limit(Some(bad)),
-                    Err(ControllerError::InvalidArgument)
-                ),
-                "越界 limit 必须 InvalidArgument: {bad}"
-            );
-        }
-    }
-
-    #[test]
-    fn idempotency_key_must_be_canonical_lowercase_uuidv4() {
-        assert_eq!(
-            parse_idempotency_key(Some(IDEMPOTENCY_KEY)).unwrap(),
-            IDEMPOTENCY_KEY
-        );
-        assert!(matches!(
-            parse_idempotency_key(None),
-            Err(ControllerError::InvalidArgument)
-        ));
-        for bad in [
-            "",
-            "3F2504E0-4F89-41D3-9A0C-0305E82C3301",
-            "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
-            "3f2504e04f8941d39a0c0305e82c3301",
-            "not-a-uuid",
-        ] {
-            assert!(
-                matches!(
-                    parse_idempotency_key(Some(bad)),
-                    Err(ControllerError::InvalidArgument)
-                ),
-                "非法幂等键必须 InvalidArgument: {bad:?}"
-            );
-        }
-    }
 
     // ── 路由集成（fake TaskApi + fake AuthServiceApi + oneshot）────────
 
