@@ -31,18 +31,15 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::ControllerError;
-use crate::auth::service::Session;
 #[cfg(doc)]
 use crate::events::EventBus;
 use crate::events::{EventEnvelope, EventObjectAudience};
 use crate::http_api::{err_response, ok_response, request_id};
 use crate::http_auth::EndpointId;
 use crate::http_gate::{
-    authenticate_read, authenticate_write, exhausted, not_ready, read_json_body,
-    require_admin_session, single_header,
+    authenticate_read, authenticate_write, read_json_body, require_admin_session, single_header,
 };
 use crate::model::decimal_u64_json;
-use crate::operations::RecoveryMode;
 use crate::parse_device_id;
 use crate::tasks::model::{MainTaskOutcome, MainTaskState, SubTaskState};
 use crate::tasks::preview::{PREVIEW_TTL, is_canonical_uuid_v4_key};
@@ -71,86 +68,13 @@ pub use contract::{
 mod state;
 pub use state::HttpTasksState;
 
-/// 业务会话前置：`must_change_password`（规格 01 A-02 临时密码）一律 403
-/// `PASSWORD_CHANGE_REQUIRED`——**不要求** `is_admin`（admin 临时密码同样 403）、
-/// 不复制 Host/Cookie/CSRF；缺失会话仍由共享 gate 严格 401 `AUTH_REQUIRED`。
-#[allow(clippy::result_large_err)]
-pub(crate) fn require_business_session(session: &Session) -> Result<(), Response> {
-    if session.user.must_change_password {
-        return Err(err_response(
-            StatusCode::FORBIDDEN,
-            "PASSWORD_CHANGE_REQUIRED",
-            "auth.password_change_required",
-            json!({}),
-        ));
-    }
-    Ok(())
-}
+mod gate;
+pub(crate) use gate::{
+    controlled_recovery_response, require_business_session, task_error_response,
+};
 
-/// 受控恢复模式下的变更任务提交响应（05 §9「禁止变更任务调度/提交」）。
-///
-/// 503 而非 403：模式是**临时**运行状态，不是对调用者身份的判定，解除受控模式后
-/// 同一请求即可重放；`params.recovery_mode` 逐字给出线上契约字符串，便于前端提示，
-/// 不含设备、任务或凭据信息（去敏）。
-pub(crate) fn controlled_recovery_response() -> Response {
-    err_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "CONTROLLED_RECOVERY_ACTIVE",
-        "task.controlled_recovery_active",
-        json!({ "recovery_mode": RecoveryMode::ControlledRecovery.as_str() }),
-    )
-}
-
-/// 8 条任务路由共用的唯一错误映射：既有契约码 + Task 4 两个新变体，
-/// **无通用 500 兜底**（其余变体统一 503 `NOT_READY`，与既有 `backend_error` 一致）。
-pub(crate) fn task_error_response(err: &ControllerError) -> Response {
-    match err {
-        ControllerError::PermissionDenied => err_response(
-            StatusCode::FORBIDDEN,
-            "PERMISSION_DENIED",
-            "permission.denied",
-            json!({}),
-        ),
-        ControllerError::InvalidArgument => err_response(
-            StatusCode::BAD_REQUEST,
-            "INVALID_ARGUMENT",
-            "task.invalid_request",
-            json!({}),
-        ),
-        ControllerError::NotFound => err_response(
-            StatusCode::NOT_FOUND,
-            "NOT_FOUND",
-            "system.not_found",
-            json!({}),
-        ),
-        ControllerError::RevisionConflict => err_response(
-            StatusCode::CONFLICT,
-            "REVISION_CONFLICT",
-            "task.revision_conflict",
-            json!({}),
-        ),
-        ControllerError::TaskIdempotencyConflict => err_response(
-            StatusCode::CONFLICT,
-            "IDEMPOTENCY_CONFLICT",
-            "task.idempotency_conflict",
-            json!({}),
-        ),
-        ControllerError::TaskPreviewInvalidState => err_response(
-            StatusCode::CONFLICT,
-            "INVALID_STATE",
-            "task.preview_invalid_state",
-            json!({}),
-        ),
-        ControllerError::Database(_) => err_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "STORAGE_UNAVAILABLE",
-            "system.storage_unavailable",
-            json!({}),
-        ),
-        ControllerError::ResourceExhausted => exhausted(),
-        _ => not_ready(),
-    }
-}
+#[cfg(test)]
+mod fixtures;
 
 /// 单元枚举 / `TimeEvidence` 的 serde 编码恒不失败（无自定义 `Serialize`），
 /// 失败即为实现级缺陷，故 `expect` 而非静默降级为 `null`。
@@ -880,15 +804,15 @@ mod routes {
 }
 #[cfg(test)]
 mod tests {
+    use super::fixtures::{RAW_TOKEN, fixture_session};
     use super::*;
-    use crate::auth::service::{IdentityUser, Login, SessionPage};
-    use crate::auth::session::token_digest;
+    use crate::auth::service::{Login, Session, SessionPage};
     use crate::events::{EventAudience, EventBus, EventEnvelope, EventName};
     use crate::http_auth::{
         AuthFuture, AuthServiceApi, CsrfBinding, HttpAuthState, SessionAuthority,
     };
     use crate::http_security::HttpSecurityConfig;
-    use crate::operations::RuntimeRecoveryController;
+    use crate::operations::{RecoveryMode, RuntimeRecoveryController};
     use crate::tasks::model::{EvidenceKind, ReasonCode};
     use crate::tasks::preview::{PreviewOutcome, PreviewTarget};
     use crate::time::evidence::{TimeEvidence, TimeQuality};
@@ -900,7 +824,6 @@ mod tests {
     use std::time::Instant;
     use tower::ServiceExt;
 
-    const RAW_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const CSRF_TOKEN: &str = "csrf-token-fixture";
     const IDEMPOTENCY_KEY: &str = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
 
@@ -917,25 +840,6 @@ mod tests {
             sample_age_ms: None,
             offset_ms: None,
             uncertainty_ms: None,
-        }
-    }
-
-    fn fixture_session(is_admin: bool, must_change_password: bool) -> Session {
-        Session {
-            user: IdentityUser {
-                id: [7u8; 16],
-                username: if is_admin {
-                    "admin".into()
-                } else {
-                    "alice".into()
-                },
-                password_hash: "$argon2id$=synthetic-test-only=".to_string(),
-                active: true,
-                is_admin,
-                must_change_password,
-                revision: 1,
-            },
-            digest: token_digest(RAW_TOKEN.as_bytes()),
         }
     }
 
@@ -1318,145 +1222,6 @@ mod tests {
                 "非法幂等键必须 InvalidArgument: {bad:?}"
             );
         }
-    }
-
-    // ── 业务会话 gate 与统一错误映射 ─────────────────────────────────
-
-    #[tokio::test]
-    async fn temporary_password_forbids_admin_and_plain_with_exact_envelope() {
-        for is_admin in [true, false] {
-            let resp = require_business_session(&fixture_session(is_admin, true))
-                .expect_err("临时密码（含 admin）必须 403");
-            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "is_admin={is_admin}");
-            let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
-            let body: Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(
-                body["error"]["code"],
-                json!("PASSWORD_CHANGE_REQUIRED"),
-                "is_admin={is_admin}"
-            );
-            assert_eq!(
-                body["error"]["message_key"],
-                json!("auth.password_change_required"),
-                "is_admin={is_admin}"
-            );
-            assert_eq!(body["error"]["params"], json!({}), "is_admin={is_admin}");
-            let error_keys: Vec<&str> = body["error"]
-                .as_object()
-                .map(|o| o.keys().map(String::as_str).collect())
-                .unwrap_or_default();
-            assert_eq!(
-                error_keys.len(),
-                3,
-                "error 必须恰为 code/message_key/params: {body}"
-            );
-            let top_keys: Vec<&str> = body
-                .as_object()
-                .map(|o| o.keys().map(String::as_str).collect())
-                .unwrap_or_default();
-            assert_eq!(
-                top_keys.len(),
-                2,
-                "envelope 必须恰为 error+request_id: {body}"
-            );
-        }
-    }
-
-    #[test]
-    fn normal_session_passes_for_plain_and_admin() {
-        for is_admin in [false, true] {
-            assert!(
-                require_business_session(&fixture_session(is_admin, false)).is_ok(),
-                "正常（非临时密码）会话必须通过, is_admin={is_admin}"
-            );
-        }
-    }
-
-    async fn status_and_code(err: &ControllerError) -> (u16, String, String) {
-        let resp = task_error_response(err);
-        let status = resp.status().as_u16();
-        let body = to_bytes(resp.into_body(), 1_048_576).await.unwrap();
-        let value: Value = serde_json::from_slice(&body).unwrap();
-        (
-            status,
-            value["error"]["code"].as_str().unwrap().to_owned(),
-            value["error"]["message_key"].as_str().unwrap().to_owned(),
-        )
-    }
-
-    #[tokio::test]
-    async fn error_mapping_is_exact_for_every_contract_variant() {
-        assert_eq!(
-            status_and_code(&ControllerError::TaskIdempotencyConflict).await,
-            (
-                409,
-                "IDEMPOTENCY_CONFLICT".into(),
-                "task.idempotency_conflict".into()
-            )
-        );
-        assert_eq!(
-            status_and_code(&ControllerError::TaskPreviewInvalidState).await,
-            (
-                409,
-                "INVALID_STATE".into(),
-                "task.preview_invalid_state".into()
-            )
-        );
-        assert_eq!(
-            status_and_code(&ControllerError::RevisionConflict).await,
-            (
-                409,
-                "REVISION_CONFLICT".into(),
-                "task.revision_conflict".into()
-            )
-        );
-        assert_eq!(
-            status_and_code(&ControllerError::NotFound).await,
-            (404, "NOT_FOUND".into(), "system.not_found".into())
-        );
-        assert_eq!(
-            status_and_code(&ControllerError::PermissionDenied).await,
-            (403, "PERMISSION_DENIED".into(), "permission.denied".into())
-        );
-        assert_eq!(
-            status_and_code(&ControllerError::InvalidArgument).await,
-            (
-                400,
-                "INVALID_ARGUMENT".into(),
-                "task.invalid_request".into()
-            )
-        );
-        assert_eq!(
-            status_and_code(&ControllerError::Database(sqlx::Error::RowNotFound)).await,
-            (
-                503,
-                "STORAGE_UNAVAILABLE".into(),
-                "system.storage_unavailable".into()
-            )
-        );
-        assert_eq!(
-            status_and_code(&ControllerError::ResourceExhausted).await,
-            (
-                503,
-                "RESOURCE_EXHAUSTED".into(),
-                "system.resource_exhausted".into()
-            )
-        );
-        assert_eq!(
-            status_and_code(&ControllerError::Crypto).await,
-            (503, "NOT_READY".into(), "system.not_ready".into())
-        );
-    }
-
-    #[tokio::test]
-    async fn resource_exhausted_carries_retry_after_60() {
-        let resp = task_error_response(&ControllerError::ResourceExhausted);
-        assert_eq!(
-            resp.headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok()),
-            Some("60")
-        );
     }
 
     // ── 路由集成（fake TaskApi + fake AuthServiceApi + oneshot）────────
