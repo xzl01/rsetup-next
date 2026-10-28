@@ -28,10 +28,10 @@ use crate::tasks::model::{EvidenceKind, MainTaskState, ReasonCode, SubTaskState}
 use crate::tasks::preview::{PreviewOutcome, PreviewTarget};
 use crate::tasks::service::SubmitOutcome;
 
-pub(crate) const CSRF_TOKEN: &str = "csrf-token-fixture";
+pub(super) const CSRF_TOKEN: &str = "csrf-token-fixture";
 
 #[derive(Clone, Copy)]
-pub(crate) enum FakeFailure {
+pub(super) enum FakeFailure {
     NotFound,
     RevisionConflict,
     PermissionDenied,
@@ -43,7 +43,7 @@ pub(crate) enum FakeFailure {
 }
 
 impl FakeFailure {
-    pub(crate) fn error(self) -> ControllerError {
+    pub(super) fn error(self) -> ControllerError {
         match self {
             FakeFailure::NotFound => ControllerError::NotFound,
             FakeFailure::RevisionConflict => ControllerError::RevisionConflict,
@@ -57,28 +57,28 @@ impl FakeFailure {
     }
 }
 
-pub(crate) struct FakeTaskApi {
-    pub(crate) calls: Mutex<Vec<&'static str>>,
-    pub(crate) failure: Option<FakeFailure>,
+pub(super) struct FakeTaskApi {
+    pub(super) calls: Mutex<Vec<&'static str>>,
+    pub(super) failure: Option<FakeFailure>,
     /// 仅作用于 `task_detail` 的失败注入（优先于 `failure`）：用于模拟
     /// 「time_review 报 InvalidArgument 而任务不存在（detail 报 NotFound）」
     /// 的服务层组合。
-    pub(crate) detail_failure: Option<FakeFailure>,
+    pub(super) detail_failure: Option<FakeFailure>,
     /// 为真时 `task_detail` 忽略 `failure` 注入直接返回 `detail`：用于模拟
     /// 「time_review 报 InvalidArgument 但只读复核成功」的组合（no_held 与
     /// 决策矛盾两条分支）。
-    pub(crate) detail_ok: bool,
-    pub(crate) detail: TaskDetail,
-    pub(crate) page: TaskPage,
-    pub(crate) children: ChildrenPage,
-    pub(crate) preview: PreviewOutcome,
-    pub(crate) submit: SubmitOutcome,
-    pub(crate) cancel: CancelTaskResponse,
-    pub(crate) release: ReleaseLockResponse,
+    pub(super) detail_ok: bool,
+    pub(super) detail: TaskDetail,
+    pub(super) page: TaskPage,
+    pub(super) children: ChildrenPage,
+    pub(super) preview: PreviewOutcome,
+    pub(super) submit: SubmitOutcome,
+    pub(super) cancel: CancelTaskResponse,
+    pub(super) release: ReleaseLockResponse,
 }
 
 impl FakeTaskApi {
-    pub(crate) fn new() -> Self {
+    pub(super) fn new() -> Self {
         let detail = fixture_detail();
         Self {
             calls: Mutex::new(Vec::new()),
@@ -142,11 +142,11 @@ impl FakeTaskApi {
         }
     }
 
-    pub(crate) fn record(&self, name: &'static str) {
+    pub(super) fn record(&self, name: &'static str) {
         self.calls.lock().unwrap().push(name);
     }
 
-    pub(crate) fn calls(&self) -> Vec<&'static str> {
+    pub(super) fn calls(&self) -> Vec<&'static str> {
         self.calls.lock().unwrap().clone()
     }
 }
@@ -255,8 +255,8 @@ impl TaskApi for FakeTaskApi {
     }
 }
 
-pub(crate) struct FakeAuth {
-    pub(crate) session: Session,
+pub(super) struct FakeAuth {
+    pub(super) session: Session,
 }
 
 impl AuthServiceApi for FakeAuth {
@@ -320,7 +320,7 @@ impl AuthServiceApi for FakeAuth {
     }
 }
 
-pub(crate) fn app(
+pub(super) fn app(
     api: Arc<FakeTaskApi>,
     is_admin: bool,
     must_change_password: bool,
@@ -330,7 +330,7 @@ pub(crate) fn app(
 }
 
 /// 同 [`app`]，但可注入事件总线：`None` 即「未开启 SSE 事件线」的装配形态。
-pub(crate) fn app_with_events(
+pub(super) fn app_with_events(
     api: Arc<FakeTaskApi>,
     is_admin: bool,
     must_change_password: bool,
@@ -342,7 +342,7 @@ pub(crate) fn app_with_events(
 
 /// 同 [`app`]，但注入受控恢复模式唯一真源（05 §9 提交闸门测试入口）：
 /// 会话为非临时密码的管理员、CSRF 已绑定，排除其它门禁的干扰。
-pub(crate) fn app_with_recovery(
+pub(super) fn app_with_recovery(
     api: Arc<FakeTaskApi>,
     recovery: Arc<RuntimeRecoveryController>,
 ) -> Router<()> {
@@ -350,7 +350,7 @@ pub(crate) fn app_with_recovery(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_app(
+pub(super) fn build_app(
     api: Arc<FakeTaskApi>,
     is_admin: bool,
     must_change_password: bool,
@@ -386,7 +386,7 @@ pub(crate) fn build_app(
     })
 }
 
-pub(crate) fn get_request(uri: &str, with_cookie: bool) -> Request<Body> {
+pub(super) fn get_request(uri: &str, with_cookie: bool) -> Request<Body> {
     let mut builder = Request::builder()
         .method("GET")
         .uri(uri)
@@ -397,7 +397,7 @@ pub(crate) fn get_request(uri: &str, with_cookie: bool) -> Request<Body> {
     builder.body(Body::empty()).unwrap()
 }
 
-pub(crate) fn post_request(
+pub(super) fn post_request(
     uri: &str,
     body: &str,
     with_cookie: bool,
@@ -419,10 +419,10 @@ pub(crate) fn post_request(
     builder.body(Body::from(body.to_string())).unwrap()
 }
 
-pub(crate) async fn envelope(resp: Response) -> (StatusCode, Value) {
+pub(super) async fn envelope(resp: Response) -> (StatusCode, Value) {
     let status = resp.status();
     let bytes = to_bytes(resp.into_body(), 1_048_576).await.unwrap();
     (status, serde_json::from_slice(&bytes).unwrap())
 }
 
-pub(crate) const CREATE_TASK_BODY: &str = r#"{"preview_token":"00","confirm":true}"#;
+pub(super) const CREATE_TASK_BODY: &str = r#"{"preview_token":"00","confirm":true}"#;

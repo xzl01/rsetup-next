@@ -537,4 +537,4 @@ fn accepted_response(data: Value) -> Response {
 }
 
 #[cfg(test)]
-pub(crate) mod tests;
+mod tests;
