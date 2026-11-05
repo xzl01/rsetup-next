@@ -187,9 +187,15 @@ metrics-static-gates:
 	@rc=0; hits=$$(grep -rnE 'TO''DO|T''BD|FIX''ME' crates/rsetup-controller/src/metrics) || rc=$$?; \
 	 if [ $$rc -gt 1 ]; then echo "metrics 门禁 5：grep 异常退出码 $$rc（目录缺失或表达式非法），Fail-Closed" >&2; exit 1; fi; \
 	 if [ -n "$$hits" ]; then echo "metrics 门禁 5：src/metrics 下存在 TODO/TBD/FIXME 占位符" >&2; printf '%s\n' "$$hits" >&2; exit 1; fi
-	@rc=0; filelist=$$(find crates/rsetup-controller/src/main.rs crates/rsetup-controller/src/main \
-		 -type f -name '*.rs' 2>/dev/null); rc=$$?; \
-	 if [ $$rc -gt 1 ]; then echo "metrics 门禁 6：源文件枚举异常退出码 $$rc，Fail-Closed" >&2; exit 1; fi; \
+	@if [ -d crates/rsetup-controller/src/main ]; then \
+		 rc=0; filelist=$$(find crates/rsetup-controller/src/main.rs crates/rsetup-controller/src/main \
+			 -type f -name '*.rs'); rc=$$?; \
+		 if [ $$rc -ne 0 ]; then echo "metrics 门禁 6：源文件枚举异常退出码 $$rc，Fail-Closed" >&2; exit 1; fi; \
+	 else \
+		 rc=0; filelist=$$(find crates/rsetup-controller/src/main.rs crates/rsetup-controller/src/main \
+			 -type f -name '*.rs' 2>/dev/null); rc=$$?; \
+		 if [ $$rc -gt 1 ]; then echo "metrics 门禁 6：源文件枚举异常退出码 $$rc，Fail-Closed" >&2; exit 1; fi; \
+	 fi; \
 	 if [ -z "$$filelist" ]; then echo "metrics 门禁 6：未找到 crates/rsetup-controller/src/main.rs，Fail-Closed" >&2; exit 1; fi; \
 	 files=$$(printf '%s\n' "$$filelist" | sort); \
 	 rc=0; hits=$$(grep -n 'build_production_router_with_metrics_source\|SqlxMetricsSnapshotSource::new' $$files) || rc=$$?; \

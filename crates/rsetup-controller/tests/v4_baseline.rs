@@ -86,9 +86,11 @@ fn read_main_sources() -> String {
 fn collect_rs_files(dir: &Path, acc: &mut Vec<PathBuf>) {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => panic!("读取目录 {} 失败：{e}", dir.display()),
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|e| panic!("枚举目录 {} 条目失败：{e}", dir.display()));
         let path = entry.path();
         if path.is_dir() {
             collect_rs_files(&path, acc);
