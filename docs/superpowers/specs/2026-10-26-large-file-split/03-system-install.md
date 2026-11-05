@@ -1,6 +1,6 @@
 # 子规格 03：`crates/rsetup-core/src/system_install.rs` 拆分设计
 
-> **状态：待用户审阅，尚未实施。** 本文件是总览规范 [2026-10-26-large-file-split-design.md](../2026-10-26-large-file-split-design.md) §4 登记的 03 号子规格，遵守其 C1–C9 契约与 F1–F8 验证前提（下称「总览」）。本任务只写文档：未改任何源码、未编译、未运行测试、未连接数据库、未提交。
+> **状态：待用户审阅，尚未实施（历史状态：规格撰写时点；当前已实施完成，逐批登记见文末实施登记章节）。** 本文件是总览规范 [2026-10-26-large-file-split-design.md](../2026-10-26-large-file-split-design.md) §4 登记的 03 号子规格，遵守其 C1–C9 契约与 F1–F8 验证前提（下称「总览」）。本任务只写文档：未改任何源码、未编译、未运行测试、未连接数据库、未提交。
 
 撰写基线：分支 `dev-aghost`，工作树头提交 `c7ff640`；实测 `git status` 当时 [crates/rsetup-core/src/system_install.rs](../../../../crates/rsetup-core/src/system_install.rs) 与 [crates/rsetup-core/src/lib.rs](../../../../crates/rsetup-core/src/lib.rs) 均无未提交改动。行号为撰写会话对 4,720 行文件逐段实测，实施时须按当时工作树重新核对（总览 §3 并行改动注记）。
 

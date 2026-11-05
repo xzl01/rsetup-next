@@ -1,6 +1,6 @@
 # 子规格 04：`crates/rsetup-controller/src/authz/sqlx_repo.rs` 拆分设计
 
-> **状态：待用户审阅，尚未实施。** 本文件是总览规范 [2026-10-26-large-file-split-design.md](../2026-10-26-large-file-split-design.md) §4 登记的 04 号子规格，遵守其 C1–C9 契约与 F1–F8 验证前提（下称「总览」）。本任务只写文档：未改任何源码、未编译、未运行测试、未读 `secret/`、未连接数据库、未提交。
+> **状态：待用户审阅，尚未实施（历史状态：规格撰写时点；当前已实施完成，逐批登记见文末实施登记章节）。** 本文件是总览规范 [2026-10-26-large-file-split-design.md](../2026-10-26-large-file-split-design.md) §4 登记的 04 号子规格，遵守其 C1–C9 契约与 F1–F8 验证前提（下称「总览」）。本任务只写文档：未改任何源码、未编译、未运行测试、未读 `secret/`、未连接数据库、未提交。
 >
 > **修订记录（2026-10-25）：已按独立审查意见修订、待复核（不称 PASS）。** 修订项：方法计数更正为 21（12 读 + 9 写，§1.2/4.1/5/8/9）；SQL 常量更正为 22 条并在 §1.2 附全名清单供 DoD 核对（§1.2/2/3/4.2）；可见性提升收敛为 5 项、`uuid_from`/`device_from` 保持 private（§3/4.2/8 DoD）；`authz/mod.rs` 锚点更正为第 3 行（§1.1/3）；集成测试属独立 crate、只消费 `pub` 项的说明（§4.2）；依赖图补 `tx_guard`→`codec`（`ordered_user_ids` 378）与 `snapshot_repo`→`crate::authz::service`（1321/1327）互引注记（§4.3）；批 C `queries.rs::tests` 显式 `use crate::authz::sqlx_repo::sql_shape;` 接线（§5/6）。仅文档级修改，27 测试映射、单一 impl、SQL/事务不变量与批次骨架不变。
 

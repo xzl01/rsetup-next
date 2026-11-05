@@ -2,7 +2,7 @@
 
 日期：2026-10-26。作用域：全仓 12 个大型自有代码文件（清单见 §3）。
 
-> **状态：待用户审阅，尚未实施（实施阶段已启动，见§9）。** 本文是全仓大型文件拆分的**唯一总览规范**：只交付统一契约、已盘点候选、12 份子规格的登记表、建议实施顺序与验收基线。本文**不是**任何单个模块的详细设计，**不修改任何源码**，**不包含实施计划**，**不自动提交**。12 份子规格（§4 登记表所列路径）**均已完成编写并经独立只读审查与修订闭环（状态见 §4 与 §9）**，每份由新的代理子会话按 §2.8 的最低要求撰写。
+> **状态：待用户审阅，尚未实施（实施阶段已启动，见§9）（历史状态：规格撰写时点；当前已实施完成，逐批登记见文末实施登记章节）。** 本文是全仓大型文件拆分的**唯一总览规范**：只交付统一契约、已盘点候选、12 份子规格的登记表、建议实施顺序与验收基线。本文**不是**任何单个模块的详细设计，**不修改任何源码**，**不包含实施计划**，**不自动提交**。12 份子规格（§4 登记表所列路径）**均已完成编写并经独立只读审查与修订闭环（状态见 §4 与 §9）**，每份由新的代理子会话按 §2.8 的最低要求撰写。
 
 用词约定：**必须（MUST）/ 不得（MUST NOT）** 为硬门禁，违反即验收不通过；**应当（SHOULD）** 为默认做法，偏离须在子规格中说明；**可以（MAY）** 为允许项；**建议值** 为供审阅的默认，非既成决策。
 
@@ -202,7 +202,7 @@ B–E 各批次之间跨域可重叠；**跨批次重叠不解除 §5.1 的同�
 
 ## 7. 本轮交付与未交付
 
-- 已交付：本文一份（总览规范，状态：待用户审阅，尚未实施（实施阶段已启动，见§9））＋ 12 份子规格（§4 登记表所列路径，全部完成编写、独立审查与修订闭环）。
+- 已交付：本文一份（总览规范，状态：待用户审阅，尚未实施（实施阶段已启动，见§9）（历史状态：规格撰写时点；当前已实施完成，逐批登记见文末实施登记章节））＋ 12 份子规格（§4 登记表所列路径，全部完成编写、独立审查与修订闭环）。
 - 未交付（本任务边界内刻意不做）：任何源码改动、实施计划、排期、提交；任何编译、测试执行与数据库操作；任何新门禁。
 
 ## 8. 审查修订记录（2026-10-25）
@@ -215,7 +215,7 @@ B–E 各批次之间跨域可重叠；**跨批次重叠不解除 §5.1 的同�
 
 ## 9. 实施进度与核验记录（2026-10-26）
 
-全仓 12 份子规格已于 2026-10-26 全部通过静态审查。拆分实施阶段已启动，按各子规格登记批次推进并逐批完成简体中文提交，每批次均满足严格的质量与审查门禁。
+全仓 12 份子规格已于 2026-10-26 全部通过静态审查。拆分实施阶段已启动（历史状态：规格撰写时点；当前已实施完成，逐批登记见文末实施登记章节），按各子规格登记批次推进并逐批完成简体中文提交，每批次均满足严格的质量与审查门禁。
 
 ### 9.1 已完成实施模块及提交清单
 
@@ -275,11 +275,11 @@ B–E 各批次之间跨域可重叠；**跨批次重叠不解除 §5.1 的同�
    - `cb0e0de` refactor(controller): 拆分 auth/service 撤销域至 revoke 并完成模块树收敛（批次 4）
    - 逐批审查 PASS；规格登记 `d96f637`。
 
-8. **01 controller `http_auth.rs`（完成，共 5 批次，5 次提交）**
+8. **01 controller `http_auth.rs`（完成，共 5 批次，5 次提交，+9 个生产域文件 + 1 个测试支持文件（tests_support.rs））**
    - `99de683` refactor(controller): 目录化 http_auth 并迁出限速域（批次 1 原子替换+rate_limit）
    - `3beb061` refactor(controller): 拆分 http_auth 契约与状态域至 contract、state（批次 2）
    - `164f1a0` refactor(controller): 拆分 http_auth CSRF 域至 csrf（批次 3）
-   - `cd0da41` refactor(controller): 拆分 http_auth 处理器域至 login、me、password_logout、sessions（批次 4 四文件+52 测试随迁）
+   - `cd0da41` refactor(controller): 拆分 http_auth 处理器域至 login、me、password_logout、sessions（批次 4 四文件+56 测试随迁）
    - `2c04168` refactor(controller): 抽取 http_auth 共享测试设施并收敛模块门面至终态（批次 5 tests_support+router+门面 36 行终态）
    - 逐批审查 PASS；规格登记 `0b494f8`、`ce30fac`。
 
@@ -294,7 +294,7 @@ B–E 各批次之间跨域可重叠；**跨批次重叠不解除 §5.1 的同�
    - `32a77ac` refactor(controller): 收敛 tasks/service 根入口文档至各子模块并完成模块树终态（批次 8 B8 根入口 28 行终态）
    - 逐批审查 PASS；27 条测试守恒；规格登记 `daab037`、`f5a5bb2`、`ddbaffe`、`82048ae`、`d5d51cc`、`51c7480`、`7bcc7f5`、`e157f33`。
 
-10. **06 controller `tasks/http.rs`（完成，共 8 个提交含 1 次定点修复，7 批次）**
+10. **06 controller `tasks/http.rs`（完成，共 8 个实施单元，9 次实现/修复提交（含 1 次定点修复 520f761），另有登记提交）**
     - `afcaffc` refactor(controller): 拆分 tasks/http 游标编解码域至 http/cursor（批次 1 cursor）
     - `d16901d` refactor(controller): 拆分 tasks/http 契约与状态装配至 http/contract、state（批次 2 contract+state，首轮审查 FAIL 因 fmt-check 后由 520f761 修复并复核 PASS）
     - `520f761` fix(controller): 修正 tasks/http 批次2 根测试区 import 格式（批次 2 定点修复）
@@ -314,7 +314,7 @@ B–E 各批次之间跨域可重叠；**跨批次重叠不解除 §5.1 的同�
     - `e05c489` docs(app): 登记 main.rs 拆分批次3/4 实施裁决与终态（批次 4 登记）
     - 终态 `main.rs` 382 行；逐批审查 PASS。
 
-12. **10 controller `main.rs`（完成，共 5 批次 8 次提交 + 1 次定点修复）**
+12. **10 controller `main.rs`（完成，共 5 批次：5 次实施提交 + 1 次定点修复 + 5 次登记提交）**
     - `108929f` refactor(controller): 等价扩展 main.rs 源码文本门禁作用域至目录收集（批次 A）；审查 PASS；登记 `e942177`
     - `110add3` refactor(controller): 拆分 main.rs 凭据落盘与受控恢复域至 main/secret_log、recovery（批次 B）；审查 PASS；登记 `264acc3`
     - `7056c8a` refactor(controller): 拆分 main.rs 生命周期监督域至 main/lifecycle（批次 C，1262 行 + 17 测试）；审查 PASS；登记 `e158cab`
@@ -340,10 +340,11 @@ B–E 各批次之间跨域可重叠；**跨批次重叠不解除 §5.1 的同�
 3. **真实性声明**：本记录严格按实际执行结果与 git 历史记录核实登记，绝不虚称任何未执行或因环境限制无法执行的验证。如实说明：06 号批次 2 出现过 fmt-check 门禁红（首轮审查 FAIL），已由独立修复提交 `520f761` 修正并复核五条全绿；10 号批 A 因 main.rs 基线漂移（保留期清理段被回退）经用户裁决按方案 A 收窄实施（G-PC2 接线取消，G-M6/G-V4/G-PC1 照做），处置已在 10 号规格 §12 登记。
 4. **10 号门禁接线与文档修正**：三处源码文本门禁已等价扩展为目录收集——Makefile `metrics-static-gates` 第 6 条三段式（薄根必在 + `src/main/` 目录枚举 + 逐文件生产段截断，find 不进管道、空集与缺失 Fail-Closed、薄根 `build_production_router(` 正向锚点）、`tests/v4_baseline.rs` 的 `read_main_sources()`、`tests/production_composition.rs` 的 `main_production_sources()`；全部断言逐字不变，CI 合同测试 `node --test scripts/tests/*.test.mjs` 已复核通过。
 5. **批 E 文档断链修正**：`main/` 子树 4 处 rustdoc 私有项文档断链（main.rs 2 处本批引入、recovery.rs 2 处批 B 存量）由 `6be74f3` 以完整限定路径/纯 code 文本形式修正，`--document-private-items` 探针转 RC0；必需门禁 `cargo doc -D rustdoc::broken_intra_doc_links` 全程 RC0。
+6. **102 提交触达面白名单说明**：c7ff640..be0cc3f 全部触达路径限于 crates/**、docs/superpowers/specs/**、ui/**、Makefile 及 apps/desktop/src-tauri/build.rs；其中 build.rs（提交 77de6c3，TREE_DIRS 增 modules）为本总览与 05 号规格明确授权的资源接线窄例外，显式纳入白名单，非夹带。
 
 ### 9.5 收官状态与后续事项
 
 1. **已收官**：12 模块实施、逐批独立审查、子规格逐批实施登记（`01`/`12`/`06` 逐批；`02`/`03`/`04`/`07`/`08`/`09`/`11` 由 `f018311` 补录）、总览一致化均已完成。
 2. **收官门禁**：`make fmt-check`、`make metrics-static-gates`、`cargo clippy --workspace --all-targets -- -D warnings`、`make controller-test-offline`、`node --test scripts/tests/*.test.mjs` 由收官验证会话执行并另行记录结果；各批次内的模块级门禁已在对应登记段逐批记录。
 3. **仍归 CI/授权**：真库轨道（`--ignored` 用例，需操作员按引擎逐条授权专用开发库）与 desktop 真机冒烟（本沙箱缺 `libdbus-1` 依赖）不在本地执行，不作通过声明。
-4. **分支状态**：`dev-aghost` 领先 origin，全部提交均保留在本地、未推送，推送时机待用户决定。
+4. **分支状态**：截至本次核验，dev-aghost 已推送至 origin/dev-aghost，两者均为 be0cc3f，无 ahead/behind；主工作区另有 11 个未提交并行改动，不计入本次已推送提交。

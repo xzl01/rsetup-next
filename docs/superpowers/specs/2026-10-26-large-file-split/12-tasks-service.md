@@ -1,6 +1,6 @@
 # 子规格 12：`crates/rsetup-controller/src/tasks/service.rs` 拆分设计
 
-> **状态：待用户审阅，尚未实施。** 本文件是总览规范 [2026-10-26-large-file-split-design.md](../2026-10-26-large-file-split-design.md) §4 登记的 12 号子规格，遵守其 C1–C9 契约与 F1–F8 验证前提（下称「总览」）。本任务只写文档：未改任何源码、未编译、未运行测试、未读 `secret/`、未连接数据库、未提交。
+> **状态：待用户审阅，尚未实施（历史状态：规格撰写时点；当前已实施完成，逐批登记见文末实施登记章节）。** 本文件是总览规范 [2026-10-26-large-file-split-design.md](../2026-10-26-large-file-split-design.md) §4 登记的 12 号子规格，遵守其 C1–C9 契约与 F1–F8 验证前提（下称「总览」）。本任务只写文档：未改任何源码、未编译、未运行测试、未读 `secret/`、未连接数据库、未提交。
 
 撰写基线：分支 `dev-aghost`，头提交 `c7ff640`。撰写时 `git status` 实测：本文件 [tasks/service.rs](../../../../crates/rsetup-controller/src/tasks/service.rs) **无未提交改动**（行号与工作树一致），但同域 [tasks/scheduler.rs](../../../../crates/rsetup-controller/src/tasks/scheduler.rs)（+9/−7）与 [tasks/scheduler_store.rs](../../../../crates/rsetup-controller/src/tasks/scheduler_store.rs)（+83/−7 未提交）存在他人改动，漂移影响登记见 §9；全部行号为撰写会话逐段实测，实施时按当时工作树重新核对（总览 §3 并行改动注记）。任务域串行约束：本规格属总览 §5.2 批次 D 的第一项，**12 的 service/状态机边界定稿在前、06 后实施**；本文件不设计 06 的内部，与 [06-tasks-http.md](06-tasks-http.md) 的交叉一致登记见 §9。
 
