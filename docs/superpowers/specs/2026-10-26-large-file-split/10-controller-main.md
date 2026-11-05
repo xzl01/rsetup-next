@@ -320,4 +320,18 @@ crates/rsetup-controller/src/main/
 
 批E实施登记（2026-10-28，提交1c7ae9e+修复6be74f3；审查PASS）：①按父提交重采装配与启动门禁锚点，assembly原段154行与startup_gate归一化生产段154行逐字SAME，仅允许pub(super)/use与模块包装/start_if_ready签名因提权rustfmt单行→4行（体不变）/waiter_handle由缩进方法移至顶格#[cfg(test)] impl扩展块（原7行doc+方法体SAME）等适配；②薄根完整228行main()编排逐字SAME：MetricsRuntime::new第一语句（64）、时间门StartupTimeGate::start（90）先于DbPool::connect（95）、联合门禁（131–156）、listen_after_startup_gates内pre_listen（157）→finish（159）→listen（166）、监听内bind（180）→watch(false)（183）→revoke/admission/poll/scheduler（190）→shutdown signal（203）→board（222）→serve/graceful（252/256）→run_supervised_lifecycle（261）→settle_background_tasks（266–270），spawn相对次序与30s预算并行起点（startup 94–100/112–131）不变；③waiter_handle顶格属性169与mod tests属性180相邻、其后纯测试（满足§6.1截断前提）；④7条门禁测试含属性逐字随迁、10项fixture连续125行逐字SAME且private、assembly零测试（未凑覆盖新增接口）、根交付面测试9行SAME且include_str!("../Cargo.toml")路径不变；⑤薄根终态299行（文档1–13/必要私有use与6个私有#[path] mod/编排59–286/唯一测试288–299），无暂留实现与临时glob/import；⑥主bin 30守恒=薄根1+assembly 0+background1+lifecycle17+recovery2+secret_log2+startup_gate7；find实测恰7文件、顶格cfg(test)分布startup_gate 2（169/180）其余各1；C4全表：薄根299/assembly195/background162/lifecycle1262（沿用批C 900–1500内聚性论证）/recovery117/secret_log68/startup_gate654，除lifecycle外均<900；⑦三处既有门禁（Makefile三段式/v4收集器/production收集器）本批零改回且实测有效（v4 10例、production_composition 14例全绿）；⑧按方案A无retention实施；两处bin文档链接作用域观察（main.rs:9/11）已由修复提交6be74f3以完整路径链接修正、私有项探针转RC0（另recovery.rs:37/40为批B存量一并修正，其中:40降级为纯code文本）；⑨七组验证全rc0（fmt-check/metrics-static-gates/clippy --all-targets -D warnings/全量cargo test lib954+主bin30零失败、ignored真库未执行/主bin30+定向startup7+rc2_11+default1+v4_baseline10+production_composition14/rustdoc -D broken_intra_doc_links（27条lib非broken存量告警如实说明）/cfg(test)计数）；10号模块批A–E全部实施并逐批审查PASS，不扩张为真库验收结论
 
+收官后加固登记（审查 A-M1，2026-11-06）：
+1. 背景与隐患：审查 A-M1 指出，三处 main 源码收集器（`Makefile metrics-static-gates` 第 6 条、`tests/v4_baseline.rs::read_main_sources()` 与 `tests/production_composition.rs::main_production_sources()`）原实现虽然正确容忍了目录缺失（批 A 之前或回滚过渡态），但当 `src/main` 目录存在且发生部分枚举 I/O 错误（如权限受限或磁盘/虚拟文件系统 I/O 损坏）时，原收集器会吞掉错误（Makefile 容忍 `rc=1`，Rust 收集器静默 `Err(_) => return` 与 `flatten()`），由于薄根 `src/main.rs` 非空且正向锚点依然存在，门禁可能在子树未完整枚举的情况下出现假绿。
+2. 三处修改语义与 NotFound 容忍一致性（与规格 :200 完全相符）：
+   - `Makefile`（`metrics-static-gates` 第 6 条）：引入目录存在性判断。当 `crates/rsetup-controller/src/main` 目录**存在**时，`find` 必须严格返回 0，任何 `rc > 0` 立即 Fail-Closed 报错退出；当目录**不存在**时，保持既有容忍逻辑（`find` 允许 `rc=1` 并由后续空集检查兜底）。
+   - `tests/v4_baseline.rs`（`read_main_sources()`）：`fs::read_dir` 仅匹配 `std::io::ErrorKind::NotFound` 时安全跳过（保留规格明文允许的目录未建或回滚过渡态容忍）；其余任何 I/O 错误均显式 `panic!` 抛出完整路径与错误详情；拆开 `flatten()`，逐项检查 `DirEntry`，遇到枚举错误显式 `panic!`，绝不吞错。
+   - `tests/production_composition.rs`（`main_production_sources()`）：与 `v4_baseline.rs` 保持相同语义与错误处理风格。
+3. 验证结果（worktree 内执行）：
+   - `make fmt-check`：RC 0。
+   - `make metrics-static-gates`：RC 0，通过 bash `-xc` 追踪确认 `find` 返回 `rc=0`，收集面恰 7 文件。
+   - `cargo test -p rsetup-controller --test v4_baseline --locked`：RC 0，9 passed（HEAD 干净基线口径）。
+   - `cargo test -p rsetup-controller --test production_composition --locked`：RC 0，14 passed。
+   - `cargo test -p rsetup-controller --bin rsetup-controller --locked`：RC 0，30 passed。
+4. 故障注入说明：本轮加固为纯防御性语义收紧，已通过代码审查、静态语法检查与全量门禁用例回归；未在本地文件系统层面做 chmod 000 或损坏目录项等破坏性故障注入测试。
+
 
