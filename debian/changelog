@@ -1,3 +1,13 @@
+rsetup-next (0.6.0-3) bookworm; urgency=medium
+
+  * rsetup-controller 支持 CONTROLLER_ALLOWED_HOSTS=*：白名单含整项 `*` 时
+    放行任意 Host 头；其余条目仍为逐字精确匹配，缺失 Host 头仍被拒绝。
+  * 配置模板补充示例：CONTROLLER_DATABASE_URL 增加占位值连接串示例（务必
+    替换为真实账号/口令/库名），CONTROLLER_ALLOWED_HOSTS 增加放开所有访问的
+    `*` 示例与精确白名单示例；README.Debian 同步 Host 校验说明。
+
+ -- aghost <ggg17226@gmail.com>  Tue, 10 Nov 2026 09:13:14 +0000
+
 rsetup-next (0.6.0-2) bookworm; urgency=medium
 
   * rsetup-controller 与 rsetup-board-agent 在安装时创建 /etc/default 配置模板

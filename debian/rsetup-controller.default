@@ -17,9 +17,13 @@
 
 # 数据库连接串（MySQL/TiDB），含账号与口令。**这是本文件里唯一的秘密**，务必 0600。
 # 同一变量也被 rsetup-controller-migrate 使用（迁移目标就是这里指向的库）。
-#CONTROLLER_DATABASE_URL=
+# 格式示例（占位值，必须替换为真实账号/口令/库名，切勿原样使用）：
+#CONTROLLER_DATABASE_URL=mysql://rsetup:CHANGE_ME@127.0.0.1:3306/rsetup_next
 
-# 精确匹配的 Host 白名单，逗号分隔。只放中控实际被访问的名字，例如：
+# Host 白名单：默认是逐字精确匹配（逗号分隔，不支持通配/大小写折叠）。
+# 放开所有访问（任意 Host 头通过）：仅建议在可信内网，或外层反向代理已校验 Host 时使用。
+#CONTROLLER_ALLOWED_HOSTS=*
+# 精确白名单（推荐）：只放中控实际被访问的名字。
 #CONTROLLER_ALLOWED_HOSTS=127.0.0.1:8080,controller.internal.example
 # 说明：默认监听是 127.0.0.1:8080；上面这行是"经反代访问时也允许反代传来的 Host"的写法示例。
 

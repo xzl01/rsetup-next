@@ -113,9 +113,10 @@ pub enum WriteDeny {
     Csrf,
 }
 
-/// Exact membership: no case folding, no wildcards, no trimming.
+/// Exact membership, or any host when the allowlist contains the literal `*`:
+/// no case folding, no trimming, no pattern matching beyond the whole-entry `*`.
 fn host_ok(host: Option<&str>, cfg: &HttpSecurityConfig) -> bool {
-    host.is_some_and(|h| cfg.allowed_hosts.iter().any(|a| a == h))
+    host.is_some_and(|h| cfg.allowed_hosts.iter().any(|a| a == h || a == "*"))
 }
 
 /// Pre-session (login) gate: exact allowed `Host` **and** exact allowed
@@ -399,6 +400,73 @@ mod tests {
             ),
             Err(WriteDeny::Host)
         );
+    }
+
+    #[test]
+    fn wildcard_host_entry_admits_any_present_host() {
+        // 白名单含整项 `*`：任意 Host 头通过 Host 检查。
+        let mut c = cfg();
+        c.allowed_hosts = vec!["*".into()];
+        // Origin 仍必须精确匹配：合法 origin 才能整体通过。
+        assert_eq!(
+            check_pre_session(Some("evil.example:443"), Some("http://127.0.0.1:5173"), &c),
+            Ok(())
+        );
+        // Origin 不合法仍被 Origin 拒绝，`*` 只放开 Host。
+        assert_eq!(
+            check_pre_session(Some("evil.example:443"), Some("http://evil.example"), &c),
+            Err(WriteDeny::Origin)
+        );
+        // 缺失 Host 不被通配放行（请求线永远带 Host，这里是纵深防御）。
+        assert_eq!(
+            check_pre_session(None, Some("http://127.0.0.1:5173"), &c),
+            Err(WriteDeny::Host)
+        );
+        assert!(!host_ok(None, &c));
+    }
+
+    #[test]
+    fn wildcard_entry_beside_exact_entries_admits_any_host() {
+        // 精确项与 `*` 并存时，`*` 生效：任意 host 通过。
+        let mut c = cfg();
+        c.allowed_hosts = vec!["127.0.0.1:8080".into(), "*".into()];
+        let bound = "bound-csrf-token-5a5a";
+        assert_eq!(
+            check_session_write(
+                Some("evil.example"),
+                Some("http://127.0.0.1:5173"),
+                Some(bound),
+                bound,
+                &c
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            check_session_write(Some("anything.invalid:9"), None, Some(bound), bound, &c),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn without_wildcard_entry_mismatched_host_still_denied() {
+        // 防回归：白名单不含 `*` 时，Host 仍是逐字精确匹配。
+        let c = cfg();
+        let bound = "bound-csrf-token-5a5a";
+        assert_eq!(
+            check_session_write(
+                Some("evil.example"),
+                Some("http://127.0.0.1:5173"),
+                Some(bound),
+                bound,
+                &c
+            ),
+            Err(WriteDeny::Host)
+        );
+        // `*` 只按整项匹配，不是子串/模式：host 值里带 `*` 也不特殊。
+        assert!(!host_ok(Some("*"), &c));
+        let mut c = cfg();
+        c.allowed_hosts = vec!["*.example".into()];
+        assert!(!host_ok(Some("a.example"), &c));
     }
 
     #[test]

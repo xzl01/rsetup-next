@@ -64,8 +64,9 @@ prompt, do not let it install the maintainer's version over your secrets.
 
 Uncomment and fill in the four required variables (CONTROLLER_DATABASE_URL,
 CONTROLLER_ALLOWED_HOSTS, CONTROLLER_ALLOWED_ORIGIN,
-CONTROLLER_MANAGEMENT_CURSOR_SECRET_HEX). They ship empty (commented out) in both
-copies: the 0644 secret-free copy under /usr/share/doc, which documents the
+CONTROLLER_MANAGEMENT_CURSOR_SECRET_HEX). They ship commented out in both
+copies — never with real values, at most a placeholder example (see below):
+the 0644 secret-free copy under /usr/share/doc, which documents the
 available variables and is never read, and the 0600 conffile under /etc, which is
 what the unit reads — with any of the four still unset the process exits before
 serving anything, so an empty template is never a running control centre. Verify
@@ -74,6 +75,26 @@ after editing:
   ls -l /etc/default/rsetup-controller     # -rw------- root root (0600)
 
 Keep the file out of any backup or ticket that is not secret-handling.
+
+Two of the required variables deserve a closer look:
+
+  * CONTROLLER_DATABASE_URL carries the account and password inline. The
+    template ships a commented placeholder example
+    (`mysql://rsetup:CHANGE_ME@127.0.0.1:3306/rsetup_next`) — replace every
+    part with the real account, password and database name; never use the
+    example as-is. It is the only secret in the file, which is why the file
+    must stay 0600.
+  * CONTROLLER_ALLOWED_HOSTS is matched verbatim, entry by entry: no case
+    folding, no trimming, no wildcards — with exactly one exception: an
+    entry that is the single character `*` admits any `Host` header. That
+    is the "open the controller to every Host" switch, and the security
+    consequence is exactly what it sounds like — any client-supplied Host
+    passes this check — so use it only on a trusted management network, or
+    behind a reverse proxy that validates Host itself. A missing `Host` is
+    rejected even with `*` in the list. The recommended form stays the
+    exact list of names the controller is actually reached by (the default
+    bind is 127.0.0.1:8080, so a local-only setup is usually just
+    `127.0.0.1:8080`). See the commented examples in the template.
 
 2. Back up the target database, then set the migration gates
 ------------------------------------------------------------
