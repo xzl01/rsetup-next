@@ -22,6 +22,12 @@ case "$1" in
         # --system         no login shell, no password, low uid from the system
         #                  range; the account is a service identity, not a user.
         # --group          create the matching private group.
+        # --quiet          sets verbose=0 so only error-level messages reach
+        #                  stdout; this suppresses the two harmless info lines
+        #                  adduser prints when the recorded home dir does not
+        #                  exist yet (it is managed by systemd StateDirectory,
+        #                  which is the expected state), while real errors are
+        #                  still reported.
         # --home ...       record the state directory as home in the passwd
         #                  entry only.
         # --no-create-home /var/lib/rsetup-controller is owned by systemd
@@ -31,6 +37,7 @@ case "$1" in
         # --disabled-login no password/authentication path for this account.
         adduser --system \
             --group \
+            --quiet \
             --home "$SERVICE_HOME" \
             --no-create-home \
             --disabled-login \
