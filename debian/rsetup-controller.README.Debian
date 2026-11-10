@@ -109,6 +109,40 @@ Three of the required variables deserve a closer look:
     Origin the browser actually sends. See the commented examples in the
     template.
 
+Everything else in the file is optional, and while a variable stays commented
+out the service behaves exactly as it did before it was ever documented there:
+
+  * Time gate and `NTP_SERVERS` — a comma- or whitespace-separated list of NTP
+    servers the startup time gate may sample. With the variable unset the
+    server list is empty, so the gate cannot obtain authoritative time
+    evidence inside its 30-second budget: it starts on the wall clock as
+    `SystemFallback`, and a sample that arrives but cannot be trusted is
+    reported as `Stale`. Either way the service still binds and serves — the
+    gate ends with a result, not with a synchronised clock — but the quality of
+    the clock stays recorded as untrustworthy, and the task-line `time_review`
+    keeps failing closed for anything that needs authoritative time. Fill in
+    reachable NTP servers on a real deployment.
+  * Board access and `RSETUP_CONTROLLER_KEY_FILE` — path to the controller's
+    long-lived identity seed (a PKCS#8 key file, mode 0600, owned by the
+    service account) that `rsetup-board-agent` connects to. The two states are
+    deliberately different: the variable being completely absent means "board
+    access is not enabled", which is a supported configuration and not an
+    error, while a variable that is present but points at an unreadable or
+    malformed key file is a configuration error, and the service refuses to
+    start. Create the key yourself and keep it at 0600 — nothing in this
+    package generates, installs or rotates it.
+  * Prometheus metrics — off by default; whether the endpoint exists at all is
+    decided by `metrics.enabled` in the controller's TOML configuration file.
+    That file is read from `CONTROLLER_CONFIG`, or from `controller.toml` in
+    the process working directory when the variable is unset: a missing default
+    simply means "no metrics configuration", whereas an explicitly set path
+    that is missing is a startup failure rather than a silent fallback. When
+    metrics are enabled, `PROMETHEUS_AUTH_USER` and
+    `PROMETHEUS_AUTH_PASSWORD` override the Basic credentials from that file,
+    and they must be set together — setting only one of them fails at startup,
+    because otherwise a username from one source would be paired with a
+    password from the other.
+
 2. Back up the target database, then set the migration gates
 ------------------------------------------------------------
 

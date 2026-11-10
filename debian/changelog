@@ -1,3 +1,25 @@
+rsetup-next (0.6.0-7) bookworm; urgency=medium
+
+  * 配置模板 debian/rsetup-controller.default 补齐 5 个此前未记录的配置项，保持
+    「注释态 + 中文说明」风格、不含任何真实凭据：
+    可选段新增时间启动门禁的 NTP 源 NTP_SERVERS（逗号或空白分隔；未设置即服务器列表
+    为空，30s 预算内拿不到权威时间证据时以 SystemFallback/Stale 降级后照常监听，任务线
+    time_review 继续 fail-closed）；新增「板端接入（可选）」段 RSETUP_CONTROLLER_KEY_FILE
+    （中控长期身份 PKCS#8 种子文件，0600；完全未设置=明确不启用板端接入，变量存在但文件
+    不可读或格式非法=配置错误启动失败，两者语义不同）；新增「metrics（可选）」段
+    CONTROLLER_CONFIG / PROMETHEUS_AUTH_USER / PROMETHEUS_AUTH_PASSWORD（默认关闭，由
+    配置文件 metrics.enabled 决定；两个凭据变量必须成对设置，只设其一会启动失败；配置
+    文件默认相对工作目录的 controller.toml，可用 CONTROLLER_CONFIG 指向绝对路径）。
+  * debian/rsetup-controller.README.Debian：在第 1 节配置说明末尾补充上述三项的英文说明
+    （时间门禁与 NTP_SERVERS 的未设置行为与 time_review fail-closed 口径、板端接入密钥的
+    「未设置=不启用 / 存在但非法=配置错误」区别与 0600 权限要求、metrics 的默认关闭与
+    CONTROLLER_CONFIG 路径回落规则、PROMETHEUS_AUTH_USER 与 PROMETHEUS_AUTH_PASSWORD
+    必须成对）。
+  * 仅配置模板与文档补齐：不含代码改动，5 个变量在模板内均为注释态，服务默认行为不变
+    （安装与升级仍不 enable、不 start、不 restart；包内 maintainer scripts 逐字节不变）。
+
+ -- aghost <ggg17226@gmail.com>  Tue, 10 Nov 2026 11:02:00 +0000
+
 rsetup-next (0.6.0-6) bookworm; urgency=medium
 
   * Web 控制台界面视觉重构（仅前端展示层，无接口与业务行为变更）：

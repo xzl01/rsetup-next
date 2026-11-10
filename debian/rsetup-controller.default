@@ -45,9 +45,27 @@
 # 仅当反代已终止 TLS 时设为 1 或 true（给会话 Cookie 追加 Secure）；其他取值是启动错误。
 #CONTROLLER_TRUST_TLS=
 
+# 时间启动门禁的 NTP 源：逗号或空白分隔。未设置时服务器列表为空，启动在 30s 预算内
+# 无法拿到权威时间证据，会以 SystemFallback/Stale 降级后照常监听（任务线 time_review
+# 继续 fail-closed）。部署时应填可达的 NTP 服务器，例如：
+#NTP_SERVERS=ntp.aliyun.com,pool.ntp.org
+
 # 一次性管理员凭据的输出文件；systemd 单元已把它固定在
 # /var/lib/rsetup-controller/bootstrap-secret.log，一般无需在此覆盖。
 #CONTROLLER_BOOTSTRAP_SECRET_LOG=/var/lib/rsetup-controller/bootstrap-secret.log
+
+# --- 可选：板端接入（rsetup-board-agent 连接中控） ---
+# 中控长期身份密钥文件（PKCS#8 种子，权限 0600）。**完全未设置 = 明确不启用板端接入**；
+# 变量存在但文件不可读或格式非法则按配置错误启动失败，两者语义不同（详见 README.Debian）。
+#RSETUP_CONTROLLER_KEY_FILE=/var/lib/rsetup-controller/controller-identity.key
+
+# --- 可选：Prometheus metrics ---
+# 默认关闭（由配置文件里的 metrics.enabled 决定）。启用后可用下面两个变量覆盖 Basic
+# 认证凭据：二者必须成对设置，只设其一会启动失败。配置文件路径默认相对工作目录的
+# controller.toml，也可用 CONTROLLER_CONFIG 指向绝对路径。
+#CONTROLLER_CONFIG=/etc/rsetup-controller/controller.toml
+#PROMETHEUS_AUTH_USER=
+#PROMETHEUS_AUTH_PASSWORD=
 
 # --- 仅在执行 rsetup-controller-migrate --apply 时需要（不要长期留在本文件里） ---
 #
