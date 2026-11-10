@@ -107,6 +107,11 @@ impl HttpSecurityConfig {
         Self::from_values(hosts.as_deref(), origin.as_deref(), trust_tls.as_deref())
     }
 
+    /// Host 白名单判定：逐字精确匹配，或白名单含整项 `*` 时放行任意 Host；Host 缺失恒拒。
+    pub fn host_allowed(&self, host: Option<&str>) -> bool {
+        host.is_some_and(|h| self.allowed_hosts.iter().any(|a| a == h || a == "*"))
+    }
+
     /// pre-session 语义：配置恰为整项 `*` 时放开所有 Origin（含缺失）；否则要求
     /// Origin 存在且逐字精确匹配。`*.example`、`http://*` 等都不是通配。
     pub fn origin_allowed(&self, origin: Option<&str>) -> bool {
@@ -140,7 +145,7 @@ pub enum WriteDeny {
 /// Exact membership, or any host when the allowlist contains the literal `*`:
 /// no case folding, no trimming, no pattern matching beyond the whole-entry `*`.
 fn host_ok(host: Option<&str>, cfg: &HttpSecurityConfig) -> bool {
-    host.is_some_and(|h| cfg.allowed_hosts.iter().any(|a| a == h || a == "*"))
+    cfg.host_allowed(host)
 }
 
 /// Pre-session (login) gate: exact allowed `Host` **and** allowed
@@ -449,6 +454,26 @@ mod tests {
             Err(WriteDeny::Host)
         );
         assert!(!host_ok(None, &c));
+    }
+
+    #[test]
+    fn wildcard_host_entry_admits_any_host() {
+        // 直接对 host_allowed 方法断言：这是所有鉴权第一道共用的唯一判定入口。
+        let mut c = cfg();
+        c.allowed_hosts = vec!["*".into()];
+        // 整项 `*`：任意 Host 放行，Host 值本身是 `*` 也按命中通配处理。
+        assert!(c.host_allowed(Some("evil.example:443")));
+        assert!(c.host_allowed(Some("127.0.0.1:8080")));
+        assert!(c.host_allowed(Some("*")));
+        // Host 缺失恒拒，与是否配通配无关。
+        assert!(!c.host_allowed(None));
+
+        // 非 `*` 精确列表：逐字命中才放行，缺失恒拒。
+        let c = cfg();
+        assert!(c.host_allowed(Some("127.0.0.1:8080")));
+        assert!(!c.host_allowed(Some("127.0.0.1:8081")));
+        assert!(!c.host_allowed(Some("*")));
+        assert!(!c.host_allowed(None));
     }
 
     #[test]

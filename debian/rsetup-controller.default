@@ -29,7 +29,7 @@
 
 # 唯一精确匹配的浏览器 Origin（含 scheme 与端口，不能带通配符与路径）。
 # 放开所有 Origin（任意来源，含未携带 Origin 的请求）：仅建议在可信内网或外层反代
-# 已做来源校验时使用——这会移除本变量的来源限制，只剩会话 CSRF 绑定。
+# 已做来源校验时使用——这会移除本变量的来源限制，但 Host 白名单与会话 CSRF 绑定仍然生效。
 #CONTROLLER_ALLOWED_ORIGIN=*
 #CONTROLLER_ALLOWED_ORIGIN=https://controller.internal.example
 
@@ -57,9 +57,9 @@
 # 必须恰好是 1。
 #CONTROLLER_MIGRATION_ALLOW_DESTRUCTIVE=1
 # 必须与数据库真实返回的库名逐字相同；不一致时迁移直接失败，不会碰另一个库。
-#CONTROLLER_MIGRATION_EXPECTED_DATABASE=
+#CONTROLLER_MIGRATION_EXPECTED_DATABASE=rsetup_next
 # 指向**真实存在**的备份产物（备份文件或校验清单）的路径/引用；空或空白即拒绝迁移。
-#CONTROLLER_MIGRATION_BACKUP_REF=
+#CONTROLLER_MIGRATION_BACKUP_REF=/var/backups/rsetup-next/rsetup_next-20261110.dump
 # 必须逐字等于 isolated-exclusive-backed-up-disposable，语义是"已隔离独占 + 已备份"；
 # 对生产库它不表示数据可以丢弃。
-#CONTROLLER_MIGRATION_ACK=
+#CONTROLLER_MIGRATION_ACK=isolated-exclusive-backed-up-disposable

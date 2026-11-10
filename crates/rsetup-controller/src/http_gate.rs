@@ -213,7 +213,7 @@ pub(crate) async fn authenticate_read(
     endpoint: EndpointId,
 ) -> Result<Session, Response> {
     let host = single_header(headers, header::HOST);
-    if !host.is_some_and(|h| state.config.allowed_hosts.iter().any(|a| a == h)) {
+    if !state.config.host_allowed(host) {
         return Err(origin_host_invalid());
     }
     let Some(raw) = session_cookie_value(headers) else {
@@ -251,7 +251,7 @@ pub(crate) async fn authenticate_write(
     headers: &HeaderMap,
 ) -> Result<Session, Response> {
     let host = single_header(headers, header::HOST);
-    if !host.is_some_and(|h| state.config.allowed_hosts.iter().any(|a| a == h)) {
+    if !state.config.host_allowed(host) {
         return Err(origin_host_invalid());
     }
     let origin = match get_single_origin(headers) {

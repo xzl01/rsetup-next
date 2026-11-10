@@ -84,7 +84,7 @@ pub(super) async fn sessions_list(
 ) -> Response {
     // 1. Host single & exact match.
     let host = single_header(&headers, header::HOST);
-    if !host.is_some_and(|h| state.config.allowed_hosts.iter().any(|a| a == h)) {
+    if !state.config.host_allowed(host) {
         return origin_host_invalid();
     }
 
@@ -178,7 +178,7 @@ pub(super) async fn revoke_others_handler(
 ) -> Response {
     // 1. Host single & exact match.
     let host = single_header(&headers, header::HOST);
-    if !host.is_some_and(|h| state.config.allowed_hosts.iter().any(|a| a == h)) {
+    if !state.config.host_allowed(host) {
         return origin_host_invalid();
     }
 
@@ -285,7 +285,7 @@ pub(super) async fn revoke_by_id(
 ) -> Response {
     // 1. Host single & exact match.
     let host = single_header(&headers, header::HOST);
-    if !host.is_some_and(|h| state.config.allowed_hosts.iter().any(|a| a == h)) {
+    if !state.config.host_allowed(host) {
         return origin_host_invalid();
     }
 

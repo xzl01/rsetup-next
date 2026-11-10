@@ -39,7 +39,7 @@ use crate::http_gate::{
 pub(super) async fn me(State(state): State<Arc<HttpAuthState>>, headers: HeaderMap) -> Response {
     // 1. Exact single allowed Host (missing/duplicated/wrong all fail).
     let host = single_header(&headers, header::HOST);
-    if !host.is_some_and(|h| state.config.allowed_hosts.iter().any(|a| a == h)) {
+    if !state.config.host_allowed(host) {
         return err_response(
             StatusCode::FORBIDDEN,
             "CSRF_INVALID",

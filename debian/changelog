@@ -1,3 +1,18 @@
+rsetup-next (0.6.0-5) bookworm; urgency=medium
+
+  * 修复 CONTROLLER_ALLOWED_HOSTS=* 在内联 Host 检查点不生效的遗留缺陷：管理读
+    门禁、管理写门禁、会话吊销（其余会话 / 按 id）、改密、登出与当前身份共 8 处
+    鉴权第一道，统一改走新增的 HttpSecurityConfig::host_allowed（与
+    check_pre_session / check_session_write 共用同一判定），配 `*` 时不再对这些
+    端点返回 403；缺失 Host 恒拒，非 `*` 配置逐字行为不变。
+  * 配置模板 debian/rsetup-controller.default：迁移门禁补齐注释态示例值
+    （CONTROLLER_MIGRATION_ALLOW_DESTRUCTIVE / _EXPECTED_DATABASE / _BACKUP_REF /
+    _ACK，均为占位示例、不含真实凭据）；CONTROLLER_ALLOWED_ORIGIN 通配的警示
+    措辞修正为「Host 白名单与会话 CSRF 绑定仍然生效」，与 README.Debian 英文
+    口径一致。
+
+ -- aghost <ggg17226@gmail.com>  Tue, 10 Nov 2026 09:57:03 +0000
+
 rsetup-next (0.6.0-4) bookworm; urgency=medium
 
   * rsetup-controller 支持 CONTROLLER_ALLOWED_ORIGIN=*：配置值恰为整项 `*` 时
