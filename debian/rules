@@ -174,8 +174,9 @@ override_dh_auto_install:
 # /etc/default/rsetup-board-agent, each registered in the package's conffiles, so dpkg
 # preserves an operator's edits across upgrades and asks before replacing them.
 # The controller template carries the database connection string — a secret — so its mode
-# is tightened to 0600 right after dh_installinit has installed it (the helper installs
-# default files 0644); the board-agent template holds only the controller address and the
+# is tightened to 0600 right after dh_installinit has installed it, and tightened again
+# after dh_fixperms (override_dh_fixperms below, which is what actually decides the mode in
+# the finished .deb); the board-agent template holds only the controller address and the
 # trust pins, which are not secret, and stays 0644. The documentation copy under
 # /usr/share/doc stays 0644 and secret-free either way.
 # Installing a conffile changes nothing about activation: override_dh_installsystemd below
@@ -194,6 +195,19 @@ override_dh_installsystemd:
 	dh_installsystemd -prsetup-next --no-start --no-stop-on-upgrade
 	dh_installsystemd -prsetup-controller --no-enable --no-start --no-stop-on-upgrade
 	dh_installsystemd -prsetup-board-agent --no-enable --no-start --no-stop-on-upgrade
+
+# dh_fixperms ends with `find <tree> ! -type l -print0 | xargs -0 chmod go=rX,u+rw,a-s`
+# (see /usr/bin/dh_fixperms): every regular file in the tree — /etc included — is made
+# world-readable, so the 0600 applied in override_dh_installinit is silently widened back
+# to 0644 before dpkg-deb ever sees it. dh_fixperms has no per-path exemption for this
+# (its -X only removes paths from the find entirely, not from that one chmod), so the
+# controller template is re-tightened right after the helper: dh_md5sums and dh_builddeb
+# run later and only read contents, which makes this the last word on the packaged mode.
+# dpkg installs a conffile with the mode recorded in the archive, so the operator's
+# /etc/default/rsetup-controller is 0600 straight out of the package, holding the DSN.
+override_dh_fixperms:
+	dh_fixperms
+	chmod 0600 debian/rsetup-controller/etc/default/rsetup-controller
 
 override_dh_auto_clean:
 	cargo clean
