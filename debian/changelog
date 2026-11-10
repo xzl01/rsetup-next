@@ -17,6 +17,9 @@ rsetup-next (0.6.0-7) bookworm; urgency=medium
     必须成对）。
   * 仅配置模板与文档补齐：不含代码改动，5 个变量在模板内均为注释态，服务默认行为不变
     （安装与升级仍不 enable、不 start、不 restart；包内 maintainer scripts 逐字节不变）。
+  * 修复 doc 配置示例被 dh_compress 压缩（模板超过 4KB 后路径变为 .default.gz）导致
+    Debian 12 smoke 断言失败：debian/rules 的 override_dh_compress 排除该文件，保持
+    未压缩路径与 README/CI/合同测试的引用一致。
 
  -- aghost <ggg17226@gmail.com>  Tue, 10 Nov 2026 11:02:00 +0000
 

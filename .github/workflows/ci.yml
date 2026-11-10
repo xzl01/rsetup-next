@@ -421,10 +421,6 @@ jobs:
           printf '%s\tinstall-end\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$RSETUP_POLICY_LOG"
       - name: Smoke test on Debian 12
         run: |
-          # 诊断：sh -e 下断言失败无输出，先打印每条命令与关键文件状态，便于定位。
-          set -x
-          ls -la /etc/default/ || true
-          stat -c '%a %U %G %n' /etc/default/rsetup-controller /etc/default/rsetup-board-agent || true
           rsetup-next --demo status --json | grep -q '"identity"'
           rsetup-next --demo actions --json | grep -q '"system.update"'
           rsetup-next --demo sources benchmark --mirror official --json | grep -q 'bytesPerSecond'

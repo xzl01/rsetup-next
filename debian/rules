@@ -196,6 +196,12 @@ override_dh_installsystemd:
 	dh_installsystemd -prsetup-controller --no-enable --no-start --no-stop-on-upgrade
 	dh_installsystemd -prsetup-board-agent --no-enable --no-start --no-stop-on-upgrade
 
+# dh_compress 仅压缩 /usr/share/doc 下 >4KB 的文件；配置示例超过 4KB 后会被压成
+# rsetup-controller.default.gz，而 README、CI 的 --path-include 与合同测试都按
+# 未压缩路径引用它。显式排除该文件，保证路径与大小无关地稳定。
+override_dh_compress:
+	dh_compress -X rsetup-controller.default
+
 # dh_fixperms ends with `find <tree> ! -type l -print0 | xargs -0 chmod go=rX,u+rw,a-s`
 # (see /usr/bin/dh_fixperms): every regular file in the tree — /etc included — is made
 # world-readable, so the 0600 applied in override_dh_installinit is silently widened back
