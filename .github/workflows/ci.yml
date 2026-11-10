@@ -435,7 +435,11 @@ jobs:
           test -f /usr/lib/systemd/system/rsetup-board-agent.service
           test -f /usr/lib/systemd/system/rsetup-controller.service
           test -f /usr/share/doc/rsetup-controller/rsetup-controller.default
-          test ! -e /etc/default/rsetup-controller
+          # 安装时创建配置文件（conffile）：controller 含数据库秘密故 0600，
+          # board-agent 为空模板待操作员填写必填项。
+          test -f /etc/default/rsetup-controller
+          test "$(stat -c '%a' /etc/default/rsetup-controller)" = "600"
+          test -f /etc/default/rsetup-board-agent
           /usr/bin/rsetup-controller-migrate --help | grep -q "rsetup-controller-migrate"
           /usr/bin/rsetup-admin --help | grep -q "rsetup-admin"
           /usr/bin/rsetup-board-agent --help | grep -q "rsetup-board-agent"

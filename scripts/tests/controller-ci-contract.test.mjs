@@ -1774,15 +1774,17 @@ const assertDebian12DocExampleWiring = (jobText) => {
   }
   // smoke 不许被反向削弱来「适配」裁剪：示例的磁盘存在断言删掉，裁剪回归就会重新
   // 全绿（dpkg 数据库列表在文件被裁掉后仍能列名，证明不了落盘，不能代替 test -f）；
-  // /etc/default 不存在断言删掉，「把示例搬去 /etc/default」就能绕过整个议题。
+  // /etc/default 断言删掉或降级，「安装时创建 conffile 模板」的设计回归就能绕过。
   const smoke = extractStepBlock(jobText, 'Smoke test on Debian 12');
   assert.ok(
     smoke.includes(`test -f ${CONTROLLER_DOC_EXAMPLE}`),
     'Smoke 步骤必须保留配置示例的 test -f 磁盘存在断言，不许降级或删起来适配裁剪',
   );
   assert.ok(
-    smoke.includes('test ! -e /etc/default/rsetup-controller'),
-    'Smoke 步骤必须保留 /etc/default/rsetup-controller 不存在的反向断言：配置示例不许被搬去 /etc/default',
+    smoke.includes('test -f /etc/default/rsetup-controller') &&
+      smoke.includes(`stat -c '%a' /etc/default/rsetup-controller`) &&
+      smoke.includes('test -f /etc/default/rsetup-board-agent'),
+    'Smoke 步骤必须断言两个配置文件由 deb 安装在 /etc/default：controller 为 0600 conffile、board-agent 存在',
   );
 };
 
