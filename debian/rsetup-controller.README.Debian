@@ -8,7 +8,8 @@ What this package provides
   /usr/bin/rsetup-controller-migrate    explicit, operator-only schema migration
   /usr/bin/rsetup-admin                   local root emergency admin recovery
   /usr/lib/systemd/system/rsetup-controller.service
-  /usr/share/doc/rsetup-controller/rsetup-controller.default  configuration example, 0644, no secrets
+  /etc/default/rsetup-controller                            configuration template, conffile, 0600, empty required values
+  /usr/share/doc/rsetup-controller/rsetup-controller.default  same template as documentation, 0644, no secrets
 
 The controller talks to MySQL/TiDB, serves the embedded web UI, and listens on
 127.0.0.1:8080 unless told otherwise. It does not terminate TLS.
@@ -24,13 +25,17 @@ not restart or stop it on upgrade (dh_installsystemd --no-enable --no-start
 or stop call on the install and upgrade paths (neither `deb-systemd-invoke
 start`/`restart`/`stop` nor the `_dh_action` variant), and beyond debhelper's
 unit state bookkeeping the only thing installing does is create the service
-account. The configuration example ships as documentation at
-/usr/share/doc/rsetup-controller/rsetup-controller.default only — the package
-installs no file under /etc — and until you create the configuration under its
-real name (section 1, one `install -m0600` command), the unit's
-ConditionPathExists=/etc/default/rsetup-controller keeps the service inactive:
-a start request is skipped rather than failing loudly, and `systemctl status`
-shows `inactive (dead)` with the failed `ConditionPathExists` in its output.
+account. The configuration itself ships as a template the package installs for
+you: /etc/default/rsetup-controller is created at install time as a dpkg conffile
+with mode 0600, its required variables still empty (section 1), and the same text
+stays under /usr/share/doc/rsetup-controller/rsetup-controller.default as a 0644,
+secret-free reference. A conffile that only exists starts nothing — the unit is
+neither enabled nor started, so the service comes up once you have filled the
+required values in and enabled it yourself. The unit's
+ConditionPathExists=/etc/default/rsetup-controller stays as a last guard for the
+case where the file has been removed by hand: while it is missing a start request
+is skipped rather than failing loudly, and `systemctl status` shows
+`inactive (dead)` with the failed `ConditionPathExists` in its output.
 
 One lifecycle is deliberately outside that promise: *removing* the package
 (`dpkg --remove` / `--purge`) may stop a running controller. That branch is
@@ -42,23 +47,29 @@ running process.
 1. Configure the service
 ------------------------
 
-  sudo install -m0600 -o root -g root \
-    /usr/share/doc/rsetup-controller/rsetup-controller.default \
-    /etc/default/rsetup-controller
+The package created the file for you, already with the mode it has to keep:
+
+  ls -l /etc/default/rsetup-controller     # -rw------- root root (0600)
   sudoedit /etc/default/rsetup-controller
 
-Create the file with its final ownership and mode in one step, then edit it in
-place: sudoedit keeps the mode of the file it opens, so the file never exists at
-0644 while it already carries a DSN. Do NOT `cp` it first and tighten the mode
-afterwards — between the copy and the chmod the future EnvironmentFile is world
-readable, and an operator who fills the database URL before that chmod exposes it.
+Edit it in place: sudoedit keeps the mode of the file it opens, so the file never
+exists at 0644 while it already carries a DSN. If you replace the file instead of
+editing it — `cp`, `install`, an editor other than sudoedit, a configuration
+management tool that writes it anew — set the mode yourself afterwards
+(`sudo chmod 0600 /etc/default/rsetup-controller`): between such a replacement and
+the chmod the EnvironmentFile is world readable, and an operator who fills the
+database URL before that chmod exposes it. Replacing a conffile also makes dpkg
+see it as locally modified on the next upgrade; that is expected — read the
+prompt, do not let it install the maintainer's version over your secrets.
 
 Uncomment and fill in the four required variables (CONTROLLER_DATABASE_URL,
 CONTROLLER_ALLOWED_HOSTS, CONTROLLER_ALLOWED_ORIGIN,
-CONTROLLER_MANAGEMENT_CURSOR_SECRET_HEX). The shipped documentation example is
-0644 and carries no secrets; the package deliberately does not install any file
-into /etc, so nothing at /etc/default/rsetup-controller exists until you create
-it. Verify before and after editing:
+CONTROLLER_MANAGEMENT_CURSOR_SECRET_HEX). They ship empty (commented out) in both
+copies: the 0644 secret-free copy under /usr/share/doc, which documents the
+available variables and is never read, and the 0600 conffile under /etc, which is
+what the unit reads — with any of the four still unset the process exits before
+serving anything, so an empty template is never a running control centre. Verify
+after editing:
 
   ls -l /etc/default/rsetup-controller     # -rw------- root root (0600)
 

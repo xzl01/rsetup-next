@@ -4,10 +4,14 @@ Description=rsetup-next Web control center (controller)
 Documentation=file:/usr/share/doc/rsetup-controller/README.Debian
 After=network-online.target
 Wants=network-online.target
-# 未由操作员创建配置（含数据库连接串）时，本单元保持 inactive 而不是启动失败：
-# 配置模板不再由包安装到 /etc（见 /usr/share/doc/rsetup-controller/rsetup-controller.default），
-# ConditionPathExists 真正由操作员创建 /etc/default/rsetup-controller 触发；
-# 包安装不会带着空配置去连库，也不会生成任何状态。
+# 配置文件 /etc/default/rsetup-controller 由本包安装（0600 conffile 模板，含数据库连接串），
+# 但本单元仍不随包 enable、不随包启动、升级也不重启/不停止
+# （dh_installsystemd --no-enable --no-start --no-stop-on-upgrade）：
+# 操作员填好必填项并显式 enable 之后，服务才会启动；
+# 文件存在而配置不完整（必填项仍为空）时，进程以配置错误失败关闭，
+# 不会带着空配置去连库，也不会生成任何状态。
+# ConditionPathExists 保留为最后一道保险：该文件被删除（例如 purge 之后）时，
+# 本单元保持 inactive 而不是启动失败。
 ConditionPathExists=/etc/default/rsetup-controller
 
 [Service]

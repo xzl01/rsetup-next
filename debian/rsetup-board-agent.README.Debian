@@ -6,11 +6,14 @@ What this package provides
 
   /usr/bin/rsetup-board-agent                board-side agent binary
   /usr/lib/systemd/system/rsetup-board-agent.service
+  /etc/default/rsetup-board-agent           configuration template (conffile, 0644,
+                                            required variables ship empty)
   /var/lib/rsetup-board-agent                durable task journal and board identity
                                              key (state directory, mode 0700)
 
-Not shipped on purpose: /etc/default/rsetup-board-agent (controller address and trust
-pins) — see the configuration section below.
+Shipped by the package, empty on purpose: /etc/default/rsetup-board-agent is installed as
+a conffile whose controller address and trust pins are still unset — site material you
+fill in; see the configuration section below.
 
 The unit is installed but neither enabled, started, nor restarted on upgrade
 (dh_installsystemd --no-enable --no-start --no-stop-on-upgrade): no maintainer
@@ -58,19 +61,26 @@ particular reboot) as closed-loop on the strength of this package.
 Required configuration: /etc/default/rsetup-board-agent
 -------------------------------------------------------
 
-The package deliberately does not ship this file — the controller address and the
-trust pins are site material. The unit declares it as a *required* EnvironmentFile
-(no leading "-"), which fails closed in two different ways that must not be confused:
-until you create the file, systemd fails the unit before ExecStart (the log line is
-"Failed to load environment files: No such file or directory") — the agent binary
-never runs, so it produces no exit status of its own. Exit status 78 (configuration
-error) is what the binary itself returns once the file exists but a required variable
-is missing or invalid. Both are fail-closed behaviour, not a warning to ignore, and the
-unit deliberately does not make the file optional. systemd reads it literally, line by
-line: no shell, no $expansion, no command substitution; anything that is not KEY=VALUE
-must be a # comment.
+The package installs this file as a dpkg conffile template, and the two required
+variables ship empty: the controller address and the trust pins are site material only
+you can supply, so the agent comes up only after you fill them in. The unit declares the
+file as a *required* EnvironmentFile (no leading "-"), which fails closed in two
+different ways that must not be confused: with the template as installed — the file
+exists but RSETUP_CONTROLLER_ADDR and RSETUP_CONTROLLER_PUBLIC_KEYS are empty, or a
+value is invalid — the binary runs and returns exit status 78 (configuration error), so
+it never dials an unknown address and never trusts an unverified peer. If the file is
+gone (removed by hand, or dropped by a purge), systemd fails the unit before ExecStart
+instead (the log line is "Failed to load environment files: No such file or directory")
+— the agent binary never runs, so it produces no exit status of its own. Both are
+fail-closed behaviour, not a warning to ignore, and the unit deliberately does not make
+the file optional. systemd reads it literally, line by line: no shell, no $expansion, no
+command substitution; anything that is not KEY=VALUE must be a # comment.
 
-  # /etc/default/rsetup-board-agent — template, replace every PLACEHOLDER
+The file dpkg installs looks exactly like the template below with the four site values
+left empty; the placeholders show what to put there:
+
+  # /etc/default/rsetup-board-agent — installed as a conffile by the package;
+  # every PLACEHOLDER below (and the empty values as shipped) is operator material
   RSETUP_CONTROLLER_ADDR=controller.example.internal:8443
   # Required. Comma-separated 64-char lowercase hex public keys you trust. There is
   # no trust-on-first-use: with no pin configured the agent refuses to start rather

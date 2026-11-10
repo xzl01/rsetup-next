@@ -34,8 +34,10 @@ export CARGO_PROFILE_RELEASE_DEBUG := 1
 #
 # The controller and the board agent units are installed but neither enabled,
 # started nor restarted on upgrade (override_dh_installsystemd below, plus the controller
-# unit's own ConditionPathExists). Connecting to a real database, running a migration and
-# writing /etc/default/rsetup-controller are operator actions; see
+# unit's own ConditionPathExists). Each of the two ships its /etc/default configuration as
+# a conffile template whose required variables are empty (override_dh_installinit below),
+# so the configuration step is editing that file rather than creating it; connecting to a
+# real database and running a migration stay operator actions, see
 # debian/rsetup-controller.README.Debian. On the board side the unit ships the
 # production --connect mode (outbound encrypted session, read-only business), so
 # deciding whether a board should run the agent at all is likewise an operator
@@ -108,9 +110,10 @@ override_dh_auto_install:
 	install -Dm755 target/release/rsetup-controller-migrate debian/rsetup-controller/usr/bin/rsetup-controller-migrate
 	install -Dm755 target/release/rsetup-admin debian/rsetup-controller/usr/bin/rsetup-admin
 	install -Dm644 data/rsetup-controller.service debian/rsetup-controller/usr/lib/systemd/system/rsetup-controller.service
-	# Configuration example: 0644 documentation file, secret-free by construction.
-	# The operator copies it to /etc/default/rsetup-controller, populates secrets,
-	# and tightens permissions to 0600 before starting the service.
+	# Documentation copy of the configuration template: 0644 and secret-free by
+	# construction. The live configuration /etc/default/rsetup-controller is a 0600
+	# conffile created by dh_installinit (see override_dh_installinit below), so this
+	# copy only documents the available variables and is never read by the unit.
 	install -Dm644 debian/rsetup-controller.default debian/rsetup-controller/usr/share/doc/rsetup-controller/rsetup-controller.default
 	install -Dm644 debian/rsetup-controller.README.Debian debian/rsetup-controller/usr/share/doc/rsetup-controller/README.Debian
 	install -Dm755 target/release/rsetup-board-agent debian/rsetup-board-agent/usr/bin/rsetup-board-agent
@@ -165,13 +168,27 @@ override_dh_auto_install:
 # (scripts/lib/systemd-maintainer-audit.mjs) encodes exactly that split — it does not
 # treat every deb-systemd-invoke stop as a violation, and it does not ignore stops either.
 #
-# dh_installinit would install debian/rsetup-controller.default as /etc/default/rsetup-controller
-# (conffile). The controller package intentionally ships its configuration template only under
-# /usr/share/doc/rsetup-controller/rsetup-controller.default, so override dh_installinit to exclude
-# rsetup-controller (running only for rsetup-next and rsetup-board-agent).
+# Both privileged packages now ship their configuration as a /etc/default conffile that
+# dh_installinit creates at install time: debian/rsetup-controller.default becomes
+# /etc/default/rsetup-controller and debian/rsetup-board-agent.default becomes
+# /etc/default/rsetup-board-agent, each registered in the package's conffiles, so dpkg
+# preserves an operator's edits across upgrades and asks before replacing them.
+# The controller template carries the database connection string — a secret — so its mode
+# is tightened to 0600 right after dh_installinit has installed it (the helper installs
+# default files 0644); the board-agent template holds only the controller address and the
+# trust pins, which are not secret, and stays 0644. The documentation copy under
+# /usr/share/doc stays 0644 and secret-free either way.
+# Installing a conffile changes nothing about activation: override_dh_installsystemd below
+# still passes --no-enable --no-start --no-stop-on-upgrade, so installing or upgrading
+# never enables, starts, restarts or stops either service — the templates ship with the
+# required variables empty, and filling them in, enabling and starting stay operator
+# actions. An override replaces the helper for **every** binary package, so all three are
+# listed explicitly.
 override_dh_installinit:
 	dh_installinit -prsetup-next
 	dh_installinit -prsetup-board-agent
+	dh_installinit -prsetup-controller
+	chmod 0600 debian/rsetup-controller/etc/default/rsetup-controller
 
 override_dh_installsystemd:
 	dh_installsystemd -prsetup-next --no-start --no-stop-on-upgrade

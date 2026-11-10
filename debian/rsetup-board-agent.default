@@ -1,0 +1,44 @@
+# /etc/default/rsetup-board-agent — rsetup-board-agent 配置（本文件由包安装为 conffile）。
+#
+# 本文件随包安装，是 dpkg 管理的 conffile：升级时 dpkg 会保留你改过的版本（或在覆盖前询问），
+# 不会再被静默替换。单元里的 EnvironmentFile 是**必需**项（未加 '-' 前缀），地址与显式信任
+# pin 属站点资料，包只提供下面的空模板：必填项留空时进程以 78（配置错误）失败关闭。
+#
+# systemd 的 EnvironmentFile 语法是 KEY=VALUE 逐行赋值：不认识的行必须是注释（以 # 开头），
+# 值不要加 shell 的 $、反引号或命令替换（EnvironmentFile 不经过 shell，写了也不会展开）。
+#
+# 修改后需要 `sudo systemctl daemon-reload && sudo systemctl restart rsetup-board-agent` 生效。
+# 完整安装后步骤见 /usr/share/doc/rsetup-board-agent/README.Debian。
+
+# --- 必填：留空或取值非法，进程直接以 78 退出（fail-closed），不会带着空配置外连 ---
+
+# 中控地址，格式为 host:port（不是 URL，不含凭据），例如 controller.example.internal:8443。
+RSETUP_CONTROLLER_ADDR=
+
+# 信任的中控公钥 pin：逗号分隔的 64 位小写十六进制串，例如 <64-hex>[,<64-hex>]。
+# 没有 TOFU（trust-on-first-use）：未配置任何 pin 时 agent 拒绝启动，而不是信任应答者；
+# 轮换期可同时列出新旧两个 pin。
+RSETUP_CONTROLLER_PUBLIC_KEYS=
+
+# --- 状态路径：默认即单元 StateDirectory 创建的位置，一般无需修改 ---
+
+# 板端身份密钥文件：启动期载入一次，须为 0600 且位于 0700 目录内（符号链接或属主不符一律拒绝）。
+RSETUP_BOARD_KEY_FILE=/var/lib/rsetup-board-agent/board.key
+
+# 持久任务 journal 目录：必须已存在（进程不静默创建状态根，缺失即 78）；
+# StateDirectory=rsetup-board-agent 会把它创建为 0700。
+RSETUP_BOARD_JOURNAL_DIR=/var/lib/rsetup-board-agent
+
+# --- 可选：握手设备描述符四项，留空即不上报对应字段 ---
+
+# 板卡序列号。
+RSETUP_BOARD_DEVICE_SN=
+
+# 板卡型号。
+RSETUP_BOARD_DEVICE_MODEL=
+
+# 固件版本。
+RSETUP_BOARD_FW_VERSION=
+
+# 自由格式补充信息（单行）。
+RSETUP_BOARD_EXTRA_INFO=

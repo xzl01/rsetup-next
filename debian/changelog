@@ -1,3 +1,13 @@
+rsetup-next (0.6.0-2) bookworm; urgency=medium
+
+  * rsetup-controller 与 rsetup-board-agent 在安装时创建 /etc/default 配置模板
+    （conffile）：/etc/default/rsetup-controller 权限 0600（其中含数据库连接串
+    秘密），/etc/default/rsetup-board-agent 权限 0644；无默认值的必填项留空，
+    由操作员填写后服务才可运行。文档目录仍保留 0644 的无秘密副本供参考。
+  * 两个服务的启用与启停行为不变：安装与升级均不启用、不启动、不重启、不停止。
+
+ -- aghost <ggg17226@gmail.com>  Tue, 10 Nov 2026 08:37:21 +0000
+
 rsetup-next (0.6.0-1) bookworm; urgency=medium
 
   * 添加主控和板端

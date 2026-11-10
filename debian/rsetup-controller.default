@@ -1,10 +1,11 @@
 # /usr/share/doc/rsetup-controller/rsetup-controller.default — rsetup-controller 示例配置。
 #
-# 本样例作为文档示例随包安装，权限 0644 且**不含任何秘密**。
-# 部署时请复制为 /etc/default/rsetup-controller 并填入真实值，随后立刻收紧权限：
+# 真正生效的配置在 /etc/default/rsetup-controller：**安装时已由本包创建**为一个 conffile
+# 模板（权限 0600，属主 root:root），直接编辑它并填入下面的必填项即可，无需复制本文件。
+# 本副本以 0644 保留在文档目录，**不含任何秘密**，仅供查阅可用变量与格式：
 #
-#     sudo cp /usr/share/doc/rsetup-controller/rsetup-controller.default /etc/default/rsetup-controller
-#     sudo chmod 0600 /etc/default/rsetup-controller
+#     sudoedit /etc/default/rsetup-controller
+#     ls -l /etc/default/rsetup-controller        # -rw------- root root (0600)
 #
 # systemd 的 EnvironmentFile 语法是 KEY=VALUE 逐行赋值：不认识的行必须是注释（以 # 开头），
 # 值不要加 shell 的 $、反引号或命令替换（EnvironmentFile 不经过 shell，写了也不会展开）。

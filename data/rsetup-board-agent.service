@@ -31,13 +31,14 @@ Group=root
 StateDirectory=rsetup-board-agent
 StateDirectoryMode=0700
 WorkingDirectory=/var/lib/rsetup-board-agent
-# 连接参数全部来自下面这个**必需**的 EnvironmentFile（本包不携带该文件：地址与信任 pin
-# 属站点资料，由运维创建，模板见 README.Debian）。失败关闭分两级，别混为一谈：
-#   * 该文件不存在 → systemd 在执行 ExecStart **之前**就因加载环境文件失败而拒绝本次启动
-#     （journal 里是 `Failed to load environment files: No such file or directory`），
-#     二进制根本没有运行，因此**不会**得到它的退出码 78；
+# 连接参数全部来自下面这个**必需**的 EnvironmentFile（本包安装一个空模板 conffile：地址与
+# 显式信任 pin 属站点资料，必须由运维填写，模板见 README.Debian）。失败关闭分两级，别混为一谈：
 #   * 该文件存在但缺任何必填项——尤其是缺显式中控公钥 pin——或取值非法 → 二进制启动后
-#     以 78 失败关闭。
+#     以 78 失败关闭；包刚装好、模板尚未填写时命中的正是这一级；
+#   * 该文件不存在（被删除，或 purge 移除了 conffile）→ systemd 在执行 ExecStart **之前**
+#     就因加载环境文件失败而拒绝本次启动
+#     （journal 里是 `Failed to load environment files: No such file or directory`），
+#     二进制根本没有运行，因此**不会**得到它的退出码 78。
 # 两级都是预期的失败关闭，绝不 TOFU 自动信任。这里刻意不加 '-' 前缀（不放宽成可选）：
 #   RSETUP_CONTROLLER_ADDR          中控地址 host:port（不是 URL，不含凭据）
 #   RSETUP_CONTROLLER_PUBLIC_KEYS   显式中控信任 pin，逗号分隔 64 位 hex（必填）
@@ -81,7 +82,8 @@ WantedBy=multi-user.target
 # 2) 真实重启边界仍未实现：本单元不注入 reboot dispatcher，device.reboot.prepare /
 #    device.reboot.execute 一律返回 capability unavailable（1004），能力清单也不申报
 #    可执行重启；本单元与二进制都不会重启主机。要闭环必须由人工接线真实调度器。
-# 3) 本包不携带 /etc/default/rsetup-board-agent，而上面的 EnvironmentFile 是必需的：
-#    未创建该文件时 systemd 在执行 ExecStart 前就拒绝本次启动（环境文件加载失败），
-#    二进制未被执行，所以**不是**它自己的 78；文件存在但缺必填项或取值非法时，才是
-#    二进制以 78 退出。两种表现同向失败关闭，都是预期行为，不是可被忽略的告警。
+# 3) 上面的 EnvironmentFile 是必需的，本包随包安装它的空模板 conffile（必填项留空）：
+#    刚装好时文件已存在，但中控地址与显式 pin 为空 → 二进制以 78 失败关闭；若该文件被删除
+#    （例如 purge 移除了 conffile），systemd 在执行 ExecStart 前就拒绝本次启动（环境文件
+#    加载失败），二进制未被执行，那种表现**不是**它自己的 78。两种表现同向失败关闭，
+#    都是预期行为，不是可被忽略的告警。
