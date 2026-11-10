@@ -35,6 +35,9 @@ crates/rsetup-tunnel/target/
 /*.changes
 /.pc
 
+# 本地 deb 交付目录：打包产物统一收在这里，二进制不入库。
+/bin/
+
 # Editors, local environment, and review artifacts
 /.cargo-local/
 /.vscode*
