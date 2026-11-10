@@ -1,3 +1,25 @@
+rsetup-next (0.6.0-6) bookworm; urgency=medium
+
+  * Web 控制台界面视觉重构（仅前端展示层，无接口与业务行为变更）：
+    apps/controller-web/src/styles.css 建立「现代管理后台」设计基线——补齐模板
+    已引用但一直缺失布局规则的 .app-header / .app-main / .app-footer /
+    .auth-signed-in / .auth-nav / .devices-view / .admin-view 等 class，并以
+    :root 设计 token 统一深蓝主色（#1e3a8a / #164b94）、浅灰画布（#f1f5f9）、
+    白色卡片表面、1px 边框（#e2e8f0）、10px 圆角与轻阴影、间距刻度。
+  * 顶栏改为 sticky 白底 + 下边框 + 轻阴影，标题深蓝 1.25rem/700，语言选择
+    统一为输入框风格；主体内容居中容器最大 1200px。
+  * 登录后收拢为工具条（标题 + 当前身份 + 退出），主导航改为轻量 pill 并在
+    App.vue 按当前路由绑定 is-active 高亮，管理端入口以 .auth-nav__group 分组；
+    原 App.vue 中与全局同名的 scoped 片段上收至 styles.css，避免特异性竞争。
+  * 设备列表项卡片化（悬停加深阴影与主色边框）、搜索框固定 320px 靠右、空状态
+    与占位提示改为居中虚线卡片；管理视图统一为卡片容器 + 表格表头浅灰底与行
+    悬停、工具条与面板浅灰分区；实时事件条增加前置状态点（随 tone 上色）。
+  * 新增 ≤768px 断点（工具条纵向、搜索全宽、表格内边距收紧），保留 320px、
+    prefers-reduced-motion、prefers-contrast: more 与 :focus-visible 焦点环，
+    按钮最小高度 2.75rem 与 white-space: normal 不变；无新增依赖、无外部资源。
+
+ -- aghost <ggg17226@gmail.com>  Tue, 10 Nov 2026 10:52:00 +0000
+
 rsetup-next (0.6.0-5) bookworm; urgency=medium
 
   * 修复 CONTROLLER_ALLOWED_HOSTS=* 在内联 Host 检查点不生效的遗留缺陷：管理读

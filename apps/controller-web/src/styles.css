@@ -1,21 +1,60 @@
+/* ══════════════════════════════════════════════════════════════════════
+   控制台 Web 全局样式：现代管理后台视觉基线
+   分层顺序：设计 token → 全局基线 → 页面骨架（顶栏/主体/页脚）→
+   登录与已登录工具条 → 通用组件 → 各视图容器 → 响应式与无障碍偏好
+   ══════════════════════════════════════════════════════════════════════ */
+
 :root {
   color-scheme: light;
-  --color-canvas: #f7f9fc;
+
+  /* 主色：深蓝系 */
+  --color-primary: #1e3a8a;
+  --color-primary-hover: #164b94;
+  --color-primary-subtle: #e0e7ff;
+  --color-link: #164b94;
+
+  /* 画布与表面 */
+  --color-canvas: #f1f5f9;
   --color-surface: #ffffff;
-  --color-text: #182235;
-  --color-muted: #41536a;
-  --color-border: #69788b;
-  --color-primary: #164b94;
+  --color-surface-subtle: #f8fafc;
+
+  /* 文本 */
+  --color-text: #0f172a;
+  --color-text-muted: #475569;
+  /* 旧别名：历史组件按 --color-muted 引用，保留以免回归 */
+  --color-muted: #475569;
+
+  /* 边框与分隔线 */
+  --color-border: #e2e8f0;
+  --color-border-strong: #cbd5e1;
+
+  /* 语义色 */
   --color-danger: #a12333;
   --color-success: #126146;
   --color-warning: #74500b;
   --color-focus: #854c00;
+
+  /* 圆角 */
+  --radius: 10px;
+  --radius-sm: 6px;
+  --radius-pill: 999px;
+
+  /* 阴影：克制的一层投影，避免"悬浮卡片" */
+  --shadow-sm: 0 1px 2px rgb(15 23 42 / 0.06);
+  --shadow-md: 0 4px 12px rgb(15 23 42 / 0.08);
+
+  /* 页面骨架尺寸 */
+  --container-width: 1200px;
+  --header-height: 4rem;
+
+  /* 间距刻度 */
   --space-1: 0.25rem;
   --space-2: 0.5rem;
   --space-3: 0.75rem;
   --space-4: 1rem;
+  --space-5: 1.25rem;
   --space-6: 1.5rem;
-  --radius: 0.375rem;
+
   font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   line-height: 1.5;
   background: var(--color-canvas);
@@ -23,12 +62,210 @@
 }
 
 *, *::before, *::after { box-sizing: border-box; }
-body { min-width: 0; margin: 0; }
-button, input { font: inherit; }
+
+body {
+  min-width: 0;
+  margin: 0;
+  background: var(--color-canvas);
+  color: var(--color-text);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+button, input, select, textarea { font: inherit; }
 button { cursor: pointer; }
 button:disabled { cursor: not-allowed; opacity: 0.65; }
+
+a { color: var(--color-link); }
+a:hover { color: var(--color-primary); }
+::selection { background: var(--color-primary-subtle); color: var(--color-text); }
+
+h1, h2, h3 { line-height: 1.3; letter-spacing: -0.011em; }
+
 :focus-visible { outline: 3px solid var(--color-focus); outline-offset: 3px; }
 
+/* ── 跳转链接（键盘可达性）──────────────────────────────────────────── */
+.skip-link {
+  position: absolute;
+  inset-block-start: 0;
+  inset-inline-start: 0;
+  padding: var(--space-2) var(--space-4);
+  background: var(--color-surface);
+  color: var(--color-primary);
+  font-weight: 600;
+  border: 1px solid var(--color-border);
+  border-radius: 0 0 var(--radius) 0;
+  transform: translateY(-150%);
+  z-index: 3;
+}
+.skip-link:focus { transform: none; }
+
+/* ── 页面骨架：顶栏 / 主体 / 页脚 ──────────────────────────────────── */
+.app-header {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-4);
+  min-height: var(--header-height);
+  padding: var(--space-2) var(--space-6);
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-border);
+  box-shadow: var(--shadow-sm);
+  min-width: 0;
+}
+/* 标题与语言选择同行，标题不再独占一行抬高整页首屏基线 */
+.app-header h1 {
+  margin: 0;
+  margin-inline-end: auto;
+  font-size: 1.25rem;
+  font-weight: 700;
+  letter-spacing: -0.018em;
+  color: var(--color-primary);
+  overflow-wrap: anywhere;
+}
+.app-header label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--color-text-muted);
+}
+.app-header select {
+  max-width: 100%;
+  min-height: 2.25rem;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font: inherit;
+}
+.app-header select:hover { border-color: var(--color-primary); }
+
+.app-main {
+  width: min(100%, var(--container-width));
+  margin-inline: auto;
+  padding: var(--space-6);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+/* 跳转链接的目标：聚焦由内容本身表达，不额外画环 */
+.app-main:focus { outline: none; }
+
+.app-footer {
+  width: min(100%, var(--container-width));
+  margin-inline: auto;
+  padding: var(--space-6);
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--color-text-muted);
+  font-size: 0.8125rem;
+  border-top: 1px solid var(--color-border);
+}
+
+/* ── 登录 / 修改口令表单：单列表单卡片 ─────────────────────────────── */
+.auth-form {
+  padding: var(--space-6);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+}
+.auth-form > h2 {
+  margin: 0 0 var(--space-4);
+  font-size: 1.125rem;
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--color-border);
+}
+.auth-retry { margin-inline-start: auto; }
+
+/* ── 已登录工具条：标题 + 当前用户 + 主操作 ───────────────────────── */
+.auth-signed-in {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3) var(--space-4);
+  min-width: 0;
+}
+.auth-signed-in > h2 {
+  order: 1;
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 1.1rem;
+}
+/* 已登录身份条：标题、显示名与登出按钮同一行，视图正文从下一行整行铺开 */
+.auth-signed-in > p[role="status"] {
+  order: 2;
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  padding: 2px var(--space-3);
+  background: var(--color-surface-subtle);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-pill);
+  color: var(--color-text-muted);
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+.auth-signed-in > button {
+  order: 3;
+  margin-inline-start: auto;
+}
+.auth-signed-in > .auth-nav { order: 4; flex: 1 0 100%; align-self: stretch; }
+/* 工具条之后的一切视图正文整行铺开，不被工具条的 flex 收缩 */
+.auth-signed-in > :nth-child(n + 5) { order: 5; flex: 1 1 100%; min-width: 0; }
+
+/* ── 主导航：轻量 pill，当前路由高亮（is-active 由 App.vue 绑定）──── */
+.auth-nav {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  padding-block: var(--space-3);
+  border-bottom: 1px solid var(--color-border);
+}
+.auth-nav__group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  margin-inline-start: var(--space-1);
+  padding-inline-start: var(--space-3);
+  border-inline-start: 1px solid var(--color-border);
+}
+.auth-nav .base-button {
+  min-height: 2.75rem;
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--color-primary);
+  font-size: 0.875rem;
+  font-weight: 600;
+  box-shadow: none;
+}
+.auth-nav .base-button:hover:not(:disabled) {
+  background: var(--color-primary-subtle);
+  border-color: var(--color-primary-subtle);
+}
+.auth-nav .base-button.is-active {
+  background: var(--color-primary);
+  border-color: var(--color-primary);
+  color: #fff;
+}
+.auth-nav .base-button.is-active:hover:not(:disabled) {
+  background: var(--color-primary-hover);
+  border-color: var(--color-primary-hover);
+}
+
+/* ── 通用组件：按钮 ────────────────────────────────────────────────── */
 .base-button,
 .async-state__retry {
   display: inline-flex;
@@ -45,33 +282,66 @@ button:disabled { cursor: not-allowed; opacity: 0.65; }
   font-weight: 600;
   text-align: center;
   white-space: normal;
+  transition: background-color 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
 }
-.base-button--primary { color: #fff; background: var(--color-primary); }
+.base-button--primary {
+  color: #fff;
+  background: var(--color-primary);
+  border-color: var(--color-primary);
+  box-shadow: var(--shadow-sm);
+}
+.base-button--primary:hover:not(:disabled) { background: var(--color-primary-hover); border-color: var(--color-primary-hover); }
 .base-button--secondary,
-.async-state__retry { color: var(--color-primary); background: var(--color-surface); }
-.base-button--danger { color: #fff; background: var(--color-danger); }
+.async-state__retry {
+  color: var(--color-primary);
+  background: var(--color-surface);
+  border-color: var(--color-border-strong);
+  box-shadow: var(--shadow-sm);
+}
+.base-button--secondary:hover:not(:disabled),
+.async-state__retry:hover:not(:disabled) { background: var(--color-primary-subtle); border-color: var(--color-primary); }
+.base-button--danger {
+  color: #fff;
+  background: var(--color-danger);
+  border-color: var(--color-danger);
+  box-shadow: var(--shadow-sm);
+}
+.base-button--danger:hover:not(:disabled) { filter: brightness(0.92); }
 .base-button__loading { font-size: 0.875em; }
 
+/* ── 通用组件：输入框与下拉 ───────────────────────────────────────── */
 .base-input { display: grid; gap: var(--space-1); min-width: 0; max-width: 32rem; }
 .base-input__label,
 .base-input__hint,
 .base-input__error { min-width: 0; overflow-wrap: anywhere; }
-.base-input__label { font-weight: 600; }
+.base-input__label { font-weight: 600; font-size: 0.875rem; }
 .base-input__control {
   width: 100%;
   min-width: 0;
   min-height: 2.75rem;
   padding: var(--space-2) var(--space-3);
-  border: 2px solid var(--color-border);
+  border: 2px solid var(--color-border-strong);
   border-radius: var(--radius);
   background: var(--color-surface);
   color: var(--color-text);
 }
+.base-input__control:hover { border-color: var(--color-primary); }
 .base-input__control[aria-invalid="true"] { border-color: var(--color-danger); }
 .base-input__hint, .base-input__error { margin: 0; }
-.base-input__hint { color: var(--color-muted); }
+.base-input__hint { color: var(--color-text-muted); }
 .base-input__error { color: var(--color-danger); font-weight: 600; }
+textarea.base-input__control,
+.admin-view__panel textarea {
+  font: inherit;
+  max-width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: 2px solid var(--color-border-strong);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+  color: var(--color-text);
+}
 
+/* ── 通用组件：提示条与异步状态 ───────────────────────────────────── */
 .app-notice, .async-state {
   min-width: 0;
   max-width: 100%;
@@ -81,6 +351,7 @@ button:disabled { cursor: not-allowed; opacity: 0.65; }
   border-inline-start-width: 0.4rem;
   border-radius: var(--radius);
   background: var(--color-surface);
+  box-shadow: var(--shadow-sm);
 }
 .app-notice__tone { display: inline-block; margin-inline-end: var(--space-2); }
 .app-notice__body { margin-block-start: var(--space-2); }
@@ -89,16 +360,232 @@ button:disabled { cursor: not-allowed; opacity: 0.65; }
 .app-notice--warning { border-inline-start-color: var(--color-warning); }
 .app-notice--error, .async-state--error { border-inline-start-color: var(--color-danger); }
 .async-state__title { margin-block: 0 var(--space-2); font-size: 1.25rem; }
-.async-state__description { margin-block: 0 var(--space-3); color: var(--color-muted); }
+.async-state__description { margin-block: 0 var(--space-3); color: var(--color-text-muted); }
+
+/* ── 实时事件通道指示器 ───────────────────────────────────────────── */
+.event-connection-state {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  margin-block: 0;
+  padding: var(--space-2) var(--space-3);
+  overflow-wrap: anywhere;
+  font-size: 0.8125rem;
+  color: var(--color-text-muted);
+  background: var(--color-surface-subtle);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+}
+/* 状态点：颜色由组件的 tone 上色（currentColor），成功绿 / 失效红 */
+.event-connection-state::before {
+  content: "";
+  flex: none;
+  inline-size: 0.5rem;
+  block-size: 0.5rem;
+  border-radius: var(--radius-pill);
+  background: currentColor;
+}
+
+/* ── 设备列表视图 ─────────────────────────────────────────────────── */
+.devices-view__search { width: 20rem; max-width: 100%; }
+.devices-view__search .base-input { max-width: none; }
+.devices-view__empty {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-6) var(--space-4);
+  text-align: center;
+  color: var(--color-text-muted);
+  background: var(--color-surface);
+  border: 1px dashed var(--color-border-strong);
+  border-radius: var(--radius);
+}
+.devices-view__empty p { margin: 0; overflow-wrap: anywhere; }
+.devices-view__pagination { display: flex; justify-content: center; }
+.devices-view__pagination-error { display: grid; }
+/* 列表项卡片化：父容器 class 链确保压过组件内的同名基础样式 */
+.devices-view .devices-view__list .device-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+}
+.devices-view .devices-view__list .device-item:hover {
+  border-color: var(--color-primary);
+  box-shadow: var(--shadow-md);
+}
+.devices-view .devices-view__list .device-item__name-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  font-weight: 650;
+  color: var(--color-primary);
+  text-align: left;
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+.devices-view .devices-view__list .device-item__name-btn:hover { text-decoration: underline; }
+.devices-view .devices-view__list .device-item__id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8125rem;
+  color: var(--color-text-muted);
+}
+
+/* ── 会话列表 ─────────────────────────────────────────────────────── */
+.auth-sessions {
+  background: var(--color-surface);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+  padding-inline: var(--space-4);
+  padding-block-end: var(--space-4);
+}
+.auth-sessions__item {
+  background: var(--color-surface-subtle);
+  border-radius: var(--radius);
+}
+
+/* ── 管理视图通用容器（admin-*）───────────────────────────────────── */
+.admin-view {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+  padding-inline: var(--space-5, 1.25rem);
+  padding-block-end: var(--space-5, 1.25rem);
+}
+.admin-view > h3,
+.admin-view__header { margin-block-end: var(--space-1); }
+.admin-view__header h3 { font-size: 1.0625rem; }
+.admin-view__toolbar { gap: var(--space-3); }
+.admin-view__table {
+  width: 100%;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  overflow-wrap: anywhere;
+}
+.admin-view .admin-view__table th {
+  background: var(--color-surface-subtle);
+  font-weight: 600;
+  font-size: 0.8125rem;
+  text-transform: none;
+  color: var(--color-text-muted);
+}
+.admin-view .admin-view__table th,
+.admin-view .admin-view__table td {
+  padding: 0.625rem 0.75rem;
+  border-bottom: 1px solid var(--color-border);
+}
+.admin-view .admin-view__table tbody tr:last-child > * { border-bottom: none; }
+.admin-view .admin-view__table tbody tr:hover > * { background: var(--color-surface-subtle); }
+.admin-view__list { list-style: none; padding: 0; margin: 0; display: grid; gap: var(--space-2); }
+.admin-view .admin-view__item {
+  background: var(--color-surface-subtle);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: var(--space-3);
+}
+.admin-view__panel {
+  background: var(--color-surface-subtle);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: var(--space-4);
+}
+.admin-view__notice {
+  background: var(--color-surface-subtle);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+}
+.admin-view__actions { display: flex; gap: var(--space-2); flex-wrap: wrap; }
+.admin-view__pagination { display: flex; justify-content: center; padding-block-start: var(--space-2); }
+.admin-view__badge {
+  border: 1px solid var(--color-border);
+  color: var(--color-text-muted);
+  font-weight: 600;
+}
+.admin-view__grid > div {
+  background: var(--color-surface-subtle);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+}
+
+/* ── 任务与详情视图容器 ───────────────────────────────────────────── */
+.tasks-view__preview,
+.task-detail-view__meta {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+}
+.task-detail-view .profile-card,
+.task-detail-view .status-card,
+.device-detail .profile-card,
+.device-detail .status-card {
+  background: var(--color-surface);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+}
+.task-state-list__items { list-style: none; padding: 0; margin: 0; }
+.device-detail .device-detail__error { min-width: 0; }
+
+/* ── 占位提示 ─────────────────────────────────────────────────────── */
+.app-placeholder {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-6);
+  text-align: center;
+  background: var(--color-surface);
+  border: 1px dashed var(--color-border-strong);
+  border-radius: var(--radius);
+}
+.app-placeholder p { margin: 0; color: var(--color-text-muted); }
+
+/* ── 响应式：窄屏（平板/手机横屏）────────────────────────────────── */
+@media (max-width: 768px) {
+  .app-header { padding: var(--space-3) var(--space-4); row-gap: var(--space-2); }
+  .app-header h1 { flex: 1 1 100%; margin-inline-end: 0; font-size: 1.125rem; }
+  .app-main, .app-footer { padding: var(--space-4); }
+  .auth-form { padding: var(--space-4); }
+  /* 工具条在窄屏纵向堆叠，登出按钮不再靠右悬浮 */
+  .auth-signed-in { flex-direction: column; align-items: stretch; }
+  .auth-signed-in > button { margin-inline-start: 0; width: 100%; }
+  .auth-nav__group { padding-inline-start: 0; margin-inline-start: 0; border-inline-start: 0; }
+  .devices-view__header { flex-direction: column; align-items: stretch; }
+  .devices-view__search { width: 100%; }
+  .devices-view .devices-view__list .device-item { flex-direction: column; align-items: stretch; }
+  .admin-view .admin-view__table th,
+  .admin-view .admin-view__table td { padding: var(--space-2); }
+}
 
 @media (max-width: 320px) {
   .app-notice, .async-state { padding: var(--space-2); }
   .base-button, .async-state__retry { width: 100%; }
+  .app-header, .app-main, .app-footer { padding-inline: var(--space-2); }
+  .devices-view__empty { padding: var(--space-4) var(--space-2); }
 }
+
+/* ── 无障碍偏好 ───────────────────────────────────────────────────── */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; scroll-behavior: auto !important; transition-duration: 0.01ms !important; }
 }
 @media (prefers-contrast: more) {
-  :root { --color-border: #182235; --color-muted: #182235; --color-focus: #000000; }
+  :root {
+    --color-border: #182235;
+    --color-border-strong: #182235;
+    --color-muted: #182235;
+    --color-text-muted: #182235;
+    --color-focus: #000000;
+    --shadow-sm: none;
+    --shadow-md: none;
+  }
   .base-button, .async-state__retry, .base-input__control, .app-notice, .async-state { border-width: 3px; }
+  .app-header, .app-footer { border-bottom-width: 2px; }
+  .admin-view, .admin-view__panel, .admin-view__table, .devices-view .devices-view__list .device-item,
+  .devices-view__empty, .auth-form, .event-connection-state, .app-placeholder { border-width: 2px; }
+  .auth-nav .base-button { border-width: 2px; }
 }

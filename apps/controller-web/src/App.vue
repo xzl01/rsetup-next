@@ -816,6 +816,7 @@ onUnmounted(() => {
       <nav :aria-label="t('auth.sessions.title')" class="auth-nav">
         <BaseButton
           variant="secondary"
+          :class="{ 'is-active': route.name === 'devices' }"
           :disabled="busy"
           @click="() => navigateTo({ name: 'devices' })"
         >
@@ -823,6 +824,7 @@ onUnmounted(() => {
         </BaseButton>
         <BaseButton
           variant="secondary"
+          :class="{ 'is-active': route.name === 'tasks' }"
           :disabled="busy"
           @click="() => navigateTo({ name: 'tasks' })"
         >
@@ -830,22 +832,24 @@ onUnmounted(() => {
         </BaseButton>
         <BaseButton
           variant="secondary"
+          :class="{ 'is-active': route.name === 'sessions' }"
           :disabled="busy"
           @click="() => navigateTo({ name: 'sessions' })"
         >
           {{ t('auth.sessions.title') }}
         </BaseButton>
-        <template v-if="isAdminUser">
+        <span v-if="isAdminUser" class="auth-nav__group">
           <BaseButton
             v-for="entry in adminNav"
             :key="entry.label"
             variant="secondary"
+            :class="{ 'is-active': route.name === entry.route.name }"
             :disabled="busy"
             @click="() => navigateTo(entry.route)"
           >
             {{ entry.label }}
           </BaseButton>
-        </template>
+        </span>
       </nav>
       <BaseButton :loading="busy" :loading-label="t('button.loading')" @click="submitLogout">{{ t('auth.logout.label') }}</BaseButton>
 
@@ -937,44 +941,5 @@ onUnmounted(() => {
   <footer class="app-footer">{{ t('app.title') }}</footer>
 </template>
 
-<style scoped>
-.skip-link {
-  position: absolute;
-  inset-block-start: 0;
-  inset-inline-start: 0;
-  padding: var(--space-2) var(--space-4);
-  background: var(--color-surface);
-  transform: translateY(-150%);
-  z-index: 1;
-}
-.skip-link:focus { transform: none; }
-.app-header, .app-main, .app-footer {
-  width: min(100%, 68rem);
-  margin-inline: auto;
-  padding: var(--space-4);
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
-.app-header { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-2) var(--space-4); }
-/* 标题与语言选择同行，标题不再独占一行抬高整页首屏基线 */
-.app-header h1 { margin: 0; margin-inline-end: auto; }
-.app-header select { max-width: 100%; min-height: 2.75rem; font: inherit; }
-.auth-signed-in {
-  display: grid;
-  grid-template-columns: auto auto minmax(0, 1fr) auto;
-  align-items: center;
-  gap: var(--space-3) var(--space-4);
-  min-width: 0;
-}
-/* 已登录身份条：标题、显示名、导航与登出按钮收拢为一行，登出不再被栅格拉伸成整行，
-   视图正文从第二行整行铺开，避免主内容被挤到折叠线下 */
-.auth-signed-in > h2 { grid-column: 1; margin: 0; }
-.auth-signed-in > p[role="status"] { grid-column: 2; margin: 0; }
-.auth-signed-in > .auth-nav { grid-column: 3; justify-self: start; }
-.auth-signed-in > button { grid-column: 4; justify-self: end; }
-.auth-signed-in > :nth-child(n + 5) { grid-column: 1 / -1; }
-.auth-nav { display: flex; flex-wrap: wrap; gap: var(--space-2); min-width: 0; }
-.auth-retry { margin-inline-start: auto; }
-.app-placeholder { display: grid; gap: var(--space-2); padding: var(--space-4); border: 1px dashed var(--color-border, #ccc); border-radius: 4px; }
-.app-placeholder p { margin: 0; color: var(--color-text-muted, #666); }
-</style>
+<!-- 页面骨架、导航与视图容器的展示样式统一收在 styles.css：
+     组件级 scoped 规则会以更高特异性压过全局设计系统，故此处不再保留同名片段。 -->
