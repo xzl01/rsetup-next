@@ -1,3 +1,19 @@
+rsetup-next (0.6.0-4) bookworm; urgency=medium
+
+  * rsetup-controller 支持 CONTROLLER_ALLOWED_ORIGIN=*：配置值恰为整项 `*` 时
+    放开所有 Origin（任意 Origin，含未携带 Origin 的请求）通过 Origin 检查；
+    其余取值仍为逐字精确匹配——pre-session 写（登录）缺失 Origin 仍被拒绝，
+    已登录会话写路径的缺失 Origin 豁免保持不变，`*.example`、`http://*` 等
+    部分形式都不是通配。会话 CSRF 绑定、Host 白名单及其余门禁完全不变。
+  * 覆盖全部 Origin 比较点：check_pre_session / check_session_write、管理写
+    鉴权、会话吊销（其余会话 / 按 id）、改密与登出、SSE 握手，统一走
+    HttpSecurityConfig::origin_allowed / origin_allowed_if_present，避免配置
+    `*` 后个别端点仍返回 403。
+  * 配置模板与 README.Debian 同步：CONTROLLER_ALLOWED_ORIGIN 增加 `*` 示例、
+    安全警示与适用场景（与 CONTROLLER_ALLOWED_HOSTS 的 Host 通配说明并列）。
+
+ -- aghost <ggg17226@gmail.com>  Tue, 10 Nov 2026 09:34:00 +0000
+
 rsetup-next (0.6.0-3) bookworm; urgency=medium
 
   * rsetup-controller 支持 CONTROLLER_ALLOWED_HOSTS=*：白名单含整项 `*` 时

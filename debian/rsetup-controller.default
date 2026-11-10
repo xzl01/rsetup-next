@@ -28,6 +28,9 @@
 # 说明：默认监听是 127.0.0.1:8080；上面这行是"经反代访问时也允许反代传来的 Host"的写法示例。
 
 # 唯一精确匹配的浏览器 Origin（含 scheme 与端口，不能带通配符与路径）。
+# 放开所有 Origin（任意来源，含未携带 Origin 的请求）：仅建议在可信内网或外层反代
+# 已做来源校验时使用——这会移除本变量的来源限制，只剩会话 CSRF 绑定。
+#CONTROLLER_ALLOWED_ORIGIN=*
 #CONTROLLER_ALLOWED_ORIGIN=https://controller.internal.example
 
 # 管理 cursor 的密钥：十六进制编码的随机串（例如 openssl rand -hex 32 的输出）。

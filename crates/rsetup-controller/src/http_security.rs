@@ -4,7 +4,9 @@
 //! - Exact-allowlist `Host` / `Origin` checks: pre-session writes (login)
 //!   require an allowed `Origin`; established-session writes tolerate a
 //!   missing `Origin` (non-browser clients) but never relax the
-//!   session-bound `X-CSRF-Token` check.
+//!   session-bound `X-CSRF-Token` check. A `CONTROLLER_ALLOWED_ORIGIN` of
+//!   the whole-entry `*` relaxes only the `Origin` check — never the CSRF
+//!   binding.
 //! - Session-bound CSRF comparison is constant time (`subtle::ConstantTimeEq`,
 //!   length checked first because the token is fixed 64-hex) and fails closed on
 //!   an empty bound — see [`csrf_token_matches`].
@@ -48,8 +50,9 @@ pub const LOGIN_RATE_MAX_KEYS: usize = 4096;
 pub struct HttpSecurityConfig {
     /// Exact allowed `Host` header strings, including port.
     pub allowed_hosts: Vec<String>,
-    /// Exact allowed `Origin` header string; `None` only when the struct is
-    /// built directly in tests — `from_values` always sets `Some`.
+    /// Exact allowed `Origin` header string, or the literal `*` to admit any
+    /// `Origin`; `None` only when the struct is built directly in tests —
+    /// `from_values` always sets `Some`.
     pub allowed_origin: Option<String>,
     /// Append `Secure` to the session cookie only when explicitly trusted.
     pub trust_tls: bool,
@@ -57,8 +60,8 @@ pub struct HttpSecurityConfig {
 
 impl HttpSecurityConfig {
     /// Pure constructor. `hosts` is the comma-separated exact `Host` list
-    /// (`CONTROLLER_ALLOWED_HOSTS`), `origin` the exact `Origin`
-    /// (`CONTROLLER_ALLOWED_ORIGIN`), `trust_tls` the
+    /// (`CONTROLLER_ALLOWED_HOSTS`), `origin` the exact `Origin` or the
+    /// whole-entry `*` (`CONTROLLER_ALLOWED_ORIGIN`), `trust_tls` the
     /// `CONTROLLER_TRUST_TLS` value (`"1"`/`"true"`, default false).
     /// Missing/empty values and unrecognised `trust_tls` values are fixed
     /// `Config` errors that never echo the supplied values.
@@ -103,6 +106,27 @@ impl HttpSecurityConfig {
         let trust_tls = std::env::var("CONTROLLER_TRUST_TLS").ok();
         Self::from_values(hosts.as_deref(), origin.as_deref(), trust_tls.as_deref())
     }
+
+    /// pre-session 语义：配置恰为整项 `*` 时放开所有 Origin（含缺失）；否则要求
+    /// Origin 存在且逐字精确匹配。`*.example`、`http://*` 等都不是通配。
+    pub fn origin_allowed(&self, origin: Option<&str>) -> bool {
+        match self.allowed_origin.as_deref() {
+            Some("*") => true,
+            allowed => origin.is_some() && allowed == origin,
+        }
+    }
+
+    /// session 写语义：缺失 Origin 豁免（非浏览器客户端）；携带时必须逐字精确
+    /// 匹配，或配置为整项 `*`。
+    pub fn origin_allowed_if_present(&self, origin: Option<&str>) -> bool {
+        match origin {
+            None => true,
+            Some(o) => {
+                self.allowed_origin.as_deref() == Some("*")
+                    || self.allowed_origin.as_deref() == Some(o)
+            }
+        }
+    }
 }
 
 /// Which static check denied the write, for the HTTP layer's 403 mapping.
@@ -119,9 +143,10 @@ fn host_ok(host: Option<&str>, cfg: &HttpSecurityConfig) -> bool {
     host.is_some_and(|h| cfg.allowed_hosts.iter().any(|a| a == h || a == "*"))
 }
 
-/// Pre-session (login) gate: exact allowed `Host` **and** exact allowed
+/// Pre-session (login) gate: exact allowed `Host` **and** allowed
 /// `Origin`. A missing `Origin` is rejected — CLI logins must send the
-/// allowed `Origin` explicitly.
+/// allowed `Origin` explicitly. An `allowed_origin` of the literal `*`
+/// admits any `Origin`, present or missing; nothing else is relaxed.
 pub fn check_pre_session(
     host: Option<&str>,
     origin: Option<&str>,
@@ -130,7 +155,7 @@ pub fn check_pre_session(
     if !host_ok(host, cfg) {
         return Err(WriteDeny::Host);
     }
-    if origin.is_none() || cfg.allowed_origin.as_deref() != origin {
+    if !cfg.origin_allowed(origin) {
         return Err(WriteDeny::Origin);
     }
     Ok(())
@@ -160,8 +185,9 @@ pub fn csrf_token_matches(provided: Option<&str>, bound: &str) -> bool {
 }
 
 /// Established-session write gate: exact allowed `Host`; a present
-/// `Origin` must match exactly; the `csrf` header must equal the token
-/// bound to the session. A missing `Origin` exempts only the `Origin`
+/// `Origin` must match exactly, or the `allowed_origin` must be the
+/// literal `*`; the `csrf` header must equal the token bound to the
+/// session. A missing `Origin` exempts only the `Origin`
 /// check — the bound CSRF check still applies. An empty `bound` never
 /// matches (see [`csrf_token_matches`]), so a session without a bound
 /// token is always denied with `WriteDeny::Csrf`.
@@ -175,9 +201,9 @@ pub fn check_session_write(
     if !host_ok(host, cfg) {
         return Err(WriteDeny::Host);
     }
-    // A present Origin must match exactly; a missing Origin only exempts
-    // this check, never the CSRF binding below.
-    if origin.is_some_and(|o| cfg.allowed_origin.as_deref() != Some(o)) {
+    // A present Origin must match exactly (unless the whole entry is `*`); a
+    // missing Origin only exempts this check, never the CSRF binding below.
+    if !cfg.origin_allowed_if_present(origin) {
         return Err(WriteDeny::Origin);
     }
     if !csrf_token_matches(csrf, bound) {
@@ -467,6 +493,100 @@ mod tests {
         let mut c = cfg();
         c.allowed_hosts = vec!["*.example".into()];
         assert!(!host_ok(Some("a.example"), &c));
+    }
+
+    #[test]
+    fn wildcard_origin_entry_admits_any_origin() {
+        // `CONTROLLER_ALLOWED_ORIGIN=*`：任意 Origin（含缺失）通过 Origin 检查。
+        let mut c = cfg();
+        c.allowed_origin = Some("*".into());
+        // pre-session：Origin 缺失也放行（Host 仍须合法）。
+        assert_eq!(check_pre_session(Some("127.0.0.1:8080"), None, &c), Ok(()));
+        assert_eq!(
+            check_pre_session(Some("127.0.0.1:8080"), Some("https://evil.example"), &c),
+            Ok(())
+        );
+        // `*` 只放开 Origin：Host 不合法仍是 Host 拒绝。
+        assert_eq!(
+            check_pre_session(Some("evil.example"), Some("https://evil.example"), &c),
+            Err(WriteDeny::Host)
+        );
+        // session 写：任意 Origin 与缺失 Origin 均通过，CSRF 仍用合法 bound。
+        let bound = "bound-csrf-token-5a5a";
+        assert_eq!(
+            check_session_write(
+                Some("127.0.0.1:8080"),
+                Some("https://evil.example"),
+                Some(bound),
+                bound,
+                &c
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            check_session_write(Some("127.0.0.1:8080"), None, Some(bound), bound, &c),
+            Ok(())
+        );
+        // `*` 不放行 CSRF：bound 不符仍是 Csrf 拒绝。
+        assert_eq!(
+            check_session_write(Some("127.0.0.1:8080"), None, Some("wrong"), bound, &c),
+            Err(WriteDeny::Csrf)
+        );
+    }
+
+    #[test]
+    fn origin_without_wildcard_still_requires_exact_match() {
+        // 防回归：非 `*` 配置的三条既有语义一字不改。
+        let c = cfg();
+        let bound = "bound-csrf-token-5a5a";
+        // 携带但不逐字相等 → Origin（pre-session 与 session 写都是）。
+        assert_eq!(
+            check_pre_session(Some("127.0.0.1:8080"), Some("http://evil.example"), &c),
+            Err(WriteDeny::Origin)
+        );
+        assert_eq!(
+            check_session_write(
+                Some("127.0.0.1:8080"),
+                Some("http://evil.example"),
+                Some(bound),
+                bound,
+                &c
+            ),
+            Err(WriteDeny::Origin)
+        );
+        // pre-session 缺失 Origin → 拒绝；session 写缺失 Origin 仍豁免。
+        assert_eq!(
+            check_pre_session(Some("127.0.0.1:8080"), None, &c),
+            Err(WriteDeny::Origin)
+        );
+        assert_eq!(
+            check_session_write(Some("127.0.0.1:8080"), None, Some(bound), bound, &c),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn partial_wildcard_forms_are_not_wildcards() {
+        // 只有整项 `*` 是通配：`http://*`、`*.example` 都是普通精确值。
+        for allowed in ["http://*", "*.example"] {
+            let mut c = cfg();
+            c.allowed_origin = Some(allowed.into());
+            assert!(!c.origin_allowed(Some("http://evil")));
+            assert!(!c.origin_allowed(Some("https://a.example")));
+            // 缺失 Origin 在 pre-session 仍拒绝（`*` 才豁免）。
+            assert!(!c.origin_allowed(None));
+            // session 写：缺失仍豁免，携带必须逐字相等。
+            assert!(c.origin_allowed_if_present(None));
+            assert!(!c.origin_allowed_if_present(Some("http://evil")));
+            assert!(!c.origin_allowed_if_present(Some("https://a.example")));
+            // 逐字相等才放行。
+            assert!(c.origin_allowed(Some(allowed)));
+            assert!(c.origin_allowed_if_present(Some(allowed)));
+        }
+        // `*` 是合法配置值：from_values 原样接受。
+        let c = HttpSecurityConfig::from_values(Some("127.0.0.1:8080"), Some("*"), None)
+            .expect("`*` must be a valid CONTROLLER_ALLOWED_ORIGIN");
+        assert_eq!(c.allowed_origin.as_deref(), Some("*"));
     }
 
     #[test]

@@ -76,7 +76,7 @@ after editing:
 
 Keep the file out of any backup or ticket that is not secret-handling.
 
-Two of the required variables deserve a closer look:
+Three of the required variables deserve a closer look:
 
   * CONTROLLER_DATABASE_URL carries the account and password inline. The
     template ships a commented placeholder example
@@ -95,6 +95,19 @@ Two of the required variables deserve a closer look:
     exact list of names the controller is actually reached by (the default
     bind is 127.0.0.1:8080, so a local-only setup is usually just
     `127.0.0.1:8080`). See the commented examples in the template.
+  * CONTROLLER_ALLOWED_ORIGIN is matched verbatim as well — one exact Origin
+    string, scheme and port included, no case folding, no trimming, no
+    wildcards — with the same single exception: a value that is the single
+    character `*` admits any `Origin`, including requests that carry none.
+    That is the "drop the origin restriction" switch, and the security
+    consequence is again what it sounds like — the Origin check stops
+    constraining anything — while the session-bound `X-CSRF-Token` check and
+    the Host allowlist above stay fully enforced, so use it only on a trusted
+    management network, or behind a reverse proxy that validates the origin
+    itself. Partial forms such as `*.example` or `http://*` are ordinary
+    exact values, not wildcards. The recommended form stays the single exact
+    Origin the browser actually sends. See the commented examples in the
+    template.
 
 2. Back up the target database, then set the migration gates
 ------------------------------------------------------------

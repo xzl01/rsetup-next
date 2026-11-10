@@ -11,8 +11,9 @@
 //! 50/s；未登录恒 401 `AUTH_REQUIRED`）→ ②[`require_business_session`]
 //! （临时密码会话一律 403 `PASSWORD_CHANGE_REQUIRED`，02 §7「已改密会话」）→
 //! ③Origin 允许列表（02 §7「握手校验 Host/Origin 允许列表」：`Origin` 缺失即
-//! 同源 GET，只由 Host 允许列表把关；携带时必须等于 `allowed_origin`，重复或
-//! 非 ASCII 失败关闭 403）→ ④[`crate::http_auth::AuthServiceApi::session_authority`] 取**权威**
+//! 同源 GET，只由 Host 允许列表把关；携带时必须等于 `allowed_origin`（整项
+//! `*` 放行任意 Origin），重复或非 ASCII 失败关闭 403）→
+//! ④[`crate::http_auth::AuthServiceApi::session_authority`] 取**权威**
 //! 基准快照（会话仍有效 + 当前 `authz_epoch` + 当前 `is_admin`；会话已失效
 //! 401，权威源读不出 503，且门禁在订阅之前）→ ⑤订阅总线并进入 SSE 流。
 //!
@@ -184,14 +185,15 @@ async fn events_handler(State(state): State<EventsState>, headers: HeaderMap) ->
 }
 
 /// 握手期 Origin 允许列表（02 §7）：未携带 `Origin` 即同源 GET，由 Host
-/// 允许列表把关；携带时必须精确等于 `allowed_origin`，重复头/非 ASCII 失败关闭。
+/// 允许列表把关；携带时必须精确等于 `allowed_origin`（整项 `*` 放行任意
+/// Origin），重复头/非 ASCII 失败关闭。
 // Err 变体是 axum `Response`（≥128 字节）：与 `http_gate` 的同形签名一致，
 // 失败路径直接返回固定错误响应、不在热路径装箱，故按函数抑制该 lint。
 #[allow(clippy::result_large_err)]
 fn check_handshake_origin(state: &HttpAuthState, headers: &HeaderMap) -> Result<(), Response> {
     match get_single_origin(headers) {
         Ok(None) => Ok(()),
-        Ok(Some(origin)) if state.config.allowed_origin.as_deref() == Some(origin) => Ok(()),
+        Ok(Some(origin)) if state.config.origin_allowed_if_present(Some(origin)) => Ok(()),
         Ok(Some(_)) | Err(()) => Err(origin_host_invalid()),
     }
 }

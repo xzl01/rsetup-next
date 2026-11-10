@@ -258,7 +258,7 @@ pub(crate) async fn authenticate_write(
         Ok(origin) => origin,
         Err(()) => return Err(origin_host_invalid()),
     };
-    if origin.is_some_and(|o| state.config.allowed_origin.as_deref() != Some(o)) {
+    if !state.config.origin_allowed_if_present(origin) {
         return Err(origin_host_invalid());
     }
     let Some(raw) = session_cookie_value(headers) else {

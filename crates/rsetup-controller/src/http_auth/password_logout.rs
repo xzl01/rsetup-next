@@ -31,12 +31,13 @@ pub(super) async fn password(
         return origin_host_invalid();
     }
 
-    // 2. Origin: exactly 0 (exempt) or exactly 1 matching allowed_origin.
+    // 2. Origin: exactly 0 (exempt) or exactly 1 matching allowed_origin
+    //    (a whole-entry `*` allowed_origin admits any Origin).
     let origin = match get_single_origin(&headers) {
         Ok(o) => o,
         Err(()) => return origin_host_invalid(),
     };
-    if origin.is_some_and(|o| state.config.allowed_origin.as_deref() != Some(o)) {
+    if !state.config.origin_allowed_if_present(origin) {
         return origin_host_invalid();
     }
 
@@ -163,12 +164,13 @@ pub(super) async fn logout(
         return origin_host_invalid();
     }
 
-    // 2. Origin: exactly 0 (exempt) or exactly 1 matching allowed_origin.
+    // 2. Origin: exactly 0 (exempt) or exactly 1 matching allowed_origin
+    //    (a whole-entry `*` allowed_origin admits any Origin).
     let origin = match get_single_origin(&headers) {
         Ok(o) => o,
         Err(()) => return origin_host_invalid(),
     };
-    if origin.is_some_and(|o| state.config.allowed_origin.as_deref() != Some(o)) {
+    if !state.config.origin_allowed_if_present(origin) {
         return origin_host_invalid();
     }
 
